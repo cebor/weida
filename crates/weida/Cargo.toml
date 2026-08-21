@@ -20,6 +20,11 @@ rcgen.workspace = true
 tracing-subscriber.workspace = true
 # Examples stream stdin/stdout; the library itself needs no stdio.
 tokio = { workspace = true, features = ["io-std"] }
+criterion.workspace = true
+
+[[bench]]
+name = "echo"
+harness = false
 
 [lints.rust]
 unsafe_code = "forbid"
