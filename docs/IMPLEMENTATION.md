@@ -302,7 +302,8 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Stream magic | `0x57` (ASCII `W`) | Cheap first-byte rejection of non-weida streams. |
 | Wire protocol version | `0` | Experimental per master doc §15; independent of the library version. |
 | Library version | `0.1.0` | Independent of the wire version. |
-| Client trust | explicit CA PEM files only | No platform root store and no insecure-skip mode ships in v0. The prototype uses the server's self-signed certificate as its CA. |
+| Client trust | explicit trust anchors only | No platform root store and no insecure-skip mode ships in v0. The prototype uses the server's self-signed certificate as its CA. |
+| TLS material source | file **or** in-memory PEM (`Pem`) | Requiring a path would force callers holding a key from a secret store to write it to disk first. Both sources are first class; `ServerTls::from_pem` never touches the filesystem. |
 | Rust edition | `2024` | Current stable edition. |
 | MSRV | `1.88` | Highest requirement among the pinned dependencies. |
 

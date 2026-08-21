@@ -6,7 +6,6 @@
 //! group so the measured work is the transfer, not TLS handshakes.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -18,9 +17,11 @@ use weida::{
 const PAYLOAD: usize = 1024;
 
 struct Harness {
-    _dir: PathBuf,
     runtime: Runtime,
-    cert_pem: PathBuf,
+    /// The certificate as PEM text. Nothing is written to disk: `criterion`
+    /// exits the process when the run ends, so `Drop` would not fire and a
+    /// key file would survive the benchmark.
+    cert_pem: String,
     addr: SocketAddr,
     listener: Listener,
     _binding: weida::Binding,
@@ -30,7 +31,7 @@ impl Harness {
     /// A client runtime that trusts this server.
     fn client(&self) -> Runtime {
         Runtime::new(RuntimeConfig {
-            client_tls: Some(ClientTls::from_pem_file(&self.cert_pem)),
+            client_tls: Some(ClientTls::from_pem(self.cert_pem.clone())),
             ..RuntimeConfig::default()
         })
         .expect("client runtime")
@@ -41,25 +42,17 @@ impl Harness {
     }
 }
 
-impl Drop for Harness {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self._dir);
-    }
-}
-
-async fn harness(tag: &str) -> Harness {
-    let dir = std::env::temp_dir().join(format!("weida-bench-{}-{tag}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let cert_pem = dir.join("cert.pem");
-    let key_pem = dir.join("key.pem");
+async fn harness() -> Harness {
     let generated =
         rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).expect("certificate");
-    std::fs::write(&cert_pem, generated.cert.pem()).expect("write cert");
-    std::fs::write(&key_pem, generated.signing_key.serialize_pem()).expect("write key");
+    let cert_pem = generated.cert.pem();
 
     let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
     let listener = runtime
-        .listener(ServerTls::new(&cert_pem, &key_pem))
+        .listener(ServerTls::from_pem(
+            cert_pem.clone(),
+            generated.signing_key.serialize_pem(),
+        ))
         .await
         .expect("listener");
     let binding = listener
@@ -69,7 +62,6 @@ async fn harness(tag: &str) -> Harness {
     let addr = binding.local_addr();
 
     Harness {
-        _dir: dir,
         runtime,
         cert_pem,
         addr,
@@ -96,7 +88,7 @@ fn drain(puller: Puller) {
 
 fn bench_push(c: &mut Criterion) {
     let rt = tokio_runtime();
-    let harness = rt.block_on(harness("push"));
+    let harness = rt.block_on(harness());
 
     let (best_effort, acked) = rt.block_on(async {
         drain(harness.listener.puller("/best").expect("puller best"));
@@ -152,7 +144,7 @@ fn bench_fanout(c: &mut Criterion) {
     const SUBSCRIBERS: usize = 8;
 
     let rt = tokio_runtime();
-    let harness = rt.block_on(harness("fanout"));
+    let harness = rt.block_on(harness());
 
     let (publisher, mut subscribers) = rt.block_on(async {
         let publisher: Publisher = harness.listener.publisher("/md").expect("publisher");

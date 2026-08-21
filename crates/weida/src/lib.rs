@@ -46,7 +46,7 @@ pub use weida_core::{
 };
 pub use weida_protocol::{ALPN, VERSION, codes};
 
-pub use config::{ClientTls, RuntimeConfig, ServerTls};
+pub use config::{ClientTls, Pem, RuntimeConfig, ServerTls};
 pub use endpoint::{
     Endpoint, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher, Rep, Replier, Req, Requester,
     Sub, Subscriber,

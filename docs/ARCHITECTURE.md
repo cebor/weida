@@ -420,8 +420,11 @@ The surface of crate `weida`.
 // re-exports from weida-core: Error, Outcome, AckState, AckMode, Limits, TraceContext, EndpointAddr
 pub struct RuntimeConfig { pub limits: Limits, pub client_tls: Option<ClientTls>,
     pub keep_alive: Duration /*10s*/, pub idle_timeout: Duration /*30s*/ }   // Default impl
-pub struct ClientTls { pub roots_pem: Vec<PathBuf> }        // explicit trust anchors, required for connect()
-pub struct ServerTls { pub cert_chain_pem: PathBuf, pub key_pem: PathBuf }
+pub enum Pem { Bytes(Vec<u8>), File(PathBuf) }              // TLS material need not be a file
+pub struct ClientTls { pub roots_pem: Vec<Pem> }            // explicit trust anchors, required for connect()
+impl ClientTls { pub fn from_pem_file(p) -> Self; pub fn from_pem(bytes) -> Self; }
+pub struct ServerTls { pub cert_chain_pem: Pem, pub key_pem: Pem }
+impl ServerTls { pub fn new(cert_path, key_path) -> Self; pub fn from_pem(cert, key) -> Self; }
 
 pub struct Runtime;                                          // Clone (Arc inner); needs ambient tokio
 impl Runtime {

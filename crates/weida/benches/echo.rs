@@ -6,7 +6,6 @@
 //! handshakes.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -16,7 +15,6 @@ use weida::{AckMode, Limits, Listener, Runtime, RuntimeConfig, ServerTls, Transf
 const CHUNK: usize = 64 * 1024;
 
 struct Harness {
-    _dir: PathBuf,
     runtime: Runtime,
     client: Runtime,
     addr: SocketAddr,
@@ -24,26 +22,22 @@ struct Harness {
     _binding: weida::Binding,
 }
 
-impl Drop for Harness {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self._dir);
-    }
-}
-
 /// Starts an echo server and a client runtime that trusts it.
+///
+/// The certificate stays in memory. `criterion` exits the process when the run
+/// ends, so a `Drop` that removed a temporary directory would not fire and the
+/// private key would outlive the benchmark.
 async fn harness() -> Harness {
-    let dir = std::env::temp_dir().join(format!("weida-bench-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let cert_pem = dir.join("cert.pem");
-    let key_pem = dir.join("key.pem");
     let generated =
         rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).expect("certificate");
-    std::fs::write(&cert_pem, generated.cert.pem()).expect("write cert");
-    std::fs::write(&key_pem, generated.signing_key.serialize_pem()).expect("write key");
+    let cert_pem = generated.cert.pem();
 
     let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
     let listener = runtime
-        .listener(ServerTls::new(&cert_pem, &key_pem))
+        .listener(ServerTls::from_pem(
+            cert_pem.clone(),
+            generated.signing_key.serialize_pem(),
+        ))
         .await
         .expect("listener");
     let binding = listener
@@ -84,13 +78,12 @@ async fn harness() -> Harness {
 
     let client = Runtime::new(RuntimeConfig {
         limits: Limits::default(),
-        client_tls: Some(weida::ClientTls::from_pem_file(&cert_pem)),
+        client_tls: Some(weida::ClientTls::from_pem(cert_pem)),
         ..RuntimeConfig::default()
     })
     .expect("client runtime");
 
     Harness {
-        _dir: dir,
         runtime,
         client,
         addr,

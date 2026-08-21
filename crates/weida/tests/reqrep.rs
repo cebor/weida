@@ -475,7 +475,10 @@ async fn multi_peer_requests_round_robin() {
     // One client trusting both servers.
     let client = weida::Runtime::new(weida::RuntimeConfig {
         client_tls: Some(weida::ClientTls {
-            roots_pem: vec![a.certs.cert_pem.clone(), b.certs.cert_pem.clone()],
+            roots_pem: vec![
+                weida::Pem::File(a.certs.cert_pem.clone()),
+                weida::Pem::File(b.certs.cert_pem.clone()),
+            ],
         }),
         ..weida::RuntimeConfig::default()
     })

@@ -16,7 +16,36 @@ use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use quinn::{TransportConfig, VarInt};
 use weida_core::{Error, Limits};
 
-use crate::config::{ClientTls, ServerTls};
+use crate::config::{ClientTls, Pem, ServerTls};
+
+/// Reads a certificate chain from either PEM source.
+fn certs_from(pem: &Pem) -> Result<Vec<CertificateDer<'static>>, Error> {
+    let chain: Vec<CertificateDer<'static>> = match pem {
+        Pem::Bytes(bytes) => CertificateDer::pem_slice_iter(bytes)
+            .collect::<Result<_, _>>()
+            .map_err(|e| tls_err("parsing certificates", e))?,
+        Pem::File(path) => CertificateDer::pem_file_iter(path)
+            .map_err(|e| tls_err("reading certificates", e))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| tls_err("parsing certificates", e))?,
+    };
+    if chain.is_empty() {
+        return Err(Error::Tls(format!(
+            "{} contains no certificates",
+            pem.describe()
+        )));
+    }
+    Ok(chain)
+}
+
+/// Reads a private key from either PEM source.
+fn key_from(pem: &Pem) -> Result<PrivateKeyDer<'static>, Error> {
+    match pem {
+        Pem::Bytes(bytes) => PrivateKeyDer::from_pem_slice(bytes),
+        Pem::File(path) => PrivateKeyDer::from_pem_file(path),
+    }
+    .map_err(|e| tls_err("reading the private key", e))
+}
 
 fn provider() -> Arc<quinn::rustls::crypto::CryptoProvider> {
     Arc::new(quinn::rustls::crypto::ring::default_provider())
@@ -55,24 +84,14 @@ pub(crate) fn transport_config(
     Ok(tc)
 }
 
-/// Builds a QUIC server configuration from PEM files on disk.
+/// Builds a QUIC server configuration from the configured PEM sources.
 pub(crate) fn server_config(
     tls: &ServerTls,
     limits: &Limits,
     idle_timeout: Duration,
 ) -> Result<quinn::ServerConfig, Error> {
-    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&tls.cert_chain_pem)
-        .map_err(|e| tls_err("reading certificate chain", e))?
-        .collect::<Result<_, _>>()
-        .map_err(|e| tls_err("parsing certificate chain", e))?;
-    if chain.is_empty() {
-        return Err(Error::Tls(format!(
-            "certificate chain {} contains no certificates",
-            tls.cert_chain_pem.display()
-        )));
-    }
-    let key = PrivateKeyDer::from_pem_file(&tls.key_pem)
-        .map_err(|e| tls_err("reading private key", e))?;
+    let chain = certs_from(&tls.cert_chain_pem)?;
+    let key = key_from(&tls.key_pem)?;
 
     let mut crypto = quinn::rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&quinn::rustls::version::TLS13])
@@ -89,7 +108,7 @@ pub(crate) fn server_config(
     Ok(config)
 }
 
-/// Builds a QUIC client configuration trusting exactly the configured PEM files.
+/// Builds a QUIC client configuration trusting exactly the configured sources.
 pub(crate) fn client_config(
     tls: &ClientTls,
     limits: &Limits,
@@ -100,18 +119,8 @@ pub(crate) fn client_config(
         return Err(Error::Tls("client_tls.roots_pem is empty".into()));
     }
     let mut roots = RootCertStore::empty();
-    for path in &tls.roots_pem {
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
-            .map_err(|e| tls_err("reading trust anchors", e))?
-            .collect::<Result<_, _>>()
-            .map_err(|e| tls_err("parsing trust anchors", e))?;
-        if certs.is_empty() {
-            return Err(Error::Tls(format!(
-                "trust anchor file {} contains no certificates",
-                path.display()
-            )));
-        }
-        for cert in certs {
+    for source in &tls.roots_pem {
+        for cert in certs_from(source)? {
             roots
                 .add(cert)
                 .map_err(|e| tls_err("adding a trust anchor", e))?;
