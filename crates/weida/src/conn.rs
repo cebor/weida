@@ -278,7 +278,17 @@ async fn driver(conn: quinn::Connection, limits: Limits, mut rx: mpsc::Receiver<
                 Some(ctl) => handle_ctl(&conn, &mut outgoing, &mut inbound, ctl),
                 None => break,
             },
-            _ = conn.closed() => break,
+            _ = conn.closed() => {
+                // Transitions already queued happened *before* the connection
+                // went away and must be applied first. Otherwise a transfer
+                // whose FIN is sitting in this queue would be reported as
+                // `ConnectionLost` (definitely not delivered) when the truth is
+                // `Indeterminate`.
+                while let Ok(ctl) = rx.try_recv() {
+                    handle_ctl(&conn, &mut outgoing, &mut inbound, ctl);
+                }
+                break;
+            }
         }
     }
 
