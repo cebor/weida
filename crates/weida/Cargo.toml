@@ -18,6 +18,8 @@ rustls-pki-types.workspace = true
 [dev-dependencies]
 rcgen.workspace = true
 tracing-subscriber.workspace = true
+# Examples stream stdin/stdout; the library itself needs no stdio.
+tokio = { workspace = true, features = ["io-std"] }
 
 [lints.rust]
 unsafe_code = "forbid"
