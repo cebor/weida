@@ -17,7 +17,8 @@
 use weida_core::{AckMode, TraceContext, TransferId};
 use weida_protocol::header::limits;
 use weida_protocol::{
-    AckHeader, CancelHeader, DataHeader, ErrorHeader, Hello, encode_frame, parse_preamble,
+    AckHeader, CancelHeader, DataHeader, ErrorHeader, Hello, SubscriptionHeader, encode_frame,
+    parse_preamble,
 };
 
 const ITERATIONS: usize = 100_000;
@@ -138,6 +139,7 @@ fn fuzz_smoke_data_header_from_valid_bytes() {
             content_type: Some("application/cbor".into()),
             traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
             tracestate: Some("a=1,b=2".into()),
+            topic: Some("px.eur".into()),
         },
     ];
     let mut accepted = 0usize;
@@ -286,6 +288,42 @@ fn fuzz_smoke_data_header_roundtrip() {
     }
 }
 
+#[test]
+fn fuzz_smoke_subscribe() {
+    let mut rng = Rng::new(0x7a5b_3c1d_9e0f_2468);
+    let seed = SubscriptionHeader::new("/md", "px.").encode();
+    let mut accepted = 0usize;
+    for i in 0..ITERATIONS {
+        // Alternate between free-form bytes and bit-flipped valid headers: the
+        // first explores the reject path, the second the accept path.
+        let input = if i % 2 == 0 {
+            rng.bytes(48)
+        } else {
+            let mut buf = seed.clone();
+            for _ in 0..=rng.below(3) {
+                rng.flip_bit(&mut buf);
+            }
+            buf
+        };
+        let Ok(header) = SubscriptionHeader::decode(&input) else {
+            continue;
+        };
+        accepted += 1;
+        assert!(header.endpoint.len() <= limits::MAX_ENDPOINT_BYTES);
+        assert!(header.filter.len() <= limits::MAX_FILTER_BYTES);
+        assert_eq!(
+            SubscriptionHeader::decode(&header.encode()).as_ref(),
+            Ok(&header),
+            "decoding is not idempotent for {input:?}"
+        );
+    }
+    assert!(accepted > 0, "no subscription header ever decoded");
+    assert!(
+        accepted < ITERATIONS,
+        "the decoder accepted every input; it is too permissive"
+    );
+}
+
 fn check_data_header(header: &DataHeader) {
     if let Some(e) = &header.endpoint {
         assert!(e.len() <= limits::MAX_ENDPOINT_BYTES);
@@ -299,9 +337,13 @@ fn check_data_header(header: &DataHeader) {
     if let Some(ts) = &header.tracestate {
         assert!(ts.len() <= limits::MAX_TRACESTATE_BYTES);
     }
-    // A request always carries an endpoint, a reply always a correlation id.
+    if let Some(topic) = &header.topic {
+        assert!(topic.len() <= limits::MAX_TOPIC_BYTES);
+    }
+    // Oneshot and request always carry an endpoint, a reply always a
+    // correlation id.
     match header.role {
-        1 => assert!(header.endpoint.is_some()),
+        0 | 1 => assert!(header.endpoint.is_some()),
         2 => assert!(header.correlation_id.is_some()),
         _ => {}
     }
@@ -325,7 +367,7 @@ fn arbitrary_data_header(rng: &mut Rng) -> DataHeader {
         }
     };
     DataHeader {
-        endpoint: if role == 1 {
+        endpoint: if role == 0 || role == 1 {
             Some(format!(
                 "/{}",
                 "e".repeat(rng.below(limits::MAX_ENDPOINT_BYTES))
@@ -355,5 +397,6 @@ fn arbitrary_data_header(rng: &mut Rng) -> DataHeader {
         content_type: text(rng, limits::MAX_CONTENT_TYPE_BYTES),
         traceparent: text(rng, limits::MAX_TRACEPARENT_BYTES),
         tracestate: text(rng, limits::MAX_TRACESTATE_BYTES),
+        topic: text(rng, limits::MAX_TOPIC_BYTES),
     }
 }

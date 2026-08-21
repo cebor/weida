@@ -32,6 +32,10 @@ pub mod limits {
     pub const MAX_TRACEPARENT_BYTES: usize = 128;
     /// Cap for the DATA `tracestate` field.
     pub const MAX_TRACESTATE_BYTES: usize = 512;
+    /// Cap for the DATA `topic` field.
+    pub const MAX_TOPIC_BYTES: usize = 256;
+    /// Cap for the SUBSCRIBE/UNSUBSCRIBE `filter` field.
+    pub const MAX_FILTER_BYTES: usize = 256;
     /// Cap for the ERROR `message` field.
     pub const MAX_MESSAGE_BYTES: usize = 1024;
     /// Cap on the number of items in a HELLO list field.
@@ -63,6 +67,7 @@ mod data_key {
     pub const CONTENT_TYPE: u64 = 6;
     pub const TRACEPARENT: u64 = 7;
     pub const TRACESTATE: u64 = 8;
+    pub const TOPIC: u64 = 9;
 }
 
 /// ACK keys.
@@ -81,6 +86,12 @@ mod error_key {
 /// CANCEL keys.
 mod cancel_key {
     pub const ID: u64 = 0;
+}
+
+/// SUBSCRIBE and UNSUBSCRIBE keys.
+mod subscription_key {
+    pub const ENDPOINT: u64 = 0;
+    pub const FILTER: u64 = 1;
 }
 
 /// Why a header was rejected. Every variant is a protocol violation.
@@ -507,7 +518,7 @@ impl Hello {
 /// silently reinterpreted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataHeader {
-    /// Endpoint path; present iff `role` is `request`.
+    /// Endpoint path; required iff `role` is `oneshot` or `request`.
     pub endpoint: Option<String>,
     /// Sender's transfer id.
     pub transfer_id: TransferId,
@@ -525,9 +536,32 @@ pub struct DataHeader {
     pub traceparent: Option<String>,
     /// W3C `tracestate`, opaque passthrough.
     pub tracestate: Option<String>,
+    /// Pub/Sub topic; opaque bytes matched by byte prefix. Only meaningful on
+    /// `oneshot` transfers fanned out by a publisher.
+    pub topic: Option<String>,
 }
 
 impl DataHeader {
+    /// A fire-and-forget header with no optional metadata.
+    pub fn oneshot(
+        endpoint: impl Into<String>,
+        transfer_id: TransferId,
+        ack_mode: AckMode,
+    ) -> DataHeader {
+        DataHeader {
+            endpoint: Some(endpoint.into()),
+            transfer_id,
+            role: Role::Oneshot.to_wire(),
+            correlation_id: None,
+            ack_mode: ack_mode.to_wire(),
+            content_len: None,
+            content_type: None,
+            traceparent: None,
+            tracestate: None,
+            topic: None,
+        }
+    }
+
     /// A request header with no optional metadata.
     pub fn request(
         endpoint: impl Into<String>,
@@ -544,6 +578,7 @@ impl DataHeader {
             content_type: None,
             traceparent: None,
             tracestate: None,
+            topic: None,
         }
     }
 
@@ -563,6 +598,7 @@ impl DataHeader {
             content_type: None,
             traceparent: None,
             tracestate: None,
+            topic: None,
         }
     }
 
@@ -588,7 +624,8 @@ impl DataHeader {
             + u64::from(self.content_len.is_some())
             + u64::from(self.content_type.is_some())
             + u64::from(self.traceparent.is_some())
-            + u64::from(self.tracestate.is_some());
+            + u64::from(self.tracestate.is_some())
+            + u64::from(self.topic.is_some());
         encode_with(|e| {
             e.map(count)?;
             if let Some(endpoint) = &self.endpoint {
@@ -614,6 +651,9 @@ impl DataHeader {
             if let Some(ts) = &self.tracestate {
                 e.u64(data_key::TRACESTATE)?.str(ts)?;
             }
+            if let Some(topic) = &self.topic {
+                e.u64(data_key::TOPIC)?.str(topic)?;
+            }
             Ok(())
         })
     }
@@ -632,6 +672,7 @@ impl DataHeader {
         let mut content_type = None;
         let mut traceparent = None;
         let mut tracestate = None;
+        let mut topic = None;
         {
             let mut m = MapReader::new(&mut d)?;
             while let Some(key) = m.next_key()? {
@@ -651,6 +692,7 @@ impl DataHeader {
                     data_key::TRACESTATE => {
                         tracestate = Some(m.text(key, limits::MAX_TRACESTATE_BYTES)?)
                     }
+                    data_key::TOPIC => topic = Some(m.text(key, limits::MAX_TOPIC_BYTES)?),
                     _ => m.skip()?,
                 }
             }
@@ -658,7 +700,7 @@ impl DataHeader {
             m.require(data_key::ROLE)?;
             // Conditional requirements. A reserved role requires neither, and
             // the receiver answers it with UNSUPPORTED.
-            if role == Role::Request.to_wire() {
+            if role == Role::Oneshot.to_wire() || role == Role::Request.to_wire() {
                 m.require(data_key::ENDPOINT)?;
             }
             if role == Role::Reply.to_wire() {
@@ -676,6 +718,7 @@ impl DataHeader {
             content_type,
             traceparent,
             tracestate,
+            topic,
         })
     }
 }
@@ -839,6 +882,70 @@ impl CancelHeader {
     }
 }
 
+/// SUBSCRIBE and UNSUBSCRIBE header.
+///
+/// Both frames carry the same two keys: the publisher path to (un)subscribe on
+/// and the topic filter. The filter is a byte prefix, not a pattern: an empty
+/// filter matches every topic, and no character in it is special.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionHeader {
+    /// Publisher endpoint path.
+    pub endpoint: String,
+    /// Topic prefix; the empty string matches everything.
+    pub filter: String,
+}
+
+impl SubscriptionHeader {
+    /// A header for `endpoint` and `filter`.
+    pub fn new(endpoint: impl Into<String>, filter: impl Into<String>) -> SubscriptionHeader {
+        SubscriptionHeader {
+            endpoint: endpoint.into(),
+            filter: filter.into(),
+        }
+    }
+
+    /// Encodes the header.
+    pub fn encode(&self) -> Vec<u8> {
+        // Both keys are required, so neither is elided: an absent filter and an
+        // empty filter would otherwise be indistinguishable on the wire, and
+        // the empty filter is the "everything" subscription.
+        encode_with(|e| {
+            e.map(2)?;
+            e.u64(subscription_key::ENDPOINT)?.str(&self.endpoint)?;
+            e.u64(subscription_key::FILTER)?.str(&self.filter)?;
+            Ok(())
+        })
+    }
+
+    /// Decodes the header.
+    pub fn decode(bytes: &[u8]) -> Result<SubscriptionHeader, HeaderError> {
+        let mut d = Decoder::new(bytes);
+        let mut endpoint = None;
+        let mut filter = None;
+        {
+            let mut m = MapReader::new(&mut d)?;
+            while let Some(key) = m.next_key()? {
+                match key {
+                    subscription_key::ENDPOINT => {
+                        endpoint = Some(m.text(key, limits::MAX_ENDPOINT_BYTES)?)
+                    }
+                    subscription_key::FILTER => {
+                        filter = Some(m.text(key, limits::MAX_FILTER_BYTES)?)
+                    }
+                    _ => m.skip()?,
+                }
+            }
+            m.require(subscription_key::ENDPOINT)?;
+            m.require(subscription_key::FILTER)?;
+        }
+        finish(&d)?;
+        Ok(SubscriptionHeader {
+            endpoint: endpoint.expect("presence checked above"),
+            filter: filter.expect("presence checked above"),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,6 +1004,51 @@ mod tests {
         assert_eq!(CancelHeader::decode(&bytes).unwrap(), h);
     }
 
+    #[test]
+    fn golden_oneshot_data_header() {
+        let h = DataHeader::oneshot("/t", tid(1), AckMode::None);
+        let bytes = h.encode();
+        // `ack_mode = 0` is the default and is omitted; `role = 0` is written.
+        assert_eq!(
+            bytes,
+            vec![0xA3, 0x00, 0x62, 0x2F, 0x74, 0x01, 0x01, 0x02, 0x00]
+        );
+        assert_eq!(bytes.len(), 0x09);
+        assert_eq!(DataHeader::decode(&bytes).unwrap(), h);
+    }
+
+    #[test]
+    fn golden_pub_copy_data_header() {
+        let mut h = DataHeader::oneshot("/md", tid(1), AckMode::None);
+        h.topic = Some("px.eur".into());
+        let bytes = h.encode();
+        assert_eq!(
+            bytes,
+            vec![
+                0xA4, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x01, 0x01, 0x02, 0x00, 0x09, 0x66, 0x70, 0x78,
+                0x2E, 0x65, 0x75, 0x72
+            ]
+        );
+        assert_eq!(bytes.len(), 0x12);
+        assert_eq!(DataHeader::decode(&bytes).unwrap(), h);
+    }
+
+    #[test]
+    fn golden_subscription_headers() {
+        let h = SubscriptionHeader::new("/md", "px.");
+        let bytes = h.encode();
+        assert_eq!(
+            bytes,
+            vec![
+                0xA2, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x01, 0x63, 0x70, 0x78, 0x2E
+            ]
+        );
+        assert_eq!(bytes.len(), 0x0B);
+        // One header layout serves both kinds; only the kind byte differs, and
+        // that byte belongs to the preamble (see `frame::tests::golden_preambles`).
+        assert_eq!(SubscriptionHeader::decode(&bytes).unwrap(), h);
+    }
+
     // --- roundtrips -------------------------------------------------------
 
     #[test]
@@ -911,6 +1063,7 @@ mod tests {
             content_type: Some("application/octet-stream".into()),
             traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
             tracestate: Some("vendor=value".into()),
+            topic: Some("px.eur".into()),
         };
         assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
     }
@@ -950,6 +1103,7 @@ mod tests {
             content_type: Some("t".into()),
             traceparent: Some("p".into()),
             tracestate: Some("s".into()),
+            topic: Some("k".into()),
         };
         let bytes = h.encode();
         let mut d = Decoder::new(&bytes);
@@ -1111,7 +1265,7 @@ mod tests {
             e.u64(2)?.u64(2)?;
             e.u64(3)?.u64(1)?;
             e.u64(4)?.u64(1)?;
-            e.u64(9)?.array(64)?;
+            e.u64(40)?.array(64)?;
             for i in 0..64u64 {
                 e.u64(i)?;
             }
@@ -1231,6 +1385,20 @@ mod tests {
             HeaderError::MissingKey(data_key::ENDPOINT)
         );
 
+        // Oneshot without an endpoint: dispatch needs the path, so the same
+        // requirement applies as for a request.
+        let bytes = encode_with(|e| {
+            e.map(3)?;
+            e.u64(1)?.u64(1)?;
+            e.u64(2)?.u64(0)?;
+            e.u64(4)?.u64(0)?;
+            Ok(())
+        });
+        assert_eq!(
+            DataHeader::decode(&bytes).unwrap_err(),
+            HeaderError::MissingKey(data_key::ENDPOINT)
+        );
+
         // Reply without a correlation id.
         let bytes = encode_with(|e| {
             e.map(3)?;
@@ -1256,6 +1424,96 @@ mod tests {
         assert_eq!(
             Hello::decode(&bytes).unwrap_err(),
             HeaderError::MissingKey(hello_key::CAPABILITIES)
+        );
+    }
+
+    // --- subscription headers ---------------------------------------------
+
+    #[test]
+    fn an_empty_filter_is_legal_and_survives_the_roundtrip() {
+        let h = SubscriptionHeader::new("/md", "");
+        let bytes = h.encode();
+        assert_eq!(SubscriptionHeader::decode(&bytes).unwrap(), h);
+        // The key is written even though the value is empty: absent and empty
+        // must stay distinguishable, and empty means "every topic".
+        assert!(
+            bytes.contains(&0x60),
+            "the empty filter is encoded: {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn subscription_strings_are_capped() {
+        for (key, max) in [
+            (subscription_key::ENDPOINT, limits::MAX_ENDPOINT_BYTES),
+            (subscription_key::FILTER, limits::MAX_FILTER_BYTES),
+        ] {
+            let build = |len: usize| {
+                let text = "a".repeat(len);
+                let mut h = SubscriptionHeader::new("/md", "px.");
+                if key == subscription_key::ENDPOINT {
+                    h.endpoint = text;
+                } else {
+                    h.filter = text;
+                }
+                h.encode()
+            };
+            assert_eq!(
+                SubscriptionHeader::decode(&build(max + 1)).unwrap_err(),
+                HeaderError::StringTooLong {
+                    key,
+                    len: max + 1,
+                    max
+                },
+                "key {key}"
+            );
+            assert!(
+                SubscriptionHeader::decode(&build(max)).is_ok(),
+                "key {key} at cap"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_headers_require_both_keys() {
+        let only = |key: u64| {
+            encode_with(|e| {
+                e.map(1)?;
+                e.u64(key)?.str("/md")?;
+                Ok(())
+            })
+        };
+        assert_eq!(
+            SubscriptionHeader::decode(&only(subscription_key::ENDPOINT)).unwrap_err(),
+            HeaderError::MissingKey(subscription_key::FILTER)
+        );
+        assert_eq!(
+            SubscriptionHeader::decode(&only(subscription_key::FILTER)).unwrap_err(),
+            HeaderError::MissingKey(subscription_key::ENDPOINT)
+        );
+    }
+
+    #[test]
+    fn subscription_headers_reject_malformed_input() {
+        assert!(SubscriptionHeader::decode(&[]).is_err());
+        // Trailing bytes.
+        let mut bytes = SubscriptionHeader::new("/md", "px.").encode();
+        bytes.push(0xff);
+        assert_eq!(
+            SubscriptionHeader::decode(&bytes).unwrap_err(),
+            HeaderError::TrailingBytes
+        );
+        // Unknown keys are skipped, like every other header.
+        let extended = encode_with(|e| {
+            e.map(3)?;
+            e.u64(0)?.str("/md")?;
+            e.u64(1)?.str("px.")?;
+            e.u64(40)?.array(2)?.u64(1)?.u64(2)?;
+            Ok(())
+        });
+        assert_eq!(
+            SubscriptionHeader::decode(&extended).unwrap(),
+            SubscriptionHeader::new("/md", "px.")
         );
     }
 
@@ -1305,15 +1563,17 @@ mod tests {
                 data_key::CONTENT_TYPE => h.content_type = Some(text),
                 data_key::TRACEPARENT => h.traceparent = Some(text),
                 data_key::TRACESTATE => h.tracestate = Some(text),
+                data_key::TOPIC => h.topic = Some(text),
                 other => panic!("key {other} is not a text field"),
             }
             h.encode()
         };
-        let cases: [(u64, usize); 4] = [
+        let cases: [(u64, usize); 5] = [
             (data_key::ENDPOINT, limits::MAX_ENDPOINT_BYTES),
             (data_key::CONTENT_TYPE, limits::MAX_CONTENT_TYPE_BYTES),
             (data_key::TRACEPARENT, limits::MAX_TRACEPARENT_BYTES),
             (data_key::TRACESTATE, limits::MAX_TRACESTATE_BYTES),
+            (data_key::TOPIC, limits::MAX_TOPIC_BYTES),
         ];
         for (key, max) in cases {
             assert_eq!(
@@ -1456,9 +1716,11 @@ mod tests {
 
     #[test]
     fn tags_are_rejected() {
+        // Key 50 is unknown, so the value goes through `skip_value`, which is
+        // where the tag rule lives.
         let bytes = encode_with(|e| {
             e.map(1)?;
-            e.u64(9)?.tag(minicbor::data::IanaTag::Cbor)?.u64(1)?;
+            e.u64(50)?.tag(minicbor::data::IanaTag::Cbor)?.u64(1)?;
             Ok(())
         });
         assert_eq!(
@@ -1471,7 +1733,8 @@ mod tests {
 
     #[test]
     fn reserved_roles_and_ack_modes_survive_decoding() {
-        for role in [0u64, 3, 99] {
+        // Role 0 is `oneshot` since Phase 3; 3.. remain reserved.
+        for role in [3u64, 99, u64::MAX] {
             for ack in [2u64, 3, 4, 77] {
                 let bytes = encode_with(|e| {
                     e.map(3)?;

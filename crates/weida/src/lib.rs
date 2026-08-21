@@ -1,7 +1,8 @@
 //! weida: a QUIC-native messaging framework.
 //!
-//! This crate hosts the runtime, the native QUIC transport and the Req/Rep
-//! pattern. `docs/ARCHITECTURE.md` describes the layer model,
+//! This crate hosts the runtime, the native QUIC transport and the brokerless
+//! messaging patterns: Req/Rep, Push/Pull and Pub/Sub.
+//! `docs/ARCHITECTURE.md` describes the layer model,
 //! `docs/PROTOCOL.md` is the normative wire specification, and
 //! `docs/FAILURE_MODEL.md` defines what each outcome means.
 //!
@@ -34,6 +35,7 @@ mod conn;
 mod endpoint;
 mod listener;
 mod pool;
+mod pubsub;
 mod runtime;
 mod tls;
 mod transfer;
@@ -45,7 +47,10 @@ pub use weida_core::{
 pub use weida_protocol::{ALPN, VERSION, codes};
 
 pub use config::{ClientTls, RuntimeConfig, ServerTls};
-pub use endpoint::{Endpoint, Pattern, Rep, Replier, Req, Requester};
+pub use endpoint::{
+    Endpoint, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher, Rep, Replier, Req, Requester,
+    Sub, Subscriber,
+};
 pub use listener::{Binding, Listener};
 pub use runtime::Runtime;
 pub use transfer::{

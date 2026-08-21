@@ -25,6 +25,7 @@ fn full_request() -> DataHeader {
         content_type: Some("application/octet-stream".into()),
         traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
         tracestate: Some("vendor=value,other=thing".into()),
+        topic: Some("px.eur".into()),
     }
 }
 

@@ -135,17 +135,19 @@ impl fmt::Display for Outcome {
 
 /// Role of a DATA transfer on the wire.
 ///
-/// `oneshot` (`0`) is reserved for the fire-and-forget patterns of Phase 3 and
-/// is not accepted in v0.
+/// `oneshot` (`0`) is the fire-and-forget role of Push/Pull and Pub/Sub: it
+/// carries an endpoint path and expects no reply. Roles `3..` are reserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
+    /// A fire-and-forget transfer; carries an endpoint path, no correlation.
+    Oneshot,
     /// A request; carries an endpoint path and expects a correlated reply.
     Request,
     /// A reply; carries the correlation id of the request it answers.
     Reply,
 }
 
-/// Wire code for `role = oneshot` (reserved).
+/// Wire code for `role = oneshot`.
 pub const ROLE_ONESHOT: u64 = 0;
 /// Wire code for `role = request`.
 pub const ROLE_REQUEST: u64 = 1;
@@ -156,6 +158,7 @@ impl Role {
     /// The wire code for this role.
     pub const fn to_wire(self) -> u64 {
         match self {
+            Role::Oneshot => ROLE_ONESHOT,
             Role::Request => ROLE_REQUEST,
             Role::Reply => ROLE_REPLY,
         }
@@ -164,16 +167,24 @@ impl Role {
     /// Interprets a wire code, returning `None` for reserved or unknown values.
     pub const fn from_wire(code: u64) -> Option<Role> {
         match code {
+            ROLE_ONESHOT => Some(Role::Oneshot),
             ROLE_REQUEST => Some(Role::Request),
             ROLE_REPLY => Some(Role::Reply),
             _ => None,
         }
+    }
+
+    /// True if this role addresses an endpoint path, so the wire header must
+    /// carry `endpoint`.
+    pub const fn addresses_endpoint(self) -> bool {
+        matches!(self, Role::Oneshot | Role::Request)
     }
 }
 
 impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Role::Oneshot => f.write_str("oneshot"),
             Role::Request => f.write_str("request"),
             Role::Reply => f.write_str("reply"),
         }
@@ -223,10 +234,19 @@ mod tests {
 
     #[test]
     fn role_wire_roundtrip_and_reserved() {
+        assert_eq!(Role::from_wire(ROLE_ONESHOT), Some(Role::Oneshot));
         assert_eq!(Role::from_wire(1), Some(Role::Request));
         assert_eq!(Role::from_wire(2), Some(Role::Reply));
-        assert_eq!(Role::from_wire(ROLE_ONESHOT), None);
-        assert_eq!(Role::from_wire(3), None);
+        // Roles 3.. are reserved.
+        for code in [3u64, 4, 63, u64::MAX] {
+            assert_eq!(Role::from_wire(code), None, "role {code}");
+        }
+        for role in [Role::Oneshot, Role::Request, Role::Reply] {
+            assert_eq!(Role::from_wire(role.to_wire()), Some(role));
+        }
+        assert!(Role::Oneshot.addresses_endpoint());
+        assert!(Role::Request.addresses_endpoint());
+        assert!(!Role::Reply.addresses_endpoint());
     }
 
     #[test]

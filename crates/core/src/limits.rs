@@ -32,6 +32,14 @@ pub struct Limits {
     /// How long to wait for the peer HELLO before closing the connection with
     /// `NEGOTIATION_FAILED`, in milliseconds.
     pub hello_timeout_ms: u64,
+    /// Subscription filters one peer connection may hold at once, summed over
+    /// every path. Exceeding it closes the connection with `LIMIT_EXCEEDED`:
+    /// SUBSCRIBE has no transfer id to answer with an ERROR frame.
+    pub max_subscriptions: usize,
+    /// Payload bytes a publisher may hold queued for one subscriber. A message
+    /// that does not fit is dropped for that subscriber and counted; the
+    /// publisher never blocks on a slow consumer.
+    pub subscriber_buffer_bytes: usize,
 }
 
 impl Limits {
@@ -52,6 +60,8 @@ impl Default for Limits {
             max_pending: 4096,
             endpoint_queue: 256,
             hello_timeout_ms: 10_000,
+            max_subscriptions: 256,
+            subscriber_buffer_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -71,6 +81,8 @@ mod tests {
         assert_eq!(l.max_pending, 4096);
         assert_eq!(l.endpoint_queue, 256);
         assert_eq!(l.hello_timeout_ms, 10_000);
+        assert_eq!(l.max_subscriptions, 256);
+        assert_eq!(l.subscriber_buffer_bytes, 8 << 20);
     }
 
     #[test]

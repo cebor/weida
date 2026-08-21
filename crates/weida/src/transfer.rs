@@ -17,7 +17,7 @@ use quinn::VarInt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{oneshot, watch};
 use weida_core::state::{RecvAction, RecvEvent, RecvMachine, RecvState};
-use weida_core::{AckMode, Error, Outcome, TraceContext, TransferId};
+use weida_core::{AckMode, Error, Outcome, Role, TraceContext, TransferId};
 use weida_protocol::{DataHeader, FrameKind, codes, encode_preamble};
 
 use crate::conn::{ConnHandle, Ctl, read_error, write_error};
@@ -84,6 +84,8 @@ pub struct IncomingMeta {
     pub trace: Option<TraceContext>,
     /// Opaque `tracestate`, forwarded unmodified.
     pub tracestate: Option<String>,
+    /// Pub/Sub topic, when the transfer came from a publisher fan-out.
+    pub topic: Option<String>,
 }
 
 impl IncomingMeta {
@@ -100,6 +102,7 @@ impl IncomingMeta {
                 .as_deref()
                 .and_then(|v| TraceContext::parse_traceparent(v).ok()),
             tracestate: header.tracestate.clone(),
+            topic: header.topic.clone(),
         }
     }
 }
@@ -120,7 +123,12 @@ pub(crate) fn new_trace_context() -> TraceContext {
 }
 
 /// Builds the DATA header for an outgoing transfer.
+///
+/// `role` is explicit rather than inferred from `correlation_id`: oneshot and
+/// request are both uncorrelated, so the presence of a correlation id no
+/// longer determines the role.
 pub(crate) fn data_header(
+    role: Role,
     endpoint: Option<&str>,
     id: TransferId,
     correlation_id: Option<TransferId>,
@@ -131,16 +139,14 @@ pub(crate) fn data_header(
     let header = DataHeader {
         endpoint: endpoint.map(str::to_owned),
         transfer_id: id,
-        role: match correlation_id {
-            Some(_) => weida_core::policy::ROLE_REPLY,
-            None => weida_core::policy::ROLE_REQUEST,
-        },
+        role: role.to_wire(),
         correlation_id,
         ack_mode: meta.ack_mode.to_wire(),
         content_len: meta.content_len,
         content_type: meta.content_type.clone(),
         traceparent: Some(trace.to_traceparent()),
         tracestate,
+        topic: None,
     };
     (header, trace)
 }
@@ -468,6 +474,7 @@ impl IncomingRequest {
 
         let reserved = conn.register(meta.ack_mode, false).await?;
         let (header, trace) = data_header(
+            Role::Reply,
             None,
             reserved.id,
             Some(correlation_id),
@@ -613,7 +620,14 @@ mod tests {
     #[test]
     fn request_headers_carry_the_endpoint_and_a_trace_context() {
         let meta = TransferMeta::default().with_ack(AckMode::Accepted);
-        let (header, trace) = data_header(Some("/transform"), TransferId::FIRST, None, &meta, None);
+        let (header, trace) = data_header(
+            Role::Request,
+            Some("/transform"),
+            TransferId::FIRST,
+            None,
+            &meta,
+            None,
+        );
         assert_eq!(header.endpoint.as_deref(), Some("/transform"));
         assert_eq!(header.role, weida_core::policy::ROLE_REQUEST);
         assert_eq!(header.correlation_id, None);
@@ -630,6 +644,7 @@ mod tests {
     fn reply_headers_carry_the_correlation_id_and_tracestate() {
         let correlation = TransferId::new(9).unwrap();
         let (header, _) = data_header(
+            Role::Reply,
             None,
             TransferId::FIRST,
             Some(correlation),

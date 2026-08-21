@@ -15,20 +15,33 @@ use weida_core::{Error, Limits, validate_endpoint_path};
 use weida_protocol::codes;
 
 use crate::conn::ConnCtx;
-use crate::endpoint::{Endpoint, RepState, Replier};
+use crate::endpoint::{Endpoint, PubState, Publisher, PullState, Puller, RepState, Replier};
+use crate::pubsub::SubRegistry;
 use crate::runtime::RuntimeInner;
-use crate::transfer::IncomingRequest;
+use crate::transfer::{IncomingRequest, IncomingTransfer};
+
+/// What a registered endpoint path does with an inbound transfer.
+pub(crate) enum Route {
+    /// A replier: inbound `request` transfers become [`IncomingRequest`]s.
+    Request(mpsc::Sender<IncomingRequest>),
+    /// A puller or subscriber: inbound `oneshot` transfers are queued as-is.
+    Transfer(mpsc::Sender<IncomingTransfer>),
+    /// A publisher. Nothing inbound is accepted on this path; the entry exists
+    /// so the path is claimed exclusively and so SUBSCRIBE can be answered for
+    /// a path that really is served here.
+    Pub,
+}
 
 /// Endpoint path to accept-queue map.
 ///
 /// A plain `RwLock<HashMap>`, not an async lock: lookup is a hash and a channel
 /// clone, and the guard is never held across an `await`.
 pub(crate) struct Namespace {
-    routes: RwLock<HashMap<Arc<str>, mpsc::Sender<IncomingRequest>>>,
+    routes: RwLock<HashMap<Arc<str>, Route>>,
 }
 
 impl Namespace {
-    fn new() -> Namespace {
+    pub(crate) fn new() -> Namespace {
         Namespace {
             routes: RwLock::new(HashMap::new()),
         }
@@ -37,22 +50,47 @@ impl Namespace {
     /// Looks a path up. The path is compared byte for byte: it is an opaque
     /// identifier, so there is no splitting, prefix matching or wildcarding
     /// (master doc §4, §81 rule 5).
-    pub(crate) fn lookup(&self, path: &str) -> Option<mpsc::Sender<IncomingRequest>> {
+    ///
+    /// Returns a clone of the route's sender rather than a guard, so the lock
+    /// is never held across an `await`.
+    pub(crate) fn lookup(&self, path: &str) -> Option<Route> {
         self.routes
             .read()
             .expect("namespace lock poisoned")
             .get(path)
-            .cloned()
+            .map(Route::clone_sender)
     }
 
-    fn register(&self, path: &str, queue: mpsc::Sender<IncomingRequest>) -> Result<(), Error> {
+    pub(crate) fn register(&self, path: &str, route: Route) -> Result<(), Error> {
         let mut routes = self.routes.write().expect("namespace lock poisoned");
         match routes.entry(Arc::from(path)) {
             Entry::Occupied(_) => Err(Error::AlreadyRegistered),
             Entry::Vacant(slot) => {
-                slot.insert(queue);
+                slot.insert(route);
                 Ok(())
             }
+        }
+    }
+
+    /// Releases a path so the same endpoint can be registered again.
+    ///
+    /// Used by subscriber teardown: a `Sub` claims its path on the pooled
+    /// client connection and must give it back, or a later `Sub` on the same
+    /// connection would fail with [`Error::AlreadyRegistered`] forever.
+    pub(crate) fn unregister(&self, path: &str) {
+        self.routes
+            .write()
+            .expect("namespace lock poisoned")
+            .remove(path);
+    }
+}
+
+impl Route {
+    fn clone_sender(&self) -> Route {
+        match self {
+            Route::Request(tx) => Route::Request(tx.clone()),
+            Route::Transfer(tx) => Route::Transfer(tx.clone()),
+            Route::Pub => Route::Pub,
         }
     }
 }
@@ -60,6 +98,7 @@ impl Namespace {
 pub(crate) struct ListenerInner {
     pub(crate) runtime: Arc<RuntimeInner>,
     pub(crate) namespace: Arc<Namespace>,
+    pub(crate) subs: Arc<SubRegistry>,
     pub(crate) server_config: quinn::ServerConfig,
 }
 
@@ -71,10 +110,12 @@ pub struct Listener {
 
 impl Listener {
     pub(crate) fn new(runtime: Arc<RuntimeInner>, server_config: quinn::ServerConfig) -> Listener {
+        let limits = runtime.config.limits;
         Listener {
             inner: Arc::new(ListenerInner {
                 runtime,
                 namespace: Arc::new(Namespace::new()),
+                subs: Arc::new(SubRegistry::new(limits)),
                 server_config,
             }),
         }
@@ -93,6 +134,7 @@ impl Listener {
         tokio::spawn(accept_connections(
             endpoint.clone(),
             Arc::clone(&self.inner.namespace),
+            Arc::clone(&self.inner.subs),
             self.inner.runtime.config.limits,
         ));
 
@@ -110,8 +152,36 @@ impl Listener {
     pub fn replier(&self, path: &str) -> Result<Replier, Error> {
         validate_endpoint_path(path)?;
         let (tx, rx) = mpsc::channel(self.inner.runtime.config.limits.endpoint_queue);
-        self.inner.namespace.register(path, tx)?;
+        self.inner.namespace.register(path, Route::Request(tx))?;
         Ok(Endpoint::from_state(RepState::new(path, rx)))
+    }
+
+    /// Registers a puller for `path`.
+    ///
+    /// Pull binds and Push connects, mirroring Rep/Req. The path must be a
+    /// valid endpoint path and must not already be registered on this
+    /// listener, whatever pattern claimed it.
+    pub fn puller(&self, path: &str) -> Result<Puller, Error> {
+        validate_endpoint_path(path)?;
+        let (tx, rx) = mpsc::channel(self.inner.runtime.config.limits.endpoint_queue);
+        self.inner.namespace.register(path, Route::Transfer(tx))?;
+        Ok(Endpoint::from_state(PullState::new(path, rx)))
+    }
+
+    /// Registers a publisher for `path`.
+    ///
+    /// Pub binds and Sub connects. Nothing inbound is accepted on the path —
+    /// the registration claims it exclusively — and subscriptions that arrived
+    /// before this call are already recorded, so a publisher created after its
+    /// subscribers still reaches them.
+    pub fn publisher(&self, path: &str) -> Result<Publisher, Error> {
+        validate_endpoint_path(path)?;
+        self.inner.namespace.register(path, Route::Pub)?;
+        Ok(Endpoint::from_state(PubState::new(
+            path,
+            Arc::clone(&self.inner.subs),
+            self.inner.runtime.config.limits.subscriber_buffer_bytes,
+        )))
     }
 }
 
@@ -146,7 +216,12 @@ fn shutdown_code() -> VarInt {
 }
 
 /// Accepts connections until the endpoint is closed.
-async fn accept_connections(endpoint: quinn::Endpoint, namespace: Arc<Namespace>, limits: Limits) {
+async fn accept_connections(
+    endpoint: quinn::Endpoint,
+    namespace: Arc<Namespace>,
+    subs: Arc<SubRegistry>,
+    limits: Limits,
+) {
     let live = Arc::new(AtomicUsize::new(0));
     while let Some(incoming) = endpoint.accept().await {
         if live.load(Ordering::Relaxed) >= limits.max_connections {
@@ -168,17 +243,23 @@ async fn accept_connections(endpoint: quinn::Endpoint, namespace: Arc<Namespace>
         }
 
         let namespace = Arc::clone(&namespace);
+        let subs = Arc::clone(&subs);
         let live = Arc::clone(&live);
         live.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
                     let remote = conn.remote_address();
+                    let conn_id = conn.stable_id();
                     tracing::debug!(%remote, "connection accepted");
                     // The handle must outlive the connection: it owns the
                     // actor's control channel.
-                    let _ctx = ConnCtx::spawn(conn.clone(), limits, Some(namespace));
+                    let _ctx =
+                        ConnCtx::spawn(conn.clone(), limits, namespace, Some(Arc::clone(&subs)));
                     let reason = conn.closed().await;
+                    // A peer that goes away takes its subscriptions with it;
+                    // otherwise connection churn would grow the registry.
+                    subs.remove_connection(conn_id);
                     tracing::debug!(%remote, %reason, "connection closed");
                 }
                 Err(e) => tracing::debug!(error = %e, "handshake failed"),
@@ -197,24 +278,41 @@ mod tests {
     async fn namespace_rejects_duplicate_paths() {
         let ns = Namespace::new();
         let (tx, _rx) = mpsc::channel(1);
-        ns.register("/a", tx.clone()).unwrap();
+        ns.register("/a", Route::Request(tx.clone())).unwrap();
         assert!(matches!(
-            ns.register("/a", tx.clone()),
+            ns.register("/a", Route::Request(tx.clone())),
             Err(Error::AlreadyRegistered)
         ));
-        ns.register("/b", tx).unwrap();
+        // The pattern behind the path is irrelevant: a path is claimed once.
+        assert!(matches!(
+            ns.register("/a", Route::Pub),
+            Err(Error::AlreadyRegistered)
+        ));
+        ns.register("/b", Route::Request(tx)).unwrap();
     }
 
     #[tokio::test]
     async fn namespace_lookup_is_exact() {
         let ns = Namespace::new();
         let (tx, _rx) = mpsc::channel(1);
-        ns.register("/jobs/a", tx).unwrap();
+        ns.register("/jobs/a", Route::Request(tx)).unwrap();
         assert!(ns.lookup("/jobs/a").is_some());
         // No prefix matching, no wildcards, no trailing-slash equivalence.
         assert!(ns.lookup("/jobs").is_none());
         assert!(ns.lookup("/jobs/a/").is_none());
         assert!(ns.lookup("/jobs/*").is_none());
         assert!(ns.lookup("/JOBS/A").is_none());
+    }
+
+    #[tokio::test]
+    async fn unregistering_releases_the_path() {
+        let ns = Namespace::new();
+        let (tx, _rx) = mpsc::channel(1);
+        ns.register("/s", Route::Transfer(tx)).unwrap();
+        ns.unregister("/s");
+        assert!(ns.lookup("/s").is_none());
+        // Unregistering an unknown path is not an error.
+        ns.unregister("/s");
+        ns.register("/s", Route::Pub).unwrap();
     }
 }

@@ -26,6 +26,7 @@ struct ArbHeader {
     content_type: Option<String>,
     traceparent: Option<String>,
     tracestate: Option<String>,
+    topic: Option<String>,
 }
 
 /// Truncates on a char boundary so the result stays valid UTF-8.
@@ -49,7 +50,7 @@ fuzz_target!(|input: ArbHeader| {
 
     // The conditional requirements are part of the wire contract, so only
     // headers that satisfy them are representable.
-    let endpoint = if role == 1 {
+    let endpoint = if role == 0 || role == 1 {
         Some(endpoint.unwrap_or_else(|| "/".to_owned()))
     } else {
         endpoint
@@ -70,6 +71,7 @@ fuzz_target!(|input: ArbHeader| {
         content_type: cap(input.content_type, limits::MAX_CONTENT_TYPE_BYTES),
         traceparent: cap(input.traceparent, limits::MAX_TRACEPARENT_BYTES),
         tracestate: cap(input.tracestate, limits::MAX_TRACESTATE_BYTES),
+        topic: cap(input.topic, limits::MAX_TOPIC_BYTES),
     };
 
     let bytes = header.encode();

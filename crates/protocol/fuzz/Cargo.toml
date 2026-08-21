@@ -54,3 +54,10 @@ path = "fuzz_targets/roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "subscribe"
+path = "fuzz_targets/subscribe.rs"
+test = false
+doc = false
+bench = false

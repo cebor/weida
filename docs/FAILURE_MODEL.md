@@ -133,7 +133,7 @@ success and then report the error afterwards.
 | Event | Receiver action |
 | --- | --- |
 | Peer `RESET_STREAM` before FIN | Discard all partial state for that transfer. Send **no** ACK and **no** ERROR frame. Surface a `Canceled` error to any application read in progress. |
-| Receiver refuses inbound payload | `STOP_SENDING` with the appropriate application error code: `UNKNOWN_ENDPOINT` for an unregistered path, `REJECTED` when the application drops the body before FIN or a reserved header value was requested, `CANCELED` when a local cancellation caused the refusal. |
+| Receiver refuses inbound payload | `STOP_SENDING` with the appropriate application error code: `UNKNOWN_ENDPOINT` for an unregistered path, `REJECTED` when the application drops the body before FIN, a reserved header value was requested, or the `role` is one the addressed endpoint does not serve ([PROTOCOL.md](PROTOCOL.md) §9.4), `CANCELED` when a local cancellation caused the refusal. |
 | Application drops a request without opening a reply | Send ERROR `{re, NO_REPLY}` so the requester does not hang until the idle timeout. |
 
 ### Connection teardown
@@ -141,6 +141,24 @@ success and then report the error afterwards.
 When a connection fails, every pending table entry on that connection MUST be resolved by
 these rules — pending ACK waiters, pending reply waiters and active inbound request cancel
 signals alike. No pending operation may be left to time out silently.
+
+### Publisher fan-out loss
+
+One loss mode in v0 is deliberately outside the outcome vocabulary above. When a publisher
+fans a message out, a subscriber whose byte budget is exhausted does not receive that
+message, and **no** transfer is ever opened for it — so there is no `transfer_id`, no ACK
+waiter and no outcome to resolve. The loss is therefore:
+
+- invisible to the subscriber, which cannot distinguish "nothing was published" from
+  "a message was dropped for me" (making it visible needs a sequence field, which v0 does
+  not have);
+- visible to the publisher only in aggregate, as `Publisher::publish` returning a smaller
+  count than `Publisher::subscriber_count` and as the `Publisher::dropped` counter.
+
+This is the intended behaviour for fan-out, not a gap in the failure model
+([GUARANTEES.md](GUARANTEES.md) §6): a publisher that blocked on its slowest subscriber
+would let one consumer degrade every other. Applications that cannot tolerate silent loss
+must not use Pub/Sub for that data in v0.
 
 ---
 

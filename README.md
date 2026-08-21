@@ -12,6 +12,7 @@ same patterns and the same programming model.
 
 **Status:** alpha. Wire protocol version `0` (experimental, breaking changes permitted
 within `0.x`). Phases 0-2 implemented: docs, core model, native QUIC transport with Req/Rep.
+Phase 3 in progress: Push/Pull and Pub/Sub have landed.
 
 ## Documentation
 
@@ -31,7 +32,7 @@ within `0.x`). Phases 0-2 implemented: docs, core model, native QUIC transport w
 | --- | --- | --- |
 | `crates/core` | `weida-core` | I/O-free model: errors, ids, endpoint addresses, limits, policies, trace context, state machines |
 | `crates/protocol` | `weida-protocol` | wire codec, no I/O: varints, framing, CBOR headers, negotiation, error codes |
-| `crates/weida` | `weida` | runtime, native QUIC transport, Req/Rep endpoints and transfers |
+| `crates/weida` | `weida` | runtime, native QUIC transport, Req/Rep, Push/Pull and Pub/Sub endpoints and transfers |
 
 ## Try the prototype
 

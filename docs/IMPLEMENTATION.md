@@ -18,7 +18,7 @@ chaotically across phases.
 | 0 | Architecture/specification | done |
 | 1 | Core model | done |
 | 2 | Native QUIC transport | done |
-| 3 | Brokerless messaging patterns | not started |
+| 3 | Brokerless messaging patterns | in progress |
 | 4 | Reliability | not started |
 | 5 | Persistence subsystem | not started |
 | 6 | Standalone broker | not started |
@@ -29,8 +29,9 @@ chaotically across phases.
 | 11 | CLI and administration | not started |
 | 12 | Documentation/site/stabilization | not started |
 
-Phases 0, 1 and 2 constitute the current increment. Phase 3 and later are explicitly out of
-scope for it.
+Phases 0, 1 and 2 are complete. Phase 3 is under way: its first increment (Push/Pull and
+Pub/Sub) has landed; Router/Dealer are answered as emergent rather than implemented, see
+[ARCHITECTURE.md](ARCHITECTURE.md) §6a. Phases 4 and later remain out of scope.
 
 ### Phase 0 — Architecture/specification
 
@@ -86,6 +87,40 @@ Delivers `weida-protocol` and crate `weida`.
 
 Large streaming transfers are tested immediately, not deferred.
 
+---
+
+### Phase 3 — Brokerless messaging patterns
+
+Master doc §79 asks at minimum for Push/Pull, Pub/Sub, Req/Rep and Router/Dealer
+equivalents. §82 asks whether a smaller internal primitive set implements them cleanly.
+
+**Delivered in the first increment:**
+
+- The §82 answer: four primitives (P1 one-way transfer, P2 correlation, P3 peer set plus
+  selection policy, P4 bounded inbound queue behind an opaque path), recorded with the
+  Router/Dealer-is-emergent rationale in [ARCHITECTURE.md](ARCHITECTURE.md) §6a.
+- Wire: `role = 0` (oneshot) implemented, DATA key `9` (`topic`), frame kinds `5`
+  (SUBSCRIBE) and `6` (UNSUBSCRIBE), limits `max_subscriptions` and
+  `subscriber_buffer_bytes` — all normative in [PROTOCOL.md](PROTOCOL.md).
+- Push/Pull: `Pusher` connects and round-robins over its peers, `Puller` binds. Both
+  acknowledgement modes work unchanged, because they ride P1.
+- Pub/Sub: `Publisher` binds, `Subscriber` connects; byte-prefix topic filters; fan-out
+  with a per-subscriber byte budget and explicit drops, so a slow subscriber never stalls
+  the publisher.
+- Refusal rather than reinterpretation when a role meets an endpoint that does not serve
+  it: ERROR `UNSUPPORTED` plus `STOP_SENDING(REJECTED)`, connection intact.
+
+**Deliberately deferred** (recorded now, not discovered later):
+
+- Connecting publishers and binding pushers; v0 fixes Pub/Pull as binders and Sub/Push as
+  connectors.
+- Streaming fan-out — tee-ing one long stream to many subscribers needs its own drop and
+  ordering design.
+- Per-producer ordering. Ordering is `None` for both new patterns; a sequence field would
+  be a protocol addition, not an implementation detail.
+- Coalescing backpressure (master doc §27); only `Block`, `Reject` and fan-out `Drop` exist.
+- Router/Dealer as first-class types, and the broker work they would actually require
+  (master doc §47, §85, Phase 6).
 ---
 
 ## 2. Mandatory development loop per phase
@@ -205,6 +240,29 @@ of the path buffers a whole transfer, which is what requirement 16 exists to est
 No thresholds are asserted on the benchmark numbers this increment; they are the baseline
 for later comparison.
 
+### Verified results — Phase 3, first increment
+
+Same machine and toolchains. The Phase 0-2 numbers above are left as recorded; these are
+the checks that closed the Push/Pull and Pub/Sub increment.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Whole workspace | `cargo test --workspace` | 215 tests pass, 1 ignored (the 1 GiB memory test); `weida-core` 58, `weida-protocol` 76 unit + 9 fuzz-smoke, `weida` 26 unit + 11 Req/Rep + 7 Push/Pull + 11 Pub/Sub + 16 hostile + 1 doc |
+| Golden vectors | `cargo test -p weida-protocol` | the four new vectors byte-exact both directions: oneshot DATA, fan-out DATA with `topic`, SUBSCRIBE, UNSUBSCRIBE |
+| Drop policy | `slow_subscriber_drops_not_blocks` | 100 x 32 KiB published against a 64 KiB per-subscriber budget: the whole publish loop completes inside the deadline, the draining subscriber receives all 100, `Publisher::dropped() > 0` |
+| Filtering | `subscribe_prefix_filters_topics` | a non-matching topic published between two matching ones never arrives; proven by a FIFO sentinel rather than a sleep |
+| Selection policy reuse | `push_round_robins_two_peers` | 8 pushes over 2 peers split 4/4 by destination path, each message delivered exactly once |
+| Hostile subscriptions | `cargo test -p weida --test hostile` | 257-byte filter → `PROTOCOL_VIOLATION`; `max_subscriptions + 1` distinct filters → `LIMIT_EXCEEDED`; oneshot DATA ahead of HELLO is parked and then delivered |
+| Fuzzing | `cargo +nightly fuzz run <target> -- -runs=200000 -max_len=20000` | all six targets including the new `subscribe`, zero crashes, zero OOMs |
+| Push | `cargo bench -p weida --bench patterns` | 1 KiB push 27.6 us best effort (35.4 MiB/s), 83.0 us with an `Accepted` ACK (11.8 MiB/s) |
+| Fan-out | `cargo bench -p weida --bench patterns` | 1 KiB to 8 subscribers, published and fully drained by all 8: 65.2 us (119.8 MiB/s aggregate) |
+
+The fan-out number is the one worth reading carefully: it measures publish **plus** eight
+receives, so it is a whole-cycle figure, not the cost of `publish` itself, which is a
+non-blocking enqueue.
+
+No thresholds are asserted on these numbers either.
+
 ---
 
 ## 5. Decisions made in Phase 0
@@ -276,9 +334,21 @@ Recorded deliberately, not discovered later.
 - **No synchronous API wrapper.** The async API is the only surface. A blocking facade is a
   binding-layer concern (Phase 10).
 - **Fuzz runs need a nightly toolchain.** `cargo-fuzz` requires nightly, which is installed
-  and was used: all five targets ran 200 000 iterations each with no findings. On a host
+  and was used: all six targets ran 200 000 iterations each with no findings. On a host
   without nightly the targets are still committed and the deterministic `fuzz_smoke_*` tests
   cover the same properties on stable, at lower depth.
 - **`IncomingTransfer::read_capped` was added beyond the planned API surface.** The planned
   `collect(self, max_bytes)` cannot read a borrowed request body, so the borrowing form is
   the primitive and `collect` delegates to it.
+- **Pub/Sub fan-out drops are invisible to the subscriber.** A subscriber past its byte
+  budget at the publisher simply misses the message; nothing on the wire reports it. Only
+  the publisher counts it (`Publisher::dropped`). Making loss observable to the receiving
+  side would need a sequence field, which is the same prerequisite as per-producer
+  ordering.
+- **One subscriber per path per connection.** A `Subscriber` claims its path in the dialling
+  connection's namespace, so two subscribers on one pooled connection asking for the same
+  path collide with `AlreadyRegistered`. Fanning one subscription out to several in-process
+  consumers is left to the application; silently multiplexing two subscribers onto one queue
+  would be worse.
+- **Publisher direction is fixed.** Pub and Pull bind; Sub and Push connect. The reverse
+  directions wait for a use case that demands them.

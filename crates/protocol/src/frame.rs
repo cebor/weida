@@ -27,6 +27,10 @@ pub enum FrameKind {
     Error,
     /// Withdrawal of interest in a request's replies; header-only.
     Cancel,
+    /// Registration of interest in a publisher's topics; header-only.
+    Subscribe,
+    /// Withdrawal of a previous SUBSCRIBE; header-only.
+    Unsubscribe,
 }
 
 impl FrameKind {
@@ -38,6 +42,8 @@ impl FrameKind {
             FrameKind::Ack => 2,
             FrameKind::Error => 3,
             FrameKind::Cancel => 4,
+            FrameKind::Subscribe => 5,
+            FrameKind::Unsubscribe => 6,
         }
     }
 
@@ -51,6 +57,8 @@ impl FrameKind {
             2 => Some(FrameKind::Ack),
             3 => Some(FrameKind::Error),
             4 => Some(FrameKind::Cancel),
+            5 => Some(FrameKind::Subscribe),
+            6 => Some(FrameKind::Unsubscribe),
             _ => None,
         }
     }
@@ -69,6 +77,8 @@ impl fmt::Display for FrameKind {
             FrameKind::Ack => "ACK",
             FrameKind::Error => "ERROR",
             FrameKind::Cancel => "CANCEL",
+            FrameKind::Subscribe => "SUBSCRIBE",
+            FrameKind::Unsubscribe => "UNSUBSCRIBE",
         };
         f.write_str(s)
     }
@@ -186,12 +196,14 @@ mod tests {
             (FrameKind::Ack, 2),
             (FrameKind::Error, 3),
             (FrameKind::Cancel, 4),
+            (FrameKind::Subscribe, 5),
+            (FrameKind::Unsubscribe, 6),
         ];
         for (kind, code) in all {
             assert_eq!(kind.to_u8(), code);
             assert_eq!(FrameKind::from_u8(code), Some(kind));
         }
-        for code in 5u8..=255 {
+        for code in 7u8..=255 {
             assert_eq!(FrameKind::from_u8(code), None, "kind {code}");
         }
     }
@@ -204,6 +216,8 @@ mod tests {
             FrameKind::Ack,
             FrameKind::Error,
             FrameKind::Cancel,
+            FrameKind::Subscribe,
+            FrameKind::Unsubscribe,
         ] {
             assert!(!k.has_payload(), "{k}");
         }
@@ -222,24 +236,30 @@ mod tests {
     }
 
     #[test]
-    fn golden_preambles() {
-        // The preamble bytes of the four golden vectors in docs/PROTOCOL.md.
-        assert_eq!(
-            encode_frame(FrameKind::Data, &[0; 11])[..3],
-            [0x57, 0x01, 0x0b]
-        );
-        assert_eq!(
-            encode_frame(FrameKind::Hello, &[0; 16])[..3],
-            [0x57, 0x00, 0x10]
-        );
-        assert_eq!(
-            encode_frame(FrameKind::Ack, &[0; 5])[..3],
-            [0x57, 0x02, 0x05]
-        );
-        assert_eq!(
-            encode_frame(FrameKind::Cancel, &[0; 3])[..3],
-            [0x57, 0x04, 0x03]
-        );
+    fn every_kind_encodes_its_documented_kind_byte() {
+        // Per-kind preamble encoding and round-trip. The golden *frames* of
+        // docs/PROTOCOL.md §8 are asserted end-to-end, against real headers,
+        // in `tests/golden_vectors.rs`; this covers the kind byte for every
+        // kind, including those no golden vector exercises.
+        for (kind, code) in [
+            (FrameKind::Hello, 0x00u8),
+            (FrameKind::Data, 0x01),
+            (FrameKind::Ack, 0x02),
+            (FrameKind::Error, 0x03),
+            (FrameKind::Cancel, 0x04),
+            (FrameKind::Subscribe, 0x05),
+            (FrameKind::Unsubscribe, 0x06),
+        ] {
+            for header_len in [0usize, 3, 5, 9, 11, 16, 18] {
+                let frame = encode_frame(kind, &vec![0; header_len]);
+                assert_eq!(frame[0], MAGIC, "{kind}: magic");
+                assert_eq!(frame[1], code, "{kind}: kind byte");
+                let (preamble, used) = parse_preamble(&frame, CAP).unwrap();
+                assert_eq!(preamble.kind, kind);
+                assert_eq!(preamble.header_len as usize, header_len);
+                assert_eq!(frame.len() - used, header_len, "{kind}: header follows");
+            }
+        }
     }
 
     #[test]
@@ -265,8 +285,8 @@ mod tests {
 
     #[test]
     fn unknown_kind_is_a_violation() {
-        let err = parse_preamble(&[MAGIC, 0x05, 0x00], CAP).unwrap_err();
-        assert_eq!(err, PreambleError::UnknownKind(5));
+        let err = parse_preamble(&[MAGIC, 0x07, 0x00], CAP).unwrap_err();
+        assert_eq!(err, PreambleError::UnknownKind(7));
         assert!(err.is_violation());
     }
 

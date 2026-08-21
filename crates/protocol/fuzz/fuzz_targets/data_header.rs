@@ -28,7 +28,11 @@ fuzz_target!(|data: &[u8]| {
     if let Some(ts) = &header.tracestate {
         assert!(ts.len() <= limits::MAX_TRACESTATE_BYTES);
     }
+    if let Some(topic) = &header.topic {
+        assert!(topic.len() <= limits::MAX_TOPIC_BYTES);
+    }
     match header.role {
+        0 => assert!(header.endpoint.is_some(), "a oneshot must carry an endpoint"),
         1 => assert!(header.endpoint.is_some(), "a request must carry an endpoint"),
         2 => assert!(
             header.correlation_id.is_some(),

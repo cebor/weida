@@ -211,6 +211,27 @@ normative in [FAILURE_MODEL.md](FAILURE_MODEL.md).
 | Delivery | `BestEffort` only | v0 performs no retries. A failed or indeterminate transfer is reported to the application, which decides. `AtMostOnce` and `AtLeastOnce` require retry and dedup machinery that does not exist yet. |
 | Ordering | `None` | QUIC guarantees byte order **within** one stream, and each transfer is one stream, so a single transfer's payload is ordered. Across transfers there is no ordering guarantee of any kind. `PerProducer`, `PerKey` and `Total` are not implemented. |
 | Deduplication | `None` | No idempotency ids, no dedup window. Receiver-side `transfer_id` uniqueness is explicitly not enforced ([PROTOCOL.md](PROTOCOL.md) §6.2). |
-| Backpressure | `Block`, `Reject` | `Block`: QUIC stream and connection flow control plus bounded internal channels (`endpoint_queue`, the actor control channel) make senders await capacity. `Reject`: exceeding `max_pending` fails `open()` locally with `LimitExceeded` without touching the connection. `Drop`, `Spill` and `Coalesce` are not implemented. |
+| Backpressure | `Block`, `Reject`, `Drop` | `Block`: QUIC stream and connection flow control plus bounded internal channels (`endpoint_queue`, the actor control channel) make senders await capacity; this is what Req/Rep and Push/Pull use. `Reject`: exceeding `max_pending` fails `open()` locally with `LimitExceeded` without touching the connection. `Drop`: publisher fan-out only — a subscriber past `subscriber_buffer_bytes` loses the message rather than stalling the publisher. `Spill` and `Coalesce` are not implemented. |
 | Indeterminate outcomes | implemented | First-class: `Outcome`/`Error` distinguish `Indeterminate` from definite failure. See [FAILURE_MODEL.md](FAILURE_MODEL.md). |
 | Hop-locality | implemented, trivially | Exactly one hop exists in v0 (direct connection). No composition of hops is possible yet. |
+
+### Per pattern
+
+| Pattern | Delivery | Acknowledgement | Ordering |
+| --- | --- | --- | --- |
+| Req/Rep | `BestEffort` | `None` or `Accepted` | `None` across transfers |
+| Push/Pull | `BestEffort` | `None` or `Accepted` | `None` |
+| Pub/Sub | `BestEffort`, with per-subscriber drop | `None` (fan-out copies are always `ack_mode = 0`) | `None` |
+
+Two points deserve emphasis, because both are easy to assume otherwise:
+
+- **Pub/Sub drops are silent to the subscriber.** A subscriber whose byte budget at the
+  publisher is exhausted simply does not receive that message; nothing on the wire tells it
+  so. The publisher counts the drop locally (`Publisher::dropped`). This is the one place
+  where weida answers overload by discarding, and it is confined to fan-out (master doc
+  §17).
+- **Ordering is `None` for the new patterns, not "usually ordered".** Each message is its
+  own stream and QUIC does not order streams relative to each other. A publisher's
+  per-subscriber writer enqueues copies in publication order, but that is an implementation
+  property of one hop, not a guarantee an application may rely on. Per-producer ordering
+  requires a sequence field that v0 does not have.

@@ -24,10 +24,11 @@ use weida_core::{
 };
 use weida_protocol::{
     AckHeader, Agreed, CancelHeader, DataHeader, ErrorHeader, FrameKind, Hello, MAX_PREAMBLE_LEN,
-    PreambleError, codes, encode_frame, negotiate, parse_preamble,
+    PreambleError, SubscriptionHeader, codes, encode_frame, negotiate, parse_preamble,
 };
 
-use crate::listener::Namespace;
+use crate::listener::{Namespace, Route};
+use crate::pubsub::SubRegistry;
 use crate::transfer::{IncomingMeta, IncomingRequest, IncomingTransfer};
 
 /// Depth of the control channel between API handles and the actor.
@@ -61,6 +62,12 @@ pub(crate) enum Ctl {
     SendError { re: TransferId, code: ErrorCode },
     /// Emit a CANCEL frame for one of our own requests.
     SendCancel { id: TransferId },
+    /// Emit an UNSUBSCRIBE frame.
+    ///
+    /// Routed through the actor rather than spawned by the caller: a
+    /// subscriber's `Drop` may run outside a Tokio reactor, and a destructor
+    /// must never be the thing that needs one.
+    SendUnsubscribe { path: Arc<str>, filter: String },
     /// Track an accepted inbound request so CANCEL frames can reach it.
     TrackInbound {
         id: TransferId,
@@ -97,8 +104,14 @@ pub(crate) struct ConnCtx {
     pub conn: quinn::Connection,
     pub ctl: mpsc::Sender<Ctl>,
     pub limits: Limits,
-    /// `None` on a client connection: nothing is registered to serve.
-    pub namespace: Option<Arc<Namespace>>,
+    /// Endpoint routing table. Client connections get a fresh empty one rather
+    /// than sharing the listener's: a `Sub` registers its path on the
+    /// connection it dialled, so both directions need a namespace.
+    pub namespace: Arc<Namespace>,
+    /// Publisher-side subscriptions. `None` on a client connection: a peer
+    /// that subscribes to us when we serve no publishers is useless, not
+    /// hostile, so the frame is ignored rather than treated as a violation.
+    pub subs: Option<Arc<SubRegistry>>,
     agreed: watch::Receiver<Option<Agreed>>,
     next_id: AtomicU64,
 }
@@ -110,7 +123,8 @@ impl ConnCtx {
     pub(crate) fn spawn(
         conn: quinn::Connection,
         limits: Limits,
-        namespace: Option<Arc<Namespace>>,
+        namespace: Arc<Namespace>,
+        subs: Option<Arc<SubRegistry>>,
     ) -> ConnHandle {
         let (ctl_tx, ctl_rx) = mpsc::channel(CTL_QUEUE);
         let (agreed_tx, agreed_rx) = watch::channel(None);
@@ -120,6 +134,7 @@ impl ConnCtx {
             ctl: ctl_tx,
             limits,
             namespace,
+            subs,
             agreed: agreed_rx,
             next_id: AtomicU64::new(1),
         });
@@ -131,7 +146,11 @@ impl ConnCtx {
     }
 
     /// Reserves the next outgoing transfer id.
-    fn next_transfer_id(&self) -> TransferId {
+    ///
+    /// Public to the crate because publisher fan-out writes DATA frames that
+    /// are never registered: an `ack_mode = none` oneshot has no correlation,
+    /// so it needs an id but no table entry.
+    pub(crate) fn next_transfer_id(&self) -> TransferId {
         let raw = self.next_id.fetch_add(1, Ordering::Relaxed);
         TransferId::new(raw).expect("the counter starts at 1 and cannot reach 0 in practice")
     }
@@ -407,6 +426,11 @@ fn handle_ctl(
         Ctl::SendCancel { id } => {
             spawn_control(conn, FrameKind::Cancel, CancelHeader { id }.encode())
         }
+        Ctl::SendUnsubscribe { path, filter } => spawn_control(
+            conn,
+            FrameKind::Unsubscribe,
+            SubscriptionHeader::new(&*path, filter).encode(),
+        ),
         Ctl::TrackInbound { id, cancel } => {
             inbound.insert(id.get(), cancel);
         }
@@ -452,7 +476,7 @@ fn spawn_control(conn: &quinn::Connection, kind: FrameKind, header: Vec<u8>) {
 }
 
 /// Writes one header-only control frame on its own stream (master doc §11).
-async fn write_control(
+pub(crate) async fn write_control(
     conn: &quinn::Connection,
     kind: FrameKind,
     header: &[u8],
@@ -594,6 +618,8 @@ async fn handle_stream(
             }
             Err(e) => violation(ctx, &e.to_string()),
         },
+        FrameKind::Subscribe => handle_subscription(ctx, &header, true),
+        FrameKind::Unsubscribe => handle_subscription(ctx, &header, false),
     }
 }
 
@@ -601,6 +627,50 @@ fn violation(ctx: &ConnHandle, reason: &str) -> Result<(), Error> {
     tracing::debug!(reason, "closing connection: protocol violation");
     close(&ctx.conn, codes::PROTOCOL_VIOLATION, reason);
     Err(Error::Protocol(reason.to_owned()))
+}
+
+/// Applies a SUBSCRIBE or UNSUBSCRIBE frame.
+///
+/// Both carry the same header, and both are already parked behind negotiation
+/// by `handle_stream`, so a subscription that overtakes the peer's HELLO is
+/// delayed rather than refused.
+fn handle_subscription(ctx: &ConnHandle, header: &[u8], subscribe: bool) -> Result<(), Error> {
+    let header = match SubscriptionHeader::decode(header) {
+        Ok(h) => h,
+        Err(e) => return violation(ctx, &e.to_string()),
+    };
+    let Some(subs) = ctx.subs.as_ref() else {
+        // A client connection serves no publishers. Nothing to do, and nothing
+        // wrong with the peer's frame.
+        tracing::debug!(
+            endpoint = %header.endpoint,
+            "ignoring a subscription frame: this side publishes nothing"
+        );
+        return Ok(());
+    };
+
+    if subscribe {
+        if subs
+            .subscribe(&header.endpoint, ctx, header.filter)
+            .is_err()
+        {
+            // SUBSCRIBE has no transfer id, so there is nothing to answer with
+            // an ERROR frame; the connection is the only granularity available.
+            tracing::debug!(
+                max = ctx.limits.max_subscriptions,
+                "subscription limit reached; closing the connection"
+            );
+            close(
+                &ctx.conn,
+                codes::LIMIT_EXCEEDED,
+                "too many subscriptions on one connection",
+            );
+            return Err(Error::LimitExceeded);
+        }
+    } else {
+        subs.unsubscribe(&header.endpoint, ctx.conn.stable_id(), &header.filter);
+    }
+    Ok(())
 }
 
 fn handle_hello(
@@ -658,38 +728,40 @@ async fn handle_data(
     };
 
     let meta = IncomingMeta::from_header(&header, ack_mode);
-    match role {
-        Role::Reply => {
-            let correlation_id = header
-                .correlation_id
-                .expect("the decoder requires it for replies")
-                .get();
-            let transfer = IncomingTransfer::new(Arc::clone(ctx), stream, meta);
-            ctx.send(Ctl::ReplyArrived {
+    if role == Role::Reply {
+        let correlation_id = header
+            .correlation_id
+            .expect("the decoder requires it for replies")
+            .get();
+        let transfer = IncomingTransfer::new(Arc::clone(ctx), stream, meta);
+        return ctx
+            .send(Ctl::ReplyArrived {
                 correlation_id,
                 transfer: Box::new(transfer),
             })
-            .await
-        }
-        Role::Request => {
-            let path = header
-                .endpoint
-                .as_deref()
-                .expect("the decoder requires it for requests");
-            let route = ctx.namespace.as_ref().and_then(|ns| ns.lookup(path));
-            let Some(route) = route else {
-                tracing::debug!(path, "no endpoint registered");
-                refuse(
-                    ctx,
-                    stream,
-                    header.transfer_id,
-                    RecvEvent::UnknownEndpoint,
-                    ack_mode,
-                );
-                return Ok(());
-            };
+            .await;
+    }
 
-            let id = header.transfer_id;
+    // Oneshot and request both address a path.
+    let path = header
+        .endpoint
+        .as_deref()
+        .expect("the decoder requires an endpoint for oneshot and request");
+    let Some(route) = ctx.namespace.lookup(path) else {
+        tracing::debug!(path, "no endpoint registered");
+        refuse(
+            ctx,
+            stream,
+            header.transfer_id,
+            RecvEvent::UnknownEndpoint,
+            ack_mode,
+        );
+        return Ok(());
+    };
+
+    let id = header.transfer_id;
+    match (role, route) {
+        (Role::Request, Route::Request(queue)) => {
             let (cancel_tx, cancel_rx) = watch::channel(false);
             ctx.send(Ctl::TrackInbound {
                 id,
@@ -703,7 +775,7 @@ async fn handle_data(
             );
             // Awaiting a queue slot is the backpressure path: it stalls this
             // stream's task, which stalls the peer through QUIC flow control.
-            if route.send(request).await.is_err() {
+            if queue.send(request).await.is_err() {
                 tracing::debug!(path, "endpoint went away while dispatching");
                 ctx.notify(Ctl::UntrackInbound { id: id.get() });
                 ctx.notify(Ctl::SendError {
@@ -711,6 +783,28 @@ async fn handle_data(
                     code: ErrorCode::UnknownEndpoint,
                 });
             }
+            Ok(())
+        }
+        (Role::Oneshot, Route::Transfer(queue)) => {
+            let transfer = IncomingTransfer::new(Arc::clone(ctx), stream, meta);
+            // Same backpressure path as a request: no cancel tracking, because
+            // a oneshot has no reply to withdraw.
+            if queue.send(transfer).await.is_err() {
+                tracing::debug!(path, "endpoint went away while dispatching");
+                ctx.notify(Ctl::SendError {
+                    re: id,
+                    code: ErrorCode::UnknownEndpoint,
+                });
+            }
+            Ok(())
+        }
+        // The path exists but serves a different pattern: a request aimed at a
+        // puller, a oneshot aimed at a replier, or anything aimed at a
+        // publisher. Refusing is the honest answer — the alternative would be
+        // to reinterpret the sender's intent.
+        (role, _) => {
+            tracing::debug!(path, %role, "endpoint does not serve this role");
+            refuse(ctx, stream, id, RecvEvent::UnsupportedPolicy, ack_mode);
             Ok(())
         }
     }

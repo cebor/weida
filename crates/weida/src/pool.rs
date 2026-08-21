@@ -7,12 +7,14 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use tokio::sync::Mutex;
 use weida_core::Error;
 
 use crate::config::RuntimeConfig;
 use crate::conn::{ConnCtx, ConnHandle, conn_error};
+use crate::listener::Namespace;
 use crate::tls;
 
 pub(crate) struct ClientPool {
@@ -88,7 +90,10 @@ impl ClientPool {
             .await
             .map_err(conn_error)?;
 
-        let handle = ConnCtx::spawn(conn, config.limits, None);
+        // A fresh namespace per client connection: a subscriber registers its
+        // path here so fanned-out copies have somewhere to go. It is not the
+        // listener's namespace — a client serves nothing on its own account.
+        let handle = ConnCtx::spawn(conn, config.limits, Arc::new(Namespace::new()), None);
         // Negotiation must complete before the caller can send anything: a
         // DATA frame ahead of our own HELLO would be parked by the peer, and a
         // version mismatch must fail `connect`, not the first request.

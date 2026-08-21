@@ -1,6 +1,6 @@
 [package]
 name = "weida"
-description = "QUIC-native messaging framework: runtime, native QUIC transport and Req/Rep"
+description = "QUIC-native messaging framework: runtime, native QUIC transport, Req/Rep, Push/Pull and Pub/Sub"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -24,6 +24,10 @@ criterion.workspace = true
 
 [[bench]]
 name = "echo"
+harness = false
+
+[[bench]]
+name = "patterns"
 harness = false
 
 [lints.rust]

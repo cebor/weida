@@ -110,8 +110,8 @@ bindings. This semantic division between Listener and Binding is mandatory.
 
 ### Endpoint
 
-An Endpoint is the actual typed messaging object: `Endpoint<Req>`, `Endpoint<Rep>`, and
-later `Endpoint<Pub>`, `Endpoint<Sub>`, `Endpoint<Push>`, `Endpoint<Pull>` and the rest.
+An Endpoint is the actual typed messaging object: `Endpoint<Req>`, `Endpoint<Rep>`,
+`Endpoint<Push>`, `Endpoint<Pull>`, `Endpoint<Pub>`, `Endpoint<Sub>`, and later the rest.
 
 Rust uses strong types rather than one dynamically configured monomorphic socket object.
 The user does not manipulate a generic `Socket` concept merely because ZeroMQ historically
@@ -356,6 +356,62 @@ stream ids; uni streams are unordered relative to one another.
 
 ---
 
+## 6a. Pattern taxonomy
+
+Master doc §82 leaves open "whether a smaller internal primitive set can implement the
+patterns cleanly". Answered from the built system: yes. Req/Rep decomposes into four
+primitives, and the other patterns are compositions of the same four, not new machinery.
+
+| # | Primitive | Where it lives | Used by |
+| --- | --- | --- | --- |
+| P1 | one-way transfer: register → open uni → DATA header → payload → outcome | `OutgoingTransfer`, `ConnCtx::register` | Req, Push, Pub (per copy) |
+| P2 | correlation: pending-reply table keyed by transfer id | `Correlator`, the connection actor | Req/Rep only |
+| P3 | peer set plus a selection policy | `PeerSet` in `endpoint.rs`; fan-out in `SubRegistry` | Req, Push (round-robin), Sub (all peers), Pub (fan-out) |
+| P4 | bounded inbound queue behind an opaque path | `Namespace` + per-endpoint mpsc | Rep, Pull, Sub |
+
+So: **Req = P1 + P2**, **Push = P1**, **Pull = P4**, **Sub = P4 + P3**, and
+**Pub = P1 per matching subscriber under a fan-out policy**. The only genuinely new code
+Phase 3 required is the fan-out selection policy and the subscription registry that feeds
+it; acknowledgement modes, cancellation, outcome vocabulary and backpressure are all
+pattern-independent because they live in P1 and P4.
+
+This is what "patterns are orthogonal to guarantees" (master doc §16) buys concretely:
+"Push/Pull with best effort" and "Push/Pull with accepted ACK" needed no reliability code
+of their own.
+
+### Router/Dealer are emergent, not missing
+
+ZeroMQ needs Dealer and Router because one socket is one ordered pipe: Dealer exists to
+multiplex unsynchronized requests onto that pipe, Router to address replies back to a
+specific peer identity.
+
+Neither constraint exists here.
+
+- **Unsynchronized multiplexed requests**: every request is already its own QUIC stream
+  with an explicit `correlation_id`. `Requester::open()` permits unlimited concurrent
+  in-flight requests with no lockstep. That is what Dealer provides.
+- **Identity-addressed replies**: a `Replier` answers over the connection the request
+  arrived on, so peer identity is implicit in the connection rather than carried in an
+  envelope. That is what Router provides for the direct-peer case.
+
+What Router adds *beyond* that — forwarding to third parties, explicit identity envelopes,
+routing tables — is broker work (master doc §47, §85), belongs to Phase 6, and would be a
+new component rather than a new socket type. Introducing `Endpoint<Router>` in v0 would
+name a distinction the transport does not have.
+
+Pair patterns are skipped for the same reason: a Pair is a Req/Rep or Push/Pull peer with a
+narrower API, architecturally identical.
+
+### Why oneshot fan-out is unordered
+
+P1 is one transfer per stream, and QUIC does not order streams relative to one another. A
+publisher's per-subscriber writer is serialized, so copies are handed to the transport in
+publication order — but that is a property of one hop's implementation, not a guarantee.
+Making per-producer ordering real requires a sequence number in the DATA header and
+reassembly on the receiving side; that is a deliberate later protocol addition rather than
+something to imply from the current behaviour ([GUARANTEES.md](GUARANTEES.md) §6).
+---
+
 ## 7. Public API v0
 
 The surface of crate `weida`.
@@ -372,17 +428,23 @@ impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Runtime, Error>;   // Error::Runtime if no tokio handle
     pub async fn listener(&self, tls: ServerTls) -> Result<Listener, Error>;
     pub fn requester(&self) -> Requester;
+    pub fn pusher(&self) -> Pusher;                          // Push connects, Pull binds
+    pub fn subscriber(&self) -> Subscriber;                  // Sub connects, Pub binds
     pub async fn shutdown(self);                             // close all conns/bindings code SHUTDOWN, wait_idle
 }
 pub struct Listener;                                         // owns Namespace shared by all bindings
 impl Listener {
     pub async fn bind_quic(&self, addr: SocketAddr) -> Result<Binding, Error>;
     pub fn replier(&self, path: &str) -> Result<Replier, Error>;   // Error::InvalidEndpointPath / AlreadyRegistered
+    pub fn puller(&self, path: &str) -> Result<Puller, Error>;     // same path-uniqueness rule
+    pub fn publisher(&self, path: &str) -> Result<Publisher, Error>;
 }
 pub struct Binding; impl Binding { pub fn local_addr(&self) -> SocketAddr; }
 
-pub struct Endpoint<P: Pattern>;                             // Pattern sealed; markers Req, Rep
+pub struct Endpoint<P: Pattern>;             // Pattern sealed; markers Req, Rep, Push, Pull, Pub, Sub
 pub type Requester = Endpoint<Req>; pub type Replier = Endpoint<Rep>;
+pub type Pusher = Endpoint<Push>;   pub type Puller = Endpoint<Pull>;
+pub type Publisher = Endpoint<Pub>; pub type Subscriber = Endpoint<Sub>;
 
 impl Requester {                                             // multi-peer: connects append; open() round-robins
     pub async fn connect(&self, url: &str) -> Result<(), Error>;   // weida://host:port/path; pooled per host:port
@@ -390,6 +452,26 @@ impl Requester {                                             // multi-peer: conn
     pub async fn request(&self, body: &[u8]) -> Result<IncomingTransfer, Error>; // open+write_all+finish+recv
 }
 impl Replier { pub async fn accept(&self) -> Result<IncomingRequest, Error>; }
+
+impl Pusher {                                                // same peer set and round-robin as Requester
+    pub async fn connect(&self, url: &str) -> Result<(), Error>;
+    pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error>; // no reply slot
+    pub async fn send(&self, body: &[u8]) -> Result<Outcome, Error>;                 // open+write_all+finish
+}
+impl Puller { pub async fn recv(&self) -> Result<IncomingTransfer, Error>; }
+
+impl Publisher {                                             // synchronous: never awaits a subscriber
+    pub fn publish(&self, topic: &str, payload: impl Into<Bytes>) -> Result<usize, Error>;
+    pub fn subscriber_count(&self) -> usize;                 // ops metrics
+    pub fn filter_count(&self) -> usize;
+    pub fn dropped(&self) -> u64;                            // messages lost to slow subscribers
+}
+impl Subscriber {
+    pub async fn connect(&self, url: &str) -> Result<(), Error>;   // claims path in the client conn's namespace
+    pub async fn subscribe(&self, filter: &str) -> Result<(), Error>;   // byte prefix; "" = everything
+    pub async fn unsubscribe(&self, filter: &str) -> Result<(), Error>;
+    pub async fn recv(&self) -> Result<IncomingTransfer, Error>;   // topic on IncomingMeta::topic
+}
 
 #[derive(Default, Clone)] pub struct TransferMeta { pub content_type: Option<String>,
     pub content_len: Option<u64>, pub ack_mode: AckMode, pub trace: Option<TraceContext> } // None → generate ids

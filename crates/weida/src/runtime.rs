@@ -10,7 +10,7 @@ use weida_protocol::codes;
 
 use crate::config::{RuntimeConfig, ServerTls};
 use crate::conn::ConnHandle;
-use crate::endpoint::{Endpoint, ReqState, Requester};
+use crate::endpoint::{Endpoint, PushState, Pusher, ReqState, Requester, SubState, Subscriber};
 use crate::listener::Listener;
 use crate::pool::ClientPool;
 use crate::tls;
@@ -76,6 +76,24 @@ impl Runtime {
     /// Creates a requester. It dials on [`Requester::connect`].
     pub fn requester(&self) -> Requester {
         Endpoint::from_state(ReqState::new(Arc::clone(&self.inner)))
+    }
+
+    /// Creates a pusher. It dials on [`Pusher::connect`].
+    pub fn pusher(&self) -> Pusher {
+        Endpoint::from_state(PushState::new(Arc::clone(&self.inner)))
+    }
+
+    /// Creates a subscriber. It dials on [`Subscriber::connect`].
+    ///
+    /// Inbound published messages queue up to `Limits::endpoint_queue`; a
+    /// subscriber that stops reading therefore stalls its own delivery and,
+    /// once the publisher's byte budget for it is exhausted, starts losing
+    /// messages rather than slowing the publisher down.
+    pub fn subscriber(&self) -> Subscriber {
+        Endpoint::from_state(SubState::new(
+            Arc::clone(&self.inner),
+            self.inner.config.limits.endpoint_queue,
+        ))
     }
 
     /// Closes every binding and pooled connection, then waits for the sockets

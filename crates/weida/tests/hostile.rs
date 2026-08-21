@@ -12,7 +12,9 @@ use std::time::Duration;
 use common::{Certs, Server, raw};
 use weida::TransferId;
 use weida::{AckMode, Error, Runtime, RuntimeConfig, TransferMeta, codes};
-use weida_protocol::{AckHeader, DataHeader, FrameKind, Hello, MAGIC, encode_preamble};
+use weida_protocol::{
+    AckHeader, DataHeader, FrameKind, Hello, MAGIC, SubscriptionHeader, encode_preamble,
+};
 
 /// Generous ceiling: every assertion below should settle in milliseconds.
 const DEADLINE: Duration = Duration::from_secs(15);
@@ -406,4 +408,133 @@ async fn a_server_that_never_sends_hello_is_dropped_after_the_timeout() {
         matches!(err, Error::Negotiation(_) | Error::ConnectionLost),
         "expected a negotiation failure, got {err:?}"
     );
+}
+
+// --- subscriptions and the oneshot role ---------------------------------
+
+#[tokio::test]
+async fn subscribe_with_an_oversized_filter_closes_the_connection() {
+    let server = Server::start().await;
+    let _publisher = server.listener.publisher("/md").expect("publisher");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    // One byte over the 256-byte filter cap. The header is well-formed CBOR,
+    // so only the decoder's per-field cap can catch it.
+    let filter = "a".repeat(weida_protocol::header_limits::MAX_FILTER_BYTES + 1);
+    let header = SubscriptionHeader::new("/md", filter).encode();
+    raw::send_frame(&conn, FrameKind::Subscribe, &header).await;
+
+    assert_eq!(
+        within(raw::closed_code(&conn)).await,
+        codes::PROTOCOL_VIOLATION
+    );
+}
+
+#[tokio::test]
+async fn a_subscribe_flood_closes_the_connection_with_limit_exceeded() {
+    let limits = weida::Limits {
+        max_subscriptions: 8,
+        ..weida::Limits::default()
+    };
+    let server = Server::start_with(limits).await;
+    let _publisher = server.listener.publisher("/md").expect("publisher");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    // Distinct filters, so none is deduplicated: one past the cap.
+    for i in 0..=limits.max_subscriptions {
+        let header = SubscriptionHeader::new("/md", format!("f{i}.")).encode();
+        // The connection dies partway through, so a failed send is expected.
+        let Ok(mut stream) = conn.open_uni().await else {
+            break;
+        };
+        if stream
+            .write_all(&weida_protocol::encode_frame(FrameKind::Subscribe, &header))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        let _ = stream.finish();
+    }
+
+    // SUBSCRIBE carries no transfer id, so there is nothing to answer with an
+    // ERROR frame: the connection is the only granularity available.
+    assert_eq!(within(raw::closed_code(&conn)).await, codes::LIMIT_EXCEEDED);
+}
+
+#[tokio::test]
+async fn unsubscribing_an_unknown_filter_is_ignored() {
+    let server = Server::start().await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    // Neither the filter nor the connection is known to the registry.
+    let header = SubscriptionHeader::new("/md", "never.").encode();
+    raw::send_frame(&conn, FrameKind::Unsubscribe, &header).await;
+    // An unknown path is equally harmless.
+    let header = SubscriptionHeader::new("/nope", "x").encode();
+    raw::send_frame(&conn, FrameKind::Unsubscribe, &header).await;
+
+    // The connection survives and still accepts a real subscription.
+    let header = SubscriptionHeader::new("/md", "px.").encode();
+    raw::send_frame(&conn, FrameKind::Subscribe, &header).await;
+    within(async {
+        while publisher.filter_count() != 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    assert!(conn.close_reason().is_none(), "the connection must survive");
+}
+
+#[tokio::test]
+async fn oneshot_data_before_hello_is_parked_not_rejected() {
+    let server = Server::start().await;
+    let puller = server.listener.puller("/jobs").expect("puller");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+
+    // DATA first, HELLO second. Unidirectional streams are unordered, so a
+    // transfer that overtakes our HELLO must be parked until negotiation
+    // completes, not refused. The new oneshot role is no exception.
+    let header = DataHeader::oneshot("/jobs", TransferId::FIRST, AckMode::None).encode();
+    let mut stream = conn.open_uni().await.expect("open uni");
+    let mut bytes = Vec::new();
+    encode_preamble(FrameKind::Data, header.len() as u64, &mut bytes);
+    bytes.extend_from_slice(&header);
+    stream.write_all(&bytes).await.expect("write header");
+
+    // Give the server a chance to (wrongly) reject before our HELLO arrives.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    raw::send_hello(&conn).await;
+
+    stream
+        .write_all(b"parked payload")
+        .await
+        .expect("write body");
+    stream.finish().expect("finish");
+
+    let transfer = within(puller.recv()).await.expect("recv");
+    assert_eq!(transfer.meta().endpoint.as_deref(), Some("/jobs"));
+    let body = within(transfer.collect(1024)).await.expect("collect");
+    assert_eq!(body, b"parked payload");
+    assert!(conn.close_reason().is_none(), "the connection must survive");
 }
