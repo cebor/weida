@@ -34,6 +34,15 @@ impl Certs {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
+        // A killed test process cannot run `Drop`, so the directory may outlive
+        // the run. Owner-only permissions keep the leftover key material
+        // unreadable rather than merely short-lived.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("restrict temp dir");
+        }
 
         let generated = rcgen::generate_simple_self_signed(vec![
             "localhost".to_owned(),
@@ -46,6 +55,12 @@ impl Certs {
         let key_pem = dir.join("key.pem");
         std::fs::write(&cert_pem, generated.cert.pem()).expect("write cert");
         std::fs::write(&key_pem, generated.signing_key.serialize_pem()).expect("write key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_pem, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict key");
+        }
 
         Certs {
             dir,

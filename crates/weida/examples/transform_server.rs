@@ -13,9 +13,14 @@
 //! * `/echo` — returns the payload unchanged.
 //!
 //! A self-signed certificate is generated on every start, valid for
-//! `localhost`, `127.0.0.1` and `::1`. The certificate is written to
-//! `--cert-out` for clients to trust; the private key is written next to it
-//! with a `.key.pem` suffix, because the server loads its key from a file.
+//! `localhost`, `127.0.0.1` and `::1`. Only the certificate is published: it is
+//! written to `--cert-out` for clients to trust.
+//!
+//! The private key never becomes a durable artifact. `ServerTls` names a key
+//! file, and `Runtime::listener` loads it eagerly, so the key is written to a
+//! private, owner-only temporary file and unlinked as soon as the listener
+//! exists. From then on it lives only inside the process, and no key material
+//! is left beside the published certificate for someone to pick up later.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -66,14 +71,50 @@ fn parse_args() -> Args {
     }
 }
 
-/// Derives the key path from the certificate path.
-fn key_path(cert_out: &Path) -> PathBuf {
-    let mut name = cert_out
-        .file_stem()
-        .unwrap_or_else(|| std::ffi::OsStr::new("weida"))
-        .to_os_string();
-    name.push(".key.pem");
-    cert_out.with_file_name(name)
+/// An owner-only temporary file that unlinks itself when dropped.
+///
+/// The key exists on disk only between generation and
+/// `Runtime::listener`, which loads it eagerly.
+struct EphemeralKey {
+    path: PathBuf,
+}
+
+impl EphemeralKey {
+    fn write(pem: &str) -> std::io::Result<EphemeralKey> {
+        let dir = std::env::temp_dir().join(format!("weida-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+
+        let path = dir.join("key.pem");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        std::io::Write::write_all(&mut file, pem.as_bytes())?;
+        std::io::Write::flush(&mut file)?;
+        Ok(EphemeralKey { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for EphemeralKey {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
 }
 
 #[tokio::main]
@@ -92,19 +133,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "127.0.0.1".to_owned(),
         "::1".to_owned(),
     ])?;
-    let key_out = key_path(&args.cert_out);
     std::fs::write(&args.cert_out, generated.cert.pem())?;
-    std::fs::write(&key_out, generated.signing_key.serialize_pem())?;
     tracing::info!(
         cert = %args.cert_out.display(),
-        key = %key_out.display(),
         "generated a self-signed certificate"
     );
 
     let runtime = Runtime::new(RuntimeConfig::default())?;
-    let listener = runtime
-        .listener(ServerTls::new(&args.cert_out, &key_out))
-        .await?;
+    let listener = {
+        // Scoped so the key file is unlinked the moment the listener owns the
+        // loaded material.
+        let key = EphemeralKey::write(&generated.signing_key.serialize_pem())?;
+        runtime
+            .listener(ServerTls::new(&args.cert_out, key.path()))
+            .await?
+    };
+    tracing::debug!("private key loaded and its temporary file removed");
     let binding = listener.bind_quic(args.bind).await?;
 
     let transform = listener.replier("/transform")?;
