@@ -108,6 +108,13 @@ A Binding represents one concrete externally reachable transport/protocol bindin
 QUIC is the reference transport; Web, ZeroMQ, MQTT, AMQP and future protocols are adapter
 bindings. This semantic division between Listener and Binding is mandatory.
 
+Credentials are therefore a property of the Binding, not of the Listener. A QUIC binding
+needs a certificate and a private key; an in-process or adapter binding may need neither,
+and two interfaces of the same service may present different certificates — an internal one
+behind an internal CA, a public one facing outward. Putting server identity on the Listener
+would make the namespace object depend on one transport's notion of identity, and would
+make a Listener that carries only a non-TLS binding unconstructible.
+
 ### Endpoint
 
 An Endpoint is the actual typed messaging object: `Endpoint<Req>`, `Endpoint<Rep>`,
@@ -429,7 +436,7 @@ impl ServerTls { pub fn new(cert_path, key_path) -> Self; pub fn from_pem(cert, 
 pub struct Runtime;                                          // Clone (Arc inner); needs ambient tokio
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Runtime, Error>;   // Error::Runtime if no tokio handle
-    pub async fn listener(&self, tls: ServerTls) -> Result<Listener, Error>;
+    pub fn listener(&self) -> Listener;                      // a namespace; credentials belong to bindings
     pub fn requester(&self) -> Requester;
     pub fn pusher(&self) -> Pusher;                          // Push connects, Pull binds
     pub fn subscriber(&self) -> Subscriber;                  // Sub connects, Pub binds
@@ -437,7 +444,9 @@ impl Runtime {
 }
 pub struct Listener;                                         // owns Namespace shared by all bindings
 impl Listener {
-    pub async fn bind_quic(&self, addr: SocketAddr) -> Result<Binding, Error>;
+    // Server identity is per binding: transports differ in what they need, and two
+    // interfaces of one service may present different certificates.
+    pub async fn bind_quic(&self, addr: SocketAddr, tls: ServerTls) -> Result<Binding, Error>;
     pub fn replier(&self, path: &str) -> Result<Replier, Error>;   // Error::InvalidEndpointPath / AlreadyRegistered
     pub fn puller(&self, path: &str) -> Result<Puller, Error>;     // same path-uniqueness rule
     pub fn publisher(&self, path: &str) -> Result<Publisher, Error>;

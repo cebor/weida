@@ -34,14 +34,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- the pulling side: binds and receives -----------------------------
     let server = Runtime::new(RuntimeConfig::default())?;
-    let listener = server
-        .listener(ServerTls::from_pem(
-            cert_pem.clone(),
-            cert.signing_key.serialize_pem(),
-        ))
-        .await?;
+    let listener = server.listener();
     let binding = listener
-        .bind_quic("127.0.0.1:0".parse::<SocketAddr>()?)
+        .bind_quic(
+            "127.0.0.1:0".parse::<SocketAddr>()?,
+            ServerTls::from_pem(cert_pem.clone(), cert.signing_key.serialize_pem()),
+        )
         .await?;
     let url = format!("weida://127.0.0.1:{}/jobs", binding.local_addr().port());
 

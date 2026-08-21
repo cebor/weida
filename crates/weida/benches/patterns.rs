@@ -48,15 +48,12 @@ async fn harness() -> Harness {
     let cert_pem = generated.cert.pem();
 
     let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-    let listener = runtime
-        .listener(ServerTls::from_pem(
-            cert_pem.clone(),
-            generated.signing_key.serialize_pem(),
-        ))
-        .await
-        .expect("listener");
+    let listener = runtime.listener();
     let binding = listener
-        .bind_quic("127.0.0.1:0".parse().expect("loopback"))
+        .bind_quic(
+            "127.0.0.1:0".parse().expect("loopback"),
+            ServerTls::from_pem(cert_pem.clone(), generated.signing_key.serialize_pem()),
+        )
         .await
         .expect("bind");
     let addr = binding.local_addr();

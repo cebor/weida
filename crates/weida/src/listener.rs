@@ -14,10 +14,12 @@ use tokio::sync::mpsc;
 use weida_core::{Error, Limits, validate_endpoint_path};
 use weida_protocol::codes;
 
+use crate::config::ServerTls;
 use crate::conn::ConnCtx;
 use crate::endpoint::{Endpoint, PubState, Publisher, PullState, Puller, RepState, Replier};
 use crate::pubsub::SubRegistry;
 use crate::runtime::RuntimeInner;
+use crate::tls;
 use crate::transfer::{IncomingRequest, IncomingTransfer};
 
 /// What a registered endpoint path does with an inbound transfer.
@@ -99,35 +101,48 @@ pub(crate) struct ListenerInner {
     pub(crate) runtime: Arc<RuntimeInner>,
     pub(crate) namespace: Arc<Namespace>,
     pub(crate) subs: Arc<SubRegistry>,
-    pub(crate) server_config: quinn::ServerConfig,
 }
 
 /// One externally reachable messaging namespace.
+///
+/// A Listener is a namespace, not a socket and not a transport: it owns the
+/// endpoint routing table and nothing else (master doc §3). Credentials belong
+/// to the individual bindings, because they are transport-specific — a QUIC
+/// binding needs a certificate and key, a future in-process or adapter binding
+/// needs neither — and because two interfaces of one service may legitimately
+/// present different certificates.
 #[derive(Clone)]
 pub struct Listener {
     inner: Arc<ListenerInner>,
 }
 
 impl Listener {
-    pub(crate) fn new(runtime: Arc<RuntimeInner>, server_config: quinn::ServerConfig) -> Listener {
+    pub(crate) fn new(runtime: Arc<RuntimeInner>) -> Listener {
         let limits = runtime.config.limits;
         Listener {
             inner: Arc::new(ListenerInner {
                 runtime,
                 namespace: Arc::new(Namespace::new()),
                 subs: Arc::new(SubRegistry::new(limits)),
-                server_config,
             }),
         }
     }
 
-    /// Adds a native QUIC binding.
+    /// Adds a native QUIC binding with its own server identity.
     ///
-    /// Pass port `0` to let the OS choose; read it back with
-    /// [`Binding::local_addr`].
-    pub async fn bind_quic(&self, addr: SocketAddr) -> Result<Binding, Error> {
-        let endpoint =
-            quinn::Endpoint::server(self.inner.server_config.clone(), addr).map_err(Error::Io)?;
+    /// The TLS material is loaded and validated here, so a misconfigured
+    /// certificate fails before the socket serves anything. Pass port `0` to
+    /// let the OS choose; read it back with [`Binding::local_addr`].
+    ///
+    /// Several bindings may serve the same Listener, each with its own
+    /// certificate: the endpoints they expose are the same, the identities they
+    /// present need not be.
+    pub async fn bind_quic(&self, addr: SocketAddr, tls: ServerTls) -> Result<Binding, Error> {
+        let limits = self.inner.runtime.config.limits;
+        let server_config =
+            tls::server_config(&tls, &limits, self.inner.runtime.config.idle_timeout)?;
+
+        let endpoint = quinn::Endpoint::server(server_config, addr).map_err(Error::Io)?;
         let local_addr = endpoint.local_addr().map_err(Error::Io)?;
         self.inner.runtime.track_endpoint(endpoint.clone());
 
@@ -135,7 +150,7 @@ impl Listener {
             endpoint.clone(),
             Arc::clone(&self.inner.namespace),
             Arc::clone(&self.inner.subs),
-            self.inner.runtime.config.limits,
+            limits,
         ));
 
         tracing::info!(%local_addr, "quic binding listening");

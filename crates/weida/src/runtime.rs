@@ -8,12 +8,11 @@ use quinn::VarInt;
 use weida_core::Error;
 use weida_protocol::codes;
 
-use crate::config::{RuntimeConfig, ServerTls};
+use crate::config::RuntimeConfig;
 use crate::conn::ConnHandle;
 use crate::endpoint::{Endpoint, PushState, Pusher, ReqState, Requester, SubState, Subscriber};
 use crate::listener::Listener;
 use crate::pool::ClientPool;
-use crate::tls;
 
 pub(crate) struct RuntimeInner {
     pub(crate) config: RuntimeConfig,
@@ -60,17 +59,13 @@ impl Runtime {
         })
     }
 
-    /// Creates a listener with the given server identity.
+    /// Creates an empty messaging namespace.
     ///
-    /// The TLS material is loaded and validated here, so a misconfigured
-    /// certificate fails before any socket is bound.
-    pub async fn listener(&self, tls: ServerTls) -> Result<Listener, Error> {
-        let server_config = tls::server_config(
-            &tls,
-            &self.inner.config.limits,
-            self.inner.config.idle_timeout,
-        )?;
-        Ok(Listener::new(Arc::clone(&self.inner), server_config))
+    /// Nothing is bound and no credentials are needed yet: a Listener is a
+    /// namespace, and server identity belongs to the individual bindings
+    /// ([`Listener::bind_quic`]).
+    pub fn listener(&self) -> Listener {
+        Listener::new(Arc::clone(&self.inner))
     }
 
     /// Creates a requester. It dials on [`Requester::connect`].
@@ -136,6 +131,7 @@ impl std::fmt::Debug for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServerTls;
 
     #[test]
     fn creating_a_runtime_without_a_reactor_fails() {
@@ -153,10 +149,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_listener_with_unreadable_tls_material_fails_early() {
+    async fn a_binding_with_unreadable_tls_material_fails_before_serving() {
         let rt = Runtime::new(RuntimeConfig::default()).unwrap();
-        let err = rt
-            .listener(ServerTls::new("/nonexistent/c.pem", "/nonexistent/k.pem"))
+        // Creating the namespace needs no credentials at all.
+        let listener = rt.listener();
+        let err = listener
+            .bind_quic(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerTls::new("/nonexistent/c.pem", "/nonexistent/k.pem"),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Tls(_)), "{err:?}");

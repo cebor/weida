@@ -107,12 +107,12 @@ impl Server {
             ..RuntimeConfig::default()
         };
         let runtime = Runtime::new(config).expect("runtime");
-        let listener = runtime
-            .listener(certs.server_tls())
-            .await
-            .expect("listener");
+        let listener = runtime.listener();
         let binding = listener
-            .bind_quic("127.0.0.1:0".parse().expect("loopback address"))
+            .bind_quic(
+                "127.0.0.1:0".parse().expect("loopback address"),
+                certs.server_tls(),
+            )
             .await
             .expect("bind");
         let addr = binding.local_addr();
