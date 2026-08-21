@@ -15,9 +15,9 @@ chaotically across phases.
 
 | Phase | Name | Status |
 | --- | --- | --- |
-| 0 | Architecture/specification | in progress |
-| 1 | Core model | in progress |
-| 2 | Native QUIC transport | in progress |
+| 0 | Architecture/specification | done |
+| 1 | Core model | done |
+| 2 | Native QUIC transport | done |
 | 3 | Brokerless messaging patterns | not started |
 | 4 | Reliability | not started |
 | 5 | Persistence subsystem | not started |
@@ -184,6 +184,27 @@ demonstrates it.
 
 This prototype proves the central architecture before the feature surface expands.
 
+### Verified results
+
+Recorded from the run that closed this increment, on an AMD Ryzen 7 5800X, Linux, stable
+Rust 1.97.1 (nightly 1.100.0 for the fuzz targets only).
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Whole workspace | `cargo test --workspace` | 182 tests pass, 1 ignored (the 1 GiB memory test); `weida-core` 58, `weida-protocol` 69 unit + 8 fuzz-smoke, `weida` 23 unit + 11 Req/Rep + 12 hostile + 1 doc |
+| Two-process prototype | `transform_server` + `printf 'hello weida' \| transform_client --ack` | stdout `HELLO WEIDA`; stderr `outcome=Acked(Accepted)`; the printed trace id appears in the server's request log line |
+| Bounded memory, in process | `cargo test --release -p weida --test large -- --ignored` | 1 GiB echoed each way, checksums equal, 905 MiB/s, peak RSS **24.0 MiB** against a 512 MiB ceiling |
+| Bounded memory, two process | `large_stream --gib 4` against the release server | 4 GiB echoed byte for byte, 908.7 MiB/s both directions, peak RSS **14.4 MiB** |
+| Fuzzing | `cargo +nightly fuzz run <target> -- -runs=200000 -max_len=20000` | all five targets, zero crashes, zero OOMs |
+| Header codec | `cargo bench -p weida-protocol` | DataHeader encode 100.2 ns / decode 60.8 ns minimal, 218.5 ns / 146.8 ns fully populated; ACK 32.8 ns / 20.2 ns; preamble parse 6.9 ns |
+| End to end | `cargo bench -p weida` | 1 KiB echo round trip 82.9 us best effort, 113.5 us with an `Accepted` ACK; 64 MiB streaming echo at 1.04 GiB/s counting both directions |
+
+Peak RSS two orders of magnitude below the payload size is the substantive result: no stage
+of the path buffers a whole transfer, which is what requirement 16 exists to establish.
+
+No thresholds are asserted on the benchmark numbers this increment; they are the baseline
+for later comparison.
+
 ---
 
 ## 5. Decisions made in Phase 0
@@ -254,7 +275,10 @@ Recorded deliberately, not discovered later.
   demand.
 - **No synchronous API wrapper.** The async API is the only surface. A blocking facade is a
   binding-layer concern (Phase 10).
-- **Fuzz runs depend on a nightly toolchain.** `cargo-fuzz` requires nightly. If nightly is
-  unavailable on a given host, the fuzz targets are still committed and the deterministic
-  `fuzz_smoke_*` unit tests provide the no-nightly fallback; the missing corpus-driven runs
-  are debt to be repaid on a host that has nightly.
+- **Fuzz runs need a nightly toolchain.** `cargo-fuzz` requires nightly, which is installed
+  and was used: all five targets ran 200 000 iterations each with no findings. On a host
+  without nightly the targets are still committed and the deterministic `fuzz_smoke_*` tests
+  cover the same properties on stable, at lower depth.
+- **`IncomingTransfer::read_capped` was added beyond the planned API surface.** The planned
+  `collect(self, max_bytes)` cannot read a borrowed request body, so the borrowing form is
+  the primitive and `collect` delegates to it.
