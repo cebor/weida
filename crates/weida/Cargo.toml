@@ -1,0 +1,23 @@
+[package]
+name = "weida"
+description = "QUIC-native messaging framework: runtime, native QUIC transport and Req/Rep"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+weida-core.workspace = true
+weida-protocol.workspace = true
+quinn.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+rand.workspace = true
+rustls-pki-types.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tracing-subscriber.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

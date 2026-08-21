@@ -1,0 +1,13 @@
+[package]
+name = "weida-protocol"
+description = "Wire protocol codec (frames, headers, negotiation) for weida"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+weida-core.workspace = true
+minicbor.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

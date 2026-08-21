@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/protocol", "crates/weida"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+version = "0.1.0"
+
+[workspace.dependencies]
+weida-core = { path = "crates/core", version = "0.1.0" }
+weida-protocol = { path = "crates/protocol", version = "0.1.0" }
+
+quinn = "0.11"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "io-util",
+    "time",
+    "net",
+] }
+bytes = "1"
+tracing = "0.1"
+rand = "0.9"
+minicbor = { version = "2", features = ["alloc"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+
+rcgen = "0.14"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+criterion = { version = "0.7", features = ["async_tokio"] }

@@ -1,0 +1,11 @@
+[package]
+name = "weida-core"
+description = "I/O-free core model for the weida QUIC-native messaging framework"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
