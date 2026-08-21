@@ -181,6 +181,9 @@ Encoder requirements:
 - Integers MUST use minimal-length encoding.
 - Absent optional keys MUST be omitted entirely. A key MUST NOT be present with a null or
   placeholder value to mean "absent".
+- `ack_mode` (DATA key `4`) is the one keyed default in v0: when absent it means `0 = none`,
+  and a sender SHOULD omit it rather than encode the zero. A decoder MUST nevertheless
+  accept an explicitly encoded `0`.
 
 Decoder requirements:
 
@@ -189,8 +192,21 @@ Decoder requirements:
 - Skipping MUST be performed by an iterative, depth-limited skip with `max_depth = 8`;
   exceeding the depth limit is a CBOR parse failure. A recursive skip is a stack-exhaustion
   vector on hostile input and MUST NOT be used.
-- Duplicate keys MUST be rejected (§3.2).
+- Duplicate keys MUST be rejected (§3.2), for every key including extension keys the
+  decoder skips.
+- Keys MUST be strictly ascending on decode as well as on encode. Rejecting a key that is
+  not greater than its predecessor makes duplicate detection complete in constant space; a
+  set of seen extension keys would itself be remote-controlled allocation (§10).
 - Non-uint keys MUST be rejected (§3.2).
+- Indefinite-length byte strings, text strings, arrays and maps MUST be rejected anywhere
+  in a header, not only at the top level.
+- CBOR tags, half-precision floats and simple values other than `false`, `true`, `null` and
+  `undefined` MUST be rejected. Extensions carry plain data items only.
+- Bytes remaining after the header map MUST be rejected: `header_len` describes exactly one
+  CBOR map.
+- A list-valued field MUST NOT declare more than 64 items, and a decoder MUST NOT reserve
+  memory from a declared length before that check. Without this bound a peer could pin
+  `max_concurrent_uni_streams` worth of large lists by opening many HELLO streams.
 
 The key space `0..=63` is reserved for this specification. Extensions MUST use keys `64`
 and above.
@@ -222,7 +238,7 @@ set is empty.
 | `1` | `uint` | `transfer_id` | yes | — | sender's transfer id on this connection (see below) |
 | `2` | `uint` | `role` | yes | — | `1 = request`, `2 = reply`; `0 = oneshot` reserved |
 | `3` | `uint` | `correlation_id` | required iff `role = reply` | — | the peer's request `transfer_id` this reply answers |
-| `4` | `uint` | `ack_mode` | yes | — | `0 = none` (default), `1 = accepted`; `2 = stored`, `3 = replicated`, `4 = processed` reserved |
+| `4` | `uint` | `ack_mode` | no, default `0` | — | `0 = none`, `1 = accepted`; `2 = stored`, `3 = replicated`, `4 = processed` reserved |
 | `5` | `uint` | `content_len` | no | — | payload length in bytes; **advisory**, not enforced |
 | `6` | `tstr` | `content_type` | no | 256 B | opaque media type label |
 | `7` | `tstr` | `traceparent` | no | 128 B | W3C Trace Context `traceparent` |
