@@ -49,6 +49,19 @@ printf 'hello weida' | cargo run -p weida --example transform_client -- --ca /tm
 Expected: stdout is exactly `HELLO WEIDA`; stderr shows `outcome=Acked(Accepted)` and a
 trace id that also appears in the server's log line for the request.
 
+## Other patterns
+
+Push/Pull and Pub/Sub each have a self-contained example: both halves run in one
+process on loopback, so there is nothing to configure.
+
+```
+cargo run -p weida --example push_pull   # fire-and-forget, best effort vs. acknowledged
+cargo run -p weida --example pub_sub     # prefix-filtered topics, two subscribers
+```
+
+Messages arrive out of order in both. Each transfer is its own QUIC stream, so ordering
+is `None` for these patterns — see [docs/GUARANTEES.md](docs/GUARANTEES.md) §6.
+
 ## Build and test
 
 ```
