@@ -160,7 +160,11 @@ fn fuzz_smoke_hello() {
     let mut rng = Rng::new(0xfeed_face_0000_0001);
     let seed = Hello::v0(MAX_HEADER_BYTES, 1024).encode();
     for i in 0..ITERATIONS {
-        let mut buf = if i % 2 == 0 { rng.bytes(48) } else { seed.clone() };
+        let mut buf = if i % 2 == 0 {
+            rng.bytes(48)
+        } else {
+            seed.clone()
+        };
         if i % 2 == 1 {
             for _ in 0..=rng.below(3) {
                 rng.flip_bit(&mut buf);
@@ -196,7 +200,11 @@ fn fuzz_smoke_control_headers() {
             1 => (&err, 1),
             _ => (&cancel, 2),
         };
-        let mut buf = if i % 6 < 3 { seed.clone() } else { rng.bytes(32) };
+        let mut buf = if i % 6 < 3 {
+            seed.clone()
+        } else {
+            rng.bytes(32)
+        };
         for _ in 0..=rng.below(3) {
             rng.flip_bit(&mut buf);
         }
@@ -318,7 +326,10 @@ fn arbitrary_data_header(rng: &mut Rng) -> DataHeader {
     };
     DataHeader {
         endpoint: if role == 1 {
-            Some(format!("/{}", "e".repeat(rng.below(limits::MAX_ENDPOINT_BYTES))))
+            Some(format!(
+                "/{}",
+                "e".repeat(rng.below(limits::MAX_ENDPOINT_BYTES))
+            ))
         } else {
             text(rng, limits::MAX_ENDPOINT_BYTES)
         },

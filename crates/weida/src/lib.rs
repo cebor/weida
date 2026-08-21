@@ -1,3 +1,53 @@
 //! weida: a QUIC-native messaging framework.
+//!
+//! This crate hosts the runtime, the native QUIC transport and the Req/Rep
+//! pattern. `docs/ARCHITECTURE.md` describes the layer model,
+//! `docs/PROTOCOL.md` is the normative wire specification, and
+//! `docs/FAILURE_MODEL.md` defines what each outcome means.
+//!
+//! ```no_run
+//! use weida::{AckMode, Runtime, RuntimeConfig, ClientTls, TransferMeta};
+//!
+//! # async fn example() -> weida::Result<()> {
+//! let mut config = RuntimeConfig::default();
+//! config.client_tls = Some(ClientTls::from_pem_file("ca.pem"));
+//! let runtime = Runtime::new(config)?;
+//!
+//! let requester = runtime.requester();
+//! requester.connect("weida://127.0.0.1:7443/transform").await?;
+//!
+//! let (mut transfer, pending) = requester
+//!     .open(TransferMeta::default().with_ack(AckMode::Accepted))
+//!     .await?;
+//! transfer.write_all(b"hello weida").await?;
+//! let outcome = transfer.finish().await?;
+//!
+//! let reply = pending.recv().await?;
+//! let body = reply.collect(64 * 1024).await?;
+//! println!("{outcome}: {}", String::from_utf8_lossy(&body));
+//! # Ok(())
+//! # }
+//! ```
 
-pub use weida_protocol::{ALPN, VERSION};
+mod config;
+mod conn;
+mod endpoint;
+mod listener;
+mod pool;
+mod runtime;
+mod tls;
+mod transfer;
+
+pub use weida_core::{
+    AckMode, AckState, EndpointAddr, Error, ErrorCode, Limits, Outcome, Result, Role, StopReason,
+    TraceContext, TransferId,
+};
+pub use weida_protocol::{ALPN, VERSION, codes};
+
+pub use config::{ClientTls, RuntimeConfig, ServerTls};
+pub use endpoint::{Endpoint, Pattern, Rep, Replier, Req, Requester};
+pub use listener::{Binding, Listener};
+pub use runtime::Runtime;
+pub use transfer::{
+    IncomingMeta, IncomingRequest, IncomingTransfer, OutgoingTransfer, PendingReply, TransferMeta,
+};
