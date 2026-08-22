@@ -59,7 +59,7 @@ async fn garbage_first_bytes_close_the_connection() {
     });
 
     let client = server.client_runtime();
-    let requester = client.requester();
+    let requester = client.requester(server.trust());
     within(requester.connect(&server.url("/ok")))
         .await
         .expect("connect");
@@ -287,12 +287,8 @@ where
     addr
 }
 
-fn client_for(certs: &Certs) -> Runtime {
-    Runtime::new(RuntimeConfig {
-        client_tls: Some(certs.client_tls()),
-        ..RuntimeConfig::default()
-    })
-    .expect("client runtime")
+fn client_for() -> Runtime {
+    Runtime::new(RuntimeConfig::default()).expect("client runtime")
 }
 
 #[tokio::test]
@@ -312,8 +308,8 @@ async fn a_server_that_never_answers_yields_indeterminate() {
         conn.close(quinn::VarInt::from_u32(0), b"bye");
     });
 
-    let client = client_for(&certs);
-    let requester = client.requester();
+    let client = client_for();
+    let requester = client.requester(certs.client_tls());
     within(requester.connect(&format!("weida://127.0.0.1:{}/t", addr.port())))
         .await
         .expect("connect");
@@ -352,8 +348,8 @@ async fn a_server_that_disappears_mid_stream_yields_connection_lost() {
         conn.close(quinn::VarInt::from_u32(0), b"gone");
     });
 
-    let client = client_for(&certs);
-    let requester = client.requester();
+    let client = client_for();
+    let requester = client.requester(certs.client_tls());
     within(requester.connect(&format!("weida://127.0.0.1:{}/t", addr.port())))
         .await
         .expect("connect");
@@ -395,12 +391,11 @@ async fn a_server_that_never_sends_hello_is_dropped_after_the_timeout() {
     };
     let client = Runtime::new(RuntimeConfig {
         limits,
-        client_tls: Some(certs.client_tls()),
         ..RuntimeConfig::default()
     })
     .expect("client runtime");
 
-    let requester = client.requester();
+    let requester = client.requester(certs.client_tls());
     let err = within(requester.connect(&format!("weida://127.0.0.1:{}/t", addr.port())))
         .await
         .expect_err("connect must not succeed without negotiation");

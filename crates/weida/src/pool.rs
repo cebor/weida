@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use weida_core::Error;
 
-use crate::config::RuntimeConfig;
+use crate::config::{ClientTls, RuntimeConfig};
 use crate::conn::{ConnCtx, ConnHandle, conn_error};
 use crate::listener::Namespace;
 use crate::tls;
@@ -21,10 +21,15 @@ pub(crate) struct ClientPool {
     state: Mutex<PoolState>,
 }
 
+/// Keyed by authority **and** trust anchors. Two endpoints dialling the same
+/// `host:port` with different trust must not share a connection: the
+/// certificate was validated against one of them, not both.
+type PoolKey = (String, u16, Arc<ClientTls>);
+
 #[derive(Default)]
 struct PoolState {
     endpoint: Option<quinn::Endpoint>,
-    connections: HashMap<(String, u16), ConnHandle>,
+    connections: HashMap<PoolKey, ConnHandle>,
 }
 
 impl ClientPool {
@@ -41,7 +46,8 @@ impl ClientPool {
         state.endpoint.take()
     }
 
-    /// Returns a live connection to `host:port`, dialling if necessary.
+    /// Returns a live connection to `host:port` authenticated against `tls`,
+    /// dialling if necessary.
     ///
     /// The returned handle has completed the HELLO exchange, so callers never
     /// have to think about negotiation.
@@ -50,8 +56,9 @@ impl ClientPool {
         config: &RuntimeConfig,
         host: &str,
         port: u16,
+        tls: &Arc<ClientTls>,
     ) -> Result<ConnHandle, Error> {
-        let key = (host.to_owned(), port);
+        let key: PoolKey = (host.to_owned(), port, Arc::clone(tls));
         let mut state = self.state.lock().await;
 
         if let Some(existing) = state.connections.get(&key) {
@@ -60,11 +67,6 @@ impl ClientPool {
             }
             state.connections.remove(&key);
         }
-
-        let client_tls = config
-            .client_tls
-            .as_ref()
-            .ok_or_else(|| Error::Tls("RuntimeConfig::client_tls is required to connect".into()))?;
 
         let endpoint = match &state.endpoint {
             Some(endpoint) => endpoint.clone(),
@@ -75,12 +77,8 @@ impl ClientPool {
             }
         };
 
-        let client_config = tls::client_config(
-            client_tls,
-            &config.limits,
-            config.keep_alive,
-            config.idle_timeout,
-        )?;
+        let client_config =
+            tls::client_config(tls, &config.limits, config.keep_alive, config.idle_timeout)?;
 
         let addr = resolve(host, port).await?;
         tracing::debug!(%addr, host, "dialling");

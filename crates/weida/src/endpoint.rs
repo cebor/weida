@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, mpsc};
 use weida_core::{EndpointAddr, Error, Outcome, Role, TraceContext};
 use weida_protocol::{FrameKind, SubscriptionHeader};
 
+use crate::config::ClientTls;
 use crate::conn::{ConnHandle, Ctl, write_control};
 use crate::listener::Route;
 use crate::pubsub::SubRegistry;
@@ -170,13 +171,15 @@ impl PeerSet {
 /// State of a requester.
 pub struct ReqState {
     runtime: Arc<RuntimeInner>,
+    tls: Arc<ClientTls>,
     peers: PeerSet,
 }
 
 impl ReqState {
-    pub(crate) fn new(runtime: Arc<RuntimeInner>) -> ReqState {
+    pub(crate) fn new(runtime: Arc<RuntimeInner>, tls: Arc<ClientTls>) -> ReqState {
         ReqState {
             runtime,
+            tls,
             peers: PeerSet::new(),
         }
     }
@@ -191,7 +194,11 @@ impl Requester {
     /// negotiation.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
         let addr = EndpointAddr::parse(url)?;
-        let conn = self.state.runtime.connect(&addr.host, addr.port).await?;
+        let conn = self
+            .state
+            .runtime
+            .connect(&addr.host, addr.port, &self.state.tls)
+            .await?;
         self.state.peers.add(conn, &addr.path);
         Ok(())
     }
@@ -287,13 +294,15 @@ impl Replier {
 /// State of a pusher.
 pub struct PushState {
     runtime: Arc<RuntimeInner>,
+    tls: Arc<ClientTls>,
     peers: PeerSet,
 }
 
 impl PushState {
-    pub(crate) fn new(runtime: Arc<RuntimeInner>) -> PushState {
+    pub(crate) fn new(runtime: Arc<RuntimeInner>, tls: Arc<ClientTls>) -> PushState {
         PushState {
             runtime,
+            tls,
             peers: PeerSet::new(),
         }
     }
@@ -306,7 +315,11 @@ impl Pusher {
     /// `host:port`.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
         let addr = EndpointAddr::parse(url)?;
-        let conn = self.state.runtime.connect(&addr.host, addr.port).await?;
+        let conn = self
+            .state
+            .runtime
+            .connect(&addr.host, addr.port, &self.state.tls)
+            .await?;
         self.state.peers.add(conn, &addr.path);
         Ok(())
     }
@@ -472,6 +485,7 @@ impl Publisher {
 /// State of a subscriber.
 pub struct SubState {
     runtime: Arc<RuntimeInner>,
+    tls: Arc<ClientTls>,
     peers: PeerSet,
     /// Filters this subscriber wants, remembered so a peer connected later
     /// receives the same subscriptions.
@@ -481,10 +495,11 @@ pub struct SubState {
 }
 
 impl SubState {
-    pub(crate) fn new(runtime: Arc<RuntimeInner>, depth: usize) -> SubState {
+    pub(crate) fn new(runtime: Arc<RuntimeInner>, tls: Arc<ClientTls>, depth: usize) -> SubState {
         let (queue_tx, queue) = mpsc::channel(depth);
         SubState {
             runtime,
+            tls,
             peers: PeerSet::new(),
             filters: std::sync::Mutex::new(HashSet::new()),
             queue_tx,
@@ -505,7 +520,11 @@ impl Subscriber {
     /// in-process consumers is the application's business, not the transport's.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
         let addr = EndpointAddr::parse(url)?;
-        let conn = self.state.runtime.connect(&addr.host, addr.port).await?;
+        let conn = self
+            .state
+            .runtime
+            .connect(&addr.host, addr.port, &self.state.tls)
+            .await?;
         conn.namespace
             .register(&addr.path, Route::Transfer(self.state.queue_tx.clone()))?;
         self.state.peers.add(ConnHandle::clone(&conn), &addr.path);

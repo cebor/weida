@@ -304,6 +304,7 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Library version | `0.1.0` | Independent of the wire version. |
 | Client trust | explicit trust anchors only | No platform root store and no insecure-skip mode ships in v0. The prototype uses the server's self-signed certificate as its CA. |
 | TLS material source | file **or** in-memory PEM (`Pem`) | Requiring a path would force callers holding a key from a secret store to write it to disk first. Both sources are first class; `ServerTls::from_pem` never touches the filesystem. |
+| Credential placement | server identity per **binding**, trust per **dialling endpoint** | Credentials are transport-specific, so they do not belong on the Listener (a namespace) or the Runtime (a resource container). Consequence: the connection pool keys on `(host, port, ClientTls)` — sharing on authority alone would hand one endpoint a peer authenticated against another's CA. |
 | Rust edition | `2024` | Current stable edition. |
 | MSRV | `1.88` | Highest requirement among the pinned dependencies. |
 

@@ -17,6 +17,7 @@ const CHUNK: usize = 64 * 1024;
 struct Harness {
     runtime: Runtime,
     client: Runtime,
+    trust: weida::ClientTls,
     addr: SocketAddr,
     _listener: Listener,
     _binding: weida::Binding,
@@ -75,14 +76,15 @@ async fn harness() -> Harness {
 
     let client = Runtime::new(RuntimeConfig {
         limits: Limits::default(),
-        client_tls: Some(weida::ClientTls::from_pem(cert_pem)),
         ..RuntimeConfig::default()
     })
     .expect("client runtime");
+    let trust = weida::ClientTls::from_pem(cert_pem);
 
     Harness {
         runtime,
         client,
+        trust,
         addr,
         _listener: listener,
         _binding: binding,
@@ -102,7 +104,7 @@ fn bench_small_rtt(c: &mut Criterion) {
     let url = format!("weida://127.0.0.1:{}/echo", harness.addr.port());
 
     let requester = rt.block_on(async {
-        let requester = harness.client.requester();
+        let requester = harness.client.requester(harness.trust.clone());
         requester.connect(&url).await.expect("connect");
         requester
     });
@@ -152,7 +154,7 @@ fn bench_stream_throughput(c: &mut Criterion) {
     let harness = rt.block_on(harness());
     let url = format!("weida://127.0.0.1:{}/echo", harness.addr.port());
     let requester = rt.block_on(async {
-        let requester = harness.client.requester();
+        let requester = harness.client.requester(harness.trust.clone());
         requester.connect(&url).await.expect("connect");
         requester
     });

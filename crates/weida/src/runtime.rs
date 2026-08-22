@@ -8,7 +8,7 @@ use quinn::VarInt;
 use weida_core::Error;
 use weida_protocol::codes;
 
-use crate::config::RuntimeConfig;
+use crate::config::{ClientTls, RuntimeConfig};
 use crate::conn::ConnHandle;
 use crate::endpoint::{Endpoint, PushState, Pusher, ReqState, Requester, SubState, Subscriber};
 use crate::listener::Listener;
@@ -29,9 +29,14 @@ impl RuntimeInner {
             .push(endpoint);
     }
 
-    /// Dials, or reuses a pooled connection to, `host:port`.
-    pub(crate) async fn connect(&self, host: &str, port: u16) -> Result<ConnHandle, Error> {
-        self.pool.connect(&self.config, host, port).await
+    /// Dials, or reuses a pooled connection to, `host:port` under `tls`.
+    pub(crate) async fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        tls: &Arc<ClientTls>,
+    ) -> Result<ConnHandle, Error> {
+        self.pool.connect(&self.config, host, port, tls).await
     }
 }
 
@@ -68,25 +73,31 @@ impl Runtime {
         Listener::new(Arc::clone(&self.inner))
     }
 
-    /// Creates a requester. It dials on [`Requester::connect`].
-    pub fn requester(&self) -> Requester {
-        Endpoint::from_state(ReqState::new(Arc::clone(&self.inner)))
+    /// Creates a requester that authenticates peers against `tls`.
+    ///
+    /// Trust belongs to the dialling endpoint, not to the runtime: one process
+    /// may legitimately talk to an internal service behind an internal CA and
+    /// to a public one, and it should not need two runtimes to do so. An
+    /// endpoint may still dial many peers — they simply share these anchors.
+    pub fn requester(&self, tls: ClientTls) -> Requester {
+        Endpoint::from_state(ReqState::new(Arc::clone(&self.inner), Arc::new(tls)))
     }
 
-    /// Creates a pusher. It dials on [`Pusher::connect`].
-    pub fn pusher(&self) -> Pusher {
-        Endpoint::from_state(PushState::new(Arc::clone(&self.inner)))
+    /// Creates a pusher that authenticates peers against `tls`.
+    pub fn pusher(&self, tls: ClientTls) -> Pusher {
+        Endpoint::from_state(PushState::new(Arc::clone(&self.inner), Arc::new(tls)))
     }
 
-    /// Creates a subscriber. It dials on [`Subscriber::connect`].
+    /// Creates a subscriber that authenticates peers against `tls`.
     ///
     /// Inbound published messages queue up to `Limits::endpoint_queue`; a
     /// subscriber that stops reading therefore stalls its own delivery and,
     /// once the publisher's byte budget for it is exhausted, starts losing
     /// messages rather than slowing the publisher down.
-    pub fn subscriber(&self) -> Subscriber {
+    pub fn subscriber(&self, tls: ClientTls) -> Subscriber {
         Endpoint::from_state(SubState::new(
             Arc::clone(&self.inner),
+            Arc::new(tls),
             self.inner.config.limits.endpoint_queue,
         ))
     }
@@ -131,7 +142,12 @@ impl std::fmt::Debug for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ServerTls;
+    use crate::config::{ClientTls, ServerTls};
+
+    /// An endpoint that trusts nothing; every dial through it must fail.
+    fn no_trust() -> ClientTls {
+        ClientTls { roots_pem: vec![] }
+    }
 
     #[test]
     fn creating_a_runtime_without_a_reactor_fails() {
@@ -144,7 +160,7 @@ mod tests {
         let rt = Runtime::new(RuntimeConfig::default()).unwrap();
         let clone = rt.clone();
         assert_eq!(clone.config().limits, rt.config().limits);
-        assert_eq!(clone.requester().peer_count(), 0);
+        assert_eq!(clone.requester(no_trust()).peer_count(), 0);
         rt.shutdown().await;
     }
 
@@ -166,7 +182,7 @@ mod tests {
     #[tokio::test]
     async fn opening_without_a_peer_fails_with_not_connected() {
         let rt = Runtime::new(RuntimeConfig::default()).unwrap();
-        let requester = rt.requester();
+        let requester = rt.requester(no_trust());
         let err = requester
             .open(crate::TransferMeta::default())
             .await
@@ -177,7 +193,9 @@ mod tests {
     #[tokio::test]
     async fn connecting_without_trust_anchors_fails() {
         let rt = Runtime::new(RuntimeConfig::default()).unwrap();
-        let requester = rt.requester();
+        // An endpoint with an empty anchor set cannot authenticate anyone, so
+        // dialling fails rather than trusting whatever answers.
+        let requester = rt.requester(no_trust());
         let err = requester
             .connect("weida://127.0.0.1:1/x")
             .await
@@ -189,7 +207,7 @@ mod tests {
     async fn a_malformed_url_is_rejected_before_dialling() {
         let rt = Runtime::new(RuntimeConfig::default()).unwrap();
         let err = rt
-            .requester()
+            .requester(no_trust())
             .connect("http://127.0.0.1:7443/x")
             .await
             .unwrap_err();

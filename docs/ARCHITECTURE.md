@@ -78,8 +78,7 @@ bindings:
 Listener
  ├── QUIC IPv4 :7443
  ├── QUIC IPv6 :7443
- ├── Web :443
- └── potentially other adapters
+ └── Web :443          (WebSocket / WebTransport / SSE)
 ```
 
 All bindings belonging to the same Listener expose the same endpoint namespace:
@@ -104,16 +103,34 @@ Listeners.
 
 ### Binding
 
-A Binding represents one concrete externally reachable transport/protocol binding. Native
-QUIC is the reference transport; Web, ZeroMQ, MQTT, AMQP and future protocols are adapter
-bindings. This semantic division between Listener and Binding is mandatory.
+A Binding represents one concrete externally reachable transport of **this** protocol.
+Native QUIC is the reference transport; the Web adapter (master doc §38, §39) is the
+framework's way into browsers and exposes the same namespace over WebSocket or
+WebTransport. This semantic division between Listener and Binding is mandatory.
 
-Credentials are therefore a property of the Binding, not of the Listener. A QUIC binding
-needs a certificate and a private key; an in-process or adapter binding may need neither,
-and two interfaces of the same service may present different certificates — an internal one
-behind an internal CA, a public one facing outward. Putting server identity on the Listener
-would make the namespace object depend on one transport's notion of identity, and would
-make a Listener that carries only a non-TLS binding unconstructible.
+A binding must be able to carry weida's addressing model: an opaque endpoint path inside a
+namespace, several endpoints per binding. That is what makes QUIC and Web bindings of one
+Listener — both can name `/jobs` and `/events` on the same port.
+
+**Legacy-protocol adapters are not bindings.** ZeroMQ, nanomsg/NNG, MQTT and AMQP get
+separate crates (`weida-zeromq`, master doc §43: "each should ideally be an independent
+crate"), implemented natively in Rust and hosted by this runtime or by an extension of it —
+and usable standalone, so `weida-zeromq` can ship on its own, later also as e.g. a Python
+package. They are deliberately outside the Listener because their addressing model cannot
+express ours: a ZeroMQ socket is one endpoint, addressed by port, with no path component.
+Multiplexing many named endpoints over one port is precisely the limitation weida's
+namespace overcomes, so folding ZeroMQ back in as a Binding would push that limitation into
+the core model. An adapter *bridges* between the two worlds; it does not extend our
+namespace onto a transport that has none.
+
+Master doc §3 lists Web, ZeroMQ, MQTT and AMQP together as "adapter bindings"; §39 and §43
+draw the line above, and that is the one the implementation follows.
+
+Credentials are a property of the Binding, not of the Listener. A QUIC binding needs a
+certificate and a private key; a Web binding terminates TLS on its own terms; and two
+interfaces of the same service may present different certificates — an internal one behind
+an internal CA, a public one facing outward. Putting server identity on the Listener would
+make the namespace object depend on one transport's notion of identity.
 
 ### Endpoint
 
@@ -178,8 +195,16 @@ Port is required. IPv6 literals use bracket form, e.g. `weida://[::1]:7443/x`.
 crates/
     core/       →  weida-core       I/O-free model
     protocol/   →  weida-protocol   wire codec, no I/O
-    weida/      →  weida            runtime + native QUIC transport + Req/Rep
+    weida/      →  weida            runtime + native QUIC transport + patterns
 ```
+
+Planned, not yet present: `weida-web` (the Web binding, Phase 8) and the legacy-protocol
+adapter crates `weida-zeromq`, `weida-mqtt`, `weida-amqp091` (Phase 9). The adapters are
+separate crates rather than modules because they are separately useful: each is a native
+Rust implementation of a foreign protocol, hosted by this runtime or an extension of it, and
+each must be usable on its own — `weida-zeromq` without a weida deployment at all, and later
+repackaged for other languages. They depend on `weida-core` and `weida-protocol`; the core
+never depends on them.
 
 ### `weida-core`
 
@@ -425,10 +450,10 @@ The surface of crate `weida`.
 
 ```rust
 // re-exports from weida-core: Error, Outcome, AckState, AckMode, Limits, TraceContext, EndpointAddr
-pub struct RuntimeConfig { pub limits: Limits, pub client_tls: Option<ClientTls>,
+pub struct RuntimeConfig { pub limits: Limits,
     pub keep_alive: Duration /*10s*/, pub idle_timeout: Duration /*30s*/ }   // Default impl
 pub enum Pem { Bytes(Vec<u8>), File(PathBuf) }              // TLS material need not be a file
-pub struct ClientTls { pub roots_pem: Vec<Pem> }            // explicit trust anchors, required for connect()
+pub struct ClientTls { pub roots_pem: Vec<Pem> }            // explicit trust anchors; Eq+Hash: pool keys on it
 impl ClientTls { pub fn from_pem_file(p) -> Self; pub fn from_pem(bytes) -> Self; }
 pub struct ServerTls { pub cert_chain_pem: Pem, pub key_pem: Pem }
 impl ServerTls { pub fn new(cert_path, key_path) -> Self; pub fn from_pem(cert, key) -> Self; }
@@ -437,9 +462,11 @@ pub struct Runtime;                                          // Clone (Arc inner
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Runtime, Error>;   // Error::Runtime if no tokio handle
     pub fn listener(&self) -> Listener;                      // a namespace; credentials belong to bindings
-    pub fn requester(&self) -> Requester;
-    pub fn pusher(&self) -> Pusher;                          // Push connects, Pull binds
-    pub fn subscriber(&self) -> Subscriber;                  // Sub connects, Pub binds
+    // Trust is per dialling endpoint, mirroring per-binding server identity: one
+    // process may talk to an internal CA and a public one without two runtimes.
+    pub fn requester(&self, tls: ClientTls) -> Requester;
+    pub fn pusher(&self, tls: ClientTls) -> Pusher;          // Push connects, Pull binds
+    pub fn subscriber(&self, tls: ClientTls) -> Subscriber;  // Sub connects, Pub binds
     pub async fn shutdown(self);                             // close all conns/bindings code SHUTDOWN, wait_idle
 }
 pub struct Listener;                                         // owns Namespace shared by all bindings

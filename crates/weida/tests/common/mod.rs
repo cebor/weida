@@ -130,7 +130,7 @@ impl Server {
         format!("weida://127.0.0.1:{}{}", self.addr.port(), path)
     }
 
-    /// A client runtime trusting this server's certificate.
+    /// A client runtime. Trust is supplied per endpoint; see [`Server::trust`].
     pub fn client_runtime(&self) -> Runtime {
         self.client_runtime_with(Limits::default())
     }
@@ -139,10 +139,14 @@ impl Server {
     pub fn client_runtime_with(&self, limits: Limits) -> Runtime {
         Runtime::new(RuntimeConfig {
             limits,
-            client_tls: Some(self.certs.client_tls()),
             ..RuntimeConfig::default()
         })
         .expect("client runtime")
+    }
+
+    /// Trust anchors for this server, to hand to a dialling endpoint.
+    pub fn trust(&self) -> ClientTls {
+        self.certs.client_tls()
     }
 }
 

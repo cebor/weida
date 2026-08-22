@@ -10,9 +10,6 @@ use weida_core::Limits;
 pub struct RuntimeConfig {
     /// Resource limits applied to every connection this runtime owns.
     pub limits: Limits,
-    /// Trust anchors for outgoing connections. Required before
-    /// [`crate::Requester::connect`] can be used.
-    pub client_tls: Option<ClientTls>,
     /// QUIC keep-alive interval for outgoing connections.
     pub keep_alive: Duration,
     /// QUIC idle timeout, applied in both directions.
@@ -23,7 +20,6 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         RuntimeConfig {
             limits: Limits::default(),
-            client_tls: None,
             keep_alive: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
         }
@@ -37,7 +33,7 @@ impl Default for RuntimeConfig {
 /// Kubernetes secret already in memory. Requiring a path would force callers
 /// to write private keys to disk just to hand them back — so both sources are
 /// first class, and neither is a workaround for the other.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Pem {
     /// PEM bytes already in memory.
     Bytes(Vec<u8>),
@@ -65,7 +61,12 @@ impl From<PathBuf> for Pem {
 ///
 /// v0 accepts explicit trust anchors only: no platform root store, and no
 /// certificate-verification bypass anywhere in the shipped code.
-#[derive(Clone, Debug)]
+///
+/// Equality is by content, and the connection pool keys on it: two endpoints
+/// dialling the same authority with different trust anchors must never share a
+/// connection, or one would be using a peer authenticated against the other's
+/// certificate authority.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ClientTls {
     /// PEM sources holding the certificates to trust.
     pub roots_pem: Vec<Pem>,
@@ -126,10 +127,6 @@ mod tests {
         let c = RuntimeConfig::default();
         assert_eq!(c.keep_alive, Duration::from_secs(10));
         assert_eq!(c.idle_timeout, Duration::from_secs(30));
-        assert!(
-            c.client_tls.is_none(),
-            "trust must be opted into explicitly"
-        );
         assert_eq!(c.limits, Limits::default());
     }
 

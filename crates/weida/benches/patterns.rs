@@ -28,13 +28,13 @@ struct Harness {
 }
 
 impl Harness {
-    /// A client runtime that trusts this server.
+    /// A client runtime and an endpoint that trusts this server.
     fn client(&self) -> Runtime {
-        Runtime::new(RuntimeConfig {
-            client_tls: Some(ClientTls::from_pem(self.cert_pem.clone())),
-            ..RuntimeConfig::default()
-        })
-        .expect("client runtime")
+        Runtime::new(RuntimeConfig::default()).expect("client runtime")
+    }
+
+    fn trust(&self) -> ClientTls {
+        ClientTls::from_pem(self.cert_pem.clone())
     }
 
     fn url(&self, path: &str) -> String {
@@ -92,12 +92,12 @@ fn bench_push(c: &mut Criterion) {
         drain(harness.listener.puller("/acked").expect("puller acked"));
 
         let client = harness.client();
-        let best_effort = client.pusher();
+        let best_effort = client.pusher(harness.trust());
         best_effort
             .connect(&harness.url("/best"))
             .await
             .expect("connect best");
-        let acked = client.pusher();
+        let acked = client.pusher(harness.trust());
         acked
             .connect(&harness.url("/acked"))
             .await
@@ -150,7 +150,7 @@ fn bench_fanout(c: &mut Criterion) {
             // One runtime per subscriber: a subscriber claims its path in its
             // connection's namespace, so they cannot share a pooled connection.
             let client = harness.client();
-            let sub = client.subscriber();
+            let sub = client.subscriber(harness.trust());
             sub.connect(&harness.url("/md")).await.expect("connect");
             sub.subscribe("").await.expect("subscribe");
             subscribers.push((client, sub));

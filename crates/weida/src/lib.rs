@@ -10,11 +10,10 @@
 //! use weida::{AckMode, Runtime, RuntimeConfig, ClientTls, TransferMeta};
 //!
 //! # async fn example() -> weida::Result<()> {
-//! let mut config = RuntimeConfig::default();
-//! config.client_tls = Some(ClientTls::from_pem_file("ca.pem"));
-//! let runtime = Runtime::new(config)?;
+//! let runtime = Runtime::new(RuntimeConfig::default())?;
 //!
-//! let requester = runtime.requester();
+//! // Trust belongs to the dialling endpoint, not to the runtime.
+//! let requester = runtime.requester(ClientTls::from_pem_file("ca.pem"));
 //! requester.connect("weida://127.0.0.1:7443/transform").await?;
 //!
 //! let (mut transfer, pending) = requester

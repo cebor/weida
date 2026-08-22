@@ -9,7 +9,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Server, Xorshift};
+use common::{Certs, Server, Xorshift};
 use tokio::io::AsyncReadExt;
 use weida::{AckMode, AckState, Error, Outcome, TraceContext, TransferMeta};
 
@@ -49,7 +49,7 @@ async fn echo_roundtrip_with_ack() {
     let handler = spawn_uppercase_handler(replier).await;
 
     let client = server.client_runtime();
-    let requester = client.requester();
+    let requester = client.requester(server.trust());
     requester
         .connect(&server.url("/transform"))
         .await
@@ -83,7 +83,7 @@ async fn best_effort_finish_reports_sent_without_waiting() {
     let handler = spawn_uppercase_handler(replier).await;
 
     let client = server.client_runtime();
-    let requester = client.requester();
+    let requester = client.requester(server.trust());
     requester
         .connect(&server.url("/transform"))
         .await
@@ -108,7 +108,7 @@ async fn streaming_overlap() {
     let handler = spawn_uppercase_handler(replier).await;
 
     let client = server.client_runtime();
-    let requester = client.requester();
+    let requester = client.requester(server.trust());
     requester
         .connect(&server.url("/transform"))
         .await
@@ -204,7 +204,7 @@ async fn cancel_mid_transfer() {
     });
 
     let client = server.client_runtime();
-    let requester = client.requester();
+    let requester = client.requester(server.trust());
     requester
         .connect(&server.url("/sink"))
         .await
@@ -227,7 +227,7 @@ async fn cancel_mid_transfer() {
     // The connection is still usable: cancellation is per transfer.
     let replier2 = server.listener.replier("/again").expect("replier");
     let handler2 = spawn_uppercase_handler(replier2).await;
-    let requester2 = client.requester();
+    let requester2 = client.requester(server.trust());
     requester2
         .connect(&server.url("/again"))
         .await
@@ -276,7 +276,7 @@ async fn reply_abort_on_cancel_frame() {
     });
 
     let client = server.client_runtime();
-    let requester = client.requester();
+    let requester = client.requester(server.trust());
     requester
         .connect(&server.url("/firehose"))
         .await
@@ -302,7 +302,7 @@ async fn reply_abort_on_cancel_frame() {
     // The connection survives.
     let replier2 = server.listener.replier("/after").expect("replier");
     let handler2 = spawn_uppercase_handler(replier2).await;
-    let requester2 = client.requester();
+    let requester2 = client.requester(server.trust());
     requester2
         .connect(&server.url("/after"))
         .await
@@ -334,7 +334,7 @@ async fn trace_propagation() {
     });
 
     let client = server.client_runtime();
-    let requester = client.requester();
+    let requester = client.requester(server.trust());
     requester
         .connect(&server.url("/traced"))
         .await
@@ -368,7 +368,7 @@ async fn unknown_endpoint_is_reported() {
     let _replier = server.listener.replier("/known").expect("replier");
 
     let client = server.client_runtime();
-    let requester = client.requester();
+    let requester = client.requester(server.trust());
     requester
         .connect(&server.url("/nowhere"))
         .await
@@ -405,7 +405,7 @@ async fn dropping_a_request_without_replying_reports_no_reply() {
     });
 
     let client = server.client_runtime();
-    let requester = client.requester();
+    let requester = client.requester(server.trust());
     requester
         .connect(&server.url("/silent"))
         .await
@@ -433,7 +433,7 @@ async fn a_reserved_ack_mode_is_refused_not_downgraded() {
     let _ = replier;
 
     let client = server.client_runtime();
-    let requester = client.requester();
+    let requester = client.requester(server.trust());
     requester
         .connect(&server.url("/strict"))
         .await
@@ -444,7 +444,7 @@ async fn a_reserved_ack_mode_is_refused_not_downgraded() {
     // does support is honoured rather than dropped.
     let replier = server.listener.replier("/honest").expect("replier");
     let handler = spawn_uppercase_handler(replier).await;
-    let requester2 = client.requester();
+    let requester2 = client.requester(server.trust());
     requester2
         .connect(&server.url("/honest"))
         .await
@@ -472,19 +472,16 @@ async fn multi_peer_requests_round_robin() {
     let handler_a = spawn_uppercase_handler(a.listener.replier("/rr").expect("replier")).await;
     let handler_b = spawn_uppercase_handler(b.listener.replier("/rr").expect("replier")).await;
 
-    // One client trusting both servers.
-    let client = weida::Runtime::new(weida::RuntimeConfig {
-        client_tls: Some(weida::ClientTls {
-            roots_pem: vec![
-                weida::Pem::File(a.certs.cert_pem.clone()),
-                weida::Pem::File(b.certs.cert_pem.clone()),
-            ],
-        }),
-        ..weida::RuntimeConfig::default()
-    })
-    .expect("client runtime");
-
-    let requester = client.requester();
+    // One requester trusting both servers: trust is a property of the dialling
+    // endpoint, so two peers under different CAs need one endpoint, not two
+    // runtimes.
+    let client = weida::Runtime::new(weida::RuntimeConfig::default()).expect("client runtime");
+    let requester = client.requester(weida::ClientTls {
+        roots_pem: vec![
+            weida::Pem::File(a.certs.cert_pem.clone()),
+            weida::Pem::File(b.certs.cert_pem.clone()),
+        ],
+    });
     requester.connect(&a.url("/rr")).await.expect("connect a");
     requester.connect(&b.url("/rr")).await.expect("connect b");
     assert_eq!(requester.peer_count(), 2);
@@ -496,6 +493,39 @@ async fn multi_peer_requests_round_robin() {
 
     handler_a.await.expect("handler a");
     handler_b.await.expect("handler b");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn endpoints_with_different_trust_do_not_share_a_connection() {
+    // The pool is keyed by authority *and* trust anchors. Sharing on authority
+    // alone would hand one endpoint a peer that was authenticated against a
+    // different endpoint's certificate authority.
+    let server = Server::start().await;
+    let handler = spawn_uppercase_handler(server.listener.replier("/t").expect("replier")).await;
+
+    let client = server.client_runtime();
+
+    // Trusts this server: dialling succeeds.
+    let trusting = client.requester(server.trust());
+    trusting.connect(&server.url("/t")).await.expect("connect");
+    let reply = trusting.request(b"hi").await.expect("request");
+    assert_eq!(reply.collect(64).await.expect("collect"), b"HI");
+
+    // Same runtime, same authority, unrelated certificate authority. If the
+    // pool reused the first connection this would wrongly succeed.
+    let stranger = Certs::generate();
+    let distrusting = client.requester(stranger.client_tls());
+    let err = distrusting
+        .connect(&server.url("/t"))
+        .await
+        .expect_err("a peer outside our trust anchors must not be accepted");
+    assert!(
+        !matches!(err, Error::AlreadyRegistered),
+        "expected a TLS/transport failure, got {err:?}"
+    );
+
+    handler.await.expect("handler");
     client.shutdown().await;
 }
 

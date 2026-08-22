@@ -28,7 +28,7 @@ async fn push_pull_roundtrip_with_ack() {
     let puller = server.listener.puller("/jobs").expect("puller");
 
     let client = server.client_runtime();
-    let pusher = client.pusher();
+    let pusher = client.pusher(server.trust());
     within(pusher.connect(&server.url("/jobs")))
         .await
         .expect("connect");
@@ -66,7 +66,7 @@ async fn push_best_effort() {
     let puller = server.listener.puller("/jobs").expect("puller");
 
     let client = server.client_runtime();
-    let pusher = client.pusher();
+    let pusher = client.pusher(server.trust());
     within(pusher.connect(&server.url("/jobs")))
         .await
         .expect("connect");
@@ -94,7 +94,7 @@ async fn push_round_robins_two_peers() {
     let right = server.listener.puller("/right").expect("right");
 
     let client = server.client_runtime();
-    let pusher = client.pusher();
+    let pusher = client.pusher(server.trust());
     within(pusher.connect(&server.url("/left")))
         .await
         .expect("dial left");
@@ -140,7 +140,7 @@ async fn push_cancel_mid_transfer() {
     let puller = server.listener.puller("/jobs").expect("puller");
 
     let client = server.client_runtime();
-    let pusher = client.pusher();
+    let pusher = client.pusher(server.trust());
     within(pusher.connect(&server.url("/jobs")))
         .await
         .expect("connect");
@@ -175,7 +175,7 @@ async fn request_to_pull_path_is_unsupported() {
     let _puller = server.listener.puller("/jobs").expect("puller");
 
     let client = server.client_runtime();
-    let requester = client.requester();
+    let requester = client.requester(server.trust());
     within(requester.connect(&server.url("/jobs")))
         .await
         .expect("connect");
@@ -195,7 +195,7 @@ async fn push_to_rep_path_is_unsupported() {
     let _replier = server.listener.replier("/rpc").expect("replier");
 
     let client = server.client_runtime();
-    let pusher = client.pusher();
+    let pusher = client.pusher(server.trust());
     within(pusher.connect(&server.url("/rpc")))
         .await
         .expect("connect");
@@ -217,7 +217,7 @@ async fn push_to_an_unknown_path_is_reported() {
     let _puller = server.listener.puller("/jobs").expect("puller");
 
     let client = server.client_runtime();
-    let pusher = client.pusher();
+    let pusher = client.pusher(server.trust());
     within(pusher.connect(&server.url("/nope")))
         .await
         .expect("connect");

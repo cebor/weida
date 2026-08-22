@@ -115,11 +115,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
     let total = args.gib * GIB;
 
-    let runtime = Runtime::new(RuntimeConfig {
-        client_tls: Some(ClientTls::from_pem_file(&args.ca)),
-        ..RuntimeConfig::default()
-    })?;
-    let requester = runtime.requester();
+    let runtime = Runtime::new(RuntimeConfig::default())?;
+    let requester = runtime.requester(ClientTls::from_pem_file(&args.ca));
     requester.connect(&args.url).await?;
 
     let (mut transfer, pending) = requester

@@ -56,7 +56,7 @@ async fn subscribe_prefix_filters_topics() {
     let publisher = server.listener.publisher("/md").expect("publisher");
 
     let client = server.client_runtime();
-    let sub = client.subscriber();
+    let sub = client.subscriber(server.trust());
     within(sub.connect(&server.url("/md")))
         .await
         .expect("connect");
@@ -97,7 +97,7 @@ async fn empty_filter_receives_all() {
     let publisher = server.listener.publisher("/md").expect("publisher");
 
     let client = server.client_runtime();
-    let sub = client.subscriber();
+    let sub = client.subscriber(server.trust());
     within(sub.connect(&server.url("/md")))
         .await
         .expect("connect");
@@ -124,8 +124,8 @@ async fn two_subscribers_both_receive() {
     // connection's namespace.
     let client_a = server.client_runtime();
     let client_b = server.client_runtime();
-    let a = client_a.subscriber();
-    let b = client_b.subscriber();
+    let a = client_a.subscriber(server.trust());
+    let b = client_b.subscriber(server.trust());
     within(a.connect(&server.url("/md")))
         .await
         .expect("connect a");
@@ -154,7 +154,7 @@ async fn unsubscribe_stops_delivery() {
     let publisher = server.listener.publisher("/md").expect("publisher");
 
     let client = server.client_runtime();
-    let sub = client.subscriber();
+    let sub = client.subscriber(server.trust());
     within(sub.connect(&server.url("/md")))
         .await
         .expect("connect");
@@ -185,7 +185,7 @@ async fn late_publisher_receives_early_subscription() {
     let server = Server::start().await;
     // No publisher yet: the path is not registered at all.
     let client = server.client_runtime();
-    let sub = client.subscriber();
+    let sub = client.subscriber(server.trust());
     within(sub.connect(&server.url("/md")))
         .await
         .expect("connect");
@@ -231,8 +231,8 @@ async fn slow_subscriber_drops_not_blocks() {
         ..Limits::default()
     });
     let fast_rt = server.client_runtime();
-    let slow = slow_rt.subscriber();
-    let fast = fast_rt.subscriber();
+    let slow = slow_rt.subscriber(server.trust());
+    let fast = fast_rt.subscriber(server.trust());
     within(slow.connect(&server.url("/md")))
         .await
         .expect("connect slow");
@@ -281,7 +281,7 @@ async fn sub_meta_carries_topic_and_trace() {
     let publisher = server.listener.publisher("/md").expect("publisher");
 
     let client = server.client_runtime();
-    let sub = client.subscriber();
+    let sub = client.subscriber(server.trust());
     within(sub.connect(&server.url("/md")))
         .await
         .expect("connect");
@@ -330,7 +330,7 @@ async fn a_publisher_path_refuses_inbound_transfers() {
 
     // A publisher path accepts no inbound transfers of any role.
     let client = server.client_runtime();
-    let pusher = client.pusher();
+    let pusher = client.pusher(server.trust());
     within(pusher.connect(&server.url("/md")))
         .await
         .expect("connect");
@@ -354,11 +354,11 @@ async fn a_second_subscriber_on_one_connection_collides() {
     // same path in its namespace. Refusing beats silently multiplexing two
     // subscribers onto one queue.
     let client = server.client_runtime();
-    let first = client.subscriber();
+    let first = client.subscriber(server.trust());
     within(first.connect(&server.url("/md")))
         .await
         .expect("connect first");
-    let second = client.subscriber();
+    let second = client.subscriber(server.trust());
     let err = within(second.connect(&server.url("/md")))
         .await
         .expect_err("the path is already claimed on this connection");

@@ -59,11 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // --- the pushing side: connects and sends -----------------------------
-    let client = Runtime::new(RuntimeConfig {
-        client_tls: Some(ClientTls::from_pem(cert_pem)),
-        ..RuntimeConfig::default()
-    })?;
-    let pusher = client.pusher();
+    let client = Runtime::new(RuntimeConfig::default())?;
+    let pusher = client.pusher(ClientTls::from_pem(cert_pem));
     pusher.connect(&url).await?;
 
     println!("pushing {JOBS} jobs to {url}");

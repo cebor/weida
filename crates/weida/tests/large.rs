@@ -73,7 +73,7 @@ async fn large_stream_bounded_memory() {
     });
 
     let client = server.client_runtime();
-    let requester = client.requester();
+    let requester = client.requester(server.trust());
     requester
         .connect(&server.url("/echo"))
         .await

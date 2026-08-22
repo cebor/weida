@@ -47,14 +47,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- two subscribing sides: connect -----------------------------------
     // One runtime each: a subscriber claims its path in its connection's
     // namespace, so two subscribers cannot share one pooled connection.
-    let prices_rt = client_runtime(&cert_pem)?;
-    let everything_rt = client_runtime(&cert_pem)?;
+    let prices_rt = Runtime::new(RuntimeConfig::default())?;
+    let everything_rt = Runtime::new(RuntimeConfig::default())?;
 
-    let prices = prices_rt.subscriber();
+    let prices = prices_rt.subscriber(ClientTls::from_pem(cert_pem.clone()));
     prices.connect(&url).await?;
     prices.subscribe("px.").await?;
 
-    let everything = everything_rt.subscriber();
+    let everything = everything_rt.subscriber(ClientTls::from_pem(cert_pem));
     everything.connect(&url).await?;
     everything.subscribe("").await?;
 
@@ -118,11 +118,4 @@ async fn await_filters(publisher: &Publisher, count: usize) {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     panic!("subscriptions never registered");
-}
-
-fn client_runtime(cert_pem: &str) -> Result<Runtime, Box<dyn std::error::Error>> {
-    Ok(Runtime::new(RuntimeConfig {
-        client_tls: Some(ClientTls::from_pem(cert_pem)),
-        ..RuntimeConfig::default()
-    })?)
 }
