@@ -30,8 +30,11 @@ chaotically across phases.
 | 12 | Documentation/site/stabilization | not started |
 
 Phases 0, 1 and 2 are complete. Phase 3 is under way: its first increment (Push/Pull and
-Pub/Sub) has landed; Router/Dealer are answered as emergent rather than implemented, see
-[ARCHITECTURE.md](ARCHITECTURE.md) §6a. Phases 4 and later remain out of scope.
+Pub/Sub) landed, and its second re-founded the stack on the layer model — L0 stream core,
+L1 patterns, L2 broker — see [ARCHITECTURE.md](ARCHITECTURE.md). Router/Dealer are answered
+as emergent rather than implemented, see [ARCHITECTURE.md](ARCHITECTURE.md) §6a. Phases 4
+and later remain out of scope; Phase 6 gained the acknowledgement vocabulary that used to
+sit in the core.
 
 ### Phase 0 — Architecture/specification
 
@@ -46,7 +49,7 @@ Delivers this documentation set, and only it: no code.
 - Serialization selected (CBOR, see §5 below).
 - Version/capability negotiation designed ([PROTOCOL.md](PROTOCOL.md) §2.3).
 - Initial Rust public API designed ([ARCHITECTURE.md](ARCHITECTURE.md) §7).
-- Deliberately unresolved questions identified (§4 below and
+- Deliberately unresolved questions identified (§6 below and
   [PROTOCOL.md](PROTOCOL.md) §11).
 
 No broker implementation begins before these foundations are coherent.
@@ -55,20 +58,22 @@ No broker implementation begins before these foundations are coherent.
 
 Delivers `weida-core`: an I/O-free crate, unit-tested without any networking.
 
-- `TransferId` and id allocation.
 - `EndpointAddr` endpoint identifiers with the `weida://` parser and the `SCHEME` constant.
-- `Error` with hand-written `Display`/`Error` impls.
+- `Error`, `ErrorCode` and `StopReason` with hand-written `Display`/`Error` impls.
 - `Limits`.
-- `AckMode`, `AckState`, `Outcome` policy types.
 - `TraceContext` with the W3C `traceparent` parser and formatter.
 - Cancellation representation.
-- The send, receive and correlation state machines, as pure transition functions matching
-  [FAILURE_MODEL.md](FAILURE_MODEL.md) §4 exactly.
+
+As first delivered the crate also carried `TransferId` and id allocation (`id.rs`), the
+`AckMode`/`AckState`/`Outcome` policy types (`policy.rs`), and the send, receive and
+correlation state machines as pure transition functions (`state/`). All three were deleted
+by the Phase 3 re-architecture below; the surviving modules are `addr`, `error`, `limits`
+and `trace`.
 
 The Runtime, Listener, Binding and typed Endpoint abstractions named in master doc §79's
 Phase 1 list are realized in crate `weida` in this increment, because their shape is
-determined by the transport they front; their model-level types (`Limits`, `Outcome`,
-`EndpointAddr`) live in `weida-core`.
+determined by the transport they front; their model-level types (`Limits`, `EndpointAddr`,
+`Error`) live in `weida-core`.
 
 ### Phase 2 — Native QUIC transport
 
@@ -76,11 +81,13 @@ Delivers `weida-protocol` and crate `weida`.
 
 - Quinn integration and connection establishment.
 - Negotiation (HELLO exchange, version and capability intersection).
-- The uni-stream protocol envelope: varints, preamble, the five frame headers, CBOR codec
-  with cap-before-allocation and depth-limited skip.
+- The protocol envelope: varints, preamble, the frame headers, CBOR codec with
+  cap-before-allocation and depth-limited skip.
 - Endpoint routing through a flat namespace shared by all bindings of a Listener.
-- Request/reply correlation.
-- Short control streams: ACK, ERROR, CANCEL.
+- Request/reply correlation over paired unidirectional streams, with ACK, ERROR and CANCEL
+  as short header-only control streams. Superseded by the Phase 3 re-architecture: an
+  exchange is now one bidirectional stream, ACK and CANCEL are gone from the wire, and
+  ERROR rides the reply half.
 - Cancellation and stream reset in both directions.
 - Resource limits, all remote-input-bounded.
 - Client connection pooling keyed by `(host, port)`.
@@ -99,16 +106,72 @@ equivalents. §82 asks whether a smaller internal primitive set implements them 
 - The §82 answer: four primitives (P1 one-way transfer, P2 correlation, P3 peer set plus
   selection policy, P4 bounded inbound queue behind an opaque path), recorded with the
   Router/Dealer-is-emergent rationale in [ARCHITECTURE.md](ARCHITECTURE.md) §6a.
-- Wire: `role = 0` (oneshot) implemented, DATA key `9` (`topic`), frame kinds `5`
-  (SUBSCRIBE) and `6` (UNSUBSCRIBE), limits `max_subscriptions` and
-  `subscriber_buffer_bytes` — all normative in [PROTOCOL.md](PROTOCOL.md).
-- Push/Pull: `Pusher` connects and round-robins over its peers, `Puller` binds. Both
-  acknowledgement modes work unchanged, because they ride P1.
+- Wire: the `topic` DATA key, the SUBSCRIBE and UNSUBSCRIBE frame kinds, and the limits
+  `max_subscriptions` and `subscriber_buffer_bytes` — all normative in
+  [PROTOCOL.md](PROTOCOL.md). (The numbers this increment assigned were compacted by the
+  re-architecture below; current numbering is `topic = 5`, SUBSCRIBE `= 3`,
+  UNSUBSCRIBE `= 4`.)
+- Push/Pull: `Pusher` connects and round-robins over its peers, `Puller` binds. Both ride
+  P1 and P3 unchanged.
 - Pub/Sub: `Publisher` binds, `Subscriber` connects; byte-prefix topic filters; fan-out
   with a per-subscriber byte budget and explicit drops, so a slow subscriber never stalls
   the publisher.
-- Refusal rather than reinterpretation when a role meets an endpoint that does not serve
-  it: ERROR `UNSUPPORTED` plus `STOP_SENDING(REJECTED)`, connection intact.
+- Refusal rather than reinterpretation when a pattern meets an endpoint that does not serve
+  it: the connection stays intact and the sender learns the reason. (As first delivered
+  that was an ERROR `UNSUPPORTED` on its own stream plus `STOP_SENDING(REJECTED)`; the
+  re-architecture gave misrouting its own stop code, see below.)
+
+**Delivered in the second increment — the layered re-architecture:**
+
+The stack was re-founded on three layers ([ARCHITECTURE.md](ARCHITECTURE.md)): **L0 stream
+core**, ZeroMQ's idea rebuilt on QUIC, whose primitives are exactly the two QUIC stream
+kinds with exactly QUIC's guarantees; **L1 patterns**, the zmq/nanomsg family as thin
+wrappers over L0; and **L2 broker**, the RabbitMQ analog, deferred to Phase 6.
+
+Deleted from the core and from the wire: `FrameKind::Ack`, `FrameKind::Cancel`,
+`AckHeader`, `CancelHeader`, the `ack_mode`, `role`, `transfer_id` and `correlation_id`
+DATA keys, `AckMode`, `AckState`, `Outcome`, `Role`, `TransferId`, `Correlator`,
+`SendMachine`, `RecvMachine`, `ReplyDisposition`, `PendingReply` and `Limits::max_pending`
+— and with them the files `crates/core/src/id.rs`, `crates/core/src/policy.rs` and the
+whole `crates/core/src/state/` directory.
+
+Two reasons, both load-bearing:
+
+1. **A brokerless application ACK means "arrived in RAM".** QUIC already retransmits, and
+   already reports that the peer's transport holds every byte. An application ACK with no
+   broker behind it therefore carried no information the transport did not already have:
+   it bought RabbitMQ's vocabulary — Accepted / Stored / Replicated / Processed — without
+   RabbitMQ's responsibility transfer. Nothing had taken responsibility for the message, so
+   the words were unearned. That vocabulary is now reserved for the L2 broker hop, where
+   responsibility genuinely changes hands, and has no v0 wire representation
+   ([GUARANTEES.md](GUARANTEES.md)).
+2. **The correlation machinery existed only because replies rode separate unidirectional
+   streams.** Correlation ids, the `Correlator`, `ReplyArrived`, the CANCEL frame and the
+   per-connection pending-reply table were all bookkeeping for one question: which reply
+   stream answers which request stream. One bidirectional stream per exchange answers it
+   structurally — the stream *is* the correlation. Nothing on the wire names an exchange,
+   the requester abandoning a reply is `STOP_SENDING(CANCELED)` on the reply half rather
+   than a CANCEL frame, and the actor that held the table is gone. P2 in the §82 taxonomy
+   stopped being "correlation" and became "exchange": a bidirectional stream, with nothing
+   behind it ([ARCHITECTURE.md](ARCHITECTURE.md) §6a).
+
+What took their place:
+
+- Req/Rep is one client-opened bidirectional stream: DATA (with `endpoint`) + payload + FIN
+  on the initiating half; DATA (no `endpoint`) + payload + FIN, **or** ERROR + FIN, on the
+  reply half. The halves are independent, so request and reply still stream simultaneously.
+- `OutgoingTransfer::finish` returns a `Delivery` transport receipt instead of an ack
+  outcome; `Delivery::delivered().await` resolves when the peer's *transport* holds every
+  byte, explicitly not when the application read it
+  ([FAILURE_MODEL.md](FAILURE_MODEL.md)).
+- The L0 API is public: `Peer` (`connect`, `open`, `open_bi`) and `Acceptor`
+  (`Listener::acceptor`, `accept() -> Incoming`) in `crates/weida/src/stream.rs`, proven by
+  `crates/weida/tests/raw_streams.rs`. The patterns in `endpoint.rs` are now wrappers over
+  it.
+- Misrouting gained its own QUIC application error code, `UNSUPPORTED = 9`, because a
+  unidirectional stream can no longer be refused with an ERROR frame of its own.
+- Frame kinds and DATA keys were renumbered densely and every golden vector recomputed
+  ([PROTOCOL.md](PROTOCOL.md) §4, §6, §8).
 
 **Deliberately deferred** (recorded now, not discovered later):
 
@@ -119,6 +182,8 @@ equivalents. §82 asks whether a smaller internal primitive set implements them 
 - Per-producer ordering. Ordering is `None` for both new patterns; a sequence field would
   be a protocol addition, not an implementation detail.
 - Coalescing backpressure (master doc §27); only `Block`, `Reject` and fan-out `Drop` exist.
+- PAIR, BUS and SURVEYOR/RESPONDENT: mapped onto L0 in
+  [ARCHITECTURE.md](ARCHITECTURE.md), deliberately not implemented until a use case asks.
 - Router/Dealer as first-class types, and the broker work they would actually require
   (master doc §47, §85, Phase 6).
 ---
@@ -196,33 +261,35 @@ Process B:
 ```
 
 Each numbered requirement below is verbatim from §83, mapped to the artifact that
-demonstrates it.
+demonstrates it. Requirement 9 is the one the project has since decided against; the row
+says so rather than quietly claiming it.
 
 | # | Requirement | Demonstrated by |
 | --- | --- | --- |
-| 1 | Establish QUIC connection. | `echo_roundtrip_with_ack` in `crates/weida/tests/reqrep.rs`; examples `transform_server` + `transform_client` |
-| 2 | Negotiate protocol. | `echo_roundtrip_with_ack`; the `versions=[99]` case in `crates/weida/tests/hostile.rs` asserting close code `NEGOTIATION_FAILED` |
-| 3 | Open uni request stream. | `echo_roundtrip_with_ack` |
-| 4 | Send metadata header. | golden-vector unit tests in `weida-protocol`; `echo_roundtrip_with_ack` |
+| 1 | Establish QUIC connection. | `echo_roundtrip` in `crates/weida/tests/reqrep.rs`; examples `transform_server` + `transform_client` |
+| 2 | Negotiate protocol. | `echo_roundtrip`; `hello_with_an_unsupported_version_fails_negotiation` in `crates/weida/tests/hostile.rs` asserting close code `NEGOTIATION_FAILED` |
+| 3 | Open uni request stream. | `echo_roundtrip` — but on a **bidirectional** stream: the re-architecture replaced §83's paired unidirectional streams with one exchange ([PROTOCOL.md](PROTOCOL.md) §4). A unidirectional request stream is still the Push/Pull shape (`push_best_effort` in `crates/weida/tests/pushpull.rs`) and the raw L0 `Peer::open` |
+| 4 | Send metadata header. | golden-vector tests in `crates/protocol/tests/golden_vectors.rs`; `echo_roundtrip` |
 | 5 | Stream arbitrary-sized input. | `streaming_overlap` in `crates/weida/tests/reqrep.rs`; example `large_stream` |
 | 6 | Server begins processing before FIN where possible. | `streaming_overlap` (handler consumes the first chunk before the request FIN) |
-| 7 | Server opens correlated reply stream before request necessarily completes. | `streaming_overlap` (handler opens the reply after the first chunk; the client withholds the remaining payload until at least one reply byte has arrived, making the overlap deterministic) |
-| 8 | Stream reply simultaneously. | `streaming_overlap` |
-| 9 | Send protocol ACK on a separate control stream. | `echo_roundtrip_with_ack` asserting `finish()` == `Acked(Accepted)`; ACK golden vector in `weida-protocol` |
+| 7 | Server opens correlated reply stream before request necessarily completes. | `streaming_overlap` (the handler replies on the exchange's reply half after the first chunk; the client withholds the remaining payload until at least one reply byte has arrived, making the overlap deterministic). The reply half exists from the moment the exchange is opened, so "opens" is now free — and the correlation is the stream, not an id |
+| 8 | Stream reply simultaneously. | `streaming_overlap`; the two halves are independent QUIC streams |
+| 9 | Send protocol ACK on a separate control stream. | **Deliberately not met.** The v0 core carries no application ACK: brokerless, it would only mean "arrived in RAM", which QUIC already guarantees (§1, Phase 3). What remains is the transport receipt, `push_delivery_receipt` in `crates/weida/tests/pushpull.rs` asserting `Delivery::delivered()`. Accepted / Stored / Replicated / Processed are reserved for the Phase 6 broker ([GUARANTEES.md](GUARANTEES.md)) |
 | 10 | Propagate OpenTelemetry trace context. | `trace_propagation` in `crates/weida/tests/reqrep.rs`; `traceparent` fuzz target under `crates/protocol/fuzz`; the trace id printed by `transform_client` and logged by `transform_server` |
-| 11 | Cancel mid-transfer. | `cancel_mid_transfer` and `reply_abort_on_cancel_frame` in `crates/weida/tests/reqrep.rs` |
-| 12 | Test connection loss. | `crates/weida/tests/hostile.rs`: raw server closing after FIN asserts `Err(Indeterminate)`; raw server closing mid-payload asserts `Err(ConnectionLost)` |
-| 13 | Test malformed headers. | `crates/weida/tests/hostile.rs`: garbage preamble and `header_len = 1 MiB` both assert close code `PROTOCOL_VIOLATION`; `weida-protocol` unit tests for duplicate keys, missing keys and oversized lengths |
-| 14 | Fuzz parser. | fuzz targets `preamble`, `data_header`, `hello`, `traceparent`, `roundtrip` under `crates/protocol/fuzz`, plus the deterministic `fuzz_smoke_*` unit tests in `weida-protocol` |
-| 15 | Benchmark small and large transfers. | `crates/protocol/benches/codec.rs` (header encode/decode); `crates/weida/benches/echo.rs` (`echo_1kib_rtt`, `stream_throughput_64mib`) |
+| 11 | Cancel mid-transfer. | `cancel_mid_transfer` and `reply_abort_when_reply_stream_dropped` in `crates/weida/tests/reqrep.rs`; `canceled_resolves_when_the_requester_walks_away` for the handler-side signal |
+| 12 | Test connection loss. | `crates/weida/tests/hostile.rs`: `a_server_that_never_answers_yields_indeterminate` (closed after FIN) and `a_server_that_disappears_mid_stream_yields_connection_lost` |
+| 13 | Test malformed headers. | `crates/weida/tests/hostile.rs`: garbage preamble and `header_len = 1 MiB` both assert close code `PROTOCOL_VIOLATION`; `weida-protocol` unit tests for duplicate keys, missing required keys (`missing_required_keys_are_rejected`) and oversized lengths |
+| 14 | Fuzz parser. | fuzz targets `preamble`, `data_header`, `hello`, `traceparent`, `roundtrip` and `subscribe` under `crates/protocol/fuzz`, plus the deterministic `fuzz_smoke_*` tests in `crates/protocol/tests/fuzz_smoke.rs` |
+| 15 | Benchmark small and large transfers. | `crates/protocol/benches/codec.rs` (header encode/decode); `crates/weida/benches/echo.rs` (`echo_1kib_rtt`, `echo_1kib_rtt_explicit`, `stream_throughput_64mib`) |
 | 16 | Demonstrate bounded memory with a multi-GB generated stream. | `large_stream_bounded_memory` in `crates/weida/tests/large.rs` (ignored by default; run with `--ignored`), asserting checksum equality and peak RSS below 512 MiB for a 1 GiB echo; example `large_stream` for ad-hoc runs |
 
 This prototype proves the central architecture before the feature surface expands.
 
-### Verified results
+### Verified results — Phases 0-2
 
-Recorded from the run that closed this increment, on an AMD Ryzen 7 5800X, Linux, stable
-Rust 1.97.1 (nightly 1.100.0 for the fuzz targets only).
+Recorded from the run that closed that increment, on an AMD Ryzen 7 5800X, Linux, stable
+Rust 1.97.1 (nightly 1.100.0 for the fuzz targets only). Left exactly as recorded: it
+measures a wire that no longer exists, so its ACK rows are history, not documentation.
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -243,7 +310,8 @@ for later comparison.
 ### Verified results — Phase 3, first increment
 
 Same machine and toolchains. The Phase 0-2 numbers above are left as recorded; these are
-the checks that closed the Push/Pull and Pub/Sub increment.
+the checks that closed the Push/Pull and Pub/Sub increment, and they too predate the
+re-architecture — the `Accepted` ACK figures below no longer have a wire to run on.
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -263,11 +331,53 @@ non-blocking enqueue.
 
 No thresholds are asserted on these numbers either.
 
+### Verified results — Phase 3, layered re-architecture
+
+Same machine and toolchains. `cargo test --workspace` green and
+`cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets` emits no
+diagnostic in any file this increment touched; the workspace's one remaining warning,
+`chunks_exact` with a constant chunk size in the untouched `crates/core/src/trace.rs`,
+predates it and is the only thing standing between the tree and a green
+`clippy -D warnings`.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Whole workspace | `cargo test --workspace` | 188 tests pass, 1 ignored (the 1 GiB memory test); `weida-core` 20, `weida-protocol` 70 unit + 6 golden-vector + 9 fuzz-smoke, `weida` 28 unit + 13 Req/Rep + 7 Push/Pull + 11 Pub/Sub + 21 hostile + 2 raw-stream + 1 doc |
+| Golden vectors | `cargo test -p weida-protocol --test golden_vectors` | all six vectors recomputed and byte-exact both directions: HELLO, DATA request, DATA reply (empty map `A0`), DATA fan-out with `topic`, ERROR `{code:5}`, SUBSCRIBE/UNSUBSCRIBE |
+| Transport receipt is not an application ack | `push_delivery_receipt` | `Delivery::delivered()` resolves **before** the puller calls `recv()` — a 1 KiB payload fits the flow-control window, so the receipt demonstrably reports the peer's transport, not its application |
+| Cancellation without a CANCEL frame | `reply_abort_when_reply_stream_dropped`, `canceled_resolves_when_the_requester_walks_away` | dropping the `ReplyStream` stops the reply half; the handler's `canceled()` future fires and its subsequent writes fail `Canceled`. The second test is verified by mutation: stubbing the future to `pending` makes it time out |
+| Typed refusal on the reply half | `bidi_request_to_a_pull_path_is_refused_with_unsupported` | a raw bidirectional DATA to a puller path is answered with a real ERROR `{UNSUPPORTED}` frame and `STOP_SENDING(UNSUPPORTED)`; the connection survives |
+| Public L0 API | `acceptor_receives_both_stream_kinds` in `crates/weida/tests/raw_streams.rs` | one `Acceptor` on `/raw` receives `Incoming::Stream` from `Peer::open` and `Incoming::Exchange` from `Peer::open_bi`, and the exchange reply round-trips |
+| Two-process prototype | `transform_server` + `printf 'hello weida' \| transform_client` | stdout `HELLO WEIDA`; stderr `delivered sent=… received=…`; the printed trace id appears in the server's request log line |
+| Fuzzing | `cargo +nightly fuzz run <target> -- -runs=200000 -max_len=20000` | all six targets against the new field set, zero crashes, zero OOMs |
+| End to end | `cargo bench -p weida` | see the table below |
+
+| Benchmark | Now | Previously recorded |
+| --- | --- | --- |
+| `echo/echo_1kib_rtt` | 58.2 us | 82.9 us over two uni streams plus control — **−30 %** |
+| `echo/echo_1kib_rtt_explicit` | 59.3 us | new: `open_bi`/`finish`/`recv` on the raw handles |
+| `stream/stream_throughput_64mib` | 130 ms | +7 % against the Phase 0-2 run |
+| `push/push_1kib_best_effort` | 7.9 us | 27.6 us — **−72 %**, no registration round trip |
+| `push/push_1kib_delivered` | 26.2 ms | replaces `push_1kib_acked` |
+| `fanout/pub_1kib_8_subscribers` | 62.1 us | 65.2 us — unchanged within noise |
+
+The echo number is the substantive one: collapsing an exchange from two unidirectional
+streams plus correlation bookkeeping into one bidirectional stream took 30 % off the round
+trip, which is what removing work rather than tuning it looks like.
+
+`push_1kib_delivered` at ~26 ms is not a weida cost. On an idle loopback connection the
+peer delays its acknowledgement up to QUIC's max ack delay, and `delivered()` waits for
+exactly that acknowledgement. The receipt is a correctness signal, not a latency-sensitive
+one, which is why `Pusher::send` discards it and callers who want it reach for
+`Pusher::open` + `finish()` + `delivered()`.
+
+No thresholds are asserted on these numbers either.
+
 ---
 
-## 5. Decisions made in Phase 0
+## 5. Decisions
 
-### Serialization: CBOR via `minicbor`
+### Serialization: CBOR via `minicbor` (Phase 0)
 
 Master doc §82 leaves the choice between MessagePack, CBOR and another compact evolvable
 format open, with criteria: parsing speed, encoding speed, allocations, unknown-field
@@ -293,7 +403,7 @@ depth-limited skipping — is not expressible through a derive macro. If `minicb
 API proves unable to express these bounds, the fallback is a hand-rolled CBOR-subset codec
 inside `weida-protocol`; the wire bytes and the golden vectors do not change either way.
 
-### Other decisions
+### Other Phase 0 decisions
 
 | Decision | Value | Rationale |
 | --- | --- | --- |
@@ -308,6 +418,17 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Rust edition | `2024` | Current stable edition. |
 | MSRV | `1.88` | Highest requirement among the pinned dependencies. |
 
+### Phase 3 re-architecture decisions
+
+| Decision | Value | Rationale |
+| --- | --- | --- |
+| Req/Rep transport | one client-opened **bidirectional** stream per exchange | The stream is the correlation. Deletes correlation ids, the per-connection pending table, the `Correlator` actor, `ReplyArrived` and the CANCEL frame in one move, and lets request and reply stream simultaneously on independent halves. |
+| Application acknowledgements | **not in the core**; reserved for the L2 broker (Phase 6) | Brokerless, an application ACK only means "arrived in RAM" — QUIC already retransmits and already reports transport receipt. Accepted / Stored / Replicated / Processed describe responsibility transfer to a hop that has taken responsibility; without such a hop the words are unearned ([GUARANTEES.md](GUARANTEES.md)). |
+| Delivery signal | `OutgoingTransfer::finish() -> Delivery`, `Delivery::delivered().await` | The honest signal QUIC can actually give: quinn's `stopped()` resolving `Ok(None)` means the peer acknowledged every byte "although not necessarily the processing of it". `finish()` is synchronous and dropping the `Delivery` is free, so fire-and-forget senders pay nothing ([FAILURE_MODEL.md](FAILURE_MODEL.md)). |
+| Misroute refusal code | QUIC application error code `UNSUPPORTED = 9` | With ERROR frames confined to the reply half of an exchange, a unidirectional stream sent to a path that does not serve it has no frame to be refused with. A dedicated stop code keeps the refusal typed instead of collapsing it into `REJECTED` ([PROTOCOL.md](PROTOCOL.md) §7). |
+| Raw stream API | `Peer` and `Acceptor` are public (`crates/weida/src/stream.rs`) | L0 is the product, not an implementation detail: if the patterns are the only way in, every unanticipated topology needs a new pattern. `Peer::open`/`open_bi` and `Acceptor::accept` expose the two QUIC stream kinds directly; the patterns are thin wrappers over them. |
+| Stream limits | `max_pending` removed; `max_concurrent_bidi_streams = 1024` added | There is no pending-reply table left to bound. Concurrent exchanges are bounded by QUIC itself instead, and the bidirectional budget was previously hardcoded to `0`. Worst-case header memory becomes `max_header_bytes * (uni + bidi)` = **48 MiB**, up from 32 MiB ([INVARIANTS.md](INVARIANTS.md)). |
+
 ---
 
 ## 6. Known debt and deferred work
@@ -318,19 +439,23 @@ Recorded deliberately, not discovered later.
   transfer metadata and emits structured logs through `tracing`. No OTel exporter, no span
   export pipeline. That belongs to the observability work; the wire fields it needs are
   already carried, so enabling it does not change the protocol.
-- **No retries.** Delivery is `BestEffort` only ([GUARANTEES.md](GUARANTEES.md) §6). Retry
-  policy arrives in Phase 4.
+- **No retries.** A refused, lost or `Indeterminate` transfer is reported to the caller and
+  never retried by the library ([GUARANTEES.md](GUARANTEES.md) §6). Retry policy arrives in
+  Phase 4.
 - **No persistence.** No payload store, no WAL, no recovery. Phase 5.
-- **No deduplication.** No idempotency ids, no dedup window; receiver-side `transfer_id`
-  uniqueness is explicitly not enforced. This is why an `Indeterminate` outcome may only be
-  retried for idempotent operations ([FAILURE_MODEL.md](FAILURE_MODEL.md) §5).
-- **Single reply per request.** Multiple correlated replies are a protocol capability the
-  stream model was chosen to allow, but v0 resolves on the first reply and resets later
-  same-correlation streams.
+- **No deduplication.** No idempotency ids, no dedup window — and since `transfer_id` left
+  the wire there is not even an identifier a receiver could deduplicate on. This is why an
+  `Indeterminate` result may only be retried for idempotent operations
+  ([FAILURE_MODEL.md](FAILURE_MODEL.md) §5).
+- **Single reply per exchange.** The reply half carries one DATA transfer or one ERROR and
+  then FIN. Answering one request several times needs either several exchanges or a framing
+  convention inside the payload; v0 offers neither.
 - **Capability codes unused.** HELLO carries `capabilities` and `required_capabilities`, but
   no code is assigned and the supported set is empty.
-- **Ack modes beyond `accepted` unimplemented.** `stored`, `replicated` and `processed` are
-  reserved code points answered with `UNSUPPORTED`.
+- **Application acknowledgements are absent, not partial.** Accepted, Stored, Replicated and
+  Processed are reserved for the Phase 6 broker: no wire representation, no code point, no
+  `UNSUPPORTED` answer, because there is nothing to ask for. The core's only delivery signal
+  is the `Delivery` transport receipt ([GUARANTEES.md](GUARANTEES.md) §6).
 - **No CI, no LICENSE, no publish metadata.** Not part of this increment; to be added on
   demand.
 - **No synchronous API wrapper.** The async API is the only surface. A blocking facade is a

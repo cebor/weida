@@ -66,9 +66,9 @@ pub(crate) fn transport_config(
 ) -> Result<TransportConfig, Error> {
     let mut tc = TransportConfig::default();
     tc.max_concurrent_uni_streams(VarInt::from_u32(limits.max_concurrent_uni_streams));
-    // Bidirectional streams are not part of the v0 protocol; refusing them
-    // keeps a peer from allocating state we would never read.
-    tc.max_concurrent_bidi_streams(VarInt::from_u32(0));
+    // Bidirectional streams carry Req/Rep exchanges: one per live request, so
+    // this bounds concurrent exchanges the peer can hold open on us.
+    tc.max_concurrent_bidi_streams(VarInt::from_u32(limits.max_concurrent_bidi_streams));
     tc.stream_receive_window(
         VarInt::from_u64(limits.stream_receive_window)
             .map_err(|_| Error::Runtime("stream_receive_window exceeds 2^62-1".into()))?,

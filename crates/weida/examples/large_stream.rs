@@ -119,14 +119,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let requester = runtime.requester(ClientTls::from_pem_file(&args.ca));
     requester.connect(&args.url).await?;
 
-    let (mut transfer, pending) = requester
+    let (mut transfer, reply) = requester
         .open(TransferMeta::default().with_content_len(total))
         .await?;
 
     // The echo must be folded away concurrently; buffering it would defeat the
     // whole point.
     let reader = tokio::spawn(async move {
-        let mut reply = pending.recv().await?;
+        let mut reply = reply.recv().await?;
         let mut digest = Fnv::new();
         let mut chunk = vec![0u8; CHUNK];
         let mut received = 0u64;
@@ -153,12 +153,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         transfer.write_all(&chunk[..n]).await?;
         sent += n as u64;
     }
-    let outcome = transfer.finish().await?;
+    let delivery = transfer.finish()?;
     let (received, received_digest) = reader.await??;
     let elapsed = started.elapsed();
 
     let mib = (sent + received) as f64 / (1024.0 * 1024.0);
-    println!("outcome={outcome}");
+    match delivery.delivered().await {
+        Ok(()) => println!("delivered (transport receipt)"),
+        Err(e) => println!("undelivered: {e}"),
+    }
     println!("sent={sent} received={received}");
     println!("checksum_sent={:#018x}", sent_digest.0);
     println!("checksum_received={received_digest:#018x}");

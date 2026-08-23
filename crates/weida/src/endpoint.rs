@@ -1,22 +1,23 @@
-//! Typed endpoints: one `Endpoint<P>` per messaging pattern.
+//! L1: typed endpoints, one `Endpoint<P>` per messaging pattern.
 //!
 //! The pattern is a type parameter rather than a runtime mode flag, so a
 //! requester cannot be asked to accept and a replier cannot be asked to dial
 //! (master doc §3). The trait is sealed: patterns are part of the protocol.
 //!
-//! The four patterns decompose into the same primitives (`docs/ARCHITECTURE.md`
-//! §Pattern taxonomy): a one-way transfer (P1), a correlation table (P2), a
-//! peer set with a selection policy (P3) and a bounded inbound queue behind an
-//! opaque path (P4). Req adds P2 to P1; Push is P1 alone; Pub replaces
-//! round-robin selection with fan-out; Pull and Sub are P4 verbatim.
+//! Everything here is a thin wrapper over the stream core ([`crate::stream`]):
+//! Req/Rep is one bidirectional stream per exchange, Push/Pull is a
+//! unidirectional stream per message with round-robin peer selection, Pub/Sub
+//! is the same stream with fan-out selection and publisher-side filtering. No
+//! pattern adds a guarantee QUIC does not already provide; the vocabulary of
+//! stored/replicated/processed belongs to a broker layer that does not exist
+//! yet (`docs/GUARANTEES.md`).
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
-use weida_core::{EndpointAddr, Error, Outcome, Role, TraceContext};
+use weida_core::{Error, TraceContext};
 use weida_protocol::{FrameKind, SubscriptionHeader};
 
 use crate::config::ClientTls;
@@ -24,9 +25,10 @@ use crate::conn::{ConnHandle, Ctl, write_control};
 use crate::listener::Route;
 use crate::pubsub::SubRegistry;
 use crate::runtime::RuntimeInner;
+use crate::stream::Peer;
 use crate::transfer::{
-    IncomingRequest, IncomingTransfer, OutgoingTransfer, PendingReply, TransferMeta, data_header,
-    new_trace_context, write_data_preamble,
+    IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream, TransferMeta,
+    new_trace_context,
 };
 
 mod sealed {
@@ -106,138 +108,44 @@ pub type Publisher = Endpoint<Pub>;
 /// The subscribing half of Pub/Sub.
 pub type Subscriber = Endpoint<Sub>;
 
-/// One connected peer: the connection and the path that was dialled on it.
-struct Peer {
-    conn: ConnHandle,
-    path: Arc<str>,
-}
-
-/// A dialling endpoint's peers plus its selection policy (primitive P3).
-///
-/// Peers accumulate: connecting again adds a peer rather than replacing one
-/// (master doc §5). Shared by Req, Push and Sub — the policy differs (Req and
-/// Push pick one, Sub addresses all of them), the set does not.
-pub(crate) struct PeerSet {
-    peers: std::sync::Mutex<Vec<Peer>>,
-    cursor: AtomicUsize,
-}
-
-impl PeerSet {
-    fn new() -> PeerSet {
-        PeerSet {
-            peers: std::sync::Mutex::new(Vec::new()),
-            cursor: AtomicUsize::new(0),
-        }
-    }
-
-    fn add(&self, conn: ConnHandle, path: &str) {
-        self.peers.lock().expect("peer list poisoned").push(Peer {
-            conn,
-            path: Arc::from(path),
-        });
-    }
-
-    fn len(&self) -> usize {
-        self.peers.lock().expect("peer list poisoned").len()
-    }
-
-    /// Picks the next live peer, round-robin.
-    fn pick(&self) -> Result<(ConnHandle, Arc<str>), Error> {
-        let peers = self.peers.lock().expect("peer list poisoned");
-        if peers.is_empty() {
-            return Err(Error::NotConnected);
-        }
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
-        for offset in 0..peers.len() {
-            let peer = &peers[(start + offset) % peers.len()];
-            if peer.conn.conn.close_reason().is_none() {
-                return Ok((Arc::clone(&peer.conn), Arc::clone(&peer.path)));
-            }
-        }
-        Err(Error::ConnectionLost)
-    }
-
-    /// Runs `f` for every peer whose connection is still open.
-    fn for_each_live(&self, mut f: impl FnMut(&ConnHandle, &str)) {
-        let peers = self.peers.lock().expect("peer list poisoned");
-        for peer in peers.iter() {
-            if peer.conn.conn.close_reason().is_none() {
-                f(&peer.conn, &peer.path);
-            }
-        }
-    }
-}
-
 /// State of a requester.
 pub struct ReqState {
-    runtime: Arc<RuntimeInner>,
-    tls: Arc<ClientTls>,
-    peers: PeerSet,
+    peer: Peer,
 }
 
 impl ReqState {
     pub(crate) fn new(runtime: Arc<RuntimeInner>, tls: Arc<ClientTls>) -> ReqState {
         ReqState {
-            runtime,
-            tls,
-            peers: PeerSet::new(),
+            peer: Peer::new(runtime, tls),
         }
     }
 }
 
 impl Requester {
     /// Connects to `weida://host:port/path`.
-    ///
-    /// Connections are pooled per `host:port`, so several endpoints addressing
-    /// the same peer share one QUIC connection. Returns once the HELLO
-    /// exchange has been negotiated, so the first request cannot race
-    /// negotiation.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
-        let addr = EndpointAddr::parse(url)?;
-        let conn = self
-            .state
-            .runtime
-            .connect(&addr.host, addr.port, &self.state.tls)
-            .await?;
-        self.state.peers.add(conn, &addr.path);
-        Ok(())
+        self.state.peer.connect(url).await
     }
 
     /// Number of connected peers.
     pub fn peer_count(&self) -> usize {
-        self.state.peers.len()
+        self.state.peer.peer_count()
     }
 
-    /// Opens a request stream and the correlated reply slot.
+    /// Opens one exchange: a request stream and its reply half.
     ///
-    /// The transfer is registered with the connection actor *before* the stream
-    /// is opened, so an ACK or a reply can never arrive before there is
-    /// somewhere to put it.
-    pub async fn open(
-        &self,
-        meta: TransferMeta,
-    ) -> Result<(OutgoingTransfer, PendingReply), Error> {
-        let (conn, path) = self.state.peers.pick()?;
-        let reserved = conn.register(meta.ack_mode, true).await?;
-        let (header, trace) =
-            data_header(Role::Request, Some(&path), reserved.id, None, &meta, None);
-
-        let mut stream = conn.open_uni().await?;
-        write_data_preamble(&mut stream, &header).await?;
-
-        let reply = PendingReply::new(
-            Arc::clone(&conn),
-            reserved.id,
-            reserved.reply.expect("registered with a reply slot"),
-        );
-        let transfer = OutgoingTransfer::new(conn, stream, reserved.id, trace, reserved.outcome);
-        Ok((transfer, reply))
+    /// Both halves belong to the same bidirectional QUIC stream, so no
+    /// correlation identifier is needed and none is sent.
+    pub async fn open(&self, meta: TransferMeta) -> Result<(OutgoingTransfer, ReplyStream), Error> {
+        self.state.peer.open_bi(meta).await
     }
 
     /// Sends `body` as one request and returns the reply stream.
     ///
     /// Convenience over [`Requester::open`] for small payloads; it never
-    /// materializes the reply.
+    /// materializes the reply. The delivery receipt is discarded: a reply is a
+    /// stronger answer than a transport acknowledgement, and waiting for both
+    /// would only add a round trip.
     pub async fn request(&self, body: &[u8]) -> Result<IncomingTransfer, Error> {
         self.request_with(TransferMeta::default(), body).await
     }
@@ -248,10 +156,10 @@ impl Requester {
         meta: TransferMeta,
         body: &[u8],
     ) -> Result<IncomingTransfer, Error> {
-        let (mut transfer, pending) = self.open(meta).await?;
+        let (mut transfer, reply) = self.open(meta).await?;
         transfer.write_all(body).await?;
-        transfer.finish().await?;
-        pending.recv().await
+        transfer.finish()?;
+        reply.recv().await
     }
 }
 
@@ -293,17 +201,13 @@ impl Replier {
 
 /// State of a pusher.
 pub struct PushState {
-    runtime: Arc<RuntimeInner>,
-    tls: Arc<ClientTls>,
-    peers: PeerSet,
+    peer: Peer,
 }
 
 impl PushState {
     pub(crate) fn new(runtime: Arc<RuntimeInner>, tls: Arc<ClientTls>) -> PushState {
         PushState {
-            runtime,
-            tls,
-            peers: PeerSet::new(),
+            peer: Peer::new(runtime, tls),
         }
     }
 }
@@ -314,55 +218,40 @@ impl Pusher {
     /// Like a requester, a pusher accumulates peers and pools connections per
     /// `host:port`.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
-        let addr = EndpointAddr::parse(url)?;
-        let conn = self
-            .state
-            .runtime
-            .connect(&addr.host, addr.port, &self.state.tls)
-            .await?;
-        self.state.peers.add(conn, &addr.path);
-        Ok(())
+        self.state.peer.connect(url).await
     }
 
     /// Number of connected peers.
     pub fn peer_count(&self) -> usize {
-        self.state.peers.len()
+        self.state.peer.peer_count()
     }
 
-    /// Opens a fire-and-forget transfer to the next peer, round-robin.
+    /// Opens a one-way transfer to the next peer, round-robin.
     ///
-    /// There is no reply slot, but the transfer is still registered: with
-    /// `AckMode::Accepted` the peer owes an acknowledgement, and
-    /// [`OutgoingTransfer::finish`] resolves to `Acked(Accepted)` rather than
-    /// `SentBestEffort`. Acknowledgement modes are orthogonal to the pattern
-    /// (master doc §16), so this needs no reliability code of its own.
+    /// Use this rather than [`Pusher::send`] when the transport receipt
+    /// matters: [`OutgoingTransfer::finish`] hands back a
+    /// [`crate::Delivery`] that resolves once the peer's transport holds every
+    /// byte.
     pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
-        let (conn, path) = self.state.peers.pick()?;
-        let reserved = conn.register(meta.ack_mode, false).await?;
-        let (header, trace) =
-            data_header(Role::Oneshot, Some(&path), reserved.id, None, &meta, None);
-
-        let mut stream = conn.open_uni().await?;
-        write_data_preamble(&mut stream, &header).await?;
-        Ok(OutgoingTransfer::new(
-            conn,
-            stream,
-            reserved.id,
-            trace,
-            reserved.outcome,
-        ))
+        self.state.peer.open(meta).await
     }
 
-    /// Sends `body` as one transfer and waits for its outcome.
-    pub async fn send(&self, body: &[u8]) -> Result<Outcome, Error> {
+    /// Sends `body` as one transfer and returns once the FIN is queued.
+    ///
+    /// Pipeline semantics: the delivery receipt is discarded, so a push costs
+    /// no round trip and reports only failures the local side already knows
+    /// about. Callers who want the receipt use [`Pusher::open`] and await
+    /// [`crate::Delivery::delivered`] themselves.
+    pub async fn send(&self, body: &[u8]) -> Result<(), Error> {
         self.send_with(TransferMeta::default(), body).await
     }
 
     /// Like [`Pusher::send`], with explicit metadata.
-    pub async fn send_with(&self, meta: TransferMeta, body: &[u8]) -> Result<Outcome, Error> {
+    pub async fn send_with(&self, meta: TransferMeta, body: &[u8]) -> Result<(), Error> {
         let mut transfer = self.open(meta).await?;
         transfer.write_all(body).await?;
-        transfer.finish().await
+        transfer.finish()?;
+        Ok(())
     }
 }
 
@@ -437,15 +326,7 @@ impl Publisher {
     /// enqueued for anyone, so reporting it beats silently dropping it for
     /// every subscriber.
     pub fn publish(&self, topic: &str, payload: impl Into<Bytes>) -> Result<usize, Error> {
-        let payload = payload.into();
-        if payload.len() > self.state.max_payload {
-            return Err(Error::LimitExceeded);
-        }
-        let want = u32::try_from(payload.len()).map_err(|_| Error::LimitExceeded)?;
-        Ok(self
-            .state
-            .registry
-            .publish(&self.state.path, topic, payload, new_trace_context(), want))
+        self.publish_inner(topic, payload.into(), new_trace_context())
     }
 
     /// Like [`Publisher::publish`], propagating an existing trace context.
@@ -455,7 +336,15 @@ impl Publisher {
         payload: impl Into<Bytes>,
         trace: TraceContext,
     ) -> Result<usize, Error> {
-        let payload = payload.into();
+        self.publish_inner(topic, payload.into(), trace)
+    }
+
+    fn publish_inner(
+        &self,
+        topic: &str,
+        payload: Bytes,
+        trace: TraceContext,
+    ) -> Result<usize, Error> {
         if payload.len() > self.state.max_payload {
             return Err(Error::LimitExceeded);
         }
@@ -484,9 +373,7 @@ impl Publisher {
 
 /// State of a subscriber.
 pub struct SubState {
-    runtime: Arc<RuntimeInner>,
-    tls: Arc<ClientTls>,
-    peers: PeerSet,
+    peer: Peer,
     /// Filters this subscriber wants, remembered so a peer connected later
     /// receives the same subscriptions.
     filters: std::sync::Mutex<HashSet<String>>,
@@ -498,9 +385,7 @@ impl SubState {
     pub(crate) fn new(runtime: Arc<RuntimeInner>, tls: Arc<ClientTls>, depth: usize) -> SubState {
         let (queue_tx, queue) = mpsc::channel(depth);
         SubState {
-            runtime,
-            tls,
-            peers: PeerSet::new(),
+            peer: Peer::new(runtime, tls),
             filters: std::sync::Mutex::new(HashSet::new()),
             queue_tx,
             queue: Mutex::new(queue),
@@ -513,21 +398,15 @@ impl Subscriber {
     /// registered so far.
     ///
     /// The subscriber registers `path` in the *client* connection's namespace:
-    /// fanned-out copies arrive as ordinary inbound oneshot transfers, so the
+    /// fanned-out copies arrive as ordinary inbound one-way transfers, so the
     /// dialling side needs a route for them. Two subscribers sharing a pooled
     /// connection and claiming the same path therefore collide with
     /// [`Error::AlreadyRegistered`]; fanning one subscription out to several
     /// in-process consumers is the application's business, not the transport's.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
-        let addr = EndpointAddr::parse(url)?;
-        let conn = self
-            .state
-            .runtime
-            .connect(&addr.host, addr.port, &self.state.tls)
-            .await?;
+        let (conn, path) = self.state.peer.dial(url).await?;
         conn.namespace
-            .register(&addr.path, Route::Transfer(self.state.queue_tx.clone()))?;
-        self.state.peers.add(ConnHandle::clone(&conn), &addr.path);
+            .register(&path, Route::Transfer(self.state.queue_tx.clone()))?;
 
         let filters: Vec<String> = self
             .state
@@ -538,14 +417,14 @@ impl Subscriber {
             .cloned()
             .collect();
         for filter in filters {
-            send_subscription(&conn, FrameKind::Subscribe, &addr.path, &filter).await?;
+            send_subscription(&conn, FrameKind::Subscribe, &path, &filter).await?;
         }
         Ok(())
     }
 
     /// Number of connected peers.
     pub fn peer_count(&self) -> usize {
-        self.state.peers.len()
+        self.state.peer.peer_count()
     }
 
     /// Registers interest in every topic starting with `filter`.
@@ -601,7 +480,7 @@ impl Subscriber {
         // Collect first: the peer lock is a std mutex and must not be held
         // across an await.
         let mut targets = Vec::new();
-        self.state.peers.for_each_live(|conn, path| {
+        self.state.peer.for_each_live(|conn, path| {
             targets.push((ConnHandle::clone(conn), path.to_owned()));
         });
         for (conn, path) in targets {
@@ -639,7 +518,7 @@ impl Drop for SubState {
             .cloned()
             .collect();
         let mut targets = Vec::new();
-        self.peers.for_each_live(|conn, path| {
+        self.peer.for_each_live(|conn, path| {
             targets.push((ConnHandle::clone(conn), Arc::<str>::from(path)));
         });
         for (conn, path) in targets {

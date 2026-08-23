@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use tokio::io::AsyncReadExt;
-use weida::{AckMode, Limits, Listener, Runtime, RuntimeConfig, ServerTls, TransferMeta};
+use weida::{Limits, Listener, Runtime, RuntimeConfig, ServerTls, TransferMeta};
 
 const CHUNK: usize = 64 * 1024;
 
@@ -46,30 +46,24 @@ async fn harness() -> Harness {
 
     let replier = listener.replier("/echo").expect("replier");
     tokio::spawn(async move {
-        while let Ok(request) = replier.accept().await {
+        while let Ok(mut request) = replier.accept().await {
             tokio::spawn(async move {
-                let mut request = request;
-                let mut reply = None;
+                let mut body = request.take_body();
+                let mut out = match request.reply(TransferMeta::default()).await {
+                    Ok(out) => out,
+                    Err(_) => return,
+                };
                 let mut chunk = vec![0u8; CHUNK];
                 loop {
-                    let n = match request.body().read(&mut chunk).await {
+                    let n = match body.read(&mut chunk).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
-                    };
-                    let out = match &mut reply {
-                        Some(out) => out,
-                        None => match request.reply(TransferMeta::default()).await {
-                            Ok(out) => reply.insert(out),
-                            Err(_) => break,
-                        },
                     };
                     if out.write_all(&chunk[..n]).await.is_err() {
                         return;
                     }
                 }
-                if let Some(reply) = reply {
-                    let _ = reply.finish().await;
-                }
+                let _ = out.finish();
             });
         }
     });
@@ -125,20 +119,25 @@ fn bench_small_rtt(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("echo_1kib_rtt_acked", |b| {
+    // The same echo through the raw handles, so the cost of `request`'s
+    // convenience layer is visible against it.
+    group.bench_function("echo_1kib_rtt_explicit", |b| {
         b.to_async(&rt).iter(|| async {
-            let (mut transfer, pending) = requester
-                .open(TransferMeta::default().with_ack(AckMode::Accepted))
-                .await
-                .expect("open");
+            let (mut transfer, reply) =
+                requester.open(TransferMeta::default()).await.expect("open");
             transfer
                 .write_all(black_box(&payload))
                 .await
                 .expect("write");
-            let outcome = transfer.finish().await.expect("finish");
-            let reply = pending.recv().await.expect("recv");
-            let body = reply.collect(4096).await.expect("collect");
-            black_box((outcome, body.len()))
+            transfer.finish().expect("finish");
+            let body = reply
+                .recv()
+                .await
+                .expect("recv")
+                .collect(4096)
+                .await
+                .expect("collect");
+            black_box(body.len())
         })
     });
     group.finish();
@@ -167,7 +166,7 @@ fn bench_stream_throughput(c: &mut Criterion) {
 
     group.bench_function("stream_throughput_64mib", |b| {
         b.to_async(&rt).iter(|| async {
-            let (mut transfer, pending) = requester
+            let (mut transfer, reply) = requester
                 .open(TransferMeta::default().with_content_len(TOTAL as u64))
                 .await
                 .expect("open");
@@ -175,7 +174,7 @@ fn bench_stream_throughput(c: &mut Criterion) {
             // The echo must be drained concurrently, or both sides stall on
             // flow control.
             let reader = tokio::spawn(async move {
-                let mut reply = pending.recv().await.expect("recv");
+                let mut reply = reply.recv().await.expect("recv");
                 let mut sink = vec![0u8; CHUNK];
                 let mut received = 0usize;
                 loop {
@@ -193,7 +192,7 @@ fn bench_stream_throughput(c: &mut Criterion) {
                 transfer.write_all(&payload).await.expect("write");
                 sent += payload.len();
             }
-            transfer.finish().await.expect("finish");
+            transfer.finish().expect("finish");
             let received = reader.await.expect("reader");
             debug_assert_eq!(received, TOTAL);
             black_box(received)

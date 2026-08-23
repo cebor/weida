@@ -41,9 +41,9 @@ pub(crate) fn matches_filter(topic: &str, filter: &str) -> bool {
 
 /// One message queued for one subscriber.
 ///
-/// The DATA header is *not* pre-encoded and shared: transfer ids are per
-/// connection, so every copy needs its own header. The payload is a `Bytes`, so
-/// the fan-out shares one allocation regardless of subscriber count.
+/// The DATA header is *not* pre-encoded and shared: each copy carries the
+/// subscriber's own path. The payload is a `Bytes`, so the fan-out shares one
+/// allocation regardless of subscriber count.
 struct PubMsg {
     topic: Arc<str>,
     payload: Bytes,
@@ -264,10 +264,8 @@ fn decrement(counts: &mut HashMap<usize, usize>, conn_id: usize, by: usize) {
 
 /// Writes one subscriber's messages, in order, each on its own uni stream.
 ///
-/// Fanned-out copies are always `ack_mode = none`: the publisher is not waiting
-/// on anyone, so there is nothing for an acknowledgement to resolve. That is
-/// also why no registration is needed — the transfer id is allocated straight
-/// from the connection and never enters a correlation table.
+/// Fan-out is one-way by construction: a published copy owes nothing back, so
+/// it rides a unidirectional stream and the publisher never waits on it.
 async fn writer(
     ctx: ConnHandle,
     path: Arc<str>,
@@ -296,7 +294,7 @@ async fn writer(
 }
 
 async fn write_one(ctx: &ConnHandle, path: &str, msg: &PubMsg) -> Result<(), Error> {
-    let mut header = DataHeader::oneshot(path, ctx.next_transfer_id(), weida_core::AckMode::None);
+    let mut header = DataHeader::addressed(path);
     header.topic = Some(msg.topic.to_string());
     header.content_len = Some(msg.payload.len() as u64);
     header.traceparent = Some(msg.trace.to_traceparent());

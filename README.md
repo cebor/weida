@@ -3,16 +3,18 @@
 weida is a messaging framework for Rust built from first principles around QUIC. Every user
 data flow maps to one QUIC stream, so a 40-byte transfer and a 40-GB transfer use the same
 protocol semantics and neither requires the payload to be materialized in memory.
-Reliability is expressed as explicit, precisely defined responsibility transfer rather than
-as the word "reliable".
 
-Where it sits: QUIC-native transport, streaming-first API, explicit guarantees with
-hop-local semantics, brokerless peer-to-peer today and brokered operation later using the
-same patterns and the same programming model.
+It is built in layers. **L0** is a stream core: ZeroMQ's idea rebuilt on QUIC, whose
+primitives are unidirectional and bidirectional streams with exactly the guarantees QUIC
+gives — ordered bytes within a stream, none across streams, flow control, a transport
+delivery receipt, and cancellation by reset. **L1** is the ZeroMQ/nanomsg pattern family as
+thin wrappers over L0: Req/Rep, Push/Pull, Pub/Sub. **L2** will be a RabbitMQ-analog broker
+with queues, publisher confirms and consumer acknowledgements; it does not exist yet, and
+its guarantee vocabulary is deliberately kept out of the socket layer until it does.
 
 **Status:** alpha. Wire protocol version `0` (experimental, breaking changes permitted
 within `0.x`). Phases 0-2 implemented: docs, core model, native QUIC transport with Req/Rep.
-Phase 3 in progress: Push/Pull and Pub/Sub have landed.
+Phase 3 in progress: Push/Pull, Pub/Sub and the raw L0 stream API have landed.
 
 ## Documentation
 
@@ -30,9 +32,9 @@ Phase 3 in progress: Push/Pull and Pub/Sub have landed.
 
 | Path | Package | Responsibility |
 | --- | --- | --- |
-| `crates/core` | `weida-core` | I/O-free model: errors, ids, endpoint addresses, limits, policies, trace context, state machines |
+| `crates/core` | `weida-core` | I/O-free model: errors, endpoint addresses, limits, trace context |
 | `crates/protocol` | `weida-protocol` | wire codec, no I/O: varints, framing, CBOR headers, negotiation, error codes |
-| `crates/weida` | `weida` | runtime, native QUIC transport, Req/Rep, Push/Pull and Pub/Sub endpoints and transfers |
+| `crates/weida` | `weida` | runtime, native QUIC transport, the raw stream core, and the Req/Rep, Push/Pull and Pub/Sub patterns |
 
 ## Try the prototype
 
@@ -43,10 +45,11 @@ cargo run -p weida --example transform_server -- --bind 127.0.0.1:7443 --cert-ou
 ```
 
 ```
-printf 'hello weida' | cargo run -p weida --example transform_client -- --ca /tmp/weida-cert.pem --ack weida://127.0.0.1:7443/transform
+printf 'hello weida' | cargo run -p weida --example transform_client -- --ca /tmp/weida-cert.pem weida://127.0.0.1:7443/transform
 ```
 
-Expected: stdout is exactly `HELLO WEIDA`; stderr shows `outcome=Acked(Accepted)` and a
+Expected: stdout is exactly `HELLO WEIDA`; stderr shows `delivered` — QUIC's transport
+receipt for the request, not an application acknowledgement — and a
 trace id that also appears in the server's log line for the request.
 
 ## Other patterns
@@ -55,7 +58,7 @@ Push/Pull and Pub/Sub each have a self-contained example: both halves run in one
 process on loopback, so there is nothing to configure.
 
 ```
-cargo run -p weida --example push_pull   # fire-and-forget, best effort vs. acknowledged
+cargo run -p weida --example push_pull   # fire-and-forget, and one transport receipt
 cargo run -p weida --example pub_sub     # prefix-filtered topics, two subscribers
 ```
 

@@ -13,6 +13,7 @@ use crate::conn::ConnHandle;
 use crate::endpoint::{Endpoint, PushState, Pusher, ReqState, Requester, SubState, Subscriber};
 use crate::listener::Listener;
 use crate::pool::ClientPool;
+use crate::stream::Peer;
 
 pub(crate) struct RuntimeInner {
     pub(crate) config: RuntimeConfig,
@@ -71,6 +72,15 @@ impl Runtime {
     /// ([`Listener::bind_quic`]).
     pub fn listener(&self) -> Listener {
         Listener::new(Arc::clone(&self.inner))
+    }
+
+    /// Creates a raw L0 peer that authenticates its peers against `tls`.
+    ///
+    /// Below the patterns: a [`Peer`] opens unidirectional and bidirectional
+    /// streams directly, with exactly QUIC's guarantees and no pattern
+    /// vocabulary layered on top.
+    pub fn peer(&self, tls: ClientTls) -> Peer {
+        Peer::new(Arc::clone(&self.inner), Arc::new(tls))
     }
 
     /// Creates a requester that authenticates peers against `tls`.

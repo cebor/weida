@@ -1,26 +1,21 @@
 //! I/O-free core model of the weida messaging framework.
 //!
 //! This crate contains no networking, no `tokio` and no serialization: only the
-//! vocabulary types (identifiers, endpoint addresses, policies, limits, trace
-//! context, errors) and the pure state machines that decide transfer outcomes.
-//! Everything here is unit-testable without a socket, per Phase 1 of the master
-//! architecture document.
+//! vocabulary types (endpoint addresses, limits, trace context, errors) that
+//! the wire codec and the transport share. Everything here is unit-testable
+//! without a socket.
+//!
+//! The correlation and acknowledgement state machines that used to live here
+//! are gone: Req/Rep rides one bidirectional QUIC stream, so the stream *is*
+//! the correlation, and delivery is QUIC's own transport receipt rather than an
+//! application-level ACK (`docs/ARCHITECTURE.md`, layer model).
 
 pub mod addr;
 pub mod error;
-pub mod id;
 pub mod limits;
-pub mod policy;
-pub mod state;
 pub mod trace;
 
 pub use addr::{EndpointAddr, MAX_PATH_BYTES, SCHEME, validate_endpoint_path};
 pub use error::{Error, ErrorCode, Result, StopReason};
-pub use id::TransferId;
 pub use limits::Limits;
-pub use policy::{AckMode, AckState, Outcome, Role};
-pub use state::{
-    Correlator, RecvAction, RecvEvent, RecvMachine, RecvState, ReplyDisposition, SendAction,
-    SendEvent, SendMachine, SendState,
-};
 pub use trace::{TraceContext, TraceError};

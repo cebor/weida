@@ -11,14 +11,8 @@
 //! `frame.rs` and `header.rs` cover the two halves independently; this file is
 //! what makes the documented frames byte-exact as published.
 
-use weida_core::{AckMode, TransferId};
-use weida_protocol::{
-    AckHeader, CancelHeader, DataHeader, FrameKind, Hello, SubscriptionHeader, encode_frame,
-};
-
-fn tid(v: u64) -> TransferId {
-    TransferId::new(v).expect("non-zero")
-}
+use weida_core::ErrorCode;
+use weida_protocol::{DataHeader, ErrorHeader, FrameKind, Hello, SubscriptionHeader, encode_frame};
 
 /// Asserts one documented frame, and that its header half decodes back.
 #[track_caller]
@@ -40,14 +34,26 @@ fn assert_frame(name: &str, kind: FrameKind, header: Vec<u8>, expected: &[u8]) {
 
 #[test]
 fn golden_data_request_frame() {
-    let h = DataHeader::request("/t", tid(1), AckMode::Accepted);
+    let h = DataHeader::addressed("/t");
     assert_frame(
         "DATA request",
         FrameKind::Data,
         h.encode(),
-        &[
-            0x57, 0x01, 0x0B, 0xA4, 0x00, 0x62, 0x2F, 0x74, 0x01, 0x01, 0x02, 0x01, 0x04, 0x01,
-        ],
+        &[0x57, 0x01, 0x05, 0xA1, 0x00, 0x62, 0x2F, 0x74],
+    );
+    assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
+}
+
+#[test]
+fn golden_data_reply_frame() {
+    // The bidirectional stream is the correlation, so the reply half names
+    // neither an endpoint nor the request it answers: the header is empty.
+    let h = DataHeader::reply();
+    assert_frame(
+        "DATA reply",
+        FrameKind::Data,
+        h.encode(),
+        &[0x57, 0x01, 0x01, 0xA0],
     );
     assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
 }
@@ -68,57 +74,29 @@ fn golden_hello_frame() {
 }
 
 #[test]
-fn golden_ack_frame() {
-    let h = AckHeader::accepted(tid(1));
+fn golden_error_frame() {
+    let h = ErrorHeader::new(ErrorCode::NoReply);
     assert_frame(
-        "ACK",
-        FrameKind::Ack,
+        "ERROR",
+        FrameKind::Error,
         h.encode(),
-        &[0x57, 0x02, 0x05, 0xA2, 0x00, 0x01, 0x01, 0x01],
+        &[0x57, 0x02, 0x03, 0xA1, 0x00, 0x05],
     );
-    assert_eq!(AckHeader::decode(&h.encode()).unwrap(), h);
-}
-
-#[test]
-fn golden_cancel_frame() {
-    let h = CancelHeader { id: tid(1) };
-    assert_frame(
-        "CANCEL",
-        FrameKind::Cancel,
-        h.encode(),
-        &[0x57, 0x04, 0x03, 0xA1, 0x00, 0x01],
-    );
-    assert_eq!(CancelHeader::decode(&h.encode()).unwrap(), h);
-}
-
-#[test]
-fn golden_oneshot_data_frame() {
-    // `ack_mode = 0` is the default and is omitted; `role = 0` is written,
-    // because it selects behaviour rather than restating a default.
-    let h = DataHeader::oneshot("/t", tid(1), AckMode::None);
-    assert_frame(
-        "DATA oneshot",
-        FrameKind::Data,
-        h.encode(),
-        &[
-            0x57, 0x01, 0x09, 0xA3, 0x00, 0x62, 0x2F, 0x74, 0x01, 0x01, 0x02, 0x00,
-        ],
-    );
-    assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
+    assert_eq!(ErrorHeader::decode(&h.encode()).unwrap(), h);
 }
 
 #[test]
 fn golden_fanout_data_frame() {
     // The shape of one copy a publisher writes to one subscriber.
-    let mut h = DataHeader::oneshot("/md", tid(1), AckMode::None);
+    let mut h = DataHeader::addressed("/md");
     h.topic = Some("px.eur".into());
     assert_frame(
         "DATA fan-out copy",
         FrameKind::Data,
         h.encode(),
         &[
-            0x57, 0x01, 0x12, 0xA4, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x01, 0x01, 0x02, 0x00, 0x09,
-            0x66, 0x70, 0x78, 0x2E, 0x65, 0x75, 0x72,
+            0x57, 0x01, 0x0E, 0xA2, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x05, 0x66, 0x70, 0x78, 0x2E,
+            0x65, 0x75, 0x72,
         ],
     );
     assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
@@ -133,7 +111,7 @@ fn golden_subscribe_and_unsubscribe_frames() {
         FrameKind::Subscribe,
         header.clone(),
         &[
-            0x57, 0x05, 0x0B, 0xA2, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x01, 0x63, 0x70, 0x78, 0x2E,
+            0x57, 0x03, 0x0B, 0xA2, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x01, 0x63, 0x70, 0x78, 0x2E,
         ],
     );
     assert_frame(
@@ -141,7 +119,7 @@ fn golden_subscribe_and_unsubscribe_frames() {
         FrameKind::Unsubscribe,
         header.clone(),
         &[
-            0x57, 0x06, 0x0B, 0xA2, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x01, 0x63, 0x70, 0x78, 0x2E,
+            0x57, 0x04, 0x0B, 0xA2, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x01, 0x63, 0x70, 0x78, 0x2E,
         ],
     );
     // One header layout serves both kinds: the two frames differ in exactly

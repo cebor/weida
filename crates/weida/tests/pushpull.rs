@@ -1,9 +1,8 @@
 //! Push/Pull over real QUIC on loopback.
 //!
-//! Push is the one-way transfer primitive with no reply slot: the same
-//! `OutgoingTransfer` machinery as Req, minus correlation. These tests assert
-//! that the outcome vocabulary, the acknowledgement modes and the round-robin
-//! peer policy all carry over unchanged, and that mixing patterns on one path
+//! Push is the one-way stream primitive: no reply half, no correlation, one
+//! unidirectional QUIC stream per message. These tests assert the delivery
+//! receipt, the round-robin peer policy, and that mixing patterns on one path
 //! is refused rather than reinterpreted.
 
 mod common;
@@ -11,7 +10,7 @@ mod common;
 use std::time::Duration;
 
 use common::Server;
-use weida::{AckMode, AckState, Error, Outcome, TransferMeta};
+use weida::{Error, TransferMeta};
 
 /// Generous ceiling: every assertion below should settle in milliseconds.
 const DEADLINE: Duration = Duration::from_secs(15);
@@ -23,7 +22,7 @@ async fn within<F: Future>(f: F) -> F::Output {
 }
 
 #[tokio::test]
-async fn push_pull_roundtrip_with_ack() {
+async fn push_delivery_receipt() {
     let server = Server::start().await;
     let puller = server.listener.puller("/jobs").expect("puller");
 
@@ -34,28 +33,24 @@ async fn push_pull_roundtrip_with_ack() {
         .expect("connect");
 
     let payload = vec![0x5au8; 1024];
-    let sender = {
-        let payload = payload.clone();
-        tokio::spawn(async move {
-            pusher
-                .send_with(
-                    TransferMeta::default().with_ack(AckMode::Accepted),
-                    &payload,
-                )
-                .await
-        })
-    };
+    let mut transfer = within(pusher.open(TransferMeta::default()))
+        .await
+        .expect("open");
+    within(transfer.write_all(&payload)).await.expect("write");
+    let delivery = transfer.finish().expect("finish");
+
+    // The receipt is QUIC's fin-acknowledgement, not an application ack: 1 KiB
+    // fits the flow-control window, so the peer's transport holds every byte
+    // long before the puller asks for them. Awaiting it *before* `recv` is the
+    // whole point — it must not deadlock, and it must not mean "the
+    // application read it".
+    within(delivery.delivered()).await.expect("delivered");
 
     let transfer = within(puller.recv()).await.expect("recv");
     assert_eq!(transfer.meta().endpoint.as_deref(), Some("/jobs"));
-    assert_eq!(transfer.meta().correlation_id, None);
+    assert_eq!(transfer.meta().topic, None);
     let body = within(transfer.collect(64 * 1024)).await.expect("collect");
     assert_eq!(body, payload);
-
-    // The ACK is emitted when the application reaches EOF, so it can only
-    // resolve after `collect` above.
-    let outcome = within(sender).await.expect("task").expect("send");
-    assert_eq!(outcome, Outcome::Acked(AckState::Accepted));
 
     client.shutdown().await;
 }
@@ -71,12 +66,10 @@ async fn push_best_effort() {
         .await
         .expect("connect");
 
-    // Best effort settles at FIN without waiting for the peer.
-    let outcome = within(pusher.send(b"fire and forget")).await.expect("send");
-    assert_eq!(outcome, Outcome::SentBestEffort);
+    // Pipeline semantics: `send` discards the receipt and returns at FIN.
+    within(pusher.send(b"fire and forget")).await.expect("send");
 
     let transfer = within(puller.recv()).await.expect("recv");
-    assert_eq!(transfer.meta().ack_mode, AckMode::None);
     let body = within(transfer.collect(1024)).await.expect("collect");
     assert_eq!(body, b"fire and forget");
 
@@ -87,8 +80,7 @@ async fn push_best_effort() {
 async fn push_round_robins_two_peers() {
     // One pusher, two peers, two distinct destination paths on one server.
     // A peer carries the path that was dialled on it, so which puller receives
-    // a message *is* the observable output of the selection policy — the same
-    // `PeerSet::pick` a requester uses (pattern primitive P3).
+    // a message *is* the observable output of the selection policy.
     let server = Server::start().await;
     let left = server.listener.puller("/left").expect("left");
     let right = server.listener.puller("/right").expect("right");
@@ -161,8 +153,7 @@ async fn push_cancel_mid_transfer() {
     assert!(matches!(err, Error::Canceled), "{err:?}");
 
     // The connection survives: the next push is served normally.
-    let outcome = within(pusher.send(b"next")).await.expect("send");
-    assert_eq!(outcome, Outcome::SentBestEffort);
+    within(pusher.send(b"next")).await.expect("send");
     let next = within(puller.recv()).await.expect("recv next");
     assert_eq!(within(next.collect(64)).await.expect("collect"), b"next");
 
@@ -180,7 +171,8 @@ async fn request_to_pull_path_is_unsupported() {
         .await
         .expect("connect");
 
-    // The path exists but serves oneshots. Refusing beats guessing.
+    // The path exists but serves one-way transfers. Refusing beats guessing,
+    // and the exchange's own reply half carries the reason.
     let err = within(requester.request(b"hello"))
         .await
         .expect_err("a request to a pull path must be refused");
@@ -200,13 +192,15 @@ async fn push_to_rep_path_is_unsupported() {
         .await
         .expect("connect");
 
-    let err = within(pusher.send_with(
-        TransferMeta::default().with_ack(AckMode::Accepted),
-        b"hello",
-    ))
-    .await
-    .expect_err("a push to a replier path must be refused");
-    assert!(matches!(err, Error::Unsupported), "{err:?}");
+    // A one-way stream has no reply half, so the refusal is the stop code. It
+    // may land while writing or only once the receipt is awaited.
+    assert!(
+        matches!(
+            within(push_and_confirm(&pusher, b"hello")).await,
+            Err(Error::Unsupported)
+        ),
+        "a push to a replier path must be refused with Unsupported"
+    );
 
     client.shutdown().await;
 }
@@ -222,13 +216,23 @@ async fn push_to_an_unknown_path_is_reported() {
         .await
         .expect("connect");
 
-    let err = within(pusher.send_with(
-        TransferMeta::default().with_ack(AckMode::Accepted),
-        b"hello",
-    ))
-    .await
-    .expect_err("an unknown path must be reported");
-    assert!(matches!(err, Error::UnknownEndpoint), "{err:?}");
+    assert!(
+        matches!(
+            within(push_and_confirm(&pusher, b"hello")).await,
+            Err(Error::UnknownEndpoint)
+        ),
+        "an unknown path must be reported"
+    );
 
     client.shutdown().await;
+}
+
+/// Pushes `body` and waits for the transport receipt.
+///
+/// A refusal races the write: `STOP_SENDING` may arrive mid-write or only after
+/// the FIN, so both points are checked and the error value is what matters.
+async fn push_and_confirm(pusher: &weida::Pusher, body: &[u8]) -> Result<(), Error> {
+    let mut transfer = pusher.open(TransferMeta::default()).await?;
+    transfer.write_all(body).await?;
+    transfer.finish()?.delivered().await
 }

@@ -21,12 +21,8 @@ pub enum FrameKind {
     Hello,
     /// A transfer: header followed by opaque payload until FIN.
     Data,
-    /// Acknowledgement of a transfer; header-only.
-    Ack,
-    /// Failure report for a transfer; header-only.
+    /// Failure report on the reply half of an exchange; header-only.
     Error,
-    /// Withdrawal of interest in a request's replies; header-only.
-    Cancel,
     /// Registration of interest in a publisher's topics; header-only.
     Subscribe,
     /// Withdrawal of a previous SUBSCRIBE; header-only.
@@ -39,11 +35,9 @@ impl FrameKind {
         match self {
             FrameKind::Hello => 0,
             FrameKind::Data => 1,
-            FrameKind::Ack => 2,
-            FrameKind::Error => 3,
-            FrameKind::Cancel => 4,
-            FrameKind::Subscribe => 5,
-            FrameKind::Unsubscribe => 6,
+            FrameKind::Error => 2,
+            FrameKind::Subscribe => 3,
+            FrameKind::Unsubscribe => 4,
         }
     }
 
@@ -54,11 +48,9 @@ impl FrameKind {
         match code {
             0 => Some(FrameKind::Hello),
             1 => Some(FrameKind::Data),
-            2 => Some(FrameKind::Ack),
-            3 => Some(FrameKind::Error),
-            4 => Some(FrameKind::Cancel),
-            5 => Some(FrameKind::Subscribe),
-            6 => Some(FrameKind::Unsubscribe),
+            2 => Some(FrameKind::Error),
+            3 => Some(FrameKind::Subscribe),
+            4 => Some(FrameKind::Unsubscribe),
             _ => None,
         }
     }
@@ -74,9 +66,7 @@ impl fmt::Display for FrameKind {
         let s = match self {
             FrameKind::Hello => "HELLO",
             FrameKind::Data => "DATA",
-            FrameKind::Ack => "ACK",
             FrameKind::Error => "ERROR",
-            FrameKind::Cancel => "CANCEL",
             FrameKind::Subscribe => "SUBSCRIBE",
             FrameKind::Unsubscribe => "UNSUBSCRIBE",
         };
@@ -193,17 +183,15 @@ mod tests {
         let all = [
             (FrameKind::Hello, 0u8),
             (FrameKind::Data, 1),
-            (FrameKind::Ack, 2),
-            (FrameKind::Error, 3),
-            (FrameKind::Cancel, 4),
-            (FrameKind::Subscribe, 5),
-            (FrameKind::Unsubscribe, 6),
+            (FrameKind::Error, 2),
+            (FrameKind::Subscribe, 3),
+            (FrameKind::Unsubscribe, 4),
         ];
         for (kind, code) in all {
             assert_eq!(kind.to_u8(), code);
             assert_eq!(FrameKind::from_u8(code), Some(kind));
         }
-        for code in 7u8..=255 {
+        for code in 5u8..=255 {
             assert_eq!(FrameKind::from_u8(code), None, "kind {code}");
         }
     }
@@ -213,9 +201,7 @@ mod tests {
         assert!(FrameKind::Data.has_payload());
         for k in [
             FrameKind::Hello,
-            FrameKind::Ack,
             FrameKind::Error,
-            FrameKind::Cancel,
             FrameKind::Subscribe,
             FrameKind::Unsubscribe,
         ] {
@@ -244,11 +230,9 @@ mod tests {
         for (kind, code) in [
             (FrameKind::Hello, 0x00u8),
             (FrameKind::Data, 0x01),
-            (FrameKind::Ack, 0x02),
-            (FrameKind::Error, 0x03),
-            (FrameKind::Cancel, 0x04),
-            (FrameKind::Subscribe, 0x05),
-            (FrameKind::Unsubscribe, 0x06),
+            (FrameKind::Error, 0x02),
+            (FrameKind::Subscribe, 0x03),
+            (FrameKind::Unsubscribe, 0x04),
         ] {
             for header_len in [0usize, 3, 5, 9, 11, 16, 18] {
                 let frame = encode_frame(kind, &vec![0; header_len]);
@@ -285,8 +269,8 @@ mod tests {
 
     #[test]
     fn unknown_kind_is_a_violation() {
-        let err = parse_preamble(&[MAGIC, 0x07, 0x00], CAP).unwrap_err();
-        assert_eq!(err, PreambleError::UnknownKind(7));
+        let err = parse_preamble(&[MAGIC, 0x05, 0x00], CAP).unwrap_err();
+        assert_eq!(err, PreambleError::UnknownKind(5));
         assert!(err.is_violation());
     }
 
@@ -316,7 +300,7 @@ mod tests {
     #[test]
     fn non_minimal_length_encodings_are_accepted() {
         // header_len = 5 in the 8-byte form.
-        let buf = [MAGIC, FrameKind::Ack.to_u8(), 0xc0, 0, 0, 0, 0, 0, 0, 5];
+        let buf = [MAGIC, FrameKind::Error.to_u8(), 0xc0, 0, 0, 0, 0, 0, 0, 5];
         let (p, used) = parse_preamble(&buf, CAP).unwrap();
         assert_eq!(p.header_len, 5);
         assert_eq!(used, 10);

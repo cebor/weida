@@ -24,6 +24,8 @@ pub const SHUTDOWN: u64 = 6;
 pub const REJECTED: u64 = 7;
 /// No endpoint is registered for the requested path.
 pub const UNKNOWN_ENDPOINT: u64 = 8;
+/// The endpoint exists but does not serve this stream kind.
+pub const UNSUPPORTED: u64 = 9;
 
 /// Human-readable name for a code, for logs and close reasons.
 pub const fn name(code: u64) -> &'static str {
@@ -37,6 +39,7 @@ pub const fn name(code: u64) -> &'static str {
         SHUTDOWN => "SHUTDOWN",
         REJECTED => "REJECTED",
         UNKNOWN_ENDPOINT => "UNKNOWN_ENDPOINT",
+        UNSUPPORTED => "UNSUPPORTED",
         _ => "UNKNOWN",
     }
 }
@@ -47,6 +50,7 @@ pub const fn stop_reason(code: u64) -> StopReason {
         REJECTED => StopReason::Rejected,
         CANCELED => StopReason::Canceled,
         UNKNOWN_ENDPOINT => StopReason::UnknownEndpoint,
+        UNSUPPORTED => StopReason::Unsupported,
         other => StopReason::Other(other),
     }
 }
@@ -67,9 +71,10 @@ mod tests {
                 LIMIT_EXCEEDED,
                 SHUTDOWN,
                 REJECTED,
-                UNKNOWN_ENDPOINT
+                UNKNOWN_ENDPOINT,
+                UNSUPPORTED
             ],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8]
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
         );
     }
 
@@ -77,14 +82,16 @@ mod tests {
     fn names_are_defined_for_known_codes() {
         assert_eq!(name(PROTOCOL_VIOLATION), "PROTOCOL_VIOLATION");
         assert_eq!(name(NEGOTIATION_FAILED), "NEGOTIATION_FAILED");
-        assert_eq!(name(9), "UNKNOWN");
+        assert_eq!(name(UNSUPPORTED), "UNSUPPORTED");
+        assert_eq!(name(10), "UNKNOWN");
     }
 
     #[test]
-    fn stop_reasons_map_the_three_refusal_codes() {
+    fn stop_reasons_map_the_four_refusal_codes() {
         assert_eq!(stop_reason(REJECTED), StopReason::Rejected);
         assert_eq!(stop_reason(CANCELED), StopReason::Canceled);
         assert_eq!(stop_reason(UNKNOWN_ENDPOINT), StopReason::UnknownEndpoint);
+        assert_eq!(stop_reason(UNSUPPORTED), StopReason::Unsupported);
         assert_eq!(stop_reason(42), StopReason::Other(42));
     }
 }

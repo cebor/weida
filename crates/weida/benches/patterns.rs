@@ -10,8 +10,7 @@ use std::net::SocketAddr;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use weida::{
-    AckMode, ClientTls, Listener, Publisher, Puller, Runtime, RuntimeConfig, ServerTls,
-    TransferMeta,
+    ClientTls, Listener, Publisher, Puller, Runtime, RuntimeConfig, ServerTls, TransferMeta,
 };
 
 const PAYLOAD: usize = 1024;
@@ -87,9 +86,14 @@ fn bench_push(c: &mut Criterion) {
     let rt = tokio_runtime();
     let harness = rt.block_on(harness());
 
-    let (best_effort, acked) = rt.block_on(async {
+    let (best_effort, delivered) = rt.block_on(async {
         drain(harness.listener.puller("/best").expect("puller best"));
-        drain(harness.listener.puller("/acked").expect("puller acked"));
+        drain(
+            harness
+                .listener
+                .puller("/delivered")
+                .expect("puller delivered"),
+        );
 
         let client = harness.client();
         let best_effort = client.pusher(harness.trust());
@@ -97,12 +101,12 @@ fn bench_push(c: &mut Criterion) {
             .connect(&harness.url("/best"))
             .await
             .expect("connect best");
-        let acked = client.pusher(harness.trust());
-        acked
-            .connect(&harness.url("/acked"))
+        let delivered = client.pusher(harness.trust());
+        delivered
+            .connect(&harness.url("/delivered"))
             .await
-            .expect("connect acked");
-        (best_effort, acked)
+            .expect("connect delivered");
+        (best_effort, delivered)
     });
 
     let payload = vec![0x61u8; PAYLOAD];
@@ -113,23 +117,25 @@ fn bench_push(c: &mut Criterion) {
     // path alone.
     group.bench_function("push_1kib_best_effort", |b| {
         b.to_async(&rt).iter(|| async {
-            let outcome = best_effort.send(black_box(&payload)).await.expect("send");
-            black_box(outcome)
+            best_effort.send(black_box(&payload)).await.expect("send");
         })
     });
 
-    // `Accepted` waits for the receiver's ACK, which is emitted when the
-    // application reaches EOF: one round trip plus the handler's read.
-    group.bench_function("push_1kib_acked", |b| {
+    // Awaiting the receipt waits for the peer's transport acknowledgement:
+    // one network round trip, and no application involvement at all.
+    group.bench_function("push_1kib_delivered", |b| {
         b.to_async(&rt).iter(|| async {
-            let outcome = acked
-                .send_with(
-                    TransferMeta::default().with_ack(AckMode::Accepted),
-                    black_box(&payload),
-                )
+            let mut transfer = delivered.open(TransferMeta::default()).await.expect("open");
+            transfer
+                .write_all(black_box(&payload))
                 .await
-                .expect("send");
-            black_box(outcome)
+                .expect("write");
+            transfer
+                .finish()
+                .expect("finish")
+                .delivered()
+                .await
+                .expect("delivered");
         })
     });
     group.finish();

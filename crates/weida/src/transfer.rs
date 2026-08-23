@@ -3,24 +3,23 @@
 //! These own their `quinn` streams outright: payload bytes go straight to the
 //! socket without passing through the connection actor, so a transfer costs no
 //! task hop and takes no lock (master doc §49). The actor is involved only for
-//! registration and for the short control frames.
+//! the two control frames a destructor may still need to emit.
 //!
 //! Nothing here materializes a payload. `AsyncRead`/`AsyncWrite` are the
 //! primitive API; `collect(max_bytes)` is an opt-in convenience with an
 //! explicit cap (master doc §8, §81 rule 3).
 
+use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use quinn::VarInt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{oneshot, watch};
-use weida_core::state::{RecvAction, RecvEvent, RecvMachine, RecvState};
-use weida_core::{AckMode, Error, Outcome, Role, TraceContext, TransferId};
-use weida_protocol::{DataHeader, FrameKind, codes, encode_preamble};
+use weida_core::{Error, ErrorCode, TraceContext};
+use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes, encode_preamble};
 
-use crate::conn::{ConnHandle, Ctl, read_error, write_error};
+use crate::conn::{ConnHandle, Ctl, read_error, read_frame, write_error, write_error_frame};
 
 /// Per-transfer metadata supplied by the application.
 #[derive(Clone, Debug, Default)]
@@ -29,19 +28,11 @@ pub struct TransferMeta {
     pub content_type: Option<String>,
     /// Advisory payload length.
     pub content_len: Option<u64>,
-    /// Acknowledgement level requested from the peer.
-    pub ack_mode: AckMode,
     /// Trace context to propagate. `None` generates a fresh root context.
     pub trace: Option<TraceContext>,
 }
 
 impl TransferMeta {
-    /// Requests an `Accepted` acknowledgement.
-    pub fn with_ack(mut self, ack_mode: AckMode) -> TransferMeta {
-        self.ack_mode = ack_mode;
-        self
-    }
-
     /// Sets the content type label.
     pub fn with_content_type(mut self, content_type: impl Into<String>) -> TransferMeta {
         self.content_type = Some(content_type.into());
@@ -64,14 +55,8 @@ impl TransferMeta {
 /// Metadata of an inbound transfer.
 #[derive(Clone, Debug)]
 pub struct IncomingMeta {
-    /// Endpoint path, for requests.
+    /// Endpoint path. Present on an initiating stream, absent on a reply.
     pub endpoint: Option<String>,
-    /// The sender's transfer id.
-    pub transfer_id: TransferId,
-    /// The request this reply answers, for replies.
-    pub correlation_id: Option<TransferId>,
-    /// Acknowledgement level the sender requested.
-    pub ack_mode: AckMode,
     /// Advisory payload length.
     pub content_len: Option<u64>,
     /// Opaque content type label.
@@ -89,12 +74,9 @@ pub struct IncomingMeta {
 }
 
 impl IncomingMeta {
-    pub(crate) fn from_header(header: &DataHeader, ack_mode: AckMode) -> IncomingMeta {
+    pub(crate) fn from_header(header: &DataHeader) -> IncomingMeta {
         IncomingMeta {
             endpoint: header.endpoint.clone(),
-            transfer_id: header.transfer_id,
-            correlation_id: header.correlation_id,
-            ack_mode,
             content_len: header.content_len,
             content_type: header.content_type.clone(),
             trace: header
@@ -124,24 +106,17 @@ pub(crate) fn new_trace_context() -> TraceContext {
 
 /// Builds the DATA header for an outgoing transfer.
 ///
-/// `role` is explicit rather than inferred from `correlation_id`: oneshot and
-/// request are both uncorrelated, so the presence of a correlation id no
-/// longer determines the role.
+/// `endpoint` is `Some` on an initiating stream and `None` on the reply half of
+/// an exchange, which is the only distinction the header still makes: the
+/// stream itself carries the role and the correlation.
 pub(crate) fn data_header(
-    role: Role,
     endpoint: Option<&str>,
-    id: TransferId,
-    correlation_id: Option<TransferId>,
     meta: &TransferMeta,
     tracestate: Option<String>,
 ) -> (DataHeader, TraceContext) {
     let trace = meta.trace.unwrap_or_else(new_trace_context);
     let header = DataHeader {
         endpoint: endpoint.map(str::to_owned),
-        transfer_id: id,
-        role: role.to_wire(),
-        correlation_id,
-        ack_mode: meta.ack_mode.to_wire(),
         content_len: meta.content_len,
         content_type: meta.content_type.clone(),
         traceparent: Some(trace.to_traceparent()),
@@ -151,40 +126,24 @@ pub(crate) fn data_header(
     (header, trace)
 }
 
-/// An outgoing transfer: a QUIC stream plus the outcome the peer owes us.
+/// An outgoing transfer: one QUIC send stream, owned outright.
 ///
 /// Also implements [`AsyncWrite`], so a transfer can be a `tokio::io::copy`
-/// destination. `finish` must still be called to learn the outcome.
+/// destination. [`OutgoingTransfer::finish`] marks the FIN and hands back the
+/// [`Delivery`] receipt.
 pub struct OutgoingTransfer {
-    conn: ConnHandle,
     stream: quinn::SendStream,
-    id: TransferId,
     trace: TraceContext,
-    outcome: Option<oneshot::Receiver<Result<Outcome, Error>>>,
     settled: bool,
 }
 
 impl OutgoingTransfer {
-    pub(crate) fn new(
-        conn: ConnHandle,
-        stream: quinn::SendStream,
-        id: TransferId,
-        trace: TraceContext,
-        outcome: oneshot::Receiver<Result<Outcome, Error>>,
-    ) -> OutgoingTransfer {
+    pub(crate) fn new(stream: quinn::SendStream, trace: TraceContext) -> OutgoingTransfer {
         OutgoingTransfer {
-            conn,
             stream,
-            id,
             trace,
-            outcome: Some(outcome),
             settled: false,
         }
-    }
-
-    /// This transfer's id, unique per connection and sender.
-    pub fn id(&self) -> TransferId {
-        self.id
     }
 
     /// The trace context propagated with this transfer.
@@ -195,46 +154,36 @@ impl OutgoingTransfer {
     /// Writes the whole buffer.
     ///
     /// A peer that refuses the transfer mid-write surfaces here as
-    /// [`Error::Rejected`], [`Error::UnknownEndpoint`] or [`Error::Canceled`].
+    /// [`Error::Rejected`], [`Error::UnknownEndpoint`], [`Error::Unsupported`]
+    /// or [`Error::Canceled`].
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), Error> {
-        match self.stream.write_all(buf).await {
-            Ok(()) => Ok(()),
-            Err(quinn::WriteError::Stopped(code)) => {
-                let code = code.into_inner();
-                self.conn.notify(Ctl::Stopped {
-                    id: self.id.get(),
-                    code,
-                });
-                Err(codes::stop_reason(code).into())
-            }
-            Err(e) => Err(write_error(e)),
-        }
+        self.stream.write_all(buf).await.map_err(write_error)
     }
 
-    /// Finishes the transfer and waits for its outcome.
+    /// Marks the end of the payload and returns the delivery receipt.
     ///
-    /// `Ok` carries [`Outcome::SentBestEffort`] or [`Outcome::Acked`]. `Err`
-    /// distinguishes [`Error::ConnectionLost`] (definitely not delivered) from
-    /// [`Error::Indeterminate`] (unknown), per `docs/FAILURE_MODEL.md`.
-    pub async fn finish(mut self) -> Result<Outcome, Error> {
+    /// Returns immediately: the FIN is queued and the peer's transport
+    /// acknowledgement is awaited through [`Delivery::delivered`], or ignored
+    /// entirely by dropping the receipt.
+    ///
+    /// Fails only if the stream is already closed — the peer reset it, or the
+    /// connection went away — in which case no FIN was ever sent.
+    pub fn finish(mut self) -> Result<Delivery, Error> {
         self.settled = true;
-        // `finish` only marks the FIN, so the peer's answer can reach the actor
-        // before this notification does. The send machine holds it.
-        let closed = self.stream.finish().is_err();
-        self.conn.notify(Ctl::Fin { id: self.id.get() });
-        let outcome = self.outcome.take().expect("outcome taken once");
-        match outcome.await {
-            Ok(result) => result,
-            Err(_) if closed => Err(Error::ConnectionLost),
-            Err(_) => Err(Error::ConnectionLost),
-        }
+        self.stream
+            .finish()
+            .map_err(|_| Error::Transport("stream already closed".into()))?;
+        // `stopped()` yields a `'static` future, so the receipt outlives the
+        // handle it came from.
+        Ok(Delivery {
+            stopped: Box::pin(self.stream.stopped()),
+        })
     }
 
     /// Abandons the transfer, resetting the stream with `CANCELED`.
     pub fn cancel(mut self) {
         self.settled = true;
         let _ = self.stream.reset(canceled());
-        self.conn.notify(Ctl::Cancel { id: self.id.get() });
     }
 }
 
@@ -245,7 +194,6 @@ impl Drop for OutgoingTransfer {
             // stream so the peer discards the partial payload instead of
             // waiting for a FIN that will never come.
             let _ = self.stream.reset(canceled());
-            self.conn.notify(Ctl::Cancel { id: self.id.get() });
         }
     }
 }
@@ -271,9 +219,47 @@ impl AsyncWrite for OutgoingTransfer {
 impl std::fmt::Debug for OutgoingTransfer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutgoingTransfer")
-            .field("id", &self.id)
             .field("settled", &self.settled)
             .finish_non_exhaustive()
+    }
+}
+
+/// The transport receipt for a finished transfer.
+///
+/// This is QUIC's own fin-acknowledgement, not an application acknowledgement:
+/// [`Delivery::delivered`] resolving means *the peer's transport holds every
+/// byte*, and says nothing about the peer's application having read, stored or
+/// processed them. Guarantees of that shape belong to a broker hop and are
+/// deliberately absent from the v0 core (`docs/GUARANTEES.md`).
+///
+/// Dropping a `Delivery` is free: that is the fire-and-forget path.
+pub struct Delivery {
+    stopped:
+        Pin<Box<dyn Future<Output = Result<Option<VarInt>, quinn::StoppedError>> + Send + Sync>>,
+}
+
+impl Delivery {
+    /// Waits for the peer's transport to acknowledge the whole payload.
+    ///
+    /// `Ok(())` means every byte and the FIN were acknowledged. A refusal
+    /// (`STOP_SENDING`) surfaces as the matching error; a connection lost after
+    /// the FIN yields [`Error::Indeterminate`], because the payload may or may
+    /// not have arrived (`docs/FAILURE_MODEL.md`).
+    pub async fn delivered(self) -> Result<(), Error> {
+        match self.stopped.await {
+            Ok(None) => Ok(()),
+            Ok(Some(code)) => Err(codes::stop_reason(code.into_inner()).into()),
+            Err(quinn::StoppedError::ConnectionLost(_)) => Err(Error::Indeterminate),
+            Err(quinn::StoppedError::ZeroRttRejected) => {
+                Err(Error::Transport("0-RTT data rejected by the peer".into()))
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Delivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Delivery").finish_non_exhaustive()
     }
 }
 
@@ -281,29 +267,26 @@ fn canceled() -> VarInt {
     VarInt::from_u32(codes::CANCELED as u32)
 }
 
-/// An inbound transfer: a QUIC stream plus the metadata that described it.
+/// An inbound transfer: a QUIC receive stream plus the metadata that described
+/// it.
 ///
-/// Implements [`AsyncRead`]. Reaching EOF is what triggers an ACK when the
-/// sender asked for one: the acknowledgement means "the application consumed
-/// the payload", not "the bytes reached the kernel".
+/// Implements [`AsyncRead`]. Reaching EOF is just EOF: the v0 core emits no
+/// acknowledgement, because a brokerless one would only restate what QUIC's
+/// own transport receipt already says.
 pub struct IncomingTransfer {
-    conn: ConnHandle,
     stream: quinn::RecvStream,
-    meta: IncomingMeta,
-    machine: RecvMachine,
+    meta: Arc<IncomingMeta>,
+    /// Set once the payload ended, was reset, or was refused: `Drop` then has
+    /// nothing left to stop.
+    done: bool,
 }
 
 impl IncomingTransfer {
-    pub(crate) fn new(
-        conn: ConnHandle,
-        stream: quinn::RecvStream,
-        meta: IncomingMeta,
-    ) -> IncomingTransfer {
+    pub(crate) fn new(stream: quinn::RecvStream, meta: Arc<IncomingMeta>) -> IncomingTransfer {
         IncomingTransfer {
-            machine: RecvMachine::new(meta.ack_mode),
-            conn,
             stream,
             meta,
+            done: false,
         }
     }
 
@@ -314,7 +297,7 @@ impl IncomingTransfer {
 
     /// Refuses the payload with `STOP_SENDING(code)` and forgets the transfer.
     pub(crate) fn refuse(mut self, code: u64) {
-        self.machine.on(RecvEvent::AppAbandonedBody);
+        self.done = true;
         let _ = self
             .stream
             .stop(VarInt::from_u64(code).expect("application codes are small"));
@@ -338,18 +321,18 @@ impl IncomingTransfer {
                 Ok(Some(0)) => continue,
                 Ok(Some(n)) => {
                     if out.len() + n > max_bytes {
-                        self.machine.on(RecvEvent::AppAbandonedBody);
+                        self.done = true;
                         let _ = self.stream.stop(rejected());
                         return Err(Error::LimitExceeded);
                     }
                     out.extend_from_slice(&chunk[..n]);
                 }
                 Ok(None) => {
-                    self.on_eof();
+                    self.done = true;
                     return Ok(out);
                 }
                 Err(e) => {
-                    self.machine.on(RecvEvent::PeerReset);
+                    self.done = true;
                     return Err(read_error(e));
                 }
             }
@@ -360,23 +343,13 @@ impl IncomingTransfer {
     pub async fn collect(mut self, max_bytes: usize) -> Result<Vec<u8>, Error> {
         self.read_capped(max_bytes).await
     }
-
-    /// Applies the end-of-payload transition, emitting an ACK if one is owed.
-    fn on_eof(&mut self) {
-        if let RecvAction::SendAck(_) = self.machine.on(RecvEvent::PayloadEnd) {
-            self.conn.notify(Ctl::SendAck {
-                re: self.meta.transfer_id,
-            });
-        }
-    }
 }
 
 impl Drop for IncomingTransfer {
     fn drop(&mut self) {
-        if self.machine.state() == RecvState::Reading {
+        if !self.done {
             // The application walked away mid-payload: refuse the rest rather
             // than draining bytes nobody wants.
-            self.machine.on(RecvEvent::AppAbandonedBody);
             let _ = self.stream.stop(rejected());
         }
     }
@@ -390,7 +363,7 @@ impl std::fmt::Debug for IncomingTransfer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IncomingTransfer")
             .field("meta", &self.meta)
-            .field("state", &self.machine.state())
+            .field("done", &self.done)
             .finish_non_exhaustive()
     }
 }
@@ -405,93 +378,159 @@ impl AsyncRead for IncomingTransfer {
         match AsyncRead::poll_read(Pin::new(&mut self.stream), cx, buf) {
             Poll::Ready(Ok(())) => {
                 if buf.filled().len() == before {
-                    self.on_eof();
+                    self.done = true;
                 }
                 Poll::Ready(Ok(()))
             }
-            other => other,
+            Poll::Ready(Err(e)) => {
+                self.done = true;
+                Poll::Ready(Err(e))
+            }
+            pending => pending,
         }
     }
 }
 
-/// A request accepted by a [`crate::Replier`].
+/// The reply half of an exchange, before the application claims it.
 ///
-/// Dropping it without calling [`IncomingRequest::reply`] tells the requester
-/// that no reply is coming, instead of leaving it waiting.
+/// Dropping it without a reply is what tells the requester that none is
+/// coming: the ERROR frame goes through the connection actor with a
+/// non-blocking `notify`, because a destructor may run on a thread with no
+/// reactor.
+struct ReplyHalf {
+    send: Option<quinn::SendStream>,
+    conn: ConnHandle,
+}
+
+impl Drop for ReplyHalf {
+    fn drop(&mut self) {
+        if let Some(send) = self.send.take() {
+            self.conn.notify(Ctl::ReplyError {
+                send,
+                code: ErrorCode::NoReply,
+            });
+        }
+    }
+}
+
+/// A request accepted by a [`crate::Replier`] or a raw [`crate::Acceptor`].
+///
+/// One bidirectional QUIC stream: the request payload arrives on the receive
+/// half, the reply leaves on the send half. Dropping it without calling
+/// [`IncomingRequest::reply`] tells the requester that no reply is coming,
+/// instead of leaving it waiting.
 pub struct IncomingRequest {
-    body: IncomingTransfer,
-    cancel: watch::Receiver<bool>,
-    replied: AtomicBool,
+    body: Option<IncomingTransfer>,
+    meta: Arc<IncomingMeta>,
+    reply: ReplyHalf,
 }
 
 impl IncomingRequest {
-    pub(crate) fn new(body: IncomingTransfer, cancel: watch::Receiver<bool>) -> IncomingRequest {
+    pub(crate) fn new(
+        body: IncomingTransfer,
+        send: quinn::SendStream,
+        conn: ConnHandle,
+    ) -> IncomingRequest {
         IncomingRequest {
-            body,
-            cancel,
-            replied: AtomicBool::new(false),
+            meta: Arc::clone(&body.meta),
+            body: Some(body),
+            reply: ReplyHalf {
+                send: Some(send),
+                conn,
+            },
         }
     }
 
     /// Metadata from the request's DATA header.
     pub fn meta(&self) -> &IncomingMeta {
-        self.body.meta()
+        &self.meta
     }
 
-    /// The request payload.
+    /// The request payload, borrowed.
+    ///
+    /// Panics after [`IncomingRequest::take_body`] has detached it.
     pub fn body(&mut self) -> &mut IncomingTransfer {
-        &mut self.body
+        self.body
+            .as_mut()
+            .expect("the request body was detached by take_body")
     }
 
-    /// Watches for a CANCEL frame from the requester.
+    /// Detaches the request payload so it outlives the request handle.
     ///
-    /// The value flips to `true` once the requester stops wanting replies. A
-    /// handler streaming a long reply should poll this and stop early.
-    pub fn canceled(&self) -> watch::Receiver<bool> {
-        self.cancel.clone()
-    }
-
-    /// True if the requester has canceled.
-    pub fn is_canceled(&self) -> bool {
-        *self.cancel.borrow()
-    }
-
-    /// Opens the correlated reply stream.
+    /// Needed exactly when the handler streams in both directions at once:
+    /// [`IncomingRequest::reply`] consumes the request, and a body left inside
+    /// it is refused with `REJECTED` at that point. Detaching first keeps both
+    /// halves of the exchange live simultaneously, which is what makes
+    /// simultaneous request and reply streaming possible (master doc §10).
     ///
-    /// This may be called before the request body has been fully read: the
-    /// reply is an independent stream, which is what makes simultaneous
-    /// request and reply streaming possible (master doc §10).
+    /// Panics if called twice.
+    pub fn take_body(&mut self) -> IncomingTransfer {
+        self.body
+            .take()
+            .expect("the request body is detached at most once")
+    }
+
+    /// Resolves when the requester stops wanting a reply.
+    ///
+    /// This is the reply half's `STOP_SENDING`, which a requester emits by
+    /// dropping its [`ReplyStream`]. The future is independent of the stream
+    /// handle, so it can sit in a `select!` beside the reply writes — but it
+    /// must be taken *before* [`IncomingRequest::reply`] consumes the request.
+    pub fn canceled(&self) -> impl Future<Output = ()> + Send + use<> {
+        let stopped = self.reply.send.as_ref().map(|s| s.stopped());
+        async move {
+            match stopped {
+                Some(fut) => {
+                    let _ = fut.await;
+                }
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// Opens the reply half.
+    ///
+    /// Consuming: an exchange has exactly one reply, so a second one is not
+    /// representable. A request body still attached here is dropped, which
+    /// refuses whatever is *left* of it with `REJECTED`; a body already read
+    /// to EOF costs nothing. Call [`IncomingRequest::take_body`] first if the
+    /// handler still needs to read while it replies.
     ///
     /// The reply inherits the request's trace context unless `meta` overrides
     /// it.
-    pub async fn reply(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
-        let conn = self.body.conn.clone();
-        let correlation_id = self.body.meta.transfer_id;
-        let meta = match (meta.trace, self.body.meta.trace) {
+    pub async fn reply(mut self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
+        // `IncomingTransfer::drop` stops the half only when the payload has
+        // not already ended, so a completed request is left alone.
+        drop(self.body.take());
+        let mut send = self
+            .reply
+            .send
+            .take()
+            .expect("the send half is taken exactly once, by this method");
+
+        let meta = match (meta.trace, self.meta.trace) {
             (None, Some(inherited)) => meta.with_trace(inherited),
             _ => meta,
         };
+        // No endpoint: the stream is the correlation, so the reply half
+        // addresses nothing.
+        let (header, trace) = data_header(None, &meta, self.meta.tracestate.clone());
+        write_data_preamble(&mut send, &header).await?;
+        Ok(OutgoingTransfer::new(send, trace))
+    }
 
-        let reserved = conn.register(meta.ack_mode, false).await?;
-        let (header, trace) = data_header(
-            Role::Reply,
-            None,
-            reserved.id,
-            Some(correlation_id),
-            &meta,
-            self.body.meta.tracestate.clone(),
-        );
-
-        let mut stream = conn.open_uni().await?;
-        write_data_preamble(&mut stream, &header).await?;
-        self.replied.store(true, Ordering::Relaxed);
-        Ok(OutgoingTransfer::new(
-            conn,
-            stream,
-            reserved.id,
-            trace,
-            reserved.outcome,
-        ))
+    /// Refuses the exchange: a typed ERROR on the reply half, `STOP_SENDING` on
+    /// the request half so the peer stops writing a payload nobody will read.
+    pub(crate) async fn refuse(mut self, code: ErrorCode, stop: u64) {
+        if let Some(body) = self.body.take() {
+            body.refuse(stop);
+        }
+        let Some(mut send) = self.reply.send.take() else {
+            return;
+        };
+        if let Err(e) = write_error_frame(&mut send, code).await {
+            tracing::debug!(error = %e, "failed to refuse an exchange");
+        }
     }
 }
 
@@ -499,22 +538,7 @@ impl std::fmt::Debug for IncomingRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IncomingRequest")
             .field("meta", self.meta())
-            .field("canceled", &self.is_canceled())
             .finish_non_exhaustive()
-    }
-}
-
-impl Drop for IncomingRequest {
-    fn drop(&mut self) {
-        let id = self.body.meta.transfer_id;
-        self.body.conn.notify(Ctl::UntrackInbound { id: id.get() });
-        if !self.replied.load(Ordering::Relaxed) {
-            // Without this the requester would wait for a reply forever.
-            self.body.conn.notify(Ctl::SendError {
-                re: id,
-                code: weida_core::ErrorCode::NoReply,
-            });
-        }
     }
 }
 
@@ -530,60 +554,81 @@ pub(crate) async fn write_data_preamble(
     stream.write_all(&buf).await.map_err(write_error)
 }
 
-/// A reply the requester is waiting for.
+/// The reply half of an exchange the requester is waiting on.
 ///
-/// Dropping it before [`PendingReply::recv`] sends a CANCEL frame, so a
-/// responder streaming a long reply learns that nobody is listening.
-pub struct PendingReply {
+/// Dropping it before [`ReplyStream::recv`] stops the half with `CANCELED`, so
+/// a responder streaming a long reply learns that nobody is listening. That
+/// stop replaces the CANCEL frame of earlier drafts: the stream carries the
+/// correlation, so cancellation needs no identifier and no control frame.
+pub struct ReplyStream {
+    recv: Option<quinn::RecvStream>,
     conn: ConnHandle,
-    id: TransferId,
-    rx: Option<oneshot::Receiver<Result<IncomingTransfer, Error>>>,
 }
 
-impl PendingReply {
-    pub(crate) fn new(
-        conn: ConnHandle,
-        id: TransferId,
-        rx: oneshot::Receiver<Result<IncomingTransfer, Error>>,
-    ) -> PendingReply {
-        PendingReply {
+impl ReplyStream {
+    pub(crate) fn new(recv: quinn::RecvStream, conn: ConnHandle) -> ReplyStream {
+        ReplyStream {
+            recv: Some(recv),
             conn,
-            id,
-            rx: Some(rx),
         }
     }
 
-    /// The request id this reply is correlated to.
-    pub fn correlation_id(&self) -> TransferId {
-        self.id
-    }
-
-    /// Waits for the reply stream.
+    /// Waits for the reply header.
+    ///
+    /// A DATA header yields the reply payload; an ERROR header yields the
+    /// corresponding [`Error`], which is how `UNKNOWN_ENDPOINT`, `UNSUPPORTED`
+    /// and `NO_REPLY` reach the requester.
+    ///
+    /// A connection lost while waiting is [`Error::Indeterminate`], never
+    /// `ConnectionLost`: the replier may already have acted on the request and
+    /// produced an answer we never saw, so claiming a definite failure here
+    /// would be a lie (master doc §22).
     pub async fn recv(mut self) -> Result<IncomingTransfer, Error> {
-        let rx = self.rx.take().expect("receiver taken once");
-        match rx.await {
-            Ok(result) => result,
-            // The actor dropped the sender without a verdict: the connection
-            // is gone and the request had already been finished.
-            Err(_) => Err(Error::Indeterminate),
+        let mut recv = self.recv.take().expect("the receiver is taken once");
+        let (preamble, header) = read_frame(&mut recv, self.conn.limits.max_header_bytes)
+            .await
+            .map_err(indeterminate_on_loss)?;
+        match preamble.kind {
+            FrameKind::Data => {
+                let header = DataHeader::decode(&header)?;
+                let meta = Arc::new(IncomingMeta::from_header(&header));
+                Ok(IncomingTransfer::new(recv, meta))
+            }
+            FrameKind::Error => {
+                let header = ErrorHeader::decode(&header)?;
+                Err(header.error_code().map_or_else(
+                    || Error::Transport(format!("peer reported error code {}", header.code)),
+                    Error::from,
+                ))
+            }
+            other => Err(Error::Protocol(format!(
+                "{other} is not legal on the reply half of an exchange"
+            ))),
         }
     }
 }
 
-impl std::fmt::Debug for PendingReply {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingReply")
-            .field("correlation_id", &self.id)
-            .field("awaiting", &self.rx.is_some())
-            .finish_non_exhaustive()
+/// Re-labels a lost connection while awaiting a reply.
+fn indeterminate_on_loss(e: Error) -> Error {
+    match e {
+        Error::ConnectionLost => Error::Indeterminate,
+        other => other,
     }
 }
 
-impl Drop for PendingReply {
+impl Drop for ReplyStream {
     fn drop(&mut self) {
-        if self.rx.is_some() {
-            self.conn.notify(Ctl::SendCancel { id: self.id });
+        if let Some(mut recv) = self.recv.take() {
+            let _ = recv.stop(canceled());
         }
+    }
+}
+
+impl std::fmt::Debug for ReplyStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplyStream")
+            .field("awaiting", &self.recv.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -595,11 +640,9 @@ mod tests {
     fn transfer_meta_builders_compose() {
         let trace = new_trace_context();
         let meta = TransferMeta::default()
-            .with_ack(AckMode::Accepted)
             .with_content_type("text/plain")
             .with_content_len(7)
             .with_trace(trace);
-        assert_eq!(meta.ack_mode, AckMode::Accepted);
         assert_eq!(meta.content_type.as_deref(), Some("text/plain"));
         assert_eq!(meta.content_len, Some(7));
         assert_eq!(meta.trace, Some(trace));
@@ -618,20 +661,11 @@ mod tests {
     }
 
     #[test]
-    fn request_headers_carry_the_endpoint_and_a_trace_context() {
-        let meta = TransferMeta::default().with_ack(AckMode::Accepted);
-        let (header, trace) = data_header(
-            Role::Request,
-            Some("/transform"),
-            TransferId::FIRST,
-            None,
-            &meta,
-            None,
-        );
+    fn initiating_headers_carry_the_endpoint_and_a_trace_context() {
+        let meta = TransferMeta::default().with_content_len(3);
+        let (header, trace) = data_header(Some("/transform"), &meta, None);
         assert_eq!(header.endpoint.as_deref(), Some("/transform"));
-        assert_eq!(header.role, weida_core::policy::ROLE_REQUEST);
-        assert_eq!(header.correlation_id, None);
-        assert_eq!(header.ack_mode, AckMode::Accepted.to_wire());
+        assert_eq!(header.content_len, Some(3));
         assert_eq!(
             header.traceparent.as_deref(),
             Some(&*trace.to_traceparent())
@@ -641,35 +675,22 @@ mod tests {
     }
 
     #[test]
-    fn reply_headers_carry_the_correlation_id_and_tracestate() {
-        let correlation = TransferId::new(9).unwrap();
-        let (header, _) = data_header(
-            Role::Reply,
-            None,
-            TransferId::FIRST,
-            Some(correlation),
-            &TransferMeta::default(),
-            Some("vendor=x".into()),
-        );
+    fn reply_headers_carry_no_endpoint_but_keep_tracestate() {
+        let (header, _) = data_header(None, &TransferMeta::default(), Some("vendor=x".into()));
         assert_eq!(header.endpoint, None);
-        assert_eq!(header.role, weida_core::policy::ROLE_REPLY);
-        assert_eq!(header.correlation_id, Some(correlation));
         assert_eq!(header.tracestate.as_deref(), Some("vendor=x"));
         assert_eq!(DataHeader::decode(&header.encode()).unwrap(), header);
     }
 
     #[test]
     fn incoming_meta_ignores_a_malformed_traceparent() {
-        let mut header = DataHeader::request("/x", TransferId::FIRST, AckMode::None);
+        let mut header = DataHeader::addressed("/x");
         header.traceparent = Some("not-a-traceparent".into());
-        let meta = IncomingMeta::from_header(&header, AckMode::None);
+        let meta = IncomingMeta::from_header(&header);
         assert!(meta.trace.is_none());
 
         let good = new_trace_context();
         header.traceparent = Some(good.to_traceparent());
-        assert_eq!(
-            IncomingMeta::from_header(&header, AckMode::None).trace,
-            Some(good)
-        );
+        assert_eq!(IncomingMeta::from_header(&header).trace, Some(good));
     }
 }

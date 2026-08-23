@@ -41,6 +41,11 @@ An implementation MUST NOT report one of these states unless the exact condition
 holds. In particular, `Accepted` MUST NOT be reported before the payload has actually been
 handed to the application, and `Stored` MUST NOT be reported for an in-memory buffer.
 
+These four states describe a responsibility transfer **to a broker hop**. They are reserved
+for the **L2 broker layer** (Phase 6) and carry no v0 wire representation: with no broker in
+the topology there is nobody to transfer responsibility *to*, and an acknowledgement that
+only says "the bytes are in the peer's RAM" is a claim QUIC already makes for free (§3).
+
 ---
 
 ## 2. Guarantees are hop-local
@@ -93,13 +98,36 @@ that is a property of a composed system, not of a transport.
 
 ```text
 None
-Accepted
-Stored
-Replicated(...)
-Processed
+TransportReceipt          (v0 core)
+Accepted                  (reserved, L2 broker)
+Stored                    (reserved, L2 broker)
+Replicated(...)           (reserved, L2 broker)
+Processed                 (reserved, L2 broker)
 ```
 
-Semantics per §1.
+The v0 stream core offers exactly one delivery signal, the **transport receipt**.
+`OutgoingTransfer::finish` hands back a `Delivery`, and `Delivery::delivered().await`
+resolves `Ok(())` when the peer's transport holds every byte of the payload and the FIN.
+quinn documents the underlying condition as the local side finishing the stream and the peer
+then acknowledging receipt of all stream data *"(although not necessarily the processing of
+it)"*. That parenthesis is the whole distinction: a transport receipt says the bytes
+arrived, never that an application read them, still less that it acted on them.
+
+`Accepted`, `Stored`, `Replicated` and `Processed` are reserved for the L2 broker layer and
+are deliberately absent from the v0 wire ([PROTOCOL.md](PROTOCOL.md) §11). Earlier drafts
+carried application ACK frames in the core and they were removed: without a broker in the
+topology, an application ACK means "arrived in RAM at the other end", which is precisely
+what QUIC already guarantees by retransmitting until the peer acknowledges. It bought
+RabbitMQ's vocabulary without RabbitMQ's responsibility transfer — the one thing that makes
+the vocabulary worth having (§1). The words return when a hop exists that can own the
+message.
+
+The receipt is a correctness signal, not a latency-sensitive one. On an idle loopback
+connection `delivered()` resolves in ~26 ms, because the peer delays its acknowledgement up
+to QUIC's max ack delay; the same 1 KiB push without the receipt costs ~7.9 µs. This is why
+`Pusher::send` finishes the transfer and drops the `Delivery` — zmq pipeline semantics —
+while callers who want the receipt use `Pusher::open` plus `finish()` and `delivered()`
+themselves. Dropping a `Delivery` is free and observes no outcome at all.
 
 ### Ordering
 
@@ -137,7 +165,8 @@ These names are provisional; semantics matter more than naming.
 ## 4. Configuration of guarantees
 
 The framework must support the full performance/reliability spectrum. Illustrative
-configurations:
+configurations — only the first is reachable in the v0 core, the other two describe the L2
+broker layer:
 
 **Very fast**
 
@@ -173,10 +202,11 @@ Two rules govern configuration:
 - Invalid combinations MUST be rejected. Validation is explicit and happens at
   configuration time, not silently at runtime.
 - A requested guarantee MUST NEVER be silently weakened (master doc §81 rule 6). If a peer
-  or a build cannot honour a requested guarantee, the operation MUST fail visibly. In v0
-  this is why a reserved `ack_mode` yields an ERROR frame with code `UNSUPPORTED` rather
-  than being downgraded to `accepted` or `none`
-  (see [PROTOCOL.md](PROTOCOL.md) §6.2).
+  or a build cannot honour a requested guarantee, the operation MUST fail visibly. The v0
+  core has no acknowledgement knob to weaken — it offers the transport receipt or nothing —
+  so the rule shows up in routing instead: a stream addressed to an endpoint whose pattern
+  cannot serve it is refused with `UNSUPPORTED` rather than quietly treated as something
+  the endpoint does understand (see [PROTOCOL.md](PROTOCOL.md) §9).
 
 ---
 
@@ -188,9 +218,9 @@ represented explicitly, as a first-class result rather than as an error or a suc
 Example:
 
 ```text
-server persisted operation
-ACK sent
-network disappeared before caller received ACK
+replier read the request to FIN and acted on it
+reply written
+connection disappeared before the requester saw it
 ```
 
 The truthful result is not necessarily `Failed`. It may be `Indeterminate` /
@@ -205,26 +235,34 @@ normative in [FAILURE_MODEL.md](FAILURE_MODEL.md).
 
 ## 6. Implementation status in v0
 
+Everything below describes the **L0 stream core** and the **L1 patterns** built on it. The
+L2 broker layer, where the completion states of §1 acquire meaning, is Phase 6.
+
 | Dimension | v0 support | Notes |
 | --- | --- | --- |
-| Acknowledgement | `None`, `Accepted` | `Accepted` means exactly "the peer read the complete payload to FIN and handed it to the application". `Stored`, `Replicated`, `Processed` exist only as reserved `ack_mode` code points `2`, `3`, `4`; requesting one is answered with an ERROR frame code `UNSUPPORTED` plus `STOP_SENDING(REJECTED)` and is never downgraded. |
+| Acknowledgement | transport receipt only | `Delivery::delivered()` resolves `Ok(())` when the peer's **transport** holds every byte and the FIN — explicitly not "the application read it" (§3). There is no application acknowledgement anywhere in the v0 core: `Accepted`, `Stored`, `Replicated` and `Processed` are reserved for the L2 broker layer and have no wire representation, not even a reserved code point ([PROTOCOL.md](PROTOCOL.md) §11). |
 | Delivery | `BestEffort` only | v0 performs no retries. A failed or indeterminate transfer is reported to the application, which decides. `AtMostOnce` and `AtLeastOnce` require retry and dedup machinery that does not exist yet. |
-| Ordering | `None` | QUIC guarantees byte order **within** one stream, and each transfer is one stream, so a single transfer's payload is ordered. Across transfers there is no ordering guarantee of any kind. `PerProducer`, `PerKey` and `Total` are not implemented. |
-| Deduplication | `None` | No idempotency ids, no dedup window. Receiver-side `transfer_id` uniqueness is explicitly not enforced ([PROTOCOL.md](PROTOCOL.md) §6.2). |
-| Backpressure | `Block`, `Reject`, `Drop` | `Block`: QUIC stream and connection flow control plus bounded internal channels (`endpoint_queue`, the actor control channel) make senders await capacity; this is what Req/Rep and Push/Pull use. `Reject`: exceeding `max_pending` fails `open()` locally with `LimitExceeded` without touching the connection. `Drop`: publisher fan-out only — a subscriber past `subscriber_buffer_bytes` loses the message rather than stalling the publisher. `Spill` and `Coalesce` are not implemented. |
-| Indeterminate outcomes | implemented | First-class: `Outcome`/`Error` distinguish `Indeterminate` from definite failure. See [FAILURE_MODEL.md](FAILURE_MODEL.md). |
+| Ordering | `None` | QUIC guarantees byte order **within** one stream. A one-way transfer is one stream, and each half of an exchange is one stream, so a single payload is ordered end to end. Across streams there is no ordering guarantee of any kind. `PerProducer`, `PerKey` and `Total` are not implemented. |
+| Deduplication | `None` | No idempotency ids, no dedup window. Nothing on the wire names a transfer — correlation is the stream itself — so a receiver could not deduplicate even if it wanted to. |
+| Backpressure | `Block`, `Reject`, `Drop` | `Block`: QUIC stream and connection flow control, the concurrent-stream budgets (`max_concurrent_uni_streams`, `max_concurrent_bidi_streams`) and bounded internal channels (`endpoint_queue`, the actor control channel) make senders await capacity; this is what Req/Rep and Push/Pull use. `Reject`: `IncomingTransfer::read_capped` refuses a payload past its cap with `STOP_SENDING(REJECTED)` and `LimitExceeded` before buffering it, and `Publisher::publish` rejects a payload larger than `subscriber_buffer_bytes` locally. `Drop`: publisher fan-out only — a subscriber past `subscriber_buffer_bytes` loses the message rather than stalling the publisher. `Spill` and `Coalesce` are not implemented. |
+| Indeterminate outcomes | implemented | First-class: `Error::Indeterminate` is deliberately excluded from `Error::is_definite_failure()`. See [FAILURE_MODEL.md](FAILURE_MODEL.md). |
 | Hop-locality | implemented, trivially | Exactly one hop exists in v0 (direct connection). No composition of hops is possible yet. |
 
 ### Per pattern
 
 | Pattern | Delivery | Acknowledgement | Ordering |
 | --- | --- | --- | --- |
-| Req/Rep | `BestEffort` | `None` or `Accepted` | `None` across transfers |
-| Push/Pull | `BestEffort` | `None` or `Accepted` | `None` |
-| Pub/Sub | `BestEffort`, with per-subscriber drop | `None` (fan-out copies are always `ack_mode = 0`) | `None` |
+| Req/Rep | `BestEffort` | the reply itself | `None` across exchanges |
+| Push/Pull | `BestEffort` | optional transport receipt | `None` |
+| Pub/Sub | `BestEffort`, with per-subscriber drop | none | `None` |
 
-Two points deserve emphasis, because both are easy to assume otherwise:
+Three points deserve emphasis, because each is easy to assume otherwise:
 
+- **Req/Rep needs no receipt.** A reply is written by the peer's application after it read
+  the request to FIN and dispatched it, so it proves strictly more than a transport receipt
+  ever could. `Requester::request` therefore drops the `Delivery` of the request half and
+  waits on the reply; an ERROR frame on the reply half is equally conclusive. The receipt
+  remains available to callers who drive the halves themselves with `Requester::open`.
 - **Pub/Sub drops are silent to the subscriber.** A subscriber whose byte budget at the
   publisher is exhausted simply does not receive that message; nothing on the wire tells it
   so. The publisher counts the drop locally (`Publisher::dropped`). This is the one place

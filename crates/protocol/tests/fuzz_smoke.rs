@@ -11,14 +11,13 @@
 //! * no panic, no arithmetic overflow, no unbounded allocation;
 //! * a decoded header re-encodes and decodes to an identical value
 //!   (decoding is idempotent — the fixed point matters, not byte equality,
-//!   because unknown keys and explicit defaults are dropped);
+//!   because unknown keys are dropped);
 //! * every accepted value respects the documented caps.
 
-use weida_core::{AckMode, TraceContext, TransferId};
+use weida_core::{ErrorCode, TraceContext};
 use weida_protocol::header::limits;
 use weida_protocol::{
-    AckHeader, CancelHeader, DataHeader, ErrorHeader, Hello, SubscriptionHeader, encode_frame,
-    parse_preamble,
+    DataHeader, ErrorHeader, Hello, SubscriptionHeader, encode_frame, parse_preamble,
 };
 
 const ITERATIONS: usize = 100_000;
@@ -78,7 +77,7 @@ fn fuzz_smoke_preamble_from_valid_frames() {
     let mut rng = Rng::new(0x1234_5678_9abc_def0);
     let valid = encode_frame(
         weida_protocol::FrameKind::Data,
-        &DataHeader::request("/t", TransferId::FIRST, AckMode::Accepted).encode(),
+        &DataHeader::addressed("/t").encode(),
     );
     for _ in 0..ITERATIONS {
         let mut buf = valid.clone();
@@ -123,18 +122,10 @@ fn fuzz_smoke_data_header() {
 fn fuzz_smoke_data_header_from_valid_bytes() {
     let mut rng = Rng::new(0x0bad_c0de_0bad_c0de);
     let seeds = [
-        DataHeader::request("/transform", TransferId::FIRST, AckMode::Accepted),
-        DataHeader::reply(
-            TransferId::new(7).unwrap(),
-            TransferId::new(3).unwrap(),
-            AckMode::None,
-        ),
+        DataHeader::addressed("/transform"),
+        DataHeader::reply(),
         DataHeader {
             endpoint: Some("/x".into()),
-            transfer_id: TransferId::new(u64::MAX).unwrap(),
-            role: 1,
-            correlation_id: None,
-            ack_mode: 4,
             content_len: Some(u64::MAX),
             content_type: Some("application/cbor".into()),
             traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
@@ -184,23 +175,21 @@ fn fuzz_smoke_hello() {
 #[test]
 fn fuzz_smoke_control_headers() {
     let mut rng = Rng::new(0x5555_aaaa_5555_aaaa);
-    let ack = AckHeader::accepted(TransferId::FIRST).encode();
-    let err = ErrorHeader {
-        re: TransferId::FIRST,
+    // Both ERROR shapes: bare (the only one the transport ever writes) and
+    // one carrying a diagnostic message.
+    let bare = ErrorHeader::new(ErrorCode::NoReply).encode();
+    let detailed = ErrorHeader {
         code: 4,
         message: Some("detail".into()),
     }
     .encode();
-    let cancel = CancelHeader {
-        id: TransferId::FIRST,
-    }
-    .encode();
+    let subscription = SubscriptionHeader::new("/md", "px.").encode();
 
     for i in 0..ITERATIONS {
         let (seed, which) = match i % 3 {
-            0 => (&ack, 0),
-            1 => (&err, 1),
-            _ => (&cancel, 2),
+            0 => (&bare, 0),
+            1 => (&detailed, 1),
+            _ => (&subscription, 2),
         };
         let mut buf = if i % 6 < 3 {
             seed.clone()
@@ -211,12 +200,7 @@ fn fuzz_smoke_control_headers() {
             rng.flip_bit(&mut buf);
         }
         match which {
-            0 => {
-                if let Ok(h) = AckHeader::decode(&buf) {
-                    assert_eq!(AckHeader::decode(&h.encode()), Ok(h));
-                }
-            }
-            1 => {
+            0 | 1 => {
                 if let Ok(h) = ErrorHeader::decode(&buf) {
                     if let Some(m) = &h.message {
                         assert!(m.len() <= limits::MAX_MESSAGE_BYTES);
@@ -225,8 +209,10 @@ fn fuzz_smoke_control_headers() {
                 }
             }
             _ => {
-                if let Ok(h) = CancelHeader::decode(&buf) {
-                    assert_eq!(CancelHeader::decode(&h.encode()), Ok(h));
+                if let Ok(h) = SubscriptionHeader::decode(&buf) {
+                    assert!(h.endpoint.len() <= limits::MAX_ENDPOINT_BYTES);
+                    assert!(h.filter.len() <= limits::MAX_FILTER_BYTES);
+                    assert_eq!(SubscriptionHeader::decode(&h.encode()).as_ref(), Ok(&h));
                 }
             }
         }
@@ -340,24 +326,11 @@ fn check_data_header(header: &DataHeader) {
     if let Some(topic) = &header.topic {
         assert!(topic.len() <= limits::MAX_TOPIC_BYTES);
     }
-    // Oneshot and request always carry an endpoint, a reply always a
-    // correlation id.
-    match header.role {
-        0 | 1 => assert!(header.endpoint.is_some()),
-        2 => assert!(header.correlation_id.is_some()),
-        _ => {}
-    }
 }
 
-/// Builds a header covering the whole shape space: both roles, reserved codes,
-/// present and absent optional fields, and strings at their caps.
+/// Builds a header covering the whole shape space: present and absent optional
+/// fields, and strings at their caps.
 fn arbitrary_data_header(rng: &mut Rng) -> DataHeader {
-    let role = match rng.below(4) {
-        0 => 1,
-        1 => 2,
-        2 => 0,
-        _ => rng.next_u64(),
-    };
     let text = |rng: &mut Rng, max: usize| -> Option<String> {
         match rng.below(4) {
             0 => None,
@@ -367,28 +340,7 @@ fn arbitrary_data_header(rng: &mut Rng) -> DataHeader {
         }
     };
     DataHeader {
-        endpoint: if role == 0 || role == 1 {
-            Some(format!(
-                "/{}",
-                "e".repeat(rng.below(limits::MAX_ENDPOINT_BYTES))
-            ))
-        } else {
-            text(rng, limits::MAX_ENDPOINT_BYTES)
-        },
-        transfer_id: TransferId::new(rng.next_u64() | 1).expect("odd values are non-zero"),
-        role,
-        correlation_id: if role == 2 {
-            Some(TransferId::new(rng.next_u64() | 1).expect("odd values are non-zero"))
-        } else if rng.below(2) == 0 {
-            TransferId::new(rng.next_u64())
-        } else {
-            None
-        },
-        ack_mode: match rng.below(3) {
-            0 => 0,
-            1 => 1,
-            _ => rng.next_u64(),
-        },
+        endpoint: text(rng, limits::MAX_ENDPOINT_BYTES),
         content_len: if rng.below(2) == 0 {
             Some(rng.next_u64())
         } else {

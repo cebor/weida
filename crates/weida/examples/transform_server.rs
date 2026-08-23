@@ -162,52 +162,45 @@ async fn handle(
         .unwrap_or_else(|| "-".to_owned());
     tracing::info!(
         endpoint = meta.endpoint.as_deref().unwrap_or("-"),
-        transfer_id = %meta.transfer_id,
-        ack_mode = %meta.ack_mode,
         content_len = meta.content_len.unwrap_or_default(),
         trace_id = %trace_id,
         "request accepted"
     );
 
-    let mut reply = None;
+    // Taken before `reply` consumes the request, and independent of the stream
+    // handle, so it can sit in the `select!` below beside the writes.
+    let canceled = request.canceled();
+    tokio::pin!(canceled);
+    // Detaching the request half keeps both directions of the one
+    // bidirectional stream live at once: the reply is written while the
+    // request is still arriving, which is the point of the architecture.
+    let mut body = request.take_body();
+    let mut out = request.reply(TransferMeta::default()).await?;
+    tracing::debug!(trace_id = %trace_id, "reply half opened before request FIN");
+
     let mut chunk = vec![0u8; CHUNK];
     let mut total = 0u64;
-
     loop {
-        let n = request.body().read(&mut chunk).await?;
+        let n = body.read(&mut chunk).await?;
         if n == 0 {
             break;
         }
         total += n as u64;
-        // The reply stream opens on the first chunk, long before the request
-        // reaches FIN: that overlap is the point of the architecture.
-        let out = match &mut reply {
-            Some(out) => out,
-            None => {
-                let out = request.reply(TransferMeta::default()).await?;
-                tracing::debug!(trace_id = %trace_id, "reply stream opened before request FIN");
-                reply.insert(out)
-            }
-        };
         transform.apply(&mut chunk[..n]);
-        out.write_all(&chunk[..n]).await?;
 
-        if request.is_canceled() {
-            tracing::info!(trace_id = %trace_id, "requester canceled; abandoning the reply");
-            return Ok(());
+        tokio::select! {
+            _ = &mut canceled => {
+                tracing::info!(trace_id = %trace_id, "requester canceled; abandoning the reply");
+                return Ok(());
+            }
+            written = out.write_all(&chunk[..n]) => written?,
         }
     }
 
-    // An empty request still deserves a reply, otherwise the requester waits.
-    let reply = match reply {
-        Some(reply) => reply,
-        None => request.reply(TransferMeta::default()).await?,
-    };
-    let outcome = reply.finish().await?;
+    out.finish()?;
     tracing::info!(
         bytes = total,
         trace_id = %trace_id,
-        %outcome,
         "reply finished"
     );
     Ok(())

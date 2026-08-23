@@ -5,22 +5,18 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use weida_core::{AckMode, TransferId};
+use weida_core::ErrorCode;
 use weida_protocol::{
-    AckHeader, DataHeader, FrameKind, Hello, encode_frame, encode_preamble, parse_preamble,
+    DataHeader, ErrorHeader, FrameKind, Hello, encode_frame, encode_preamble, parse_preamble,
 };
 
 fn minimal_request() -> DataHeader {
-    DataHeader::request("/transform", TransferId::FIRST, AckMode::Accepted)
+    DataHeader::addressed("/transform")
 }
 
 fn full_request() -> DataHeader {
     DataHeader {
         endpoint: Some("/transform".into()),
-        transfer_id: TransferId::new(4_294_967_296).expect("non-zero"),
-        role: 1,
-        correlation_id: None,
-        ack_mode: 1,
         content_len: Some(1 << 40),
         content_type: Some("application/octet-stream".into()),
         traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
@@ -54,8 +50,8 @@ fn bench_data_header(c: &mut Criterion) {
 fn bench_control_frames(c: &mut Criterion) {
     let hello = Hello::v0(16 * 1024, 2048);
     let hello_bytes = hello.encode();
-    let ack = AckHeader::accepted(TransferId::FIRST);
-    let ack_bytes = ack.encode();
+    let error = ErrorHeader::new(ErrorCode::NoReply);
+    let error_bytes = error.encode();
 
     let mut group = c.benchmark_group("control");
     group.bench_function("hello_encode", |b| {
@@ -64,11 +60,11 @@ fn bench_control_frames(c: &mut Criterion) {
     group.bench_function("hello_decode", |b| {
         b.iter(|| Hello::decode(black_box(&hello_bytes)).expect("valid"))
     });
-    group.bench_function("ack_encode", |b| {
-        b.iter(|| black_box(black_box(&ack).encode()))
+    group.bench_function("error_encode", |b| {
+        b.iter(|| black_box(black_box(&error).encode()))
     });
-    group.bench_function("ack_decode", |b| {
-        b.iter(|| AckHeader::decode(black_box(&ack_bytes)).expect("valid"))
+    group.bench_function("error_decode", |b| {
+        b.iter(|| ErrorHeader::decode(black_box(&error_bytes)).expect("valid"))
     });
     group.finish();
 }
@@ -81,7 +77,7 @@ fn bench_framing(c: &mut Criterion) {
     group.bench_function("encode_preamble", |b| {
         b.iter(|| {
             let mut out = Vec::with_capacity(16);
-            encode_preamble(FrameKind::Data, black_box(11), &mut out);
+            encode_preamble(FrameKind::Data, black_box(5), &mut out);
             black_box(out)
         })
     });

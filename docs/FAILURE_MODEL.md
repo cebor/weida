@@ -89,65 +89,120 @@ request side effect succeeds but reply disappears                       [partial
 
 Notes on the covered ones:
 
-- **network disappears during stream** — exercised by the hostile-peer test that closes the
-  connection after reading half the request; the sender observes `ConnectionLost` while
-  still pre-FIN.
+- **network disappears during stream** — exercised by
+  `hostile::a_server_that_disappears_mid_stream_yields_connection_lost`, which closes the
+  connection after reading part of the request; the sender observes `ConnectionLost` while
+  still pre-FIN, and `is_definite_failure()` is true.
 - **receiver crashes during stream** — indistinguishable at the wire from the previous case;
   same rule, same outcome.
-- **receiver gets entire transfer but crashes before ACK** — exercised by the hostile-peer
-  test where a raw server reads the request to FIN, sends nothing, then closes with
-  `NO_ERROR`; the sender observes `Indeterminate`. This is the canonical §22 case.
+- **receiver gets the entire transfer but crashes before answering** — exercised by
+  `hostile::a_server_that_never_answers_yields_indeterminate`, where a raw server reads the
+  request to FIN, sends nothing, then closes with `NO_ERROR`. The transport receipt resolves
+  `Ok(())` — the peer's stack really did take every byte — or `Indeterminate` if the close
+  races the acknowledgement, while `ReplyStream::recv()` resolves `Indeterminate` either
+  way. That split is the canonical §22 case, and the sharpest demonstration that a transport
+  receipt is not an application acknowledgement ([GUARANTEES.md](GUARANTEES.md) §3).
 - **request side effect succeeds but reply disappears** — *partially* covered: the
   disappearing-reply half is covered (the requester resolves `Indeterminate`), but there is
   no side-effect durability to reason about in v0, so the scenario cannot be closed until
   persistence exists.
 
-Every guarantee mode must have explicitly documented outcomes. In v0 there are two
-acknowledgement modes (`none`, `accepted`), and §4 documents the outcomes of both
-exhaustively.
+Every guarantee mode must have explicitly documented outcomes. The v0 core has exactly one
+delivery signal — the transport receipt — and §4 documents its outcomes exhaustively,
+together with the reply-side, cancellation and receiver-side rules that surround it.
 
 ---
 
 ## 4. v0 sender outcome rules
 
-Normative. These rules are implemented as pure transition functions in `weida-core` so they
-can be tested without networking.
+Normative. There is no separate outcome enum and no pending-transfer table: the stream *is*
+the transfer, so a sender's outcome is whatever `write_all`, `finish()` and the resulting
+`Delivery` report.
 
-| Event | Local state | Outcome | Rationale |
+| Event | Local state | Result | Rationale |
 | --- | --- | --- | --- |
-| Connection lost | before local FIN | `Failed(ConnectionLost)` | The receiver discards partial transfers on reset or connection loss ([PROTOCOL.md](PROTOCOL.md) §9.3), so the payload was definitely not delivered. Definite failure, not indeterminate. |
-| Connection lost | after local FIN, awaiting ACK or reply | `Indeterminate` | The peer may have read the payload to FIN and handed it to the application, and the ACK or reply may have been lost. The caller cannot know. |
-| ERROR frame received | any | `Failed(code)` | The peer explicitly reported refusal or failure. `code` maps to `UnknownEndpoint`, `Rejected`, `Unsupported`, `Internal` or `NoReply`. |
-| `STOP_SENDING` observed | any | `Failed(Rejected)`, `Failed(UnknownEndpoint)` or `Failed(Canceled)`, selected by the QUIC application error code | The receiver refused the inbound payload. The refusal is explicit, so the outcome is definite. |
-| ACK received | awaiting ACK | `Acked(Accepted)` | The peer read the complete payload to FIN and handed it to the application ([GUARANTEES.md](GUARANTEES.md) §1). |
-| Local FIN completes | `ack_mode = none` | `SentBestEffort` | No acknowledgement was requested; the only assertion is that the local side finished writing. It is explicitly not a delivery claim. |
+| Connection lost | before local FIN | `write_all` fails with `Error::ConnectionLost`; `is_definite_failure()` is true | The receiver discards partial transfers on reset or connection loss ([PROTOCOL.md](PROTOCOL.md) §9), so the payload was definitely not delivered. Definite failure, not indeterminate. |
+| Local FIN completes | `Delivery` dropped | nothing is observed at all | `finish()` is synchronous and dropping the receipt is free. Fire-and-forget by choice: the only assertion is that the local side finished writing, which is explicitly not a delivery claim. |
+| Connection lost | after local FIN, before the receipt | `Delivery::delivered()` yields `Error::Indeterminate` | The FIN went out. The peer may hold every byte and may already have acted on them; no local observation distinguishes that from a loss. `is_definite_failure()` is false. |
+| Receipt resolves | after local FIN | `Delivery::delivered()` yields `Ok(())` | The peer's **transport** acknowledged every byte and the FIN. It is not a claim that the peer's application read the payload ([GUARANTEES.md](GUARANTEES.md) §3). |
+| `STOP_SENDING` observed | any | definite typed refusal, selected by the QUIC application error code: `REJECTED` → `Error::Rejected`, `CANCELED` → `Error::Canceled`, `UNKNOWN_ENDPOINT` → `Error::UnknownEndpoint`, `UNSUPPORTED` → `Error::Unsupported` | The receiver refused explicitly, so the outcome is definite. The refusal surfaces from `write_all` when it lands mid-payload and from `delivered()` otherwise; a sender must be prepared to see it at either point. |
+| 0-RTT rejected | any | `Error::Transport` | The data was never delivered under the accepted keys. |
+
+`Error::is_definite_failure()` is the machine-readable form of the word "definite": true for
+`ConnectionLost`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `Canceled`, `NotConnected`
+and `LimitExceeded`. A typed refusal — by stop code or by ERROR frame — proves the payload
+never reached an application, which is exactly what makes it definite. `Indeterminate` is
+outside the set by construction, because keeping it apart from failure is the whole point of
+master doc §22, and so is `NoReply`: a replier that declines to answer has still read the
+request and may well have acted on it, so only the answer is missing. The membership is
+pinned by `definite_failures_exclude_the_unknowable_ones`.
+
+### Reply-side rules
+
+An exchange's reply half carries the other half of the sender's outcome.
+
+| Event | Result of `ReplyStream::recv()` |
+| --- | --- |
+| DATA header | `Ok(IncomingTransfer)` — the reply payload follows on that half until FIN |
+| ERROR header | `Err`, by code: `UNKNOWN_ENDPOINT`, `REJECTED`, `UNSUPPORTED` and `NO_REPLY` map to the matching `Error`; `INTERNAL` maps to `Error::Transport` |
+| Connection lost | `Error::Indeterminate`, **never** `ConnectionLost` |
+| Any other frame kind | `Error::Protocol` — nothing else is legal on a reply half |
+
+The connection-lost row is a rule, not an accident of implementation. The replier may
+already have read the request, dispatched it and produced an answer that died with the
+connection; claiming a definite failure there would be a lie. `ReplyStream::recv` therefore
+re-labels `ConnectionLost` as `Indeterminate` before it reaches the caller. The request
+half's own receipt is unaffected and may still read `Ok(())`.
 
 ### Precedence
 
-An ERROR frame observed before an ACK has been delivered to the application **wins**: the
-transfer resolves as `Failed(code)`, not as `Acked`. An implementation MUST NOT report
-success and then report the error afterwards.
+An ERROR frame on the reply half wins over the request half's transport receipt: the
+exchange resolves as a failure carrying the ERROR code, even though the request bytes
+demonstrably arrived. An implementation MUST NOT report success and then report the error
+afterwards. The two halves never contradict each other about *delivery*, only about
+*outcome*, and the outcome is the answer.
+
+### Cancellation
+
+No frame cancels anything; cancellation is entirely QUIC stream state.
+
+| Situation | Mechanism | What the peer observes |
+| --- | --- | --- |
+| Sender abandons its own outgoing payload | `RESET_STREAM(CANCELED)` — `OutgoingTransfer::cancel`, or a drop without `finish()` | the read in progress fails with `Error::Canceled`; partial state is discarded |
+| Receiver refuses an inbound payload | `STOP_SENDING(REJECTED)` — `IncomingTransfer` dropped mid-payload, or a payload past `read_capped`'s cap | `Error::Rejected` from `write_all` or from `delivered()` |
+| Requester abandons the reply | drop `ReplyStream` before `recv()`, which stops the reply half with `CANCELED` | `IncomingRequest::canceled()` resolves; subsequent reply writes fail with `Error::Canceled` |
+| Replier will not answer | ERROR `{NO_REPLY}` + FIN on the reply half — `IncomingRequest` dropped without `reply()` | `ReplyStream::recv()` yields `Error::NoReply` |
+
+`IncomingRequest::canceled()` is the reply half's `stopped()` future, and it is `'static`:
+a handler takes it before `reply()` consumes the request, then selects on it beside its own
+reply writes. A long reply nobody wants otherwise burns the peer's flow-control window, and
+this is how the handler learns to stop.
 
 ### Receiver-side rules
 
 | Event | Receiver action |
 | --- | --- |
-| Peer `RESET_STREAM` before FIN | Discard all partial state for that transfer. Send **no** ACK and **no** ERROR frame. Surface a `Canceled` error to any application read in progress. |
-| Receiver refuses inbound payload | `STOP_SENDING` with the appropriate application error code: `UNKNOWN_ENDPOINT` for an unregistered path, `REJECTED` when the application drops the body before FIN, a reserved header value was requested, or the `role` is one the addressed endpoint does not serve ([PROTOCOL.md](PROTOCOL.md) §9.4), `CANCELED` when a local cancellation caused the refusal. |
-| Application drops a request without opening a reply | Send ERROR `{re, NO_REPLY}` so the requester does not hang until the idle timeout. |
+| Peer `RESET_STREAM` before FIN | Discard all partial state for that stream and surface `Error::Canceled` to any application read in progress. Send nothing back. |
+| Unregistered path, one-way transfer | `STOP_SENDING(UNKNOWN_ENDPOINT)`. A unidirectional stream has no return path, so the stop code carries the whole answer. |
+| Unregistered path, exchange | ERROR `{UNKNOWN_ENDPOINT}` + FIN on the reply half, plus `STOP_SENDING(UNKNOWN_ENDPOINT)` on the initiating half. |
+| Stream addressed to an endpoint whose pattern cannot serve it | One-way transfer to a replier or publisher: `STOP_SENDING(UNSUPPORTED)`. Exchange to a puller or publisher: ERROR `{UNSUPPORTED}` + FIN on the reply half, plus `STOP_SENDING(UNSUPPORTED)`. The connection survives in both cases. |
+| Application drops the body before FIN | `STOP_SENDING(REJECTED)`. |
+| Application drops a request without replying | ERROR `{NO_REPLY}` + FIN on the reply half, so the requester does not hang until the idle timeout. |
+| DATA without `endpoint` on an initiating stream, ERROR on a unidirectional stream, or any non-DATA frame opening an exchange | `CONNECTION_CLOSE(PROTOCOL_VIOLATION)`. These are framing violations, not refusals: a refusal is per-stream, a violation ends the connection ([PROTOCOL.md](PROTOCOL.md) §3). |
 
 ### Connection teardown
 
-When a connection fails, every pending table entry on that connection MUST be resolved by
-these rules — pending ACK waiters, pending reply waiters and active inbound request cancel
-signals alike. No pending operation may be left to time out silently.
+When a connection fails there is no pending table to resolve — every in-flight operation is
+a stream, and QUIC fails its halves directly. Each failure maps by the rules above: pre-FIN
+writes to `ConnectionLost`, receipts and awaited replies to `Indeterminate`, reads in
+progress to the corresponding read error. No operation may be left to time out silently.
 
 ### Publisher fan-out loss
 
 One loss mode in v0 is deliberately outside the outcome vocabulary above. When a publisher
 fans a message out, a subscriber whose byte budget is exhausted does not receive that
-message, and **no** transfer is ever opened for it — so there is no `transfer_id`, no ACK
-waiter and no outcome to resolve. The loss is therefore:
+message, and **no** stream is ever opened for it — so there is nothing to reset, no receipt
+to await and no outcome to resolve. The loss is therefore:
 
 - invisible to the subscriber, which cannot distinguish "nothing was published" from
   "a message was dropped for me" (making it visible needs a sequence field, which v0 does

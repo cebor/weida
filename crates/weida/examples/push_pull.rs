@@ -7,11 +7,12 @@
 //! Runs both halves in one process on loopback. Pull **binds** (like a
 //! replier), Push **connects** (like a requester).
 //!
-//! The one thing worth noticing: `ack_mode` is orthogonal to the pattern. The
-//! same `send` is best effort or acknowledged depending only on the metadata,
-//! and the outcome says which — `SentBestEffort` settles at FIN without waiting
-//! for anyone, `Acked(Accepted)` means the receiving application actually read
-//! the payload.
+//! The one thing worth noticing: the receipt is orthogonal to the pattern.
+//! `send` is fire-and-forget pipeline semantics — it returns at FIN and costs
+//! no round trip. `open()`/`finish()`/`delivered()` is the same transfer with
+//! QUIC's own fin-acknowledgement awaited: it means *the peer's transport
+//! holds every byte*, not that the peer's application read them. There is no
+//! application-level acknowledgement in the v0 core, by design.
 //!
 //! Expect the jobs to arrive out of order. Each transfer is its own QUIC
 //! stream and streams are unordered relative to each other, so ordering is
@@ -20,7 +21,7 @@
 
 use std::net::SocketAddr;
 
-use weida::{AckMode, ClientTls, Runtime, RuntimeConfig, ServerTls, TransferMeta};
+use weida::{ClientTls, Runtime, RuntimeConfig, ServerTls, TransferMeta};
 
 const JOBS: usize = 5;
 
@@ -48,12 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..JOBS {
             // `recv`, not `accept`: a pulled transfer owes no reply.
             let transfer = puller.recv().await?;
-            let ack = transfer.meta().ack_mode;
             let body = transfer.collect(64 * 1024).await?;
-            println!(
-                "  pulled {:>7}  (ack_mode={ack})",
-                String::from_utf8_lossy(&body)
-            );
+            println!("  pulled {:>7}", String::from_utf8_lossy(&body));
         }
         Ok::<(), weida::Error>(())
     });
@@ -64,18 +61,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pusher.connect(&url).await?;
 
     println!("pushing {JOBS} jobs to {url}");
-    for i in 0..JOBS {
-        // The last one asks to be acknowledged; the rest are fire and forget.
-        let meta = if i == JOBS - 1 {
-            TransferMeta::default().with_ack(AckMode::Accepted)
-        } else {
-            TransferMeta::default()
-        };
-        let outcome = pusher
-            .send_with(meta, format!("job-{i}").as_bytes())
-            .await?;
-        println!("  sent   job-{i}    -> {outcome}");
+    for i in 0..JOBS - 1 {
+        pusher.send(format!("job-{i}").as_bytes()).await?;
+        println!("  sent   job-{i}    -> queued");
     }
+
+    // The last one keeps the receipt. `delivered()` resolves on QUIC's
+    // transport acknowledgement — the bytes are in the peer's stack, which is
+    // strictly weaker than "the worker processed the job".
+    let last = JOBS - 1;
+    let mut transfer = pusher.open(TransferMeta::default()).await?;
+    transfer.write_all(format!("job-{last}").as_bytes()).await?;
+    transfer.finish()?.delivered().await?;
+    println!("  sent   job-{last}    -> delivered (transport receipt)");
 
     worker.await??;
 

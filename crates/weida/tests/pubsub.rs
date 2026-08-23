@@ -293,7 +293,6 @@ async fn sub_meta_carries_topic_and_trace() {
     let meta = transfer.meta().clone();
     assert_eq!(meta.topic.as_deref(), Some("px.eur"));
     assert_eq!(meta.endpoint.as_deref(), Some("/md"));
-    assert_eq!(meta.correlation_id, None);
     assert_eq!(meta.content_len, Some(4));
     assert!(
         meta.trace.is_some(),
@@ -328,18 +327,31 @@ async fn a_publisher_path_refuses_inbound_transfers() {
     let server = Server::start().await;
     let _publisher = server.listener.publisher("/md").expect("publisher");
 
-    // A publisher path accepts no inbound transfers of any role.
+    // A publisher path accepts no inbound stream of either kind.
     let client = server.client_runtime();
     let pusher = client.pusher(server.trust());
     within(pusher.connect(&server.url("/md")))
         .await
         .expect("connect");
-    let err = within(pusher.send_with(
-        weida::TransferMeta::default().with_ack(weida::AckMode::Accepted),
-        b"nope",
-    ))
-    .await
-    .expect_err("a push to a publisher path must be refused");
+    let mut transfer = within(pusher.open(weida::TransferMeta::default()))
+        .await
+        .expect("open");
+    let refused = async {
+        transfer.write_all(b"nope").await?;
+        transfer.finish()?.delivered().await
+    };
+    let err = within(refused)
+        .await
+        .expect_err("a push to a publisher path must be refused");
+    assert!(matches!(err, Error::Unsupported), "{err:?}");
+
+    let requester = client.requester(server.trust());
+    within(requester.connect(&server.url("/md")))
+        .await
+        .expect("connect");
+    let err = within(requester.request(b"nope"))
+        .await
+        .expect_err("an exchange with a publisher path must be refused");
     assert!(matches!(err, Error::Unsupported), "{err:?}");
 
     client.shutdown().await;

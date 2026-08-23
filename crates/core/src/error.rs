@@ -105,13 +105,16 @@ impl Error {
     /// True if the error proves the transfer had no effect at the peer.
     ///
     /// `Indeterminate` is deliberately *not* in this set: modelling it apart
-    /// from definite failure is the point of master doc §22.
+    /// from definite failure is the point of master doc §22. Neither is
+    /// `NoReply` — the request was accepted and may well have had an effect;
+    /// only the answer is missing.
     pub fn is_definite_failure(&self) -> bool {
         matches!(
             self,
             Error::ConnectionLost
                 | Error::Rejected
                 | Error::UnknownEndpoint
+                | Error::Unsupported
                 | Error::Canceled
                 | Error::NotConnected
                 | Error::LimitExceeded
@@ -184,6 +187,8 @@ pub enum StopReason {
     Canceled,
     /// `UNKNOWN_ENDPOINT`: no endpoint is registered for the path.
     UnknownEndpoint,
+    /// `UNSUPPORTED`: the endpoint exists but does not serve this stream kind.
+    Unsupported,
     /// Any other code, kept for diagnostics.
     Other(u64),
 }
@@ -194,6 +199,7 @@ impl From<StopReason> for Error {
             StopReason::Rejected => Error::Rejected,
             StopReason::Canceled => Error::Canceled,
             StopReason::UnknownEndpoint => Error::UnknownEndpoint,
+            StopReason::Unsupported => Error::Unsupported,
             StopReason::Other(code) => {
                 Error::Transport(format!("peer stopped receiving with code {code}"))
             }
@@ -233,9 +239,23 @@ mod tests {
     }
 
     #[test]
-    fn indeterminate_is_not_a_definite_failure() {
+    fn definite_failures_exclude_the_unknowable_ones() {
+        // A typed refusal proves the payload never reached an application.
+        for definite in [
+            Error::ConnectionLost,
+            Error::Rejected,
+            Error::UnknownEndpoint,
+            Error::Unsupported,
+            Error::Canceled,
+            Error::NotConnected,
+            Error::LimitExceeded,
+        ] {
+            assert!(definite.is_definite_failure(), "{definite:?}");
+        }
+        // `Indeterminate` is unknown by construction, and a missing reply says
+        // nothing about whether the request had an effect.
         assert!(!Error::Indeterminate.is_definite_failure());
-        assert!(Error::ConnectionLost.is_definite_failure());
+        assert!(!Error::NoReply.is_definite_failure());
     }
 
     #[test]

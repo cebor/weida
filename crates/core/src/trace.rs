@@ -71,9 +71,12 @@ const fn hex_val(b: u8) -> Option<u8> {
 
 fn decode_hex(src: &[u8], dst: &mut [u8]) -> Result<(), TraceError> {
     debug_assert_eq!(src.len(), dst.len() * 2);
-    for (out, pair) in dst.iter_mut().zip(src.chunks_exact(2)) {
-        let hi = hex_val(pair[0]).ok_or(TraceError::NotHex)?;
-        let lo = hex_val(pair[1]).ok_or(TraceError::NotHex)?;
+    // `as_chunks` over `chunks_exact`: the pair width is a constant, so the
+    // compiler gets `[u8; 2]` and the indexing below needs no bounds checks.
+    let (pairs, _remainder) = src.as_chunks::<2>();
+    for (out, &[hi, lo]) in dst.iter_mut().zip(pairs) {
+        let hi = hex_val(hi).ok_or(TraceError::NotHex)?;
+        let lo = hex_val(lo).ok_or(TraceError::NotHex)?;
         *out = (hi << 4) | lo;
     }
     Ok(())

@@ -19,15 +19,18 @@ use crate::conn::ConnCtx;
 use crate::endpoint::{Endpoint, PubState, Publisher, PullState, Puller, RepState, Replier};
 use crate::pubsub::SubRegistry;
 use crate::runtime::RuntimeInner;
+use crate::stream::{Acceptor, Incoming};
 use crate::tls;
 use crate::transfer::{IncomingRequest, IncomingTransfer};
 
 /// What a registered endpoint path does with an inbound transfer.
 pub(crate) enum Route {
-    /// A replier: inbound `request` transfers become [`IncomingRequest`]s.
+    /// A replier: inbound exchanges become [`IncomingRequest`]s.
     Request(mpsc::Sender<IncomingRequest>),
-    /// A puller or subscriber: inbound `oneshot` transfers are queued as-is.
+    /// A puller or subscriber: inbound one-way transfers are queued as-is.
     Transfer(mpsc::Sender<IncomingTransfer>),
+    /// A raw L0 acceptor: both stream kinds are queued, tagged.
+    Raw(mpsc::Sender<Incoming>),
     /// A publisher. Nothing inbound is accepted on this path; the entry exists
     /// so the path is claimed exclusively and so SUBSCRIBE can be answered for
     /// a path that really is served here.
@@ -92,6 +95,7 @@ impl Route {
         match self {
             Route::Request(tx) => Route::Request(tx.clone()),
             Route::Transfer(tx) => Route::Transfer(tx.clone()),
+            Route::Raw(tx) => Route::Raw(tx.clone()),
             Route::Pub => Route::Pub,
         }
     }
@@ -197,6 +201,19 @@ impl Listener {
             Arc::clone(&self.inner.subs),
             self.inner.runtime.config.limits.subscriber_buffer_bytes,
         )))
+    }
+
+    /// Registers a raw L0 acceptor for `path`.
+    ///
+    /// Below the patterns: an acceptor takes both stream kinds on one path and
+    /// hands them over tagged ([`crate::Incoming`]), leaving the shape of the
+    /// conversation to the application. The path is claimed exactly like a
+    /// replier's or a puller's.
+    pub fn acceptor(&self, path: &str) -> Result<Acceptor, Error> {
+        validate_endpoint_path(path)?;
+        let (tx, rx) = mpsc::channel(self.inner.runtime.config.limits.endpoint_queue);
+        self.inner.namespace.register(path, Route::Raw(tx))?;
+        Ok(Acceptor::new(path, rx))
     }
 }
 

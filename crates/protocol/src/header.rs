@@ -12,13 +12,17 @@
 //!   behaviour has to be readable.
 //!
 //! All decode failures are protocol violations that close the connection.
+//!
+//! **No field of a DATA header is required by the decoder.** A header no longer
+//! carries the stream's role, so the decoder cannot know which fields the
+//! context demands; `endpoint`-on-initiating-streams is enforced by the
+//! transport's dispatch, which does know (`docs/PROTOCOL.md` §6.2).
 
 use std::convert::Infallible;
 
 use minicbor::data::Type;
 use minicbor::{Decoder, Encoder};
-use weida_core::policy::{AckMode, Role};
-use weida_core::{Error, TransferId};
+use weida_core::Error;
 
 /// Decoder limits. The string caps are normative
 /// (`docs/PROTOCOL.md` §6); the list and depth caps are defensive
@@ -59,33 +63,17 @@ mod hello_key {
 /// DATA keys.
 mod data_key {
     pub const ENDPOINT: u64 = 0;
-    pub const TRANSFER_ID: u64 = 1;
-    pub const ROLE: u64 = 2;
-    pub const CORRELATION_ID: u64 = 3;
-    pub const ACK_MODE: u64 = 4;
-    pub const CONTENT_LEN: u64 = 5;
-    pub const CONTENT_TYPE: u64 = 6;
-    pub const TRACEPARENT: u64 = 7;
-    pub const TRACESTATE: u64 = 8;
-    pub const TOPIC: u64 = 9;
-}
-
-/// ACK keys.
-mod ack_key {
-    pub const RE: u64 = 0;
-    pub const STATE: u64 = 1;
+    pub const CONTENT_LEN: u64 = 1;
+    pub const CONTENT_TYPE: u64 = 2;
+    pub const TRACEPARENT: u64 = 3;
+    pub const TRACESTATE: u64 = 4;
+    pub const TOPIC: u64 = 5;
 }
 
 /// ERROR keys.
 mod error_key {
-    pub const RE: u64 = 0;
-    pub const CODE: u64 = 1;
-    pub const MESSAGE: u64 = 2;
-}
-
-/// CANCEL keys.
-mod cancel_key {
-    pub const ID: u64 = 0;
+    pub const CODE: u64 = 0;
+    pub const MESSAGE: u64 = 1;
 }
 
 /// SUBSCRIBE and UNSUBSCRIBE keys.
@@ -129,8 +117,6 @@ pub enum HeaderError {
     },
     /// An unknown field nested deeper than [`limits::MAX_SKIP_DEPTH`].
     DepthExceeded,
-    /// A transfer id was the reserved `0`.
-    ZeroTransferId(u64),
     /// Bytes remained after the header map.
     TrailingBytes,
 }
@@ -159,7 +145,6 @@ impl std::fmt::Display for HeaderError {
                 )
             }
             HeaderError::DepthExceeded => f.write_str("unknown field nested too deeply"),
-            HeaderError::ZeroTransferId(k) => write!(f, "key {k}: transfer id 0 is reserved"),
             HeaderError::TrailingBytes => f.write_str("trailing bytes after the header"),
         }
     }
@@ -362,11 +347,6 @@ impl<'a, 'b> MapReader<'a, 'b> {
             .map_err(|_| HeaderError::Malformed("expected an unsigned integer"))
     }
 
-    fn transfer_id(&mut self, key: u64) -> Result<TransferId, HeaderError> {
-        let raw = self.u64()?;
-        TransferId::new(raw).ok_or(HeaderError::ZeroTransferId(key))
-    }
-
     fn text(&mut self, key: u64, max: usize) -> Result<String, HeaderError> {
         let s = self
             .d
@@ -513,21 +493,14 @@ impl Hello {
 
 /// DATA header: one transfer.
 ///
-/// `role` and `ack_mode` are kept as raw wire values so that reserved codes
-/// survive decoding and can be answered with `UNSUPPORTED` instead of being
-/// silently reinterpreted.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Every field is optional at the decoder. Which of them the *context*
+/// requires is a dispatch question: an initiating stream must name an endpoint
+/// and the reply half of an exchange must not, but the decoder sees bytes, not
+/// streams (`docs/PROTOCOL.md` §6.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DataHeader {
-    /// Endpoint path; required iff `role` is `oneshot` or `request`.
+    /// Endpoint path. Required on an initiating stream, ignored on a reply.
     pub endpoint: Option<String>,
-    /// Sender's transfer id.
-    pub transfer_id: TransferId,
-    /// Raw role code.
-    pub role: u64,
-    /// Request id this reply answers; present iff `role` is `reply`.
-    pub correlation_id: Option<TransferId>,
-    /// Raw ack mode code.
-    pub ack_mode: u64,
     /// Advisory payload length.
     pub content_len: Option<u64>,
     /// Opaque content type label.
@@ -537,90 +510,30 @@ pub struct DataHeader {
     /// W3C `tracestate`, opaque passthrough.
     pub tracestate: Option<String>,
     /// Pub/Sub topic; opaque bytes matched by byte prefix. Only meaningful on
-    /// `oneshot` transfers fanned out by a publisher.
+    /// transfers fanned out by a publisher.
     pub topic: Option<String>,
 }
 
 impl DataHeader {
-    /// A fire-and-forget header with no optional metadata.
-    pub fn oneshot(
-        endpoint: impl Into<String>,
-        transfer_id: TransferId,
-        ack_mode: AckMode,
-    ) -> DataHeader {
+    /// A header addressing `endpoint`, for the initiating half of a stream.
+    pub fn addressed(endpoint: impl Into<String>) -> DataHeader {
         DataHeader {
             endpoint: Some(endpoint.into()),
-            transfer_id,
-            role: Role::Oneshot.to_wire(),
-            correlation_id: None,
-            ack_mode: ack_mode.to_wire(),
-            content_len: None,
-            content_type: None,
-            traceparent: None,
-            tracestate: None,
-            topic: None,
+            ..DataHeader::default()
         }
     }
 
-    /// A request header with no optional metadata.
-    pub fn request(
-        endpoint: impl Into<String>,
-        transfer_id: TransferId,
-        ack_mode: AckMode,
-    ) -> DataHeader {
-        DataHeader {
-            endpoint: Some(endpoint.into()),
-            transfer_id,
-            role: Role::Request.to_wire(),
-            correlation_id: None,
-            ack_mode: ack_mode.to_wire(),
-            content_len: None,
-            content_type: None,
-            traceparent: None,
-            tracestate: None,
-            topic: None,
-        }
-    }
-
-    /// A reply header with no optional metadata.
-    pub fn reply(
-        transfer_id: TransferId,
-        correlation_id: TransferId,
-        ack_mode: AckMode,
-    ) -> DataHeader {
-        DataHeader {
-            endpoint: None,
-            transfer_id,
-            role: Role::Reply.to_wire(),
-            correlation_id: Some(correlation_id),
-            ack_mode: ack_mode.to_wire(),
-            content_len: None,
-            content_type: None,
-            traceparent: None,
-            tracestate: None,
-            topic: None,
-        }
-    }
-
-    /// The role, or `None` for a reserved or unknown code.
-    pub fn role(&self) -> Option<Role> {
-        Role::from_wire(self.role)
-    }
-
-    /// The ack mode, or `None` for a reserved or unknown code.
-    pub fn ack_mode(&self) -> Option<AckMode> {
-        AckMode::from_wire(self.ack_mode)
+    /// A header for the reply half of an exchange: no endpoint, no topic.
+    ///
+    /// The stream is the correlation, so a reply carries no identifier of the
+    /// request it answers.
+    pub fn reply() -> DataHeader {
+        DataHeader::default()
     }
 
     /// Encodes the header.
     pub fn encode(&self) -> Vec<u8> {
-        // `ack_mode` defaults to 0 when absent, so the zero value is omitted
-        // rather than written out (`docs/PROTOCOL.md` §5). `role` is always
-        // written: it selects request, reply or a reserved behaviour.
-        let count = 2
-            + u64::from(self.endpoint.is_some())
-            + u64::from(self.correlation_id.is_some())
-            + u64::from(self.ack_mode != weida_core::policy::ACK_MODE_NONE)
+        let count = u64::from(self.endpoint.is_some())
             + u64::from(self.content_len.is_some())
             + u64::from(self.content_type.is_some())
             + u64::from(self.traceparent.is_some())
@@ -630,14 +543,6 @@ impl DataHeader {
             e.map(count)?;
             if let Some(endpoint) = &self.endpoint {
                 e.u64(data_key::ENDPOINT)?.str(endpoint)?;
-            }
-            e.u64(data_key::TRANSFER_ID)?.u64(self.transfer_id.get())?;
-            e.u64(data_key::ROLE)?.u64(self.role)?;
-            if let Some(id) = self.correlation_id {
-                e.u64(data_key::CORRELATION_ID)?.u64(id.get())?;
-            }
-            if self.ack_mode != weida_core::policy::ACK_MODE_NONE {
-                e.u64(data_key::ACK_MODE)?.u64(self.ack_mode)?;
             }
             if let Some(len) = self.content_len {
                 e.u64(data_key::CONTENT_LEN)?.u64(len)?;
@@ -661,126 +566,40 @@ impl DataHeader {
     /// Decodes the header.
     pub fn decode(bytes: &[u8]) -> Result<DataHeader, HeaderError> {
         let mut d = Decoder::new(bytes);
-        let mut endpoint = None;
-        let mut transfer_id = None;
-        // Absent `ack_mode` means `0 = none`; `role` has no default and is
-        // required.
-        let mut role = 0;
-        let mut correlation_id = None;
-        let mut ack_mode = weida_core::policy::ACK_MODE_NONE;
-        let mut content_len = None;
-        let mut content_type = None;
-        let mut traceparent = None;
-        let mut tracestate = None;
-        let mut topic = None;
+        let mut header = DataHeader::default();
         {
             let mut m = MapReader::new(&mut d)?;
             while let Some(key) = m.next_key()? {
                 match key {
-                    data_key::ENDPOINT => endpoint = Some(m.text(key, limits::MAX_ENDPOINT_BYTES)?),
-                    data_key::TRANSFER_ID => transfer_id = Some(m.transfer_id(key)?),
-                    data_key::ROLE => role = m.u64()?,
-                    data_key::CORRELATION_ID => correlation_id = Some(m.transfer_id(key)?),
-                    data_key::ACK_MODE => ack_mode = m.u64()?,
-                    data_key::CONTENT_LEN => content_len = Some(m.u64()?),
+                    data_key::ENDPOINT => {
+                        header.endpoint = Some(m.text(key, limits::MAX_ENDPOINT_BYTES)?)
+                    }
+                    data_key::CONTENT_LEN => header.content_len = Some(m.u64()?),
                     data_key::CONTENT_TYPE => {
-                        content_type = Some(m.text(key, limits::MAX_CONTENT_TYPE_BYTES)?)
+                        header.content_type = Some(m.text(key, limits::MAX_CONTENT_TYPE_BYTES)?)
                     }
                     data_key::TRACEPARENT => {
-                        traceparent = Some(m.text(key, limits::MAX_TRACEPARENT_BYTES)?)
+                        header.traceparent = Some(m.text(key, limits::MAX_TRACEPARENT_BYTES)?)
                     }
                     data_key::TRACESTATE => {
-                        tracestate = Some(m.text(key, limits::MAX_TRACESTATE_BYTES)?)
+                        header.tracestate = Some(m.text(key, limits::MAX_TRACESTATE_BYTES)?)
                     }
-                    data_key::TOPIC => topic = Some(m.text(key, limits::MAX_TOPIC_BYTES)?),
+                    data_key::TOPIC => header.topic = Some(m.text(key, limits::MAX_TOPIC_BYTES)?),
                     _ => m.skip()?,
                 }
             }
-            m.require(data_key::TRANSFER_ID)?;
-            m.require(data_key::ROLE)?;
-            // Conditional requirements. A reserved role requires neither, and
-            // the receiver answers it with UNSUPPORTED.
-            if role == Role::Oneshot.to_wire() || role == Role::Request.to_wire() {
-                m.require(data_key::ENDPOINT)?;
-            }
-            if role == Role::Reply.to_wire() {
-                m.require(data_key::CORRELATION_ID)?;
-            }
         }
         finish(&d)?;
-        Ok(DataHeader {
-            endpoint,
-            transfer_id: transfer_id.expect("presence checked above"),
-            role,
-            correlation_id,
-            ack_mode,
-            content_len,
-            content_type,
-            traceparent,
-            tracestate,
-            topic,
-        })
-    }
-}
-
-/// ACK header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AckHeader {
-    /// The recipient's outgoing transfer id being acknowledged.
-    pub re: TransferId,
-    /// Raw ack state code.
-    pub state: u64,
-}
-
-impl AckHeader {
-    /// An `accepted` acknowledgement.
-    pub fn accepted(re: TransferId) -> AckHeader {
-        AckHeader {
-            re,
-            state: weida_core::policy::ACK_STATE_ACCEPTED,
-        }
-    }
-
-    /// Encodes the header.
-    pub fn encode(&self) -> Vec<u8> {
-        encode_with(|e| {
-            e.map(2)?;
-            e.u64(ack_key::RE)?.u64(self.re.get())?;
-            e.u64(ack_key::STATE)?.u64(self.state)?;
-            Ok(())
-        })
-    }
-
-    /// Decodes the header.
-    pub fn decode(bytes: &[u8]) -> Result<AckHeader, HeaderError> {
-        let mut d = Decoder::new(bytes);
-        let mut re = None;
-        let mut state = 0;
-        {
-            let mut m = MapReader::new(&mut d)?;
-            while let Some(key) = m.next_key()? {
-                match key {
-                    ack_key::RE => re = Some(m.transfer_id(key)?),
-                    ack_key::STATE => state = m.u64()?,
-                    _ => m.skip()?,
-                }
-            }
-            m.require(ack_key::RE)?;
-            m.require(ack_key::STATE)?;
-        }
-        finish(&d)?;
-        Ok(AckHeader {
-            re: re.expect("presence checked above"),
-            state,
-        })
+        Ok(header)
     }
 }
 
 /// ERROR header.
+///
+/// Legal only on the reply half of a bidirectional stream: an ERROR is the
+/// alternative to a reply, so it needs no reference to what it answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ErrorHeader {
-    /// The recipient's outgoing transfer id this error refers to.
-    pub re: TransferId,
     /// Raw error code.
     pub code: u64,
     /// Human-readable detail; never machine-interpreted.
@@ -789,9 +608,8 @@ pub struct ErrorHeader {
 
 impl ErrorHeader {
     /// Builds a header for a known error code.
-    pub fn new(re: TransferId, code: weida_core::ErrorCode) -> ErrorHeader {
+    pub fn new(code: weida_core::ErrorCode) -> ErrorHeader {
         ErrorHeader {
-            re,
             code: code.to_wire(),
             message: None,
         }
@@ -804,10 +622,9 @@ impl ErrorHeader {
 
     /// Encodes the header.
     pub fn encode(&self) -> Vec<u8> {
-        let count = 2 + u64::from(self.message.is_some());
+        let count = 1 + u64::from(self.message.is_some());
         encode_with(|e| {
             e.map(count)?;
-            e.u64(error_key::RE)?.u64(self.re.get())?;
             e.u64(error_key::CODE)?.u64(self.code)?;
             if let Some(msg) = &self.message {
                 e.u64(error_key::MESSAGE)?.str(msg)?;
@@ -819,66 +636,21 @@ impl ErrorHeader {
     /// Decodes the header.
     pub fn decode(bytes: &[u8]) -> Result<ErrorHeader, HeaderError> {
         let mut d = Decoder::new(bytes);
-        let mut re = None;
         let mut code = 0;
         let mut message = None;
         {
             let mut m = MapReader::new(&mut d)?;
             while let Some(key) = m.next_key()? {
                 match key {
-                    error_key::RE => re = Some(m.transfer_id(key)?),
                     error_key::CODE => code = m.u64()?,
                     error_key::MESSAGE => message = Some(m.text(key, limits::MAX_MESSAGE_BYTES)?),
                     _ => m.skip()?,
                 }
             }
-            m.require(error_key::RE)?;
             m.require(error_key::CODE)?;
         }
         finish(&d)?;
-        Ok(ErrorHeader {
-            re: re.expect("presence checked above"),
-            code,
-            message,
-        })
-    }
-}
-
-/// CANCEL header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CancelHeader {
-    /// The sender's own request transfer id whose replies are no longer wanted.
-    pub id: TransferId,
-}
-
-impl CancelHeader {
-    /// Encodes the header.
-    pub fn encode(&self) -> Vec<u8> {
-        encode_with(|e| {
-            e.map(1)?;
-            e.u64(cancel_key::ID)?.u64(self.id.get())?;
-            Ok(())
-        })
-    }
-
-    /// Decodes the header.
-    pub fn decode(bytes: &[u8]) -> Result<CancelHeader, HeaderError> {
-        let mut d = Decoder::new(bytes);
-        let mut id = None;
-        {
-            let mut m = MapReader::new(&mut d)?;
-            while let Some(key) = m.next_key()? {
-                match key {
-                    cancel_key::ID => id = Some(m.transfer_id(key)?),
-                    _ => m.skip()?,
-                }
-            }
-            m.require(cancel_key::ID)?;
-        }
-        finish(&d)?;
-        Ok(CancelHeader {
-            id: id.expect("presence checked above"),
-        })
+        Ok(ErrorHeader { code, message })
     }
 }
 
@@ -951,23 +723,24 @@ mod tests {
     use super::*;
     use weida_core::ErrorCode;
 
-    fn tid(v: u64) -> TransferId {
-        TransferId::new(v).unwrap()
-    }
-
     // --- golden vectors, docs/PROTOCOL.md §8 ------------------------------
 
     #[test]
-    fn golden_data_header() {
-        let h = DataHeader::request("/t", tid(1), AckMode::Accepted);
+    fn golden_data_request_header() {
+        let h = DataHeader::addressed("/t");
         let bytes = h.encode();
-        assert_eq!(
-            bytes,
-            vec![
-                0xA4, 0x00, 0x62, 0x2F, 0x74, 0x01, 0x01, 0x02, 0x01, 0x04, 0x01
-            ]
-        );
-        assert_eq!(bytes.len(), 0x0B);
+        assert_eq!(bytes, vec![0xA1, 0x00, 0x62, 0x2F, 0x74]);
+        assert_eq!(bytes.len(), 0x05);
+        assert_eq!(DataHeader::decode(&bytes).unwrap(), h);
+    }
+
+    #[test]
+    fn golden_data_reply_header() {
+        // The stream is the correlation, so a reply header is an empty map.
+        let h = DataHeader::reply();
+        let bytes = h.encode();
+        assert_eq!(bytes, vec![0xA0]);
+        assert_eq!(bytes.len(), 0x01);
         assert_eq!(DataHeader::decode(&bytes).unwrap(), h);
     }
 
@@ -987,49 +760,26 @@ mod tests {
     }
 
     #[test]
-    fn golden_ack_header() {
-        let h = AckHeader::accepted(tid(1));
+    fn golden_error_header() {
+        let h = ErrorHeader::new(ErrorCode::NoReply);
         let bytes = h.encode();
-        assert_eq!(bytes, vec![0xA2, 0x00, 0x01, 0x01, 0x01]);
-        assert_eq!(bytes.len(), 0x05);
-        assert_eq!(AckHeader::decode(&bytes).unwrap(), h);
-    }
-
-    #[test]
-    fn golden_cancel_header() {
-        let h = CancelHeader { id: tid(1) };
-        let bytes = h.encode();
-        assert_eq!(bytes, vec![0xA1, 0x00, 0x01]);
+        assert_eq!(bytes, vec![0xA1, 0x00, 0x05]);
         assert_eq!(bytes.len(), 0x03);
-        assert_eq!(CancelHeader::decode(&bytes).unwrap(), h);
-    }
-
-    #[test]
-    fn golden_oneshot_data_header() {
-        let h = DataHeader::oneshot("/t", tid(1), AckMode::None);
-        let bytes = h.encode();
-        // `ack_mode = 0` is the default and is omitted; `role = 0` is written.
-        assert_eq!(
-            bytes,
-            vec![0xA3, 0x00, 0x62, 0x2F, 0x74, 0x01, 0x01, 0x02, 0x00]
-        );
-        assert_eq!(bytes.len(), 0x09);
-        assert_eq!(DataHeader::decode(&bytes).unwrap(), h);
+        assert_eq!(ErrorHeader::decode(&bytes).unwrap(), h);
     }
 
     #[test]
     fn golden_pub_copy_data_header() {
-        let mut h = DataHeader::oneshot("/md", tid(1), AckMode::None);
+        let mut h = DataHeader::addressed("/md");
         h.topic = Some("px.eur".into());
         let bytes = h.encode();
         assert_eq!(
             bytes,
             vec![
-                0xA4, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x01, 0x01, 0x02, 0x00, 0x09, 0x66, 0x70, 0x78,
-                0x2E, 0x65, 0x75, 0x72
+                0xA2, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x05, 0x66, 0x70, 0x78, 0x2E, 0x65, 0x75, 0x72
             ]
         );
-        assert_eq!(bytes.len(), 0x12);
+        assert_eq!(bytes.len(), 0x0E);
         assert_eq!(DataHeader::decode(&bytes).unwrap(), h);
     }
 
@@ -1045,7 +795,7 @@ mod tests {
         );
         assert_eq!(bytes.len(), 0x0B);
         // One header layout serves both kinds; only the kind byte differs, and
-        // that byte belongs to the preamble (see `frame::tests::golden_preambles`).
+        // that byte belongs to the preamble (see `tests/golden_vectors.rs`).
         assert_eq!(SubscriptionHeader::decode(&bytes).unwrap(), h);
     }
 
@@ -1055,10 +805,6 @@ mod tests {
     fn data_header_roundtrip_with_every_field() {
         let h = DataHeader {
             endpoint: Some("/transform".into()),
-            transfer_id: tid(9),
-            role: 1,
-            correlation_id: None,
-            ack_mode: 1,
             content_len: Some(1 << 40),
             content_type: Some("application/octet-stream".into()),
             traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
@@ -1069,22 +815,12 @@ mod tests {
     }
 
     #[test]
-    fn reply_header_roundtrip() {
-        let h = DataHeader::reply(tid(4), tid(7), AckMode::None);
-        let bytes = h.encode();
-        assert_eq!(DataHeader::decode(&bytes).unwrap(), h);
-        assert_eq!(h.role(), Some(Role::Reply));
-        assert_eq!(h.ack_mode(), Some(AckMode::None));
-    }
-
-    #[test]
     fn error_header_roundtrip_with_and_without_message() {
-        let bare = ErrorHeader::new(tid(3), ErrorCode::UnknownEndpoint);
+        let bare = ErrorHeader::new(ErrorCode::UnknownEndpoint);
         assert_eq!(ErrorHeader::decode(&bare.encode()).unwrap(), bare);
         assert_eq!(bare.error_code(), Some(ErrorCode::UnknownEndpoint));
 
         let with_msg = ErrorHeader {
-            re: tid(3),
             code: 4,
             message: Some("handler panicked".into()),
         };
@@ -1095,10 +831,6 @@ mod tests {
     fn keys_are_emitted_in_ascending_order() {
         let h = DataHeader {
             endpoint: Some("/x".into()),
-            transfer_id: tid(1),
-            role: 1,
-            correlation_id: Some(tid(2)),
-            ack_mode: 1,
             content_len: Some(1),
             content_type: Some("t".into()),
             traceparent: Some("p".into()),
@@ -1119,63 +851,29 @@ mod tests {
         }
     }
 
-    // --- defaults ---------------------------------------------------------
+    // --- optional fields --------------------------------------------------
 
     #[test]
-    fn absent_ack_mode_decodes_as_none() {
-        let bytes = encode_with(|e| {
-            e.map(3)?;
-            e.u64(0)?.str("/t")?;
-            e.u64(1)?.u64(1)?;
-            e.u64(2)?.u64(1)?;
-            Ok(())
-        });
-        let h = DataHeader::decode(&bytes).unwrap();
-        assert_eq!(h.ack_mode, 0);
-        assert_eq!(h.ack_mode(), Some(AckMode::None));
-    }
+    fn every_data_field_is_optional_at_the_decoder() {
+        // The endpoint requirement lives in dispatch, not here: a reply half
+        // legitimately carries none, and the decoder cannot tell the halves
+        // apart.
+        assert_eq!(DataHeader::decode(&[0xA0]).unwrap(), DataHeader::default());
 
-    #[test]
-    fn absent_role_is_rejected() {
-        // `role` has no default: request, reply and the reserved codes are
-        // materially different behaviours, so it must be stated explicitly.
-        let bytes = encode_with(|e| {
+        let only_topic = encode_with(|e| {
             e.map(1)?;
-            e.u64(1)?.u64(4)?;
+            e.u64(data_key::TOPIC)?.str("px.eur")?;
             Ok(())
         });
-        assert_eq!(
-            DataHeader::decode(&bytes).unwrap_err(),
-            HeaderError::MissingKey(data_key::ROLE)
-        );
+        let h = DataHeader::decode(&only_topic).unwrap();
+        assert_eq!(h.topic.as_deref(), Some("px.eur"));
+        assert_eq!(h.endpoint, None);
     }
 
     #[test]
-    fn default_values_are_omitted_by_the_encoder() {
-        let h = DataHeader::request("/t", tid(1), AckMode::None);
-        let bytes = h.encode();
-        // Only endpoint, transfer_id and role are written.
-        assert_eq!(
-            bytes,
-            vec![0xA3, 0x00, 0x62, 0x2F, 0x74, 0x01, 0x01, 0x02, 0x01]
-        );
-        assert_eq!(DataHeader::decode(&bytes).unwrap(), h);
-    }
-
-    #[test]
-    fn an_explicit_default_value_is_still_accepted() {
-        let bytes = encode_with(|e| {
-            e.map(4)?;
-            e.u64(0)?.str("/t")?;
-            e.u64(1)?.u64(1)?;
-            e.u64(2)?.u64(1)?;
-            e.u64(4)?.u64(0)?;
-            Ok(())
-        });
-        assert_eq!(
-            DataHeader::decode(&bytes).unwrap(),
-            DataHeader::request("/t", tid(1), AckMode::None)
-        );
+    fn absent_fields_are_omitted_by_the_encoder() {
+        let h = DataHeader::addressed("/t");
+        assert_eq!(h.encode(), vec![0xA1, 0x00, 0x62, 0x2F, 0x74]);
     }
 
     // --- forward compatibility -------------------------------------------
@@ -1184,13 +882,10 @@ mod tests {
     fn unknown_keys_are_skipped() {
         // Re-encode the golden DATA header with an extra key 63 holding a
         // nested structure, and check it still decodes to the same value.
-        let h = DataHeader::request("/t", tid(1), AckMode::Accepted);
+        let h = DataHeader::addressed("/t");
         let extended = encode_with(|e| {
-            e.map(5)?;
+            e.map(2)?;
             e.u64(0)?.str("/t")?;
-            e.u64(1)?.u64(1)?;
-            e.u64(2)?.u64(1)?;
-            e.u64(4)?.u64(1)?;
             e.u64(63)?.array(2)?.u64(7)?.map(1)?.u64(1)?.bool(true)?;
             Ok(())
         });
@@ -1200,27 +895,21 @@ mod tests {
     #[test]
     fn unknown_keys_above_the_reserved_range_are_skipped() {
         let extended = encode_with(|e| {
-            e.map(5)?;
+            e.map(2)?;
             e.u64(1)?.u64(5)?;
-            e.u64(2)?.u64(2)?;
-            e.u64(3)?.u64(9)?;
-            e.u64(4)?.u64(0)?;
             e.u64(1000)?.str("future")?;
             Ok(())
         });
         let h = DataHeader::decode(&extended).unwrap();
-        assert_eq!(h.transfer_id, tid(5));
-        assert_eq!(h.correlation_id, Some(tid(9)));
+        assert_eq!(h.content_len, Some(5));
     }
 
     #[test]
     fn skipping_tolerates_nesting_up_to_the_depth_limit() {
         for depth in [1usize, limits::MAX_SKIP_DEPTH] {
             let bytes = encode_with(|e| {
-                e.map(4)?;
-                e.u64(1)?.u64(1)?;
-                e.u64(2)?.u64(1)?;
-                e.u64(4)?.u64(0)?;
+                e.map(2)?;
+                e.u64(data_key::CONTENT_LEN)?.u64(1)?;
                 e.u64(50)?;
                 for _ in 0..depth {
                     e.array(1)?;
@@ -1228,15 +917,8 @@ mod tests {
                 e.u64(1)?;
                 Ok(())
             });
-            // role=request without an endpoint is rejected, so use role=reply
-            // free headers: this header has role=1 and no endpoint, hence the
-            // expected MissingKey. Depth handling is what matters here.
-            let err = DataHeader::decode(&bytes).unwrap_err();
-            assert_eq!(
-                err,
-                HeaderError::MissingKey(data_key::ENDPOINT),
-                "depth {depth}"
-            );
+            let h = DataHeader::decode(&bytes).unwrap_or_else(|e| panic!("depth {depth}: {e}"));
+            assert_eq!(h.content_len, Some(1), "depth {depth}");
         }
     }
 
@@ -1260,18 +942,15 @@ mod tests {
     #[test]
     fn skipping_a_wide_shallow_structure_is_fine() {
         let bytes = encode_with(|e| {
-            e.map(5)?;
-            e.u64(1)?.u64(1)?;
-            e.u64(2)?.u64(2)?;
-            e.u64(3)?.u64(1)?;
-            e.u64(4)?.u64(1)?;
+            e.map(2)?;
+            e.u64(data_key::CONTENT_LEN)?.u64(1)?;
             e.u64(40)?.array(64)?;
             for i in 0..64u64 {
                 e.u64(i)?;
             }
             Ok(())
         });
-        assert_eq!(DataHeader::decode(&bytes).unwrap().transfer_id, tid(1));
+        assert_eq!(DataHeader::decode(&bytes).unwrap().content_len, Some(1));
     }
 
     // --- strictness -------------------------------------------------------
@@ -1279,11 +958,9 @@ mod tests {
     #[test]
     fn duplicate_keys_are_rejected() {
         let bytes = encode_with(|e| {
-            e.map(4)?;
+            e.map(2)?;
             e.u64(1)?.u64(1)?;
             e.u64(1)?.u64(2)?;
-            e.u64(2)?.u64(1)?;
-            e.u64(4)?.u64(0)?;
             Ok(())
         });
         assert_eq!(
@@ -1296,7 +973,7 @@ mod tests {
     fn non_uint_keys_are_rejected() {
         let bytes = encode_with(|e| {
             e.map(1)?;
-            e.str("transfer_id")?.u64(1)?;
+            e.str("endpoint")?.str("/t")?;
             Ok(())
         });
         assert_eq!(
@@ -1346,10 +1023,8 @@ mod tests {
     #[test]
     fn value_type_mismatches_are_rejected() {
         let bytes = encode_with(|e| {
-            e.map(3)?;
-            e.u64(1)?.str("not a number")?;
-            e.u64(2)?.u64(1)?;
-            e.u64(4)?.u64(0)?;
+            e.map(1)?;
+            e.u64(data_key::CONTENT_LEN)?.str("not a number")?;
             Ok(())
         });
         assert!(matches!(
@@ -1360,56 +1035,15 @@ mod tests {
 
     #[test]
     fn missing_required_keys_are_rejected() {
-        // No transfer_id.
+        // ERROR without a code.
         let bytes = encode_with(|e| {
-            e.map(2)?;
-            e.u64(2)?.u64(1)?;
-            e.u64(4)?.u64(0)?;
+            e.map(1)?;
+            e.u64(error_key::MESSAGE)?.str("why")?;
             Ok(())
         });
         assert_eq!(
-            DataHeader::decode(&bytes).unwrap_err(),
-            HeaderError::MissingKey(data_key::TRANSFER_ID)
-        );
-
-        // Request without an endpoint.
-        let bytes = encode_with(|e| {
-            e.map(3)?;
-            e.u64(1)?.u64(1)?;
-            e.u64(2)?.u64(1)?;
-            e.u64(4)?.u64(0)?;
-            Ok(())
-        });
-        assert_eq!(
-            DataHeader::decode(&bytes).unwrap_err(),
-            HeaderError::MissingKey(data_key::ENDPOINT)
-        );
-
-        // Oneshot without an endpoint: dispatch needs the path, so the same
-        // requirement applies as for a request.
-        let bytes = encode_with(|e| {
-            e.map(3)?;
-            e.u64(1)?.u64(1)?;
-            e.u64(2)?.u64(0)?;
-            e.u64(4)?.u64(0)?;
-            Ok(())
-        });
-        assert_eq!(
-            DataHeader::decode(&bytes).unwrap_err(),
-            HeaderError::MissingKey(data_key::ENDPOINT)
-        );
-
-        // Reply without a correlation id.
-        let bytes = encode_with(|e| {
-            e.map(3)?;
-            e.u64(1)?.u64(1)?;
-            e.u64(2)?.u64(2)?;
-            e.u64(4)?.u64(0)?;
-            Ok(())
-        });
-        assert_eq!(
-            DataHeader::decode(&bytes).unwrap_err(),
-            HeaderError::MissingKey(data_key::CORRELATION_ID)
+            ErrorHeader::decode(&bytes).unwrap_err(),
+            HeaderError::MissingKey(error_key::CODE)
         );
 
         // HELLO missing capabilities.
@@ -1518,46 +1152,10 @@ mod tests {
     }
 
     #[test]
-    fn zero_transfer_ids_are_rejected() {
-        for key in [data_key::TRANSFER_ID, data_key::CORRELATION_ID] {
-            let bytes = encode_with(|e| {
-                e.map(3)?;
-                e.u64(key)?.u64(0)?;
-                e.u64(2)?.u64(2)?;
-                e.u64(4)?.u64(0)?;
-                Ok(())
-            });
-            assert_eq!(
-                DataHeader::decode(&bytes).unwrap_err(),
-                HeaderError::ZeroTransferId(key)
-            );
-        }
-        let ack = encode_with(|e| {
-            e.map(2)?;
-            e.u64(0)?.u64(0)?;
-            e.u64(1)?.u64(1)?;
-            Ok(())
-        });
-        assert_eq!(
-            AckHeader::decode(&ack).unwrap_err(),
-            HeaderError::ZeroTransferId(0)
-        );
-        let cancel = encode_with(|e| {
-            e.map(1)?;
-            e.u64(0)?.u64(0)?;
-            Ok(())
-        });
-        assert_eq!(
-            CancelHeader::decode(&cancel).unwrap_err(),
-            HeaderError::ZeroTransferId(0)
-        );
-    }
-
-    #[test]
     fn oversized_strings_are_rejected_per_field() {
         // Built through the encoder, which emits keys in ascending order.
         let with_text = |key: u64, text: String| -> Vec<u8> {
-            let mut h = DataHeader::reply(tid(1), tid(2), AckMode::None);
+            let mut h = DataHeader::reply();
             match key {
                 data_key::ENDPOINT => h.endpoint = Some(text),
                 data_key::CONTENT_TYPE => h.content_type = Some(text),
@@ -1598,9 +1196,9 @@ mod tests {
         // duplicate detection complete for extension keys.
         let bytes = encode_with(|e| {
             e.map(3)?;
-            e.u64(2)?.u64(2)?;
+            e.u64(2)?.str("t")?;
             e.u64(1)?.u64(1)?;
-            e.u64(3)?.u64(1)?;
+            e.u64(3)?.str("p")?;
             Ok(())
         });
         assert_eq!(
@@ -1612,10 +1210,8 @@ mod tests {
     #[test]
     fn duplicate_extension_keys_are_rejected() {
         let bytes = encode_with(|e| {
-            e.map(5)?;
+            e.map(3)?;
             e.u64(1)?.u64(1)?;
-            e.u64(2)?.u64(2)?;
-            e.u64(3)?.u64(1)?;
             e.u64(1000)?.u64(1)?;
             e.u64(1000)?.u64(2)?;
             Ok(())
@@ -1630,10 +1226,9 @@ mod tests {
     fn oversized_error_messages_are_rejected() {
         let big = "m".repeat(limits::MAX_MESSAGE_BYTES + 1);
         let bytes = encode_with(|e| {
-            e.map(3)?;
-            e.u64(0)?.u64(1)?;
-            e.u64(1)?.u64(2)?;
-            e.u64(2)?.str(&big)?;
+            e.map(2)?;
+            e.u64(error_key::CODE)?.u64(2)?;
+            e.u64(error_key::MESSAGE)?.str(&big)?;
             Ok(())
         });
         assert_eq!(
@@ -1686,17 +1281,17 @@ mod tests {
 
     #[test]
     fn trailing_bytes_are_rejected() {
-        let mut bytes = CancelHeader { id: tid(1) }.encode();
+        let mut bytes = ErrorHeader::new(ErrorCode::Rejected).encode();
         bytes.push(0xff);
         assert_eq!(
-            CancelHeader::decode(&bytes).unwrap_err(),
+            ErrorHeader::decode(&bytes).unwrap_err(),
             HeaderError::TrailingBytes
         );
     }
 
     #[test]
     fn truncated_headers_are_rejected() {
-        let full = DataHeader::request("/t", tid(1), AckMode::Accepted).encode();
+        let full = DataHeader::addressed("/t").encode();
         for cut in 0..full.len() {
             assert!(
                 DataHeader::decode(&full[..cut]).is_err(),
@@ -1709,9 +1304,8 @@ mod tests {
     fn empty_input_is_rejected_for_every_header() {
         assert!(Hello::decode(&[]).is_err());
         assert!(DataHeader::decode(&[]).is_err());
-        assert!(AckHeader::decode(&[]).is_err());
         assert!(ErrorHeader::decode(&[]).is_err());
-        assert!(CancelHeader::decode(&[]).is_err());
+        assert!(SubscriptionHeader::decode(&[]).is_err());
     }
 
     #[test]
@@ -1732,36 +1326,8 @@ mod tests {
     // --- reserved value passthrough ---------------------------------------
 
     #[test]
-    fn reserved_roles_and_ack_modes_survive_decoding() {
-        // Role 0 is `oneshot` since Phase 3; 3.. remain reserved.
-        for role in [3u64, 99, u64::MAX] {
-            for ack in [2u64, 3, 4, 77] {
-                let bytes = encode_with(|e| {
-                    e.map(3)?;
-                    e.u64(1)?.u64(1)?;
-                    e.u64(2)?.u64(role)?;
-                    e.u64(4)?.u64(ack)?;
-                    Ok(())
-                });
-                let h = DataHeader::decode(&bytes).unwrap();
-                assert_eq!(h.role, role);
-                assert_eq!(h.ack_mode, ack);
-                assert_eq!(h.role(), None, "role {role} must not be interpreted");
-                assert_eq!(h.ack_mode(), None, "ack mode {ack} must not be interpreted");
-            }
-        }
-    }
-
-    #[test]
-    fn unknown_ack_states_and_error_codes_survive_decoding() {
-        let ack = AckHeader {
-            re: tid(1),
-            state: 42,
-        };
-        assert_eq!(AckHeader::decode(&ack.encode()).unwrap().state, 42);
-
+    fn unknown_error_codes_survive_decoding() {
         let err = ErrorHeader {
-            re: tid(1),
             code: 99,
             message: None,
         };

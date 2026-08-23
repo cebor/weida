@@ -11,17 +11,12 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use weida_core::TransferId;
 use weida_protocol::DataHeader;
 use weida_protocol::header::limits;
 
 #[derive(Arbitrary, Debug)]
 struct ArbHeader {
     endpoint: Option<String>,
-    transfer_id: u64,
-    role: u64,
-    correlation_id: Option<u64>,
-    ack_mode: u64,
     content_len: Option<u64>,
     content_type: Option<String>,
     traceparent: Option<String>,
@@ -44,29 +39,10 @@ fn cap(text: Option<String>, max: usize) -> Option<String> {
 }
 
 fuzz_target!(|input: ArbHeader| {
-    let role = input.role;
-    let endpoint = cap(input.endpoint, limits::MAX_ENDPOINT_BYTES);
-    let correlation_id = input.correlation_id.and_then(TransferId::new);
-
-    // The conditional requirements are part of the wire contract, so only
-    // headers that satisfy them are representable.
-    let endpoint = if role == 0 || role == 1 {
-        Some(endpoint.unwrap_or_else(|| "/".to_owned()))
-    } else {
-        endpoint
-    };
-    let correlation_id = if role == 2 {
-        Some(correlation_id.unwrap_or(TransferId::FIRST))
-    } else {
-        correlation_id
-    };
-
+    // Every DATA field is optional on the wire, so every combination below is
+    // representable: there are no conditional requirements left to satisfy.
     let header = DataHeader {
-        endpoint,
-        transfer_id: TransferId::new(input.transfer_id).unwrap_or(TransferId::FIRST),
-        role,
-        correlation_id,
-        ack_mode: input.ack_mode,
+        endpoint: cap(input.endpoint, limits::MAX_ENDPOINT_BYTES),
         content_len: input.content_len,
         content_type: cap(input.content_type, limits::MAX_CONTENT_TYPE_BYTES),
         traceparent: cap(input.traceparent, limits::MAX_TRACEPARENT_BYTES),

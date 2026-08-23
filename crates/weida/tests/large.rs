@@ -44,31 +44,24 @@ async fn large_stream_bounded_memory() {
 
     let handler = tokio::spawn(async move {
         let mut request = replier.accept().await.expect("accept");
-        let mut reply = None;
+        // Detach the request half so both directions of the one bidirectional
+        // stream stay live at once.
+        let mut body = request.take_body();
+        let mut out = request
+            .reply(TransferMeta::default())
+            .await
+            .expect("open reply");
         let mut chunk = vec![0u8; CHUNK];
         let mut echoed = 0u64;
         loop {
-            let n = request.body().read(&mut chunk).await.expect("read body");
+            let n = body.read(&mut chunk).await.expect("read body");
             if n == 0 {
                 break;
             }
-            let out = match &mut reply {
-                Some(out) => out,
-                None => reply.insert(
-                    request
-                        .reply(TransferMeta::default())
-                        .await
-                        .expect("open reply"),
-                ),
-            };
             out.write_all(&chunk[..n]).await.expect("write reply");
             echoed += n as u64;
         }
-        reply
-            .expect("a non-empty request opens a reply")
-            .finish()
-            .await
-            .expect("finish reply");
+        out.finish().expect("finish reply");
         echoed
     });
 
@@ -79,14 +72,14 @@ async fn large_stream_bounded_memory() {
         .await
         .expect("connect");
 
-    let (mut transfer, pending) = requester
+    let (mut transfer, reply) = requester
         .open(TransferMeta::default().with_content_len(TOTAL))
         .await
         .expect("open");
 
     // Fold the echo away as it arrives; buffering it would defeat the point.
     let reader = tokio::spawn(async move {
-        let mut reply = pending.recv().await.expect("recv reply");
+        let mut reply = reply.recv().await.expect("recv reply");
         let mut digest = Fnv::default();
         let mut chunk = vec![0u8; CHUNK];
         let mut received = 0u64;
@@ -113,7 +106,7 @@ async fn large_stream_bounded_memory() {
         transfer.write_all(&chunk[..n]).await.expect("write");
         sent += n as u64;
     }
-    transfer.finish().await.expect("finish");
+    transfer.finish().expect("finish");
 
     let (received, received_digest) = reader.await.expect("reader task");
     let echoed = handler.await.expect("handler");

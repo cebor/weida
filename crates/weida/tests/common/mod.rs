@@ -278,7 +278,8 @@ pub mod raw {
         }
     }
 
-    /// Accepts streams until a DATA frame arrives, returning its header.
+    /// Accepts unidirectional streams until a DATA frame arrives, returning
+    /// its header.
     pub async fn accept_data(
         conn: &quinn::Connection,
     ) -> (quinn::RecvStream, weida_protocol::DataHeader) {
@@ -287,6 +288,41 @@ pub mod raw {
             stream,
             weida_protocol::DataHeader::decode(&header).expect("decode DATA header"),
         )
+    }
+
+    /// Accepts one bidirectional stream and reads its DATA header.
+    ///
+    /// The initiating half of an exchange always starts with DATA, so anything
+    /// else here is the library misbehaving.
+    pub async fn accept_exchange(
+        conn: &quinn::Connection,
+    ) -> (
+        quinn::SendStream,
+        quinn::RecvStream,
+        weida_protocol::DataHeader,
+    ) {
+        let (send, mut recv) = conn.accept_bi().await.expect("accept bi");
+        let (preamble, header) = read_frame(&mut recv).await;
+        assert_eq!(preamble.kind, FrameKind::Data, "exchanges open with DATA");
+        (
+            send,
+            recv,
+            weida_protocol::DataHeader::decode(&header).expect("decode DATA header"),
+        )
+    }
+
+    /// Opens a bidirectional stream and writes one DATA header on it.
+    pub async fn open_exchange(
+        conn: &quinn::Connection,
+        header: &weida_protocol::DataHeader,
+    ) -> (quinn::SendStream, quinn::RecvStream) {
+        let (mut send, recv) = conn.open_bi().await.expect("open bi");
+        let encoded = header.encode();
+        let mut bytes = Vec::new();
+        weida_protocol::encode_preamble(FrameKind::Data, encoded.len() as u64, &mut bytes);
+        bytes.extend_from_slice(&encoded);
+        send.write_all(&bytes).await.expect("write DATA header");
+        (send, recv)
     }
 
     /// Waits for the peer to close the connection and returns the application

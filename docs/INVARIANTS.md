@@ -28,25 +28,28 @@ Reproduced verbatim from master doc §77.
 ## v0 mechanical checks
 
 The invariants above span the whole project. The table below records, for the invariants
-that this increment (Phases 0-2 plus the Phase 3 pattern increment, see
-[IMPLEMENTATION.md](IMPLEMENTATION.md)) can already
-enforce, where the enforcement lives. Invariants not listed here are not yet mechanically
-checkable because the subsystem they constrain does not exist.
+that this increment (Phases 0-2, the Phase 3 pattern increment and the Phase 3 layered
+re-architecture, see [IMPLEMENTATION.md](IMPLEMENTATION.md)) can already enforce, where the
+enforcement lives. Invariants not listed here are not yet mechanically checkable because
+the subsystem they constrain does not exist.
 
 | Invariant | Enforced by |
 | --- | --- |
-| Endpoint paths are opaque identifiers | `EndpointAddr` in `weida-core` validates bytes and length only; the endpoint namespace in `weida` is a flat map keyed by the exact path string — no splitting, no prefix match, no wildcards. Pub/Sub **topics** are a separate namespace from endpoint paths and are matched by byte prefix; that prefix match is on topics only and never on paths ([PROTOCOL.md](PROTOCOL.md) §6.6) |
+| Endpoint paths are opaque identifiers | `EndpointAddr` in `weida-core` validates bytes and length only; the endpoint namespace in `weida` is a flat map keyed by the exact path string — no splitting, no prefix match, no wildcards. Pub/Sub **topics** are a separate namespace from endpoint paths and are matched by byte prefix; that prefix match is on topics only and never on paths ([PROTOCOL.md](PROTOCOL.md) §6.4) |
 | All user payloads may remain streams end-to-end | DATA payload is opaque bytes until FIN, with no internal framing ([PROTOCOL.md](PROTOCOL.md) §4) |
 | Core transport does not require payload materialization | `OutgoingTransfer` implements `AsyncWrite` and `IncomingTransfer` implements `AsyncRead`; `collect(max_bytes)` is an opt-in convenience with an explicit cap, never an internal step |
-| One data flow maps naturally to one transport stream | one QUIC uni stream per transfer: request, reply, ACK, ERROR, CANCEL and HELLO each get their own stream |
-| Replies and ACKs are distinct concepts | separate frame kinds `1` (DATA) and `2` (ACK) on separate streams; an ACK never substitutes for a reply and vice versa ([PROTOCOL.md](PROTOCOL.md) §9.2) |
-| Transfer-related control messages do not require a permanent control stream | ACK, ERROR and CANCEL are short header-only uni streams; there is no multiplexed control stream anywhere in the implementation |
-| All guarantees are defined against the immediate next hop | `ACK(accepted)` is defined strictly as "the peer read the payload to FIN and handed it to the application" ([GUARANTEES.md](GUARANTEES.md)) |
-| Disabled guarantees should not participate in the hot path | `ack_mode = none` registers no pending-ACK entry and emits no control stream; the payload path is `write` to the quinn `SendStream` with no task hop and no lock |
-| No remote input can cause unbounded memory allocation | `header_len` is compared against `max_header_bytes` **before** allocating ([PROTOCOL.md](PROTOCOL.md) §3.1); CBOR skip is iterative with `max_depth = 8`; QUIC `stream_receive_window`, `connection_receive_window` and `max_concurrent_uni_streams` bound buffered payload and concurrent stream state; `max_connections` bounds accepted connections; a peer's subscriptions are bounded by `max_subscriptions` filters per connection, each capped at 256 B, and dropped wholesale when the connection closes; payload queued for one subscriber is bounded by `subscriber_buffer_bytes`; worst-case hostile per-connection header memory is 32 MiB ([PROTOCOL.md](PROTOCOL.md) §10) |
+| One data flow maps naturally to one transport stream | one QUIC stream per data flow, and QUIC's two stream kinds are the only primitives: a one-way transfer is one unidirectional stream; a Req/Rep exchange is one bidirectional stream whose initiating half carries the request and whose reply half carries the reply or an ERROR; HELLO, SUBSCRIBE and UNSUBSCRIBE each get their own short stream ([PROTOCOL.md](PROTOCOL.md) §4) |
+| Replies and ACKs are distinct concepts | held by construction: the v0 core has no application acknowledgement to confuse a reply with. The only delivery signal is `Delivery`, a sender-side transport receipt backed by QUIC's fin-acknowledgement, which is never a frame on the wire and never arrives where a reply would. Accepted / Stored / Replicated / Processed are reserved for the L2 broker ([GUARANTEES.md](GUARANTEES.md) §6) |
+| Transfer-related control messages do not require a permanent control stream | ERROR rides the reply half of the exchange it concerns and nothing else; SUBSCRIBE and UNSUBSCRIBE are short header-only unidirectional streams; cancellation is `RESET_STREAM`/`STOP_SENDING`, transport signalling rather than a message. There is no multiplexed control stream anywhere in the implementation |
+| All guarantees are defined against the immediate next hop | `Delivery::delivered()` is defined strictly as "the next hop's **transport** acknowledged every byte and the FIN", explicitly not "the application read it" — quinn's `stopped()` says "although not necessarily the processing of it" ([GUARANTEES.md](GUARANTEES.md), [FAILURE_MODEL.md](FAILURE_MODEL.md) §4) |
+| Disabled guarantees should not participate in the hot path | `finish()` is synchronous and dropping the returned `Delivery` is free, so a fire-and-forget sender registers nothing, allocates no waiter and awaits nothing; the payload path is `write` to the quinn `SendStream` with no task hop and no lock |
+| No remote input can cause unbounded memory allocation | `header_len` is compared against `max_header_bytes` **before** allocating ([PROTOCOL.md](PROTOCOL.md) §3.1); CBOR skip is iterative with `max_depth = 8`; QUIC `stream_receive_window`, `connection_receive_window`, `max_concurrent_uni_streams` and `max_concurrent_bidi_streams` bound buffered payload and concurrent stream state; `max_connections` bounds accepted connections; a peer's subscriptions are bounded by `max_subscriptions` filters per connection, each capped at 256 B, and dropped wholesale when the connection closes; payload queued for one subscriber is bounded by `subscriber_buffer_bytes`; worst-case hostile per-connection header memory is `max_header_bytes * (max_concurrent_uni_streams + max_concurrent_bidi_streams)` = **48 MiB** ([PROTOCOL.md](PROTOCOL.md) §10) |
 
 Invariants deferred with their subsystems: brokerless/brokered API parity, broker cluster
 as one logical broker, Raft scope, stream-oriented payload replication, and adapter
-guarantee honesty. None of the v0 code may be shaped in a way that forecloses them; in
-particular the wire protocol keeps ACK semantics hop-local and extensible precisely so that
-`stored` and `replicated` can be added without changing the DATA frame layout.
+guarantee honesty. None of the v0 code may be shaped in a way that forecloses them. The
+acknowledgement vocabulary they need — Accepted, Stored, Replicated, Processed — is
+reserved for the L2 broker rather than approximated on the v0 wire, precisely so that a
+broker hop can define it against real responsibility transfer instead of inheriting a
+brokerless ACK that only ever meant "arrived in RAM"
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §1, [GUARANTEES.md](GUARANTEES.md)).

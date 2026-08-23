@@ -10,10 +10,9 @@ mod common;
 use std::time::Duration;
 
 use common::{Certs, Server, raw};
-use weida::TransferId;
-use weida::{AckMode, Error, Runtime, RuntimeConfig, TransferMeta, codes};
+use weida::{Error, Runtime, RuntimeConfig, TransferMeta, codes};
 use weida_protocol::{
-    AckHeader, DataHeader, FrameKind, Hello, MAGIC, SubscriptionHeader, encode_preamble,
+    DataHeader, ErrorHeader, FrameKind, Hello, MAGIC, SubscriptionHeader, encode_preamble,
 };
 
 /// Generous ceiling: every assertion below should settle in milliseconds.
@@ -53,9 +52,9 @@ async fn garbage_first_bytes_close_the_connection() {
     let handler = tokio::spawn(async move {
         let mut request = replier.accept().await.expect("accept");
         let body = request.body().read_capped(64).await.expect("body");
-        let reply = request.reply(TransferMeta::default()).await.expect("reply");
         assert_eq!(body, b"ping");
-        reply.finish().await.expect("finish");
+        let reply = request.reply(TransferMeta::default()).await.expect("reply");
+        reply.finish().expect("finish");
     });
 
     let client = server.client_runtime();
@@ -77,8 +76,26 @@ async fn an_unknown_frame_kind_closes_the_connection() {
         .await
         .expect("handshake");
 
-    // Correct magic, undefined kind 9.
+    // Correct magic, undefined kind 9. Kinds 5..=255 are reserved and are a
+    // violation, not a forward-compatibility hook.
     raw::send_raw(&conn, &[MAGIC, 9, 0x00]).await;
+    assert_eq!(
+        within(raw::closed_code(&conn)).await,
+        codes::PROTOCOL_VIOLATION
+    );
+}
+
+#[tokio::test]
+async fn the_first_retired_frame_kind_is_now_unknown() {
+    // Kind 5 was SUBSCRIBE before the renumbering. A peer speaking the old
+    // layout must fail loudly rather than have its frames reinterpreted.
+    let server = Server::start().await;
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+
+    raw::send_raw(&conn, &[MAGIC, 5, 0x00]).await;
     assert_eq!(
         within(raw::closed_code(&conn)).await,
         codes::PROTOCOL_VIOLATION
@@ -173,16 +190,20 @@ async fn a_malformed_cbor_header_closes_the_connection() {
 }
 
 #[tokio::test]
-async fn a_zero_transfer_id_closes_the_connection() {
+async fn uni_data_without_an_endpoint_is_a_violation() {
+    // The decoder accepts an empty DATA map — a reply half legitimately sends
+    // one — so the endpoint requirement is enforced where the stream context
+    // is known: dispatch.
     let server = Server::start().await;
+    let _puller = server.listener.puller("/jobs").expect("puller");
+
     let endpoint = raw::client_endpoint(&server.certs);
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
     raw::send_hello(&conn).await;
 
-    // Hand-encode `{0: "/t", 1: 0, 2: 1}`: transfer id 0 is reserved.
-    let header = [0xA3, 0x00, 0x62, 0x2F, 0x74, 0x01, 0x00, 0x02, 0x01];
+    let header = DataHeader::reply().encode();
     let mut bytes = Vec::new();
     encode_preamble(FrameKind::Data, header.len() as u64, &mut bytes);
     bytes.extend_from_slice(&header);
@@ -195,7 +216,7 @@ async fn a_zero_transfer_id_closes_the_connection() {
 }
 
 #[tokio::test]
-async fn a_reserved_ack_mode_is_refused_with_unsupported() {
+async fn bidi_data_without_an_endpoint_is_a_violation() {
     let server = Server::start().await;
     let _replier = server.listener.replier("/t").expect("replier");
 
@@ -205,48 +226,116 @@ async fn a_reserved_ack_mode_is_refused_with_unsupported() {
         .expect("handshake");
     raw::send_hello(&conn).await;
 
-    // ack_mode = 2 (`stored`) is reserved in v0. The server must answer
-    // UNSUPPORTED and refuse the payload, never silently downgrade it.
-    let mut header = DataHeader::request("/t", TransferId::FIRST, AckMode::None);
-    header.ack_mode = 2;
-    let encoded = header.encode();
-    let mut stream = conn.open_uni().await.expect("open uni");
+    let (mut send, _recv) = conn.open_bi().await.expect("open bi");
+    let header = DataHeader::reply().encode();
     let mut bytes = Vec::new();
-    encode_preamble(FrameKind::Data, encoded.len() as u64, &mut bytes);
-    bytes.extend_from_slice(&encoded);
-    stream.write_all(&bytes).await.expect("write header");
+    encode_preamble(FrameKind::Data, header.len() as u64, &mut bytes);
+    bytes.extend_from_slice(&header);
+    send.write_all(&bytes).await.expect("write header");
 
-    // The ERROR frame arrives on its own stream, which is not necessarily the
-    // next one: the server's HELLO is in flight too.
-    let (_error_stream, error_header) = within(raw::accept_frame(&conn, FrameKind::Error)).await;
-    let error = weida_protocol::ErrorHeader::decode(&error_header).expect("decode ERROR");
-    assert_eq!(error.re.get(), 1);
+    assert_eq!(
+        within(raw::closed_code(&conn)).await,
+        codes::PROTOCOL_VIOLATION
+    );
+}
+
+#[tokio::test]
+async fn error_frame_on_a_uni_stream_is_a_violation() {
+    // ERROR answers a request, and a request always arrives on a bidirectional
+    // stream. On a unidirectional one it refers to nothing.
+    let server = Server::start().await;
+    let _replier = server.listener.replier("/t").expect("replier");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    let header = ErrorHeader::new(weida::ErrorCode::Internal).encode();
+    raw::send_frame(&conn, FrameKind::Error, &header).await;
+
+    assert_eq!(
+        within(raw::closed_code(&conn)).await,
+        codes::PROTOCOL_VIOLATION
+    );
+}
+
+#[tokio::test]
+async fn a_non_data_frame_may_not_open_a_bidirectional_stream() {
+    let server = Server::start().await;
+    let _replier = server.listener.replier("/t").expect("replier");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    let (mut send, _recv) = conn.open_bi().await.expect("open bi");
+    send.write_all(&weida_protocol::encode_frame(
+        FrameKind::Subscribe,
+        &SubscriptionHeader::new("/t", "").encode(),
+    ))
+    .await
+    .expect("write frame");
+
+    assert_eq!(
+        within(raw::closed_code(&conn)).await,
+        codes::PROTOCOL_VIOLATION
+    );
+}
+
+#[tokio::test]
+async fn bidi_request_to_a_pull_path_is_refused_with_unsupported() {
+    let server = Server::start().await;
+    let _puller = server.listener.puller("/jobs").expect("puller");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    // A well-formed exchange aimed at a path that serves one-way transfers.
+    let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
+    let header = DataHeader::addressed("/jobs").encode();
+    let mut bytes = Vec::new();
+    encode_preamble(FrameKind::Data, header.len() as u64, &mut bytes);
+    bytes.extend_from_slice(&header);
+    send.write_all(&bytes).await.expect("write header");
+
+    // The refusal is a real ERROR frame on this exchange's own reply half —
+    // not a stream of its own, and with nothing to correlate.
+    let (preamble, error_header) = within(raw::read_frame(&mut recv)).await;
+    assert_eq!(preamble.kind, FrameKind::Error);
+    let error = ErrorHeader::decode(&error_header).expect("decode ERROR");
     assert_eq!(error.code, weida::ErrorCode::Unsupported.to_wire());
 
-    // And the payload is refused with STOP_SENDING(REJECTED).
+    // And the request half is stopped, so a large payload is not accepted.
     let stopped = within(async {
         let payload = vec![0u8; 1024 * 1024];
         loop {
-            if let Err(e) = stream.write_all(&payload).await {
+            if let Err(e) = send.write_all(&payload).await {
                 return e;
             }
         }
     })
     .await;
     match stopped {
-        quinn::WriteError::Stopped(code) => assert_eq!(code.into_inner(), codes::REJECTED),
-        other => panic!("expected STOP_SENDING(REJECTED), got {other}"),
+        quinn::WriteError::Stopped(code) => assert_eq!(code.into_inner(), codes::UNSUPPORTED),
+        other => panic!("expected STOP_SENDING(UNSUPPORTED), got {other}"),
     }
 
-    // The connection itself stays healthy: a refused transfer is not a
+    // The connection itself stays healthy: a refused exchange is not a
     // protocol violation.
     assert!(conn.close_reason().is_none());
 }
 
 #[tokio::test]
-async fn an_ack_for_an_unknown_transfer_is_ignored() {
+async fn bidi_request_to_an_unknown_path_is_refused_with_unknown_endpoint() {
     let server = Server::start().await;
-    let _replier = server.listener.replier("/t").expect("replier");
+    let _replier = server.listener.replier("/known").expect("replier");
 
     let endpoint = raw::client_endpoint(&server.certs);
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
@@ -254,17 +343,17 @@ async fn an_ack_for_an_unknown_transfer_is_ignored() {
         .expect("handshake");
     raw::send_hello(&conn).await;
 
-    // Nothing is outstanding: this races legitimately with cancellation, so it
-    // must be ignored rather than treated as an error.
-    raw::send_frame(
-        &conn,
-        FrameKind::Ack,
-        &AckHeader::accepted(TransferId::new(4242).expect("non-zero")).encode(),
-    )
-    .await;
+    let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
+    let header = DataHeader::addressed("/nowhere").encode();
+    let mut bytes = Vec::new();
+    encode_preamble(FrameKind::Data, header.len() as u64, &mut bytes);
+    bytes.extend_from_slice(&header);
+    send.write_all(&bytes).await.expect("write header");
 
-    // Give the peer a chance to misbehave, then confirm it did not.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (preamble, error_header) = within(raw::read_frame(&mut recv)).await;
+    assert_eq!(preamble.kind, FrameKind::Error);
+    let error = ErrorHeader::decode(&error_header).expect("decode ERROR");
+    assert_eq!(error.code, weida::ErrorCode::UnknownEndpoint.to_wire());
     assert!(conn.close_reason().is_none());
 }
 
@@ -296,11 +385,11 @@ async fn a_server_that_never_answers_yields_indeterminate() {
     let certs = Certs::generate();
     let addr = raw_server(&certs, |conn| async move {
         raw::send_hello(&conn).await;
-        // Read the request to FIN, then vanish without an ACK or a reply.
-        let (mut stream, header) = raw::accept_data(&conn).await;
+        // Read the request to FIN, then vanish without a reply.
+        let (_send, mut recv, header) = raw::accept_exchange(&conn).await;
         assert_eq!(header.endpoint.as_deref(), Some("/t"));
         let mut sink = vec![0u8; 64 * 1024];
-        while let Ok(Some(n)) = stream.read(&mut sink).await {
+        while let Ok(Some(n)) = recv.read(&mut sink).await {
             if n == 0 {
                 break;
             }
@@ -314,22 +403,25 @@ async fn a_server_that_never_answers_yields_indeterminate() {
         .await
         .expect("connect");
 
-    let (mut transfer, pending) =
-        within(requester.open(TransferMeta::default().with_ack(AckMode::Accepted)))
-            .await
-            .expect("open");
-    within(transfer.write_all(b"payload")).await.expect("write");
-
-    // The payload reached the peer, the answer did not: the outcome is
-    // genuinely unknown (master doc §22).
-    let err = within(transfer.finish())
+    let (mut transfer, reply) = within(requester.open(TransferMeta::default()))
         .await
-        .expect_err("must not succeed");
-    assert!(
-        matches!(err, Error::Indeterminate),
-        "expected Indeterminate, got {err:?}"
-    );
-    let err = within(pending.recv()).await.expect_err("must not succeed");
+        .expect("open");
+    within(transfer.write_all(b"payload")).await.expect("write");
+    let delivery = transfer.finish().expect("finish");
+
+    // The receipt reports the transport truth and nothing else. The peer's
+    // stack really did take every byte before it closed, so `Ok` here is
+    // correct — and is precisely why a transport receipt is not an
+    // application acknowledgement. A close that races the acknowledgement
+    // yields `Indeterminate` instead; both are honest.
+    match within(delivery.delivered()).await {
+        Ok(()) | Err(Error::Indeterminate) => {}
+        Err(e) => panic!("unexpected receipt outcome: {e:?}"),
+    }
+
+    // What is missing is the answer, and whether the peer ever produced one is
+    // genuinely unknown (master doc §22).
+    let err = within(reply.recv()).await.expect_err("must not succeed");
     assert!(
         matches!(err, Error::Indeterminate),
         "expected Indeterminate, got {err:?}"
@@ -341,10 +433,10 @@ async fn a_server_that_disappears_mid_stream_yields_connection_lost() {
     let certs = Certs::generate();
     let addr = raw_server(&certs, |conn| async move {
         raw::send_hello(&conn).await;
-        let (mut stream, _) = raw::accept_data(&conn).await;
+        let (_send, mut recv, _header) = raw::accept_exchange(&conn).await;
         // Read only a little, then drop the connection before the FIN.
         let mut sink = vec![0u8; 4096];
-        let _ = stream.read(&mut sink).await;
+        let _ = recv.read(&mut sink).await;
         conn.close(quinn::VarInt::from_u32(0), b"gone");
     });
 
@@ -354,10 +446,9 @@ async fn a_server_that_disappears_mid_stream_yields_connection_lost() {
         .await
         .expect("connect");
 
-    let (mut transfer, _pending) =
-        within(requester.open(TransferMeta::default().with_ack(AckMode::Accepted)))
-            .await
-            .expect("open");
+    let (mut transfer, _reply) = within(requester.open(TransferMeta::default()))
+        .await
+        .expect("open");
 
     // The connection dies before our FIN, so the transfer definitely did not
     // arrive: this is a definite failure, not an unknown outcome.
@@ -405,7 +496,7 @@ async fn a_server_that_never_sends_hello_is_dropped_after_the_timeout() {
     );
 }
 
-// --- subscriptions and the oneshot role ---------------------------------
+// --- subscriptions and one-way transfers --------------------------------
 
 #[tokio::test]
 async fn subscribe_with_an_oversized_filter_closes_the_connection() {
@@ -462,8 +553,9 @@ async fn a_subscribe_flood_closes_the_connection_with_limit_exceeded() {
         let _ = stream.finish();
     }
 
-    // SUBSCRIBE carries no transfer id, so there is nothing to answer with an
-    // ERROR frame: the connection is the only granularity available.
+    // SUBSCRIBE arrives on a unidirectional stream, so there is no reply half
+    // to answer with an ERROR frame: the connection is the only granularity
+    // available.
     assert_eq!(within(raw::closed_code(&conn)).await, codes::LIMIT_EXCEEDED);
 }
 
@@ -498,7 +590,7 @@ async fn unsubscribing_an_unknown_filter_is_ignored() {
 }
 
 #[tokio::test]
-async fn oneshot_data_before_hello_is_parked_not_rejected() {
+async fn data_before_hello_is_parked_not_rejected() {
     let server = Server::start().await;
     let puller = server.listener.puller("/jobs").expect("puller");
 
@@ -507,10 +599,10 @@ async fn oneshot_data_before_hello_is_parked_not_rejected() {
         .await
         .expect("handshake");
 
-    // DATA first, HELLO second. Unidirectional streams are unordered, so a
-    // transfer that overtakes our HELLO must be parked until negotiation
-    // completes, not refused. The new oneshot role is no exception.
-    let header = DataHeader::oneshot("/jobs", TransferId::FIRST, AckMode::None).encode();
+    // DATA first, HELLO second. Streams are unordered relative to each other,
+    // so a transfer that overtakes our HELLO must be parked until negotiation
+    // completes, not refused.
+    let header = DataHeader::addressed("/jobs").encode();
     let mut stream = conn.open_uni().await.expect("open uni");
     let mut bytes = Vec::new();
     encode_preamble(FrameKind::Data, header.len() as u64, &mut bytes);
@@ -531,5 +623,41 @@ async fn oneshot_data_before_hello_is_parked_not_rejected() {
     assert_eq!(transfer.meta().endpoint.as_deref(), Some("/jobs"));
     let body = within(transfer.collect(1024)).await.expect("collect");
     assert_eq!(body, b"parked payload");
+    assert!(conn.close_reason().is_none(), "the connection must survive");
+}
+
+#[tokio::test]
+async fn an_exchange_before_hello_is_parked_not_rejected() {
+    let server = Server::start().await;
+    let replier = server.listener.replier("/t").expect("replier");
+    let handler = tokio::spawn(async move {
+        let mut request = replier.accept().await.expect("accept");
+        let body = request.body().read_capped(1024).await.expect("body");
+        assert_eq!(body, b"parked");
+        let mut reply = request.reply(TransferMeta::default()).await.expect("reply");
+        reply.write_all(b"ok").await.expect("write reply");
+        reply.finish().expect("finish");
+    });
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+
+    let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
+    let header = DataHeader::addressed("/t").encode();
+    let mut bytes = Vec::new();
+    encode_preamble(FrameKind::Data, header.len() as u64, &mut bytes);
+    bytes.extend_from_slice(&header);
+    send.write_all(&bytes).await.expect("write header");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    raw::send_hello(&conn).await;
+    send.write_all(b"parked").await.expect("write body");
+    send.finish().expect("finish");
+
+    let (preamble, _header) = within(raw::read_frame(&mut recv)).await;
+    assert_eq!(preamble.kind, FrameKind::Data);
+    handler.await.expect("handler");
     assert!(conn.close_reason().is_none(), "the connection must survive");
 }
