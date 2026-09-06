@@ -22,6 +22,8 @@ pub enum Error {
     InvalidAddress(String),
     /// An endpoint path violated the addressing rules.
     InvalidEndpointPath,
+    /// A fingerprint's text form was not `sha256:` plus 64 hex digits.
+    InvalidFingerprint(String),
     /// An endpoint path is already registered on this listener.
     AlreadyRegistered,
     /// The endpoint has no usable peer connection.
@@ -49,8 +51,13 @@ pub enum Error {
     Indeterminate,
     /// A local or negotiated resource limit was reached.
     LimitExceeded,
-    /// TLS material could not be loaded or configured.
+    /// TLS material could not be loaded or configured, or the handshake
+    /// failed for a reason other than an untrusted peer.
     Tls(String),
+    /// The peer proved possession of a key whose fingerprint is neither
+    /// pinned nor certified by a configured anchor. Carries what the peer
+    /// presented, so an operator can pin it after checking it out of band.
+    Untrusted(crate::identity::Fingerprint),
     /// Underlying I/O failure.
     Io(std::io::Error),
     /// Transport-level failure that is not one of the modelled outcomes.
@@ -65,6 +72,9 @@ impl fmt::Display for Error {
             Error::InvalidEndpointPath => f.write_str(
                 "invalid endpoint path: must start with '/', be 1..=512 bytes and contain no control bytes",
             ),
+            Error::InvalidFingerprint(m) => {
+                write!(f, "invalid fingerprint: expected sha256:<64 hex digits>, got {m:?}")
+            }
             Error::AlreadyRegistered => f.write_str("endpoint path already registered"),
             Error::NotConnected => f.write_str("endpoint is not connected to any peer"),
             Error::ConnectionLost => f.write_str("connection lost before the transfer completed"),
@@ -80,6 +90,7 @@ impl fmt::Display for Error {
             }
             Error::LimitExceeded => f.write_str("resource limit exceeded"),
             Error::Tls(m) => write!(f, "tls error: {m}"),
+            Error::Untrusted(fp) => write!(f, "peer identity {fp} is not trusted"),
             Error::Io(e) => write!(f, "io error: {e}"),
             Error::Transport(m) => write!(f, "transport error: {m}"),
         }
@@ -118,6 +129,7 @@ impl Error {
                 | Error::Canceled
                 | Error::NotConnected
                 | Error::LimitExceeded
+                | Error::Untrusted(_)
         )
     }
 }
