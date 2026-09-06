@@ -192,11 +192,10 @@ async fn push_to_rep_path_is_unsupported() {
         .await
         .expect("connect");
 
-    // A one-way stream has no reply half, so the refusal is the stop code. It
-    // may land while writing or only once the receipt is awaited.
+    // A one-way stream has no reply half, so the refusal is the stop code.
     assert!(
         matches!(
-            within(push_and_confirm(&pusher, b"hello")).await,
+            within(push_and_confirm(&pusher, &beyond_the_window())).await,
             Err(Error::Unsupported)
         ),
         "a push to a replier path must be refused with Unsupported"
@@ -218,13 +217,25 @@ async fn push_to_an_unknown_path_is_reported() {
 
     assert!(
         matches!(
-            within(push_and_confirm(&pusher, b"hello")).await,
+            within(push_and_confirm(&pusher, &beyond_the_window())).await,
             Err(Error::UnknownEndpoint)
         ),
         "an unknown path must be reported"
     );
 
     client.shutdown().await;
+}
+
+/// A payload larger than the default stream receive window.
+///
+/// A refusal is only guaranteed to be *observed* when the transfer cannot
+/// complete without the peer's application acting: a payload that fits in
+/// flight can be acknowledged by the peer's transport before its application
+/// refuses it, and the receipt then says "delivered" — truthfully, since a
+/// transport receipt says nothing about the application. Past the window the
+/// write blocks until the peer reads or refuses.
+fn beyond_the_window() -> Vec<u8> {
+    vec![0u8; 2 * 1024 * 1024]
 }
 
 /// Pushes `body` and waits for the transport receipt.

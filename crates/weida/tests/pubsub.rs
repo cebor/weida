@@ -328,6 +328,14 @@ async fn a_publisher_path_refuses_inbound_transfers() {
     let _publisher = server.listener.publisher("/md").expect("publisher");
 
     // A publisher path accepts no inbound stream of either kind.
+    //
+    // The payload is larger than the stream receive window on purpose. A
+    // transfer that fits in flight can be acknowledged by the peer's
+    // *transport* before the peer's *application* refuses it, and then the
+    // receipt truthfully says "delivered" — a transport receipt says nothing
+    // about the application, including that it said no. Past the window the
+    // write cannot complete until the peer reads or refuses, so the refusal
+    // is the only way out.
     let client = server.client_runtime();
     let pusher = client.pusher(server.trust());
     within(pusher.connect(&server.url("/md")))
@@ -336,8 +344,9 @@ async fn a_publisher_path_refuses_inbound_transfers() {
     let mut transfer = within(pusher.open(weida::TransferMeta::default()))
         .await
         .expect("open");
+    let payload = vec![0u8; 2 * 1024 * 1024];
     let refused = async {
-        transfer.write_all(b"nope").await?;
+        transfer.write_all(&payload).await?;
         transfer.finish()?.delivered().await
     };
     let err = within(refused)
