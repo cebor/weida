@@ -198,11 +198,46 @@ namespace onto a transport that has none.
 Master doc §3 lists Web, ZeroMQ, MQTT and AMQP together as "adapter bindings"; §39 and §43
 draw the line above, and that is the one the implementation follows.
 
-Credentials are a property of the Binding, not of the Listener. A QUIC binding needs a
-certificate and a private key; a Web binding terminates TLS on its own terms; and two
-interfaces of the same service may present different certificates — an internal one behind
-an internal CA, a public one facing outward. Putting server identity on the Listener would
-make the namespace object depend on one transport's notion of identity.
+An **Identity** is a property of the Binding, not of the Listener. A QUIC binding needs a
+certificate chain and the private key behind it; a Web binding terminates TLS on its own
+terms; and two interfaces of the same service may present different identities — an internal
+one issued by an internal CA, a public one facing outward. Putting server identity on the
+Listener would make the namespace object depend on one transport's notion of identity. A
+binding MAY additionally require an identity from every peer that dials it
+(`ServerTls::require_client`), which is per binding for the same reason: two interfaces of
+one service may differ in whom they let in.
+
+### Identity and Trust
+
+Two questions, two types (`crates/weida/src/config.rs`):
+
+- **Identity** — *who am I*: a certificate chain plus the private key behind it. Its
+  `fingerprint()` is the SHA-256 digest of the leaf certificate's DER
+  `SubjectPublicKeyInfo`, written `sha256:<64 lowercase hex>`
+  (`Fingerprint`, `crates/core/src/identity.rs`). The key is hashed rather than the
+  certificate, so a pin survives a certificate renewal that reuses the key, and the value is
+  the same one `curl --pinnedpubkey` and HPKP pin.
+- **Trust** — *whom do I accept*: pinned fingerprints and certificate-authority anchors. A
+  peer is accepted if its fingerprint is pinned, **or** if its chain reaches an anchor and
+  the certificate names the host that was dialled. A pin consults no name; an anchor does.
+
+An address may name the peer it expects (§3), and that fingerprint **overrides** the
+endpoint's `Trust`: it is then the only identity accepted on that connection, whatever else
+the endpoint would have trusted. `Trust::by_address()` is empty and accepts nothing but what
+addresses name — dialling a plain address under it fails with `Error::Tls` before a packet
+goes out. There is no platform root store and no verification bypass anywhere in the shipped
+code.
+
+The two combinations are `ClientTls { trust, identity }` — a dialling endpoint always needs
+trust and may present an identity — and `ServerTls { identity, client_trust }` — a binding
+always needs an identity and may demand trust of its clients. Both compare by content, and
+the client connection pool keys on `ClientTls` together with the authority and the
+fingerprint the address named (§5).
+
+Identity is symmetric on the wire. Whatever a peer proved in the handshake is surfaced to the
+receiving application as `IncomingMeta::peer` — `None` for a client that dialled
+anonymously. It comes from the handshake and never from a header, so it cannot be claimed,
+only proved (master doc §47).
 
 ### Endpoint
 
@@ -250,12 +285,19 @@ and belongs to L2 ([GUARANTEES.md](GUARANTEES.md),
 The address syntax is a URL:
 
 ```text
-weida://host:port/path
+weida://[sha256:<hex>@]host:port/path
 ```
 
 The master doc writes this as `mq://`. `weida://` is the concrete scheme chosen for this
 implementation; per master doc §82 the names in the master doc are working names. The scheme
 exists as a single constant `SCHEME` in `crates/core/src/addr.rs`.
+
+The optional fingerprint in the userinfo position names the peer expected to answer, so one
+string carries both *where* to dial and *whom* to accept:
+`weida://sha256:9f86…@10.0.0.8:7443/samples`. It parses into `EndpointAddr::peer`
+(`Option<Fingerprint>`) and a malformed value is `Error::InvalidFingerprint`. When present it
+overrides the dialling endpoint's `Trust` (§2), which is what makes a discovery record, a
+config line or a pasted terminal line a complete address rather than half of one.
 
 Path rules:
 
@@ -437,26 +479,52 @@ early DATA stream is never a protocol violation.
 ### Client connection pool
 
 The `Runtime` holds one lazily-bound client `quinn::Endpoint` (`[::]:0`, falling back to
-`0.0.0.0:0` where IPv6 is unavailable) and a map keyed by `(host, port)` and the trust
-anchors — two endpoints dialling one authority under different anchors must never share a
-connection. `connect()` resolves the host, dials, uses the host string as written for TLS
-server-name verification, and waits for the HELLO exchange before returning, so a returned
-connection is always negotiated. The dialled peers themselves live in the `PeerSet` inside a
-`Peer` (module `stream`): each `connect()` appends a `(connection, path)` pair, and `pick()`
-round-robins across the live ones.
+`0.0.0.0:0` where IPv6 is unavailable) and a map keyed by
+`(host, port, ClientTls, Option<Fingerprint> from the address)` (`crates/weida/src/pool.rs`).
+Every part of that key is load-bearing: two endpoints dialling one authority under different
+trust, under different client identities, or expecting different peers must never share a
+connection, or one would be using a peer authenticated on the other's terms. `connect()`
+resolves the host, dials, uses the host string as written for the TLS server name — which
+only an anchor check consults, since a pin ignores names — and waits for the HELLO exchange
+before returning, so a returned connection is always negotiated. A closed entry is evicted
+when the same key is dialled again; a handshake the verifier refused becomes
+`Error::Untrusted(fp)`, carrying the fingerprint that actually answered so an operator can
+decide whether to pin it. The dialled peers themselves live in the `PeerSet` inside a `Peer`
+(module `stream`): each `connect()` appends a `(connection, path)` pair, `pick()` round-robins
+across the live ones, and `peer_count()` counts only peers whose connection is still open.
+`add()` reaps closed entries as it appends, so the set cannot grow with uptime — at most one
+dead entry per loss survives, until the next `connect()`.
 
 ### TLS
 
-Server: PEM certificate chain and key are loaded from disk, `alpn_protocols` is set to
-exactly `[b"weida/0"]`, and the transport configuration applies the stream and connection
-windows, both stream-count limits and the idle timeout from `Limits`. The bidirectional
-limit was hardcoded to `0` while Req/Rep rode unidirectional streams — the transport refused
-bidirectional streams outright — and is now `max_concurrent_bidi_streams`, which is what
-bounds the exchanges a peer may hold open on us.
+Server: the binding's `Identity` supplies the certificate chain and key — from files or from
+PEM already in memory, because a key held in a secret store must not have to be written to
+disk first — `alpn_protocols` is set to exactly `[b"weida/0"]`, and the transport
+configuration applies the stream and connection windows, both stream-count limits and the
+idle timeout from `Limits`. The bidirectional limit was hardcoded to `0` while Req/Rep rode
+unidirectional streams — the transport refused bidirectional streams outright — and is now
+`max_concurrent_bidi_streams`, which is what bounds the exchanges a peer may hold open on us.
+A binding whose `client_trust` is set requires client authentication: an anonymous client and
+a client whose identity it does not trust both fail the handshake and see `Error::Tls`.
+Requiring an empty `Trust` is rejected at bind time, because it would accept nobody.
 
-Client: trust anchors come **only** from explicitly configured PEM root files. There are no
-platform roots and no insecure-skip-verification mode in v0. Same ALPN, plus the 10 s
-keep-alive.
+Client: same ALPN, plus the 10 s keep-alive. Keep-alives are sent by the dialling side only,
+so an idle connection is held open by the client alone.
+
+One verification policy serves both directions (`Policy` in `crates/weida/src/tls.rs`): the
+leaf's fingerprint is computed, a fingerprint the address named decides alone, a pin accepts
+outright, and anything else must chain to an anchor under the usual webpki rules. Whatever
+the trust path, the handshake signature is verified with the crypto provider's algorithms, so
+a peer is only ever accepted for a key it proved it holds. The provider is named explicitly
+rather than taken from the rustls process default: a library must not install global state in
+its host application.
+
+**Authentication is not authorization.** A completed handshake says which key answered and
+nothing about what that peer may do. Deciding that is the application's job, on
+`IncomingMeta::peer`: the identity is on every inbound transfer and request, so a handler can
+refuse per endpoint, per topic or per payload. The only allow list built into v0 is a `Trust`
+pin list on a binding, which is connection-wide and all-or-nothing; the authorization hooks
+of master doc §46 are not implemented.
 
 ---
 
@@ -629,32 +697,61 @@ each is a choice rather than an omission.
 The surface of crate `weida`, grouped by layer.
 
 ```rust
-// re-exports from weida-core: Error, ErrorCode, StopReason, Limits, TraceContext, EndpointAddr
+// re-exports from weida-core: Error, ErrorCode, StopReason, Limits, TraceContext,
+//     EndpointAddr (with .peer: Option<Fingerprint>), Fingerprint
+// new error variants: Error::InvalidFingerprint(String), Error::Untrusted(Fingerprint)
 pub struct RuntimeConfig { pub limits: Limits,
     pub keep_alive: Duration /*10s*/, pub idle_timeout: Duration /*30s*/ }   // Default impl
 pub enum Pem { Bytes(Vec<u8>), File(PathBuf) }              // TLS material need not be a file
-pub struct ClientTls { pub roots_pem: Vec<Pem> }            // explicit trust anchors; Eq+Hash: pool keys on it
-impl ClientTls { pub fn from_pem_file(p) -> Self; pub fn from_pem(bytes) -> Self; }
-pub struct ServerTls { pub cert_chain_pem: Pem, pub key_pem: Pem }
-impl ServerTls { pub fn new(cert_path, key_path) -> Self; pub fn from_pem(cert, key) -> Self; }
+pub struct Identity { pub cert_chain: Pem, pub key: Pem }   // who I am; Debug never prints the key
+impl Identity {
+    pub fn generate() -> Result<Identity, Error>;            // feature `generate`, on by default
+    pub fn generate_for(names: impl IntoIterator<Item = impl Into<String>>)
+        -> Result<Identity, Error>;                          // self-signed, also usable as an anchor
+    pub fn from_pem(cert_chain: impl Into<Vec<u8>>, key: impl Into<Vec<u8>>) -> Identity;
+    pub fn from_pem_files(cert_chain: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Identity;
+    pub fn from_pem_file(path: impl Into<PathBuf>) -> Identity;    // one file, chain and key
+    pub fn fingerprint(&self) -> Result<Fingerprint, Error>;  // what peers pin
+    pub fn certificate_pem(&self) -> Result<String, Error>;   // publishable, carries no key
+    pub fn to_pem(&self) -> Result<String, Error>;            // chain + key, for persisting
+}
+pub struct Trust { pub anchors: Vec<Pem>, pub pins: Vec<Fingerprint> }   // whom I accept
+impl Trust {
+    pub fn by_address() -> Trust;                             // empty: only what an address names
+    pub fn pin(fingerprint: Fingerprint) -> Trust;
+    pub fn anchor(pem: impl Into<Vec<u8>>) -> Trust;
+    pub fn anchor_file(path: impl Into<PathBuf>) -> Trust;
+    pub fn and_pin(self, fingerprint: Fingerprint) -> Trust;  // builders
+    pub fn and_anchor(self, pem: impl Into<Vec<u8>>) -> Trust;
+    pub fn and_anchor_file(self, path: impl Into<PathBuf>) -> Trust;
+    pub fn is_empty(&self) -> bool;
+}
+pub struct ClientTls { pub trust: Trust, pub identity: Option<Identity> } // Eq+Hash: pool keys on it
+impl ClientTls { pub fn new(trust: Trust) -> Self;            // dials anonymously
+    pub fn with_identity(self, identity: Identity) -> Self; }  // From<Trust> for ClientTls
+pub struct ServerTls { pub identity: Identity, pub client_trust: Option<Trust> }
+impl ServerTls { pub fn new(identity: Identity) -> Self;      // accepts anonymous peers
+    pub fn require_client(self, trust: Trust) -> Self; }       // From<Identity> for ServerTls
 
 pub struct Runtime;                                          // Clone (Arc inner); needs ambient tokio
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Runtime, Error>;   // Error::Runtime if no tokio handle
     pub fn listener(&self) -> Listener;                      // a namespace; credentials belong to bindings
-    pub fn peer(&self, tls: ClientTls) -> Peer;              // L0: streams, no pattern vocabulary
+    pub fn peer(&self, tls: impl Into<ClientTls>) -> Peer;   // L0: streams, no pattern vocabulary
     // Trust is per dialling endpoint, mirroring per-binding server identity: one
     // process may talk to an internal CA and a public one without two runtimes.
-    pub fn requester(&self, tls: ClientTls) -> Requester;
-    pub fn pusher(&self, tls: ClientTls) -> Pusher;          // Push connects, Pull binds
-    pub fn subscriber(&self, tls: ClientTls) -> Subscriber;  // Sub connects, Pub binds
+    // A bare `Trust` converts, so an endpoint that presents no identity says so by omission.
+    pub fn requester(&self, tls: impl Into<ClientTls>) -> Requester;
+    pub fn pusher(&self, tls: impl Into<ClientTls>) -> Pusher;          // Push connects, Pull binds
+    pub fn subscriber(&self, tls: impl Into<ClientTls>) -> Subscriber;  // Sub connects, Pub binds
     pub async fn shutdown(self);                             // close all conns/bindings code SHUTDOWN, wait_idle
 }
 pub struct Listener;                                         // owns Namespace shared by all bindings
 impl Listener {
     // Server identity is per binding: transports differ in what they need, and two
-    // interfaces of one service may present different certificates.
-    pub async fn bind_quic(&self, addr: SocketAddr, tls: ServerTls) -> Result<Binding, Error>;
+    // interfaces of one service may present different identities.
+    pub async fn bind_quic(&self, addr: SocketAddr, tls: impl Into<ServerTls>)
+        -> Result<Binding, Error>;                           // a bare Identity works
     pub fn replier(&self, path: &str) -> Result<Replier, Error>;   // Error::InvalidEndpointPath / AlreadyRegistered
     pub fn puller(&self, path: &str) -> Result<Puller, Error>;     // same path-uniqueness rule
     pub fn publisher(&self, path: &str) -> Result<Publisher, Error>;
@@ -666,8 +763,8 @@ impl Binding { pub fn local_addr(&self) -> SocketAddr; pub async fn close(&self)
 // ---- L0: the stream core -------------------------------------------------------------
 pub struct Peer;                                             // dialling side; multi-peer, round-robin
 impl Peer {
-    pub async fn connect(&self, url: &str) -> Result<(), Error>;   // pooled per (host:port, trust anchors)
-    pub fn peer_count(&self) -> usize;
+    pub async fn connect(&self, url: &str) -> Result<(), Error>;   // pooled per (authority, ClientTls, address pin)
+    pub fn peer_count(&self) -> usize;                             // live peers only
     pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error>;  // one-way transfer
     pub async fn open_bi(&self, meta: TransferMeta)
         -> Result<(OutgoingTransfer, ReplyStream), Error>;                            // exchange
@@ -684,7 +781,7 @@ pub type Pusher = Endpoint<Push>;   pub type Puller = Endpoint<Pull>;
 pub type Publisher = Endpoint<Pub>; pub type Subscriber = Endpoint<Sub>;
 
 impl Requester {                                             // multi-peer: connects append; open() round-robins
-    pub async fn connect(&self, url: &str) -> Result<(), Error>;   // weida://host:port/path
+    pub async fn connect(&self, url: &str) -> Result<(), Error>;   // weida://[sha256:<hex>@]host:port/path
     pub fn peer_count(&self) -> usize;
     pub async fn open(&self, meta: TransferMeta) -> Result<(OutgoingTransfer, ReplyStream), Error>;
     pub async fn request(&self, body: &[u8]) -> Result<IncomingTransfer, Error>;   // open+write+finish+recv
@@ -738,7 +835,7 @@ pub struct Delivery;                                         // dropping it is t
 impl Delivery { pub async fn delivered(self) -> Result<(), Error>; }  // QUIC's fin-ack, not an app ack
 
 pub struct IncomingTransfer;                                 // impl tokio::io::AsyncRead
-impl IncomingTransfer { pub fn meta(&self) -> &IncomingMeta; // endpoint, content_*, trace, topic
+impl IncomingTransfer { pub fn meta(&self) -> &IncomingMeta; // endpoint, content_*, trace, topic, peer
     pub async fn read_capped(&mut self, max_bytes: usize) -> Result<Vec<u8>, Error>;
     pub async fn collect(self, max_bytes: usize) -> Result<Vec<u8>, Error>; } // LimitExceeded over cap
 pub struct IncomingRequest;                                  // one accepted exchange
@@ -755,18 +852,30 @@ Type by type:
 
 - **`RuntimeConfig`** — everything a `Runtime` needs: resource limits and the two timers. Has
   a `Default`.
-- **`ClientTls`** — explicit PEM trust anchors. Required to `connect()`; there is no
-  platform-root or skip-verification path in v0.
-- **`ServerTls`** — PEM certificate chain and private key for a server binding.
+- **`Identity`** — who a binding or a dialling endpoint is: a certificate chain and the key
+  behind it, from files or from memory. `generate()` (default feature `generate`) produces a
+  self-signed identity carrying no names, made for pinning; `fingerprint()` is the value
+  peers pin, embed in an address or list in a `Trust`.
+- **`Trust`** — whom an endpoint accepts: pinned fingerprints, CA anchors, or nothing beyond
+  what the dialled address names (`Trust::by_address()`).
+- **`Fingerprint`** — the SHA-256 of a peer's DER `SubjectPublicKeyInfo`, `Display` and
+  `FromStr` as `sha256:<64 hex>`. The one identity value in the system: pinned in a `Trust`,
+  embedded in an address, reported on `IncomingMeta::peer`, carried by `Error::Untrusted`.
+- **`ClientTls`** — a dialling endpoint's `Trust` plus an optional `Identity` to present. A
+  bare `Trust` converts into it. Required to `connect()`; there is no platform-root or
+  skip-verification path in v0.
+- **`ServerTls`** — a binding's `Identity` plus an optional client `Trust`. A bare `Identity`
+  converts into it; `require_client(trust)` makes the binding authenticate its clients.
 - **`Runtime`** — the process-level container of §2. `Clone`, sharing an `Arc` inner. Needs
   an ambient tokio runtime; construction fails with `Error::Runtime` if there is none.
 - **`Listener`** — one logical messaging namespace, owning the endpoint `Namespace` shared by
   all of its bindings.
 - **`Binding`** — one concrete QUIC binding; exposes its resolved local address, which is how
   tests learn an ephemeral port.
-- **`Peer`** — the L0 dialling side: a set of connections, the trust anchors they were
-  authenticated against, and the two open calls. Every dialling pattern is this plus a
-  selection policy and some vocabulary.
+- **`Peer`** — the L0 dialling side: a set of connections, the terms they were authenticated
+  on (`ClientTls`, plus whatever each address named), and the two open calls. `peer_count`
+  reports live peers only — a closed connection leaves the set when the next `connect()` adds
+  a live one. Every dialling pattern is this plus a selection policy and some vocabulary.
 - **`Acceptor`** — the L0 bound side: one path, both stream kinds, one queue. Where a
   `Replier` accepts only exchanges and a `Puller` only one-way transfers, an `Acceptor` takes
   whatever arrives and lets the application decide.
@@ -792,6 +901,8 @@ Type by type:
 - **`IncomingTransfer`** — the read half of a transfer, an `AsyncRead`, plus its metadata.
   Reaching EOF is just EOF; the v0 core emits nothing in response. `collect(max_bytes)` is the
   opt-in materialization convenience with a mandatory cap; it is never used internally.
+  `meta().peer` is the fingerprint the sender proved in the handshake, `None` for an
+  anonymous client, and it is what an application authorizes on.
 - **`IncomingRequest`** — an accepted exchange: its metadata, its body as an
   `IncomingTransfer`, and the reply half it owes the requester. `reply()` consumes it, because
   an exchange has exactly one reply and a second one should not be representable. It may be

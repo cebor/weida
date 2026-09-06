@@ -14,13 +14,15 @@ its guarantee vocabulary is deliberately kept out of the socket layer until it d
 
 **Status:** alpha. Wire protocol version `0` (experimental, breaking changes permitted
 within `0.x`). Phases 0-2 implemented: docs, core model, native QUIC transport with Req/Rep.
-Phase 3 in progress: Push/Pull, Pub/Sub and the raw L0 stream API have landed.
+Phase 3 in progress: Push/Pull, Pub/Sub, the raw L0 stream API, and peer identity by public-key
+fingerprint have landed.
 
 ## Documentation
 
 | Document | Contents |
 | --- | --- |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layer model, terminology, addressing, crate map, runtime internals, public API v0 |
+| [docs/PATTERNS.md](docs/PATTERNS.md) | the pattern reference: per-pattern tables in the shape of `zmq_socket(3)`, and what QUIC streams do underneath, measured |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | normative wire protocol v0: framing, frame headers, golden vectors, limits |
 | [docs/GUARANTEES.md](docs/GUARANTEES.md) | guarantee vocabulary and what is actually implemented in v0 |
 | [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md) | failure scope, required scenarios, sender outcome rules, `Indeterminate` |
@@ -36,21 +38,32 @@ Phase 3 in progress: Push/Pull, Pub/Sub and the raw L0 stream API have landed.
 | `crates/protocol` | `weida-protocol` | wire codec, no I/O: varints, framing, CBOR headers, negotiation, error codes |
 | `crates/weida` | `weida` | runtime, native QUIC transport, the raw stream core, and the Req/Rep, Push/Pull and Pub/Sub patterns |
 
-## Try the prototype
+## Identity in one line
 
-Two terminals:
-
-```
-cargo run -p weida --example transform_server -- --bind 127.0.0.1:7443 --cert-out /tmp/weida-cert.pem
-```
+A weida peer is its public key. The server generates an identity and prints an address that
+names it; the client trusts that address and nothing else:
 
 ```
-printf 'hello weida' | cargo run -p weida --example transform_client -- --ca /tmp/weida-cert.pem weida://127.0.0.1:7443/transform
+$ cargo run -p weida --example transform_server -- --bind 127.0.0.1:7443
+weida://sha256:22ed30a8…9f25@127.0.0.1:7443/transform
+weida://sha256:22ed30a8…9f25@127.0.0.1:7443/echo
 ```
 
-Expected: stdout is exactly `HELLO WEIDA`; stderr shows `delivered` — QUIC's transport
-receipt for the request, not an application acknowledgement — and a
-trace id that also appears in the server's log line for the request.
+```
+$ printf 'hello weida' | cargo run -p weida --example transform_client -- 'weida://sha256:22ed30a8…9f25@127.0.0.1:7443/transform'
+HELLO WEIDA
+```
+
+No certificate file changes hands, no CA exists, and a peer with any other key is refused with
+`Untrusted(sha256:…)` naming the key that answered. `--identity PATH` keeps the server's key
+across restarts so the address stays stable; `--cert-out PATH` plus `transform_client --ca
+PATH` is the same exchange through a trusted certificate and a plain address instead. In
+code: `Identity::generate()`, `Trust::by_address()` / `Trust::pin(fp)` / `Trust::anchor(pem)`,
+`ServerTls::require_client(trust)` for mutual identity, and `IncomingMeta::peer` to see who
+sent what.
+
+Expected on stderr: `delivered` — QUIC's transport receipt for the request, not an application
+acknowledgement — and a trace id that also appears in the server's log line for the request.
 
 ## Other patterns
 
@@ -63,12 +76,14 @@ cargo run -p weida --example pub_sub     # prefix-filtered topics, two subscribe
 ```
 
 Messages arrive out of order in both. Each transfer is its own QUIC stream, so ordering
-is `None` for these patterns — see [docs/GUARANTEES.md](docs/GUARANTEES.md) §6.
+is `None` for these patterns — see [docs/PATTERNS.md](docs/PATTERNS.md) §1.7.
 
 ## Build and test
 
 ```
 cargo test --workspace
+cargo test -p weida --test streams               # QUIC stream mechanics, measured
+cargo test -p weida --test identity              # pins, anchors, addresses, client identity
 cargo test -p weida --test large -- --ignored     # 1 GiB echo, asserts bounded peak RSS
 cargo bench                                      # codec and loopback QUIC throughput
 ```

@@ -129,6 +129,20 @@ to QUIC's max ack delay; the same 1 KiB push without the receipt costs ~7.9 µs.
 while callers who want the receipt use `Pusher::open` plus `finish()` and `delivered()`
 themselves. Dropping a `Delivery` is free and observes no outcome at all.
 
+What the receipt implies about the peer's application depends on the payload size, and the
+dependency is worth stating precisely. Inside the peer's stream receive window the receipt
+resolves before the application has called `recv`, and even while the transfer is still
+parked in the peer's accept queue. Beyond the window it cannot resolve until the application
+has consumed at least `payload - window` bytes, because QUIC will not accept more than the
+window without that. A receipt for a large transfer is therefore evidence of application
+progress; a receipt for a small one is not, and no API distinguishes the two cases
+([PATTERNS.md](PATTERNS.md) §1.2, `a_receipt_beyond_the_window_implies_the_reader_consumed`).
+
+The same asymmetry cuts the other way for refusals: a one-way transfer that fits in flight may
+be acknowledged by the peer's transport before the peer's application refuses it, so
+`delivered()` may resolve `Ok(())` for a transfer the application then discarded. That is not
+a defect of the receipt but its definition ([PATTERNS.md](PATTERNS.md) §1.6).
+
 ### Ordering
 
 ```text
@@ -244,8 +258,9 @@ L2 broker layer, where the completion states of §1 acquire meaning, is Phase 6.
 | Delivery | `BestEffort` only | v0 performs no retries. A failed or indeterminate transfer is reported to the application, which decides. `AtMostOnce` and `AtLeastOnce` require retry and dedup machinery that does not exist yet. |
 | Ordering | `None` | QUIC guarantees byte order **within** one stream. A one-way transfer is one stream, and each half of an exchange is one stream, so a single payload is ordered end to end. Across streams there is no ordering guarantee of any kind. `PerProducer`, `PerKey` and `Total` are not implemented. |
 | Deduplication | `None` | No idempotency ids, no dedup window. Nothing on the wire names a transfer — correlation is the stream itself — so a receiver could not deduplicate even if it wanted to. |
-| Backpressure | `Block`, `Reject`, `Drop` | `Block`: QUIC stream and connection flow control, the concurrent-stream budgets (`max_concurrent_uni_streams`, `max_concurrent_bidi_streams`) and bounded internal channels (`endpoint_queue`, the actor control channel) make senders await capacity; this is what Req/Rep and Push/Pull use. `Reject`: `IncomingTransfer::read_capped` refuses a payload past its cap with `STOP_SENDING(REJECTED)` and `LimitExceeded` before buffering it, and `Publisher::publish` rejects a payload larger than `subscriber_buffer_bytes` locally. `Drop`: publisher fan-out only — a subscriber past `subscriber_buffer_bytes` loses the message rather than stalling the publisher. `Spill` and `Coalesce` are not implemented. |
+| Backpressure | `Block`, `Reject`, `Drop` | `Block`: QUIC stream and connection flow control, the concurrent-stream budgets (`max_concurrent_uni_streams`, `max_concurrent_bidi_streams`) and bounded internal channels (`endpoint_queue`, the actor control channel) make senders await capacity; this is what Req/Rep and Push/Pull use. The budget lands on `open`, and a transfer parked in an accept queue still holds its stream, so a deeper queue does not raise it ([PATTERNS.md](PATTERNS.md) §1.4). `Reject`: `IncomingTransfer::read_capped` refuses a payload past its cap with `STOP_SENDING(REJECTED)` and `LimitExceeded` before buffering it, and `Publisher::publish` rejects a payload larger than `subscriber_buffer_bytes` locally. `Drop`: publisher fan-out only — a subscriber past `subscriber_buffer_bytes` loses the message rather than stalling the publisher. `Spill` and `Coalesce` are not implemented. |
 | Indeterminate outcomes | implemented | First-class: `Error::Indeterminate` is deliberately excluded from `Error::is_definite_failure()`. See [FAILURE_MODEL.md](FAILURE_MODEL.md). |
+| Peer identity | implemented | Every inbound transfer carries the sending peer's proved public-key fingerprint in `IncomingMeta::peer` (`None` for an anonymous client). It comes from the TLS handshake, never from a header, so it can be authorized on but not claimed (master doc §47). Trust is stated per dialling endpoint (`Trust`: pins, anchors, or only what the address names) and optionally required of clients per binding (`ServerTls::require_client`). Authorization beyond "is this key trusted at all" is the application's decision on the fingerprint. |
 | Hop-locality | implemented, trivially | Exactly one hop exists in v0 (direct connection). No composition of hops is possible yet. |
 
 ### Per pattern

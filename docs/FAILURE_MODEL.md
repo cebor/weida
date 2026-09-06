@@ -27,7 +27,8 @@ Primary scope, verbatim from master doc §61:
 
 Byzantine fault tolerance is **out of scope**. Authenticated transport protects
 communication but does not make the cluster a BFT consensus system. A peer that completes
-the TLS handshake is trusted to be who its certificate says, and nothing more: its wire
+the TLS handshake has proved that it holds the key its identity names, and nothing more:
+what it is allowed to do is the application's decision on `IncomingMeta::peer`, and its wire
 input remains hostile ([INVARIANTS.md](INVARIANTS.md)).
 
 ---
@@ -92,9 +93,14 @@ Notes on the covered ones:
 - **network disappears during stream** — exercised by
   `hostile::a_server_that_disappears_mid_stream_yields_connection_lost`, which closes the
   connection after reading part of the request; the sender observes `ConnectionLost` while
-  still pre-FIN, and `is_definite_failure()` is true.
+  still pre-FIN, and `is_definite_failure()` is true. Two tests in
+  `crates/weida/tests/streams.rs` cover the variants that carry no close frame at all:
+  `idle_timeout_reports_loss_within_the_window`, where a silent connection simply expires,
+  and `after_the_server_restarts_the_pusher_must_reconnect`, where the first send after the
+  peer went away fails and the application has to `connect` again — v0 never reconnects by
+  itself.
 - **receiver crashes during stream** — indistinguishable at the wire from the previous case;
-  same rule, same outcome.
+  same rule, same outcome, and the same two `streams.rs` tests apply unchanged.
 - **receiver gets the entire transfer but crashes before answering** — exercised by
   `hostile::a_server_that_never_answers_yields_indeterminate`, where a raw server reads the
   request to FIN, sends nothing, then closes with `NO_ERROR`. The transport receipt resolves
@@ -127,15 +133,19 @@ the transfer, so a sender's outcome is whatever `write_all`, `finish()` and the 
 | Receipt resolves | after local FIN | `Delivery::delivered()` yields `Ok(())` | The peer's **transport** acknowledged every byte and the FIN. It is not a claim that the peer's application read the payload ([GUARANTEES.md](GUARANTEES.md) §3). |
 | `STOP_SENDING` observed | any | definite typed refusal, selected by the QUIC application error code: `REJECTED` → `Error::Rejected`, `CANCELED` → `Error::Canceled`, `UNKNOWN_ENDPOINT` → `Error::UnknownEndpoint`, `UNSUPPORTED` → `Error::Unsupported` | The receiver refused explicitly, so the outcome is definite. The refusal surfaces from `write_all` when it lands mid-payload and from `delivered()` otherwise; a sender must be prepared to see it at either point. |
 | 0-RTT rejected | any | `Error::Transport` | The data was never delivered under the accepted keys. |
+| Handshake refused: the peer is not the one trusted | nothing was sent | `connect` fails with `Error::Untrusted(fp)`; `is_definite_failure()` is true | The dial ended in the verifier, before any transfer existed. The error carries the fingerprint that actually answered rather than the one that was expected, so an operator can check it out of band and pin it. |
+| Handshake fails for any other reason | nothing was sent | `Error::Tls` | Covers a binding that requires a client identity the dialling endpoint does not present or does not trust, and a dial under an empty `Trust` to an address that names no fingerprint — the latter fails before a packet leaves. |
+| Idle timeout or stateless reset | any | `Error::ConnectionLost`; `is_definite_failure()` is true | Both mean the connection is gone, and `conn_error` maps quinn's `TimedOut` and `Reset` there rather than to a bare transport error. The *reason* does not survive: a send over a peer whose connection has closed reports `ConnectionLost` without consulting the transport error, so an idle timeout, a peer SHUTDOWN and a transport failure are indistinguishable at the API ([IMPLEMENTATION.md](IMPLEMENTATION.md) §6). Demonstrated by `idle_timeout_reports_loss_within_the_window` in `crates/weida/tests/streams.rs`, where the server's 500 ms idle timeout is shorter than the dialling side's 10 s keep-alive interval, so silence ends the connection. |
 
 `Error::is_definite_failure()` is the machine-readable form of the word "definite": true for
-`ConnectionLost`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `Canceled`, `NotConnected`
-and `LimitExceeded`. A typed refusal — by stop code or by ERROR frame — proves the payload
-never reached an application, which is exactly what makes it definite. `Indeterminate` is
-outside the set by construction, because keeping it apart from failure is the whole point of
-master doc §22, and so is `NoReply`: a replier that declines to answer has still read the
-request and may well have acted on it, so only the answer is missing. The membership is
-pinned by `definite_failures_exclude_the_unknowable_ones`.
+`ConnectionLost`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `Canceled`, `NotConnected`,
+`LimitExceeded` and `Untrusted`. A typed refusal — by stop code or by ERROR frame — proves
+the payload never reached an application, and a refused handshake proves nothing was sent at
+all; that is what makes them definite. `Indeterminate` is outside the set by construction,
+because keeping it apart from failure is the whole point of master doc §22, and so is
+`NoReply`: a replier that declines to answer has still read the request and may well have
+acted on it, so only the answer is missing. The exclusions, and every member except
+`Untrusted`, are pinned by `definite_failures_exclude_the_unknowable_ones`.
 
 ### Reply-side rules
 
@@ -168,7 +178,7 @@ No frame cancels anything; cancellation is entirely QUIC stream state.
 
 | Situation | Mechanism | What the peer observes |
 | --- | --- | --- |
-| Sender abandons its own outgoing payload | `RESET_STREAM(CANCELED)` — `OutgoingTransfer::cancel`, or a drop without `finish()` | the read in progress fails with `Error::Canceled`; partial state is discarded |
+| Sender abandons its own outgoing payload | `RESET_STREAM(CANCELED)` — `OutgoingTransfer::cancel`, or a drop without `finish()` | the transfer is never observable as complete: the read in progress fails — `Error::Canceled` through `read_capped`, `io::ErrorKind::ConnectionReset` on the `AsyncRead` — and never returns EOF |
 | Receiver refuses an inbound payload | `STOP_SENDING(REJECTED)` — `IncomingTransfer` dropped mid-payload, or a payload past `read_capped`'s cap | `Error::Rejected` from `write_all` or from `delivered()` |
 | Requester abandons the reply | drop `ReplyStream` before `recv()`, which stops the reply half with `CANCELED` | `IncomingRequest::canceled()` resolves; subsequent reply writes fail with `Error::Canceled` |
 | Replier will not answer | ERROR `{NO_REPLY}` + FIN on the reply half — `IncomingRequest` dropped without `reply()` | `ReplyStream::recv()` yields `Error::NoReply` |
@@ -177,6 +187,16 @@ No frame cancels anything; cancellation is entirely QUIC stream state.
 a handler takes it before `reply()` consumes the request, then selects on it beside its own
 reply writes. A long reply nobody wants otherwise burns the peer's flow-control window, and
 this is how the handler learns to stop.
+
+`cancel()` guarantees an outcome, not a retraction. What holds is that the receiver can never
+mistake the transfer for a complete one: it observes a reset error and never EOF. What does
+**not** hold is that the peer saw fewer bytes. The receiver's assembler is cleared when the
+reset is *processed*, so a reader that gets there first is still served whatever was already
+buffered: `cancel_discards_unread_bytes_and_keeps_read_ones` in
+`crates/weida/tests/streams.rs` reads 4 KiB of an 8 KiB transfer, cancels, and then still
+receives the entire 4 KiB remainder before the read fails. Bytes the application had already
+taken are unaffected either way. An application that must be able to withdraw a payload needs
+its own retraction; the transport offers none.
 
 ### Receiver-side rules
 
@@ -189,6 +209,21 @@ this is how the handler learns to stop.
 | Application drops the body before FIN | `STOP_SENDING(REJECTED)`. |
 | Application drops a request without replying | ERROR `{NO_REPLY}` + FIN on the reply half, so the requester does not hang until the idle timeout. |
 | DATA without `endpoint` on an initiating stream, ERROR on a unidirectional stream, or any non-DATA frame opening an exchange | `CONNECTION_CLOSE(PROTOCOL_VIOLATION)`. These are framing violations, not refusals: a refusal is per-stream, a violation ends the connection ([PROTOCOL.md](PROTOCOL.md) §3). |
+
+**A refusal can lose the race with the transport.** The refusals above are raised by the
+receiving *application's* dispatch, while the peer's transport acknowledges bytes on its own.
+A one-way transfer small enough to fit in flight may therefore be acknowledged before the
+application refuses it, and `Delivery::delivered()` then resolves `Ok(())` for a transfer that
+was discarded a moment later — truthfully, because a transport receipt says nothing about the
+application, including that it said no ([GUARANTEES.md](GUARANTEES.md) §3). The refusal is
+guaranteed to be observed only where the transfer cannot complete without the application
+acting — a payload beyond the peer's stream receive window, so that flow control makes the
+writer wait for a reader that never comes — or in Req/Rep, where the ERROR frame rides the
+reply half and is therefore ordered after the decision. That is why
+`push_to_rep_path_is_unsupported` and `push_to_an_unknown_path_is_reported` in
+`crates/weida/tests/pushpull.rs` and `a_publisher_path_refuses_inbound_transfers` in
+`crates/weida/tests/pubsub.rs` push 2 MiB instead of a few bytes: at that size the write
+cannot finish unless the peer acts, so the refusal is deterministic rather than racy.
 
 ### Connection teardown
 

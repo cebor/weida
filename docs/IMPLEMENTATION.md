@@ -30,8 +30,9 @@ chaotically across phases.
 | 12 | Documentation/site/stabilization | not started |
 
 Phases 0, 1 and 2 are complete. Phase 3 is under way: its first increment (Push/Pull and
-Pub/Sub) landed, and its second re-founded the stack on the layer model — L0 stream core,
-L1 patterns, L2 broker — see [ARCHITECTURE.md](ARCHITECTURE.md). Router/Dealer are answered
+Pub/Sub) landed, its second re-founded the stack on the layer model — L0 stream core,
+L1 patterns, L2 broker — see [ARCHITECTURE.md](ARCHITECTURE.md), and its third gave peers
+identities and pinned the stream semantics with measured probes. Router/Dealer are answered
 as emergent rather than implemented, see [ARCHITECTURE.md](ARCHITECTURE.md) §6a. Phases 4
 and later remain out of scope; Phase 6 gained the acknowledgement vocabulary that used to
 sit in the core.
@@ -90,7 +91,8 @@ Delivers `weida-protocol` and crate `weida`.
   ERROR rides the reply half.
 - Cancellation and stream reset in both directions.
 - Resource limits, all remote-input-bounded.
-- Client connection pooling keyed by `(host, port)`.
+- Client connection pooling keyed by `(host, port)`. The key has since grown the dialling
+  terms and the fingerprint the address names (third increment below).
 
 Large streaming transfers are tested immediately, not deferred.
 
@@ -172,6 +174,54 @@ What took their place:
   unidirectional stream can no longer be refused with an ERROR frame of its own.
 - Frame kinds and DATA keys were renumbered densely and every golden vector recomputed
   ([PROTOCOL.md](PROTOCOL.md) §4, §6, §8).
+
+**Delivered in the third increment — identity, trust and stream semantics:**
+
+Peers gained identities. `weida_core::Fingerprint` (`crates/core/src/identity.rs`) is the
+SHA-256 digest of a leaf certificate's DER `SubjectPublicKeyInfo`, with text form
+`sha256:<64 lowercase hex>`; the key is hashed rather than the certificate, so a pin survives
+a renewal that reuses the key. `EndpointAddr` gained `peer: Option<Fingerprint>` and the
+grammar `weida://[sha256:<hex>@]host:port/path`, so one string says where to dial and whom to
+accept. The TLS configuration was split along the two questions it answers: `Identity`
+(`generate`, `generate_for`, `from_pem`, `from_pem_files`, `from_pem_file`, `fingerprint`,
+`certificate_pem`, `to_pem`) for *who am I*, and `Trust` (`by_address`, `pin`, `anchor`,
+`anchor_file` plus the `and_*` builders) for *whom do I accept* — pinned fingerprints or CA
+anchors, with an address-named fingerprint overriding both. `ClientTls { trust, identity }`
+and `ServerTls { identity, client_trust }` combine them; `impl Into` at every call site lets
+a bare `Trust` or `Identity` stand in, and the previous root-list client shape and
+certificate-and-key server shape are both gone. A binding may now require client identity
+(`ServerTls::require_client`), and whatever a peer proved in the handshake is surfaced as
+`IncomingMeta::peer` on inbound transfers, requests and the requester's reply half — from the
+handshake, never from a header, so it can only be proved and never claimed (master doc §47).
+New errors: `Error::InvalidFingerprint` and the definite `Error::Untrusted(Fingerprint)`,
+which names the identity that answered instead of the one that was expected. The connection
+pool key became `(host, port, ClientTls, Option<Fingerprint> from the address)`.
+
+Three defects the new tests exposed were fixed. `ConnCtx::negotiated()` now fails immediately
+with the connection's close reason instead of waiting out the 10 s HELLO deadline, so a client
+whose identity a binding refuses learns it at once rather than hanging for `hello_timeout_ms`.
+`conn_error` maps `TimedOut` (idle timeout) and `Reset` (stateless reset) to
+`Error::ConnectionLost` — definite, where it used to be `Error::Transport("timed out")` — and
+a peer close carrying a TLS alert code to `Error::Tls`. `PeerSet::add` reaps entries whose
+connection has closed, so a process that reconnects after every loss no longer accumulates
+dead peers for the life of the process.
+
+The increment is pinned by 10 tests in `crates/weida/tests/identity.rs` (an address pin under
+an empty trust; a wrong pin refused with `Untrusted(what answered)` and no peer added; an
+address pin overriding an anchor; `Trust::pin` accepting only the key; pins and anchors
+composing; an anchor checking the name where a pin does not; a binding refusing anonymous and
+untrusted clients, accepting a pinned one and seeing its fingerprint in `IncomingMeta::peer`;
+an anonymous client reported as `None`; reply metadata naming the server; connections not
+shared across different terms), by unit tests in `crates/weida/src/tls.rs`,
+`crates/core/src/identity.rs` and `crates/core/src/addr.rs`, and by 10 stream probes in
+`crates/weida/tests/streams.rs` that measure what the transport actually promises about
+receipts, flow control, stream budgets, cancellation, connection loss and idle timeout (§4).
+The examples lost their PEM handling: `push_pull` and `pub_sub` use `Identity::generate()`
+plus a pinned URL and touch no files at all, `transform_server` prints its
+`weida://sha256:…@host:port/…` addresses and takes `--identity PATH` for a fingerprint that
+survives a restart and `--cert-out PATH` for publishing its certificate, while
+`transform_client` and `large_stream` take an optional `--ca PATH` and otherwise trust what
+the address names.
 
 **Deliberately deferred** (recorded now, not discovered later):
 
@@ -373,6 +423,34 @@ one, which is why `Pusher::send` discards it and callers who want it reach for
 
 No thresholds are asserted on these numbers either.
 
+### Verified results — Phase 3, identity and stream semantics
+
+Same machine as the runs above; every stream number was measured on loopback in a debug
+build against `quinn 0.11.11` / `quinn-proto 0.11.17`. `cargo test --workspace` green four
+times in a row, `cargo fmt --all --check` clean, `cargo clippy --workspace --all-targets
+-D warnings` clean with and without the `generate` feature, `cargo doc` without warnings. The
+byte counts below are observations; each test asserts the race-free bound around them, which
+is noted where the two differ.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Whole workspace | `cargo test --workspace` | green: 217 tests pass, 1 ignored (the 1 GiB memory test). Counted from the test files: `weida-core` 24, `weida-protocol` 70 unit + 6 golden-vector + 9 fuzz-smoke, `weida` 33 unit + 13 Req/Rep + 7 Push/Pull + 11 Pub/Sub + 21 hostile + 2 raw-stream + 10 identity + 10 stream + 1 doc |
+| Identity and trust | `cargo test -p weida --test identity` | the 10 tests listed in §1: pinned addresses, a refused pin reported as `Untrusted` with the fingerprint that answered, an address pin overriding an anchor, a pinned trust accepting the key and only the key, pins and anchors composing, name checking on anchors only, a binding requiring client identity, an anonymous client as `None`, the server's fingerprint on the reply half, and no connection sharing across different terms |
+| Two-process prototype | `transform_server --bind … [--identity PATH] [--cert-out PATH]` + `transform_client [--ca PATH] URL` | a pinned address round trip prints `HELLO WEIDA`; a wrong pin exits 1 with "presented sha256:…, which is not trusted"; a plain address without `--ca` fails with "nothing to trust" before any packet; restarting with `--identity` keeps the fingerprint, so the printed URL is unchanged; `--cert-out` plus `--ca` against a pinned address works |
+| A receipt beyond the window implies the reader consumed | `a_receipt_beyond_the_window_implies_the_reader_consumed` | 160 KiB pushed into a 64 KiB stream receive window: no marker at all within 300 ms while nothing is read; with an 8 KiB-chunk reader, `write_all` returns at **131072 bytes consumed** and the receipt resolves at **163840** (the whole payload). The assertion is the flow-control bound, `payload - window = 98304` |
+| The stream window is not a payload budget | `a_payload_the_size_of_the_stream_window_waits_for_the_reader` | a payload of exactly 65536 bytes against a 64 KiB window produces no `Wrote` within 300 ms although the header was already parsed; it completes as soon as the reader consumes one eighth of the window (8192 bytes). The DATA header spends the same window as the payload |
+| The connection window is the shared resource | `a_stalled_stream_does_not_block_its_siblings` | 32 KiB payloads, 64 KiB stream window, 256 KiB connection window: siblings of an unread stream arrive and read back correctly, and the stall lands at **7 unread streams = 229376 of 262144 bytes**; reading one stream's 32 KiB releases the stalled writer. The test asserts the bound `1 + blocked_at <= connection_window / payload` and the unblocking, not the index |
+| The stream budget is backpressure, and `open` is where it lands | `the_stream_budget_is_backpressure_not_an_error`, `a_deeper_endpoint_queue_does_not_raise_the_stream_budget` | with `max_concurrent_uni_streams = 2` the third transfer blocks in `Pusher::open` — not in `write_all`, not in the receipt — and never errors; reading one transfer to EOF releases it. `endpoint_queue = 8` changes nothing, because a transfer parked in the queue still owns its stream |
+| Cancellation | `cancel_discards_unread_bytes_and_keeps_read_ones` | the 4 KiB already read still compares equal; after `cancel()` the reader is served the whole 4 KiB buffered remainder and only then fails, as `io::ErrorKind::ConnectionReset` on the `AsyncRead` and as `Error::Canceled` through `read_capped` — never EOF |
+| Idle timeout is connection loss | `idle_timeout_reports_loss_within_the_window` | a 500 ms server idle timeout against the client's default 10 s keep-alive (asserted to be the longer of the two): after 1.5 s of silence the next request fails with `Error::ConnectionLost` |
+| No automatic reconnect | `after_the_server_restarts_the_pusher_must_reconnect` | the **first** send after the server closed fails with `ConnectionLost` and `peer_count()` drops to 0; nothing reconnects, and after `connect` to a replacement server carrying the same identity a send succeeds and `peer_count()` is 1 — the dead entry was reaped |
+| Hot paths unchanged | `cargo bench -p weida` (3 s measurement, both trees on the same idle machine) | `echo_1kib_rtt` 63.5-67.3 µs over four runs of this tree against 62.9 µs for the tree before it; `push_1kib_best_effort` 7.9 µs against 7.9; `pub_1kib_8_subscribers` 71.7 µs against 70.3. All within the run-to-run spread of this machine: the verifier runs once per handshake and the per-stream path gained one `Option<[u8; 32]>` copy |
+
+The two probes that resisted determinism are recorded as observations only: the buffered tail
+delivered after `cancel()` is a genuine race between the reset frame and the reader's polls,
+and the exact stall index in the connection-window probe depends on header sizes. Both tests
+assert the race-free part instead, and no stream probe is `#[ignore]`d.
+
 ---
 
 ## 5. Decisions
@@ -412,9 +490,9 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Stream magic | `0x57` (ASCII `W`) | Cheap first-byte rejection of non-weida streams. |
 | Wire protocol version | `0` | Experimental per master doc §15; independent of the library version. |
 | Library version | `0.1.0` | Independent of the wire version. |
-| Client trust | explicit trust anchors only | No platform root store and no insecure-skip mode ships in v0. The prototype uses the server's self-signed certificate as its CA. |
-| TLS material source | file **or** in-memory PEM (`Pem`) | Requiring a path would force callers holding a key from a secret store to write it to disk first. Both sources are first class; `ServerTls::from_pem` never touches the filesystem. |
-| Credential placement | server identity per **binding**, trust per **dialling endpoint** | Credentials are transport-specific, so they do not belong on the Listener (a namespace) or the Runtime (a resource container). Consequence: the connection pool keys on `(host, port, ClientTls)` — sharing on authority alone would hand one endpoint a peer authenticated against another's CA. |
+| Client trust | pinned public keys **or** configured anchors | A peer is accepted for a pinned fingerprint or for a chain to an explicitly configured anchor that names the host dialled. No platform root store and no insecure-skip mode ships in v0, and `Trust::by_address()` trusts nothing beyond what an address names. |
+| TLS material source | file **or** in-memory PEM (`Pem`) | Requiring a path would force callers holding a key from a secret store to write it to disk first. Both sources are first class; `Identity::from_pem` and `Trust::anchor` never touch the filesystem. |
+| Credential placement | identity per **binding**, trust per **dialling endpoint** | Credentials are transport-specific, so they belong neither on the Listener (a namespace) nor on the Runtime (a resource container). Consequence: the connection pool keys on `(host, port, ClientTls, address fingerprint)` — sharing on authority alone would hand one endpoint a peer authenticated on another endpoint's terms. |
 | Rust edition | `2024` | Current stable edition. |
 | MSRV | `1.88` | Highest requirement among the pinned dependencies. |
 
@@ -428,6 +506,18 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Misroute refusal code | QUIC application error code `UNSUPPORTED = 9` | With ERROR frames confined to the reply half of an exchange, a unidirectional stream sent to a path that does not serve it has no frame to be refused with. A dedicated stop code keeps the refusal typed instead of collapsing it into `REJECTED` ([PROTOCOL.md](PROTOCOL.md) §7). |
 | Raw stream API | `Peer` and `Acceptor` are public (`crates/weida/src/stream.rs`) | L0 is the product, not an implementation detail: if the patterns are the only way in, every unanticipated topology needs a new pattern. `Peer::open`/`open_bi` and `Acceptor::accept` expose the two QUIC stream kinds directly; the patterns are thin wrappers over them. |
 | Stream limits | `max_pending` removed; `max_concurrent_bidi_streams = 1024` added | There is no pending-reply table left to bound. Concurrent exchanges are bounded by QUIC itself instead, and the bidirectional budget was previously hardcoded to `0`. Worst-case header memory becomes `max_header_bytes * (uni + bidi)` = **48 MiB**, up from 32 MiB ([INVARIANTS.md](INVARIANTS.md)). |
+
+### Phase 3 identity and trust decisions
+
+| Decision | Value | Rationale |
+| --- | --- | --- |
+| Peer identity | SHA-256 of the leaf's DER `SubjectPublicKeyInfo` (`sha256:<64 hex>`) | Hashing the public key rather than the certificate keeps a pin valid across a renewal that reuses the key, and it is the same value `curl --pinnedpubkey` and HPKP pin, so an operator can compute and compare it without weida. |
+| Address may name the peer | `weida://[sha256:<hex>@]host:port/path` | One string then carries both where to dial and whom to accept — which is exactly what a discovery record, a config line or a line pasted into a terminal has to survive as. Reaching a self-signed peer safely needs nothing else configured. |
+| Address fingerprint overrides `Trust` | the named identity is the only one accepted on that connection | The most specific statement of intent wins. An operator who wrote down which peer must answer did not mean "or anybody else my CA vouches for". |
+| Empty `Trust` dials nothing but pinned addresses | `Error::Tls("nothing to trust …")`, before any packet | The only alternative to failing here is trusting everything, which must never be reachable by omission. An endpoint with no trust configured stays usable — for addresses that name their peer, and for nothing else. |
+| Client identity | optional on the dialling side; a binding may require it | Master doc §6 makes client identity optional and §46 asks for mTLS. `ClientTls` therefore carries `Option<Identity>`, and `ServerTls::require_client(trust)` refuses anonymous and untrusted peers at the handshake. Requiring an empty trust is rejected at bind time, since it would accept nobody. |
+| Certificate generation | `rcgen`, behind default feature `generate` | `Identity::generate()` is what lets a pinned deployment handle no PEM at all, so it is on by default; behind a feature so a deployment that only loads issued certificates does not link a certificate builder. |
+| Fingerprint dependencies | `rustls-webpki` (SPKI parsing) and `ring` (SHA-256) as direct dependencies | Both were already in the tree through rustls, so naming them directly adds no third-party code and no build time, which is what master doc §72's dependency discipline asks. Neither parsing a leaf's SPKI nor hashing it is something rustls exposes. |
 
 ---
 
@@ -479,3 +569,24 @@ Recorded deliberately, not discovered later.
   would be worse.
 - **Publisher direction is fixed.** Pub and Pull bind; Sub and Push connect. The reverse
   directions wait for a use case that demands them.
+- **The cause of a lost connection is erased at peer selection.** `PeerSet::pick` reports
+  `Error::ConnectionLost` for any peer whose connection has closed, without consulting the
+  `quinn::ConnectionError`, so an idle timeout, a peer SHUTDOWN and a transport error are
+  indistinguishable there. `conn_error` has the richer mapping; through the pattern APIs it is
+  unreachable once every peer entry is closed. An application deciding whether to reconnect or
+  to give up cannot tell why it lost the peer.
+- **No automatic reconnect.** A dead peer is never redialled by the library; the application
+  calls `connect` again, and dead entries are reaped at that moment (`PeerSet::add`), not
+  before.
+- **Authorization hooks are not implemented.** Master doc §46's authorization surface does not
+  exist. What ships is authentication plus the identity: applications decide on
+  `IncomingMeta::peer`, and the only built-in allow list is a `Trust` pin list on a binding,
+  which is connection-wide and all-or-nothing.
+- **The resolver takes the first address.** `pool::resolve` uses the first entry
+  `lookup_host` returns, so `weida://localhost:…` on a host where `localhost` resolves to
+  `::1` only cannot reach a server bound to `127.0.0.1`. Use the IP literal until address
+  selection learns to try more than one.
+- **`stream_receive_window` is not a payload budget.** The DATA header spends the same window
+  as the payload, and a receiver announces more window only per eighth of it, so a payload
+  sized exactly to the window cannot be written until the application starts reading (§4).
+  Correct QUIC behaviour that reads as a hang.

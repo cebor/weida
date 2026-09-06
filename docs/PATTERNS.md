@@ -1,0 +1,297 @@
+# Patterns
+
+The reference for what each weida pattern does, in the shape of `zmq_socket(3)`: one table
+per pattern naming its compatible peer, direction, routing strategy and behaviour when it has
+nowhere to send, followed by what happens at every failure. Where ZeroMQ's tables describe
+what its threads and queues do, these describe what QUIC does, because a weida pattern is a
+thin wrapper over QUIC streams and inherits its behaviour from them.
+
+Every statement below that could be false is defended by a test named in the text. The
+measured numbers are from `crates/weida/tests/streams.rs` on loopback with `quinn 0.11`; the
+statements hold on any link, the numbers do not.
+
+Related: [ARCHITECTURE.md](ARCHITECTURE.md) (layer model, primitives P1-P4),
+[GUARANTEES.md](GUARANTEES.md) (the vocabulary), [FAILURE_MODEL.md](FAILURE_MODEL.md)
+(outcome rules), [PROTOCOL.md](PROTOCOL.md) (the wire).
+
+---
+
+## 1. Common ground: what a stream is
+
+Every user data flow is one QUIC stream. A Push message, a published copy, the request half of
+an exchange and its reply half are each a stream of their own. What follows is true of all of
+them, whichever pattern opened them.
+
+### 1.1 `finish()` is a commitment
+
+Once `OutgoingTransfer::finish` has queued the FIN, the payload arrives without any local
+handle. The transfer is consumed, the `Delivery` may be dropped, the endpoint may go out of
+scope; only the connection has to live, and the runtime's pool holds it.
+`Runtime::shutdown` is the one thing that cuts a finished transfer short.
+
+*`a_finished_transfer_needs_no_local_handle_to_arrive`.*
+
+### 1.2 The receipt, inside and beyond the window
+
+`Delivery::delivered()` resolves when the peer's **transport** holds every byte and the FIN.
+Inside the peer's stream receive window that is all it means: the receipt resolves before the
+peer's application has called `recv`, and even while the transfer is still parked in the
+peer's accept queue.
+
+Beyond the window it means more, because QUIC cannot accept more bytes than the window until
+the application has consumed some. For a payload of `p` bytes against a window of `w`, the
+receipt cannot resolve until the reader has consumed at least `p - w` bytes, rounded up to the
+next eighth of a window (quinn announces window credit in eighths). So a receipt for a large
+transfer is evidence that the application is reading it; a receipt for a small one is not.
+
+*`push_delivery_receipt` (1 KiB, resolves before `recv`);
+`a_receipt_beyond_the_window_implies_the_reader_consumed` (160 KiB against a 64 KiB window:
+the write completed once 131072 bytes were consumed, the receipt at 163840);
+`the_stream_budget_is_backpressure_not_an_error` (receipt resolves for a transfer still in
+the accept queue).*
+
+### 1.3 Two windows, one shared
+
+Flow control is per stream and per connection, and the two behave differently:
+
+- **Per stream, transfers are isolated.** A stream nobody reads does not delay its siblings.
+- **Per connection, one slow reader stalls everyone.** The connection window is shared by every
+  stream on the connection. Unread streams consume it; when it is spent, every writer on the
+  connection blocks until the slow reader consumes at least an eighth of the window.
+- **The header spends the window too.** The DATA header rides on the transfer's own stream, so
+  the payload that fits in one window is `stream_receive_window - header`, and the last eighth
+  only clears once the application reads. A payload sized exactly to the window therefore
+  blocks until the reader starts. `stream_receive_window` is a buffer size, not a message size.
+
+*`a_stalled_stream_does_not_block_its_siblings` (64 KiB stream window, 256 KiB connection
+window, 32 KiB per stream: siblings flow past an unread stream; the seventh unread stream
+stalls the connection at 229376 bytes; reading the first one releases it);
+`a_payload_the_size_of_the_stream_window_waits_for_the_reader`.*
+
+### 1.4 The stream budget is backpressure, and it lands on `open`
+
+A peer grants `max_concurrent_uni_streams` and `max_concurrent_bidi_streams`. A transfer holds
+its stream until it has been read to EOF, dropped or refused — including while it sits in a
+bounded accept queue. When the budget is spent, the next `open` waits. It does not fail, and
+`write_all` and `finish` are never reached. A deeper `endpoint_queue` changes nothing: a queued
+transfer still owns its stream.
+
+*`the_stream_budget_is_backpressure_not_an_error`,
+`a_deeper_endpoint_queue_does_not_raise_the_stream_budget`,
+`a_replier_that_stops_accepting_stalls_requesters_after_the_queue_fills` (bidi budget 2,
+queue 1: exactly two exchanges complete, the third waits in `open`, one `accept` releases it).*
+
+### 1.5 Cancel: never EOF, not a retraction
+
+`OutgoingTransfer::cancel` (and dropping an unfinished transfer) resets the stream. The reader
+never observes the transfer as complete: `AsyncRead` fails with `io::ErrorKind::ConnectionReset`,
+`read_capped`/`collect` with `Error::Canceled`, never `Ok(0)`. Bytes the reader already took
+are unaffected. Bytes already buffered at the receiver may still be read before the reset is
+processed: cancellation guarantees the peer cannot mistake the transfer for a whole one, not
+that the peer saw fewer bytes.
+
+*`cancel_discards_unread_bytes_and_keeps_read_ones`, `push_cancel_mid_transfer`,
+`cancel_mid_transfer`.*
+
+### 1.6 Refusal of a one-way transfer can lose the race to the receipt
+
+A peer refuses a one-way transfer with `STOP_SENDING` and a code (`UNKNOWN_ENDPOINT`,
+`UNSUPPORTED`, `REJECTED`). That is an application act, and it races the transport
+acknowledgement: a payload that fits in flight can be acknowledged by the peer's transport
+before its application refuses it, and `delivered()` then resolves `Ok` — truthfully, since a
+receipt says nothing about the application, including that it said no. The refusal is
+guaranteed to be observed only when the transfer cannot complete without the application
+acting, which is any payload beyond the stream receive window. Req/Rep has no such race: its
+refusal is an ERROR frame written by the application on the reply half.
+
+*`push_to_an_unknown_path_is_reported`, `push_to_rep_path_is_unsupported`,
+`a_publisher_path_refuses_inbound_transfers` (all with 2 MiB payloads for this reason);
+`unknown_endpoint_is_reported`, `request_to_pull_path_is_unsupported` (Req/Rep).*
+
+### 1.7 Ordering is per stream and nothing else
+
+Bytes within a stream arrive in order. Streams arrive in no particular order relative to each
+other: a peer that opens A then B may see B dispatched first. Every pattern's ordering is
+therefore `None` across messages ([GUARANTEES.md](GUARANTEES.md) §6), and the within-stream
+order is the only order there is. An application that needs message order must carry it in
+the payload or keep one long-lived stream (§5).
+
+### 1.8 Liveness: idle timeout, keep-alive, no reconnect
+
+- A connection with no traffic is declared dead after `RuntimeConfig::idle_timeout` (30 s
+  default), the smaller of the two peers' values governing both.
+- Only the **dialling** side sends keep-alives (`RuntimeConfig::keep_alive`, 10 s default). A
+  binding with an idle timeout shorter than its clients' keep-alive interval drops them.
+- Loss surfaces as `Error::ConnectionLost` from the next operation, on the pattern APIs
+  without the cause. `Peer::peer_count` stops counting the dead peer.
+- **Nothing reconnects.** The application calls `connect` again, with the same or a new
+  address; the dead entry is reaped then. A `Subscriber` re-sends its filters on `connect`.
+
+*`idle_timeout_reports_loss_within_the_window` (server idle timeout 500 ms, client
+keep-alive 10 s, `ConnectionLost` after 1.5 s of silence);
+`after_the_server_restarts_the_pusher_must_reconnect`.*
+
+### 1.9 Identity: who is on the other side
+
+A peer is named by the SHA-256 fingerprint of its public key (`Fingerprint`, text form
+`sha256:<64 hex>`). The dialling side states whom it accepts with `Trust` — pins, anchors, or
+only what the address names (`weida://sha256:…@host:port/path`) — and a binding may require a
+client identity with `ServerTls::require_client`. Whatever arrives on a stream carries the
+peer's proved fingerprint in `IncomingMeta::peer` (`None` for an anonymous client); it comes
+from the handshake, never from a header, so it can be authorized on but not forged. A peer
+outside the terms fails `connect` with `Error::Untrusted(fingerprint)`, carrying what
+answered so an operator can pin it after checking it out of band.
+
+*`crates/weida/tests/identity.rs`, all ten.*
+
+---
+
+## 2. Req/Rep
+
+One bidirectional stream per exchange. The requester writes the request on its half and reads
+the reply, or an ERROR, on the other. The stream is the correlation; nothing on the wire names
+an exchange.
+
+| | `Requester` (`Req`) | `Replier` (`Rep`) |
+| --- | --- | --- |
+| Compatible peer | `Replier`, `Acceptor` | `Requester`, `Peer::open_bi` |
+| Direction | connects | binds |
+| Send/receive pattern | any number of concurrent exchanges, each `open` → write → `finish` → `recv` | `accept` → read body → `reply` → write → `finish`, or drop for `NO_REPLY` |
+| Incoming routing | the reply half of the exchange that asked | fair, bounded queue per path (`endpoint_queue`) |
+| Outgoing routing | round-robin over live peers, one exchange per pick | the exchange that asked |
+| Action with no peer | `Error::NotConnected` immediately; `ConnectionLost` if every peer died | `accept` waits |
+| Transport | one client-opened bidirectional stream | |
+| Ordering | `None` across exchanges; request and reply each in order | |
+| Delivery signal | the reply itself; the request's receipt is available from `open` but proves less than the reply | |
+| Backpressure | `max_concurrent_bidi_streams` on `open`, then both halves' windows | a full queue stalls the requester's `open` |
+| Cancellation | drop the `ReplyStream`: `STOP_SENDING(CANCELED)` on the reply half, `IncomingRequest::canceled` fires | drop the request: ERROR `NO_REPLY` + `STOP_SENDING(REJECTED)` |
+
+Failure modes, from the requester's side:
+
+| Event | Result of `recv` / `request` |
+| --- | --- |
+| Path unknown at the peer | `Error::UnknownEndpoint` (ERROR frame) |
+| Path serves another pattern | `Error::Unsupported` (ERROR frame) |
+| Replier dropped the request | `Error::NoReply`; the request may have had an effect |
+| Connection lost before the request FIN | `Error::ConnectionLost` from the write: definitely not delivered |
+| Connection lost after the FIN, no reply seen | `Error::Indeterminate`: the replier may have acted |
+| Replier reset the reply mid-stream | `Error::Canceled` from the read |
+
+Request and reply stream simultaneously: the replier may `take_body` and `reply` before the
+request has finished, and a requester writing a large request must drain the reply
+concurrently or it stalls the replier and therefore itself
+(*`streaming_overlap`*). Router/Dealer are not separate types: unlimited concurrent exchanges
+give Dealer's multiplexing, and the reply riding the originating stream gives Router's
+addressing for free ([ARCHITECTURE.md](ARCHITECTURE.md) §6a).
+
+---
+
+## 3. Push/Pull
+
+One unidirectional stream per message. Fire-and-forget with an optional transport receipt.
+
+| | `Pusher` (`Push`) | `Puller` (`Pull`) |
+| --- | --- | --- |
+| Compatible peer | `Puller`, `Acceptor` | `Pusher`, `Peer::open` |
+| Direction | connects | binds |
+| Send/receive pattern | `send` (returns at FIN, receipt dropped) or `open` → write → `finish` → `delivered` | `recv` → read |
+| Incoming routing | — | fair, bounded queue per path (`endpoint_queue`) |
+| Outgoing routing | round-robin over live peers, one message per pick | — |
+| Action with no peer | `Error::NotConnected` immediately; `ConnectionLost` if every peer died — never blocks, unlike ZeroMQ's PUSH | `recv` waits |
+| Transport | one client-opened unidirectional stream | |
+| Ordering | `None` | |
+| Delivery signal | none (`send`) or the transport receipt (§1.2) | none; EOF is EOF |
+| Backpressure | `max_concurrent_uni_streams` on `open` (§1.4), then the windows (§1.3) | a puller that stops reading stalls its pushers after the budget; nothing is dropped |
+| Cancellation | `cancel` or drop: the puller's read fails, never EOF (§1.5) | drop an unread transfer: `STOP_SENDING(REJECTED)` |
+
+Failure modes, from the pusher's side:
+
+| Event | `send` | `delivered()` |
+| --- | --- | --- |
+| Path unknown / wrong pattern | `UnknownEndpoint` / `Unsupported`, or `Ok` if the transport acknowledged first (§1.6) | same |
+| Connection lost before FIN | `ConnectionLost` | — |
+| Connection lost after FIN | `Ok` (the FIN was queued) | `Indeterminate` |
+| Puller refused mid-transfer | `Rejected` | `Rejected` |
+
+Round-robin is per message, and a peer is skipped only once its connection is closed; a peer
+that is merely slow keeps receiving its share and eventually stalls the pusher through its
+windows. Spreading work by capacity rather than by turn is broker work (L2).
+*`push_round_robins_two_peers`*.
+
+---
+
+## 4. Pub/Sub
+
+One unidirectional stream per subscriber per message, opened by the publisher's per-subscriber
+writer. Filters are byte prefixes carried in SUBSCRIBE/UNSUBSCRIBE frames.
+
+| | `Publisher` (`Pub`) | `Subscriber` (`Sub`) |
+| --- | --- | --- |
+| Compatible peer | `Subscriber` | `Publisher` |
+| Direction | binds | connects |
+| Send/receive pattern | `publish(topic, bytes)`: synchronous, returns the number of subscribers reached | `subscribe`/`unsubscribe`, then `recv` |
+| Incoming routing | — | one bounded queue (`endpoint_queue`) over every peer |
+| Outgoing routing | fan-out to every subscriber whose filter matches, one copy each | — |
+| Action with no peer | `publish` returns `0`; nothing is queued for a subscriber that does not exist yet | `recv` waits; `peer_count` is the only sign that the publisher is gone |
+| Transport | one server-opened unidirectional stream per (subscriber, message) | |
+| Ordering | `None`; one subscriber's copies are enqueued in publication order, but that is not a guarantee | |
+| Delivery signal | none, and none is possible: `publish` never awaits a subscriber | none |
+| Backpressure | `Drop`: a copy that does not fit in `subscriber_buffer_bytes` for that subscriber is dropped and counted in `dropped()`; the publisher never blocks | a subscriber that stops reading fills its budget at the publisher and then loses messages |
+| Payload | whole `Bytes`, at most `subscriber_buffer_bytes`; larger is `LimitExceeded` before fan-out | |
+
+Failure modes:
+
+| Event | Publisher | Subscriber |
+| --- | --- | --- |
+| Slow subscriber | drops for that subscriber only, `dropped()` grows | silently misses messages: nothing on the wire says so |
+| Subscriber's connection lost | its filters and writer are removed | `recv` keeps waiting; `peer_count` drops |
+| Publisher's connection lost | — | `recv` keeps waiting; filters are remembered and re-sent on the next `connect` |
+| Too many filters on one connection | closes it with `LIMIT_EXCEEDED` | `connect`/`subscribe` fails |
+| Message beyond the budget | `LimitExceeded`, nothing sent | — |
+
+This is the one place weida answers overload by discarding, and it is confined to fan-out
+([GUARANTEES.md](GUARANTEES.md) §6). A subscriber cannot detect a drop; making loss
+observable needs a sequence field the wire does not have. Streaming fan-out — a publisher that
+hands out a stream per subscriber instead of a `Bytes` — is a recorded deferral.
+*`slow_subscriber_drops_not_blocks`, `subscribe_prefix_filters_topics`.*
+
+---
+
+## 5. Raw streams: `Peer` and `Acceptor`
+
+The L0 core, for topologies the patterns do not cover. A `Peer` dials and opens either stream
+kind; an `Acceptor` binds one path and receives both kinds as `Incoming::Stream` or
+`Incoming::Exchange`. Everything in §1 applies without translation, and nothing else is added:
+no selection policy beyond round-robin over peers, no fan-out, no filters.
+
+Two things the patterns cannot express are natural here:
+
+- **A long-lived stream.** Open once, write many messages with a framing of your own, and
+  QUIC orders them for you — the only ordered channel weida has. The stream keeps its window
+  and its place in the budget for as long as it is open, and its reader's pace is its writer's
+  pace (§1.3). A standing feed of frames to one viewer is this shape.
+- **Both stream kinds on one path.** A control exchange and a bulk one-way stream to the same
+  endpoint, dispatched by one accept loop.
+
+*`acceptor_receives_both_stream_kinds`.*
+
+---
+
+## 6. Mapped, not implemented
+
+PAIR, BUS and SURVEYOR/RESPONDENT are mapped onto L0 in [ARCHITECTURE.md](ARCHITECTURE.md)
+and deliberately not shipped until a use case asks. Router/Dealer are emergent (§2). Connecting
+publishers and binding pushers are recorded deferrals.
+
+---
+
+## 7. Choosing
+
+| You need | Use | Because |
+| --- | --- | --- |
+| an answer per message | Req/Rep | the reply is the strongest signal weida has (§2) |
+| work distributed over workers, nothing lost under load | Push/Pull | backpressure is `Block`; the only losses are explicit refusals and `Indeterminate` after a loss (§3) |
+| the newest of a feed, many readers, laggards may lose | Pub/Sub | drops are per subscriber and counted (§4) |
+| ordered messages to one peer | a raw stream | QUIC orders bytes within a stream and nowhere else (§1.7, §5) |
+| a signal larger than `subscriber_buffer_bytes` to many readers | a raw stream per reader, until streaming fan-out exists | Pub/Sub materializes a copy per subscriber (§4) |
+| proof the peer's application acted | Req/Rep, or an L2 broker (Phase 6) | a transport receipt never says that (§1.2); `Accepted`/`Stored`/`Processed` are reserved for a hop that owns the message |
