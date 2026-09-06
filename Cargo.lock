@@ -1552,10 +1552,13 @@ dependencies = [
  "quinn",
  "rand 0.9.5",
  "rcgen",
+ "ring",
  "rustls-pki-types",
+ "rustls-webpki",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "weida",
  "weida-core",
  "weida-protocol",
 ]

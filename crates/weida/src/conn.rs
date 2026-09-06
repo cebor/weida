@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use quinn::VarInt;
 use tokio::sync::{mpsc, watch};
-use weida_core::{Error, ErrorCode, Limits};
+use weida_core::{Error, ErrorCode, Fingerprint, Limits};
 use weida_protocol::{
     Agreed, DataHeader, ErrorHeader, FrameKind, Hello, MAX_PREAMBLE_LEN, Preamble, PreambleError,
     SubscriptionHeader, codes, encode_frame, negotiate, parse_preamble,
@@ -55,6 +55,9 @@ pub(crate) struct ConnCtx {
     /// that subscribes to us when we serve no publishers is useless, not
     /// hostile, so the frame is ignored rather than treated as a violation.
     pub subs: Option<Arc<SubRegistry>>,
+    /// The identity the peer proved in the handshake, `None` for an anonymous
+    /// client. Fixed for the life of the connection.
+    pub peer: Option<Fingerprint>,
     agreed: watch::Receiver<Option<Agreed>>,
 }
 
@@ -73,6 +76,7 @@ impl ConnCtx {
         let agreed_tx = Arc::new(agreed_tx);
 
         let ctx = Arc::new(ConnCtx {
+            peer: crate::tls::peer_fingerprint(&conn),
             conn: conn.clone(),
             ctl: ctl_tx,
             limits,
@@ -94,14 +98,31 @@ impl ConnCtx {
     /// QUIC streams are unordered relative to each other, so a DATA stream can
     /// be accepted before the peer's HELLO. Parking here is correct behaviour,
     /// not a protocol violation.
+    ///
+    /// A connection that dies while we wait fails this immediately with the
+    /// reason it died. That matters most for a client whose handshake looked
+    /// complete but whose identity the server then refused: the refusal is a
+    /// connection close that arrives *after* `connect` resolved, and the
+    /// HELLO that would end this wait is never coming.
     pub(crate) async fn negotiated(&self) -> Result<Agreed, Error> {
         let mut rx = self.agreed.clone();
         loop {
             if let Some(agreed) = *rx.borrow_and_update() {
                 return Ok(agreed);
             }
-            if rx.changed().await.is_err() {
-                return Err(Error::ConnectionLost);
+            tokio::select! {
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        // The sender is gone because the connection is: the
+                        // accept loops and the deadline hold it and end with
+                        // it. Report why, not merely that.
+                        return Err(self
+                            .conn
+                            .close_reason()
+                            .map_or(Error::ConnectionLost, conn_error));
+                    }
+                }
+                reason = self.conn.closed() => return Err(conn_error(reason)),
             }
         }
     }
@@ -146,8 +167,25 @@ pub(crate) fn conn_error(e: quinn::ConnectionError) -> Error {
             _ => Error::ConnectionLost,
         },
         quinn::ConnectionError::LocallyClosed => Error::ConnectionLost,
+        // An idle timeout or a stateless reset is a lost connection: whatever
+        // was in flight will never complete, which is the definite outcome
+        // `ConnectionLost` promises (`docs/FAILURE_MODEL.md`).
+        quinn::ConnectionError::TimedOut | quinn::ConnectionError::Reset => Error::ConnectionLost,
+        // Error codes 0x100..0x200 carry a TLS alert: the handshake itself
+        // failed, whether we detected it or the peer told us so. That is a
+        // TLS outcome, not a transport one.
+        quinn::ConnectionError::TransportError(t) if is_tls_alert(t.code) => {
+            Error::Tls(t.to_string())
+        }
+        quinn::ConnectionError::ConnectionClosed(c) if is_tls_alert(c.error_code) => {
+            Error::Tls(format!("peer aborted the handshake: {c}"))
+        }
         other => Error::Transport(other.to_string()),
     }
+}
+
+fn is_tls_alert(code: quinn::TransportErrorCode) -> bool {
+    (0x100..0x200).contains(&u64::from(code))
 }
 
 /// Maps a stream write failure onto the outcome vocabulary.
@@ -261,7 +299,12 @@ async fn send_hello(conn: quinn::Connection, limits: Limits) {
 
 /// Closes the connection if the peer's HELLO never arrives.
 async fn hello_deadline(ctx: ConnHandle, agreed_tx: Arc<watch::Sender<Option<Agreed>>>) {
-    tokio::time::sleep(Duration::from_millis(ctx.limits.hello_timeout_ms)).await;
+    tokio::select! {
+        () = tokio::time::sleep(Duration::from_millis(ctx.limits.hello_timeout_ms)) => {}
+        // A connection that is already gone needs no deadline, and holding
+        // one would keep its state alive for the whole timeout.
+        _ = ctx.conn.closed() => return,
+    }
     if agreed_tx.borrow().is_none() {
         tracing::debug!("peer HELLO did not arrive in time");
         close(&ctx.conn, codes::NEGOTIATION_FAILED, "hello timeout");
@@ -515,7 +558,10 @@ async fn handle_data(
         return violation(ctx, "DATA on a unidirectional stream must name an endpoint");
     };
 
-    let transfer = IncomingTransfer::new(stream, Arc::new(IncomingMeta::from_header(&header)));
+    let transfer = IncomingTransfer::new(
+        stream,
+        Arc::new(IncomingMeta::from_header(&header, ctx.peer)),
+    );
     match ctx.namespace.lookup(&path) {
         // Awaiting a queue slot is the backpressure path: it stalls this
         // stream's task, which stalls the peer through QUIC flow control.
@@ -584,7 +630,7 @@ async fn handle_bi(
 
     let route = ctx.namespace.lookup(&path);
     let request = IncomingRequest::new(
-        IncomingTransfer::new(recv, Arc::new(IncomingMeta::from_header(&header))),
+        IncomingTransfer::new(recv, Arc::new(IncomingMeta::from_header(&header, ctx.peer))),
         send,
         Arc::clone(ctx),
     );

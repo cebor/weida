@@ -25,6 +25,8 @@ tracing = "0.1"
 rand = "0.9"
 minicbor = { version = "2", features = ["alloc"] }
 rustls-pki-types = { version = "1", features = ["std"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
+ring = "0.17"
 
 rcgen = "0.14"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

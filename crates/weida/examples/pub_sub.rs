@@ -18,24 +18,24 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use weida::{ClientTls, Publisher, Runtime, RuntimeConfig, ServerTls, Subscriber};
+use weida::{Identity, Publisher, Runtime, RuntimeConfig, Subscriber, Trust};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // A throwaway certificate for loopback, kept in memory; see push_pull.rs.
-    let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])?;
-    let cert_pem = cert.cert.pem();
+    // A throwaway identity, kept in memory; see push_pull.rs.
+    let identity = Identity::generate()?;
+    let fingerprint = identity.fingerprint()?;
 
     // --- the publishing side: binds ---------------------------------------
     let server = Runtime::new(RuntimeConfig::default())?;
     let listener = server.listener();
     let binding = listener
-        .bind_quic(
-            "127.0.0.1:0".parse::<SocketAddr>()?,
-            ServerTls::from_pem(cert_pem.clone(), cert.signing_key.serialize_pem()),
-        )
+        .bind_quic("127.0.0.1:0".parse::<SocketAddr>()?, identity)
         .await?;
-    let url = format!("weida://127.0.0.1:{}/md", binding.local_addr().port());
+    let url = format!(
+        "weida://{fingerprint}@127.0.0.1:{}/md",
+        binding.local_addr().port()
+    );
 
     let publisher = listener.publisher("/md")?;
     println!("publishing on {url}");
@@ -50,11 +50,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prices_rt = Runtime::new(RuntimeConfig::default())?;
     let everything_rt = Runtime::new(RuntimeConfig::default())?;
 
-    let prices = prices_rt.subscriber(ClientTls::from_pem(cert_pem.clone()));
+    let prices = prices_rt.subscriber(Trust::by_address());
     prices.connect(&url).await?;
     prices.subscribe("px.").await?;
 
-    let everything = everything_rt.subscriber(ClientTls::from_pem(cert_pem));
+    let everything = everything_rt.subscriber(Trust::by_address());
     everything.connect(&url).await?;
     everything.subscribe("").await?;
 

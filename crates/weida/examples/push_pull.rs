@@ -21,28 +21,28 @@
 
 use std::net::SocketAddr;
 
-use weida::{ClientTls, Runtime, RuntimeConfig, ServerTls, TransferMeta};
+use weida::{Identity, Runtime, RuntimeConfig, TransferMeta, Trust};
 
 const JOBS: usize = 5;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // A throwaway certificate for loopback. It stays in memory: `ServerTls`
-    // and `ClientTls` take PEM buffers, so there is no file to write, protect
-    // or clean up.
-    let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])?;
-    let cert_pem = cert.cert.pem();
+    // A throwaway identity for the pulling side. It stays in memory: nothing
+    // is written, protected or cleaned up. Its fingerprint goes into the URL,
+    // and that URL is everything the pushing side needs to know.
+    let identity = Identity::generate()?;
+    let fingerprint = identity.fingerprint()?;
 
     // --- the pulling side: binds and receives -----------------------------
     let server = Runtime::new(RuntimeConfig::default())?;
     let listener = server.listener();
     let binding = listener
-        .bind_quic(
-            "127.0.0.1:0".parse::<SocketAddr>()?,
-            ServerTls::from_pem(cert_pem.clone(), cert.signing_key.serialize_pem()),
-        )
+        .bind_quic("127.0.0.1:0".parse::<SocketAddr>()?, identity)
         .await?;
-    let url = format!("weida://127.0.0.1:{}/jobs", binding.local_addr().port());
+    let url = format!(
+        "weida://{fingerprint}@127.0.0.1:{}/jobs",
+        binding.local_addr().port()
+    );
 
     let puller = listener.puller("/jobs")?;
     let worker = tokio::spawn(async move {
@@ -56,8 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // --- the pushing side: connects and sends -----------------------------
+    // `Trust::by_address`: accept exactly the peer the URL names, nothing else.
     let client = Runtime::new(RuntimeConfig::default())?;
-    let pusher = client.pusher(ClientTls::from_pem(cert_pem));
+    let pusher = client.pusher(Trust::by_address());
     pusher.connect(&url).await?;
 
     println!("pushing {JOBS} jobs to {url}");

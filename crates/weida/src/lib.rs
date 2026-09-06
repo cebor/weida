@@ -7,14 +7,17 @@
 //! `docs/FAILURE_MODEL.md` defines what each outcome means.
 //!
 //! ```no_run
-//! use weida::{Runtime, RuntimeConfig, ClientTls, TransferMeta};
+//! use weida::{Runtime, RuntimeConfig, TransferMeta, Trust};
 //!
 //! # async fn example() -> weida::Result<()> {
 //! let runtime = Runtime::new(RuntimeConfig::default())?;
 //!
-//! // Trust belongs to the dialling endpoint, not to the runtime.
-//! let requester = runtime.requester(ClientTls::from_pem_file("ca.pem"));
-//! requester.connect("weida://127.0.0.1:7443/transform").await?;
+//! // Trust belongs to the dialling endpoint, not to the runtime. Here the
+//! // address itself names the peer's public key, so nothing else is needed.
+//! let requester = runtime.requester(Trust::by_address());
+//! requester
+//!     .connect("weida://sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08@127.0.0.1:7443/transform")
+//!     .await?;
 //!
 //! // One bidirectional stream: the request half and the reply half. The
 //! // stream is the correlation, so nothing on the wire names the exchange.
@@ -39,10 +42,12 @@ mod stream;
 mod tls;
 mod transfer;
 
-pub use weida_core::{EndpointAddr, Error, ErrorCode, Limits, Result, StopReason, TraceContext};
+pub use weida_core::{
+    EndpointAddr, Error, ErrorCode, Fingerprint, Limits, Result, StopReason, TraceContext,
+};
 pub use weida_protocol::{ALPN, VERSION, codes};
 
-pub use config::{ClientTls, Pem, RuntimeConfig, ServerTls};
+pub use config::{ClientTls, Identity, Pem, RuntimeConfig, ServerTls, Trust};
 pub use endpoint::{
     Endpoint, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher, Rep, Replier, Req, Requester,
     Sub, Subscriber,

@@ -552,12 +552,8 @@ async fn multi_peer_requests_round_robin() {
     // endpoint, so two peers under different CAs need one endpoint, not two
     // runtimes.
     let client = weida::Runtime::new(weida::RuntimeConfig::default()).expect("client runtime");
-    let requester = client.requester(weida::ClientTls {
-        roots_pem: vec![
-            weida::Pem::File(a.certs.cert_pem.clone()),
-            weida::Pem::File(b.certs.cert_pem.clone()),
-        ],
-    });
+    let requester = client
+        .requester(weida::Trust::anchor_file(&a.certs.cert_pem).and_anchor_file(&b.certs.cert_pem));
     requester.connect(&a.url("/rr")).await.expect("connect a");
     requester.connect(&b.url("/rr")).await.expect("connect b");
     assert_eq!(requester.peer_count(), 2);
@@ -574,9 +570,9 @@ async fn multi_peer_requests_round_robin() {
 
 #[tokio::test]
 async fn endpoints_with_different_trust_do_not_share_a_connection() {
-    // The pool is keyed by authority *and* trust anchors. Sharing on authority
-    // alone would hand one endpoint a peer that was authenticated against a
-    // different endpoint's certificate authority.
+    // The pool is keyed by authority *and* trust terms. Sharing on authority
+    // alone would hand one endpoint a peer that was authenticated on a
+    // different endpoint's terms.
     let server = Server::start().await;
     let handler = spawn_uppercase_handler(server.listener.replier("/t").expect("replier")).await;
 
@@ -595,10 +591,14 @@ async fn endpoints_with_different_trust_do_not_share_a_connection() {
     let err = distrusting
         .connect(&server.url("/t"))
         .await
-        .expect_err("a peer outside our trust anchors must not be accepted");
-    assert!(
-        !matches!(err, Error::AlreadyRegistered),
-        "expected a TLS/transport failure, got {err:?}"
+        .expect_err("a peer outside our trust must not be accepted");
+    assert_eq!(
+        match err {
+            Error::Untrusted(presented) => presented,
+            other => panic!("expected Untrusted, got {other:?}"),
+        },
+        server.certs.fingerprint(),
+        "the refusal names the identity that answered"
     );
 
     handler.await.expect("handler");

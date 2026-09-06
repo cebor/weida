@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+default = ["generate"]
+# `Identity::generate`: self-signed identities for pinning. Off for callers
+# that only ever load certificates issued elsewhere.
+generate = ["dep:rcgen"]
+
 [dependencies]
 weida-core.workspace = true
 weida-protocol.workspace = true
@@ -14,9 +20,16 @@ bytes.workspace = true
 tracing.workspace = true
 rand.workspace = true
 rustls-pki-types.workspace = true
+# Both already in the tree through rustls: the fingerprint needs a SPKI parser
+# and a SHA-256, and these are the ones rustls links anyway.
+rustls-webpki.workspace = true
+ring.workspace = true
+rcgen = { workspace = true, optional = true }
 
 [dev-dependencies]
-rcgen.workspace = true
+# Tests, examples and benches generate throwaway identities even when a
+# downstream build turns the feature off.
+weida = { path = ".", features = ["generate"] }
 tracing-subscriber.workspace = true
 # Examples stream stdin/stdout; the library itself needs no stdio.
 tokio = { workspace = true, features = ["io-std"] }

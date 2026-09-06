@@ -10,36 +10,32 @@ use std::net::SocketAddr;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use tokio::io::AsyncReadExt;
-use weida::{Limits, Listener, Runtime, RuntimeConfig, ServerTls, TransferMeta};
+use weida::{Identity, Limits, Listener, Runtime, RuntimeConfig, TransferMeta, Trust};
 
 const CHUNK: usize = 64 * 1024;
 
 struct Harness {
     runtime: Runtime,
     client: Runtime,
-    trust: weida::ClientTls,
+    trust: Trust,
     addr: SocketAddr,
     _listener: Listener,
     _binding: weida::Binding,
 }
 
-/// Starts an echo server and a client runtime that trusts it.
+/// Starts an echo server and a client runtime that pins it.
 ///
-/// The certificate stays in memory. `criterion` exits the process when the run
+/// The identity stays in memory: `criterion` exits the process when the run
 /// ends, so a `Drop` that removed a temporary directory would not fire and the
 /// private key would outlive the benchmark.
 async fn harness() -> Harness {
-    let generated =
-        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).expect("certificate");
-    let cert_pem = generated.cert.pem();
+    let identity = Identity::generate().expect("identity");
+    let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
 
     let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
     let listener = runtime.listener();
     let binding = listener
-        .bind_quic(
-            "127.0.0.1:0".parse().expect("loopback"),
-            ServerTls::from_pem(cert_pem.clone(), generated.signing_key.serialize_pem()),
-        )
+        .bind_quic("127.0.0.1:0".parse().expect("loopback"), identity)
         .await
         .expect("bind");
     let addr = binding.local_addr();
@@ -73,7 +69,6 @@ async fn harness() -> Harness {
         ..RuntimeConfig::default()
     })
     .expect("client runtime");
-    let trust = weida::ClientTls::from_pem(cert_pem);
 
     Harness {
         runtime,

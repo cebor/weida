@@ -11,7 +11,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use weida::{Binding, ClientTls, Limits, Listener, Runtime, RuntimeConfig, ServerTls};
+use weida::{
+    Binding, ClientTls, Fingerprint, Identity, Limits, Listener, Runtime, RuntimeConfig, ServerTls,
+    Trust,
+};
 
 /// A generated certificate on disk, removed when dropped.
 pub struct Certs {
@@ -69,12 +72,21 @@ impl Certs {
         }
     }
 
-    pub fn server_tls(&self) -> ServerTls {
-        ServerTls::new(&self.cert_pem, &self.key_pem)
+    pub fn identity(&self) -> Identity {
+        Identity::from_pem_files(&self.cert_pem, &self.key_pem)
     }
 
+    pub fn server_tls(&self) -> ServerTls {
+        ServerTls::new(self.identity())
+    }
+
+    /// Trusts this certificate as an anchor: the name-checked CA path.
     pub fn client_tls(&self) -> ClientTls {
-        ClientTls::from_pem_file(&self.cert_pem)
+        ClientTls::new(Trust::anchor_file(&self.cert_pem))
+    }
+
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.identity().fingerprint().expect("fingerprint")
     }
 }
 
@@ -128,6 +140,16 @@ impl Server {
     /// A `weida://` URL for `path` on this server.
     pub fn url(&self, path: &str) -> String {
         format!("weida://127.0.0.1:{}{}", self.addr.port(), path)
+    }
+
+    /// The same URL with the server's fingerprint in it: pinned by address.
+    pub fn pinned_url(&self, path: &str) -> String {
+        format!(
+            "weida://{}@127.0.0.1:{}{}",
+            self.certs.fingerprint(),
+            self.addr.port(),
+            path
+        )
     }
 
     /// A client runtime. Trust is supplied per endpoint; see [`Server::trust`].

@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 
 use quinn::VarInt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use weida_core::{Error, ErrorCode, TraceContext};
+use weida_core::{Error, ErrorCode, Fingerprint, TraceContext};
 use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes, encode_preamble};
 
 use crate::conn::{ConnHandle, Ctl, read_error, read_frame, write_error, write_error_frame};
@@ -71,10 +71,17 @@ pub struct IncomingMeta {
     pub tracestate: Option<String>,
     /// Pub/Sub topic, when the transfer came from a publisher fan-out.
     pub topic: Option<String>,
+    /// The public-key fingerprint the sending peer proved in the TLS
+    /// handshake; `None` when it dialled anonymously.
+    ///
+    /// This is the identity to authorize on. It comes from the handshake, not
+    /// from anything the peer wrote into a header, so it cannot be claimed —
+    /// only proved (master doc §47).
+    pub peer: Option<Fingerprint>,
 }
 
 impl IncomingMeta {
-    pub(crate) fn from_header(header: &DataHeader) -> IncomingMeta {
+    pub(crate) fn from_header(header: &DataHeader, peer: Option<Fingerprint>) -> IncomingMeta {
         IncomingMeta {
             endpoint: header.endpoint.clone(),
             content_len: header.content_len,
@@ -85,6 +92,7 @@ impl IncomingMeta {
                 .and_then(|v| TraceContext::parse_traceparent(v).ok()),
             tracestate: header.tracestate.clone(),
             topic: header.topic.clone(),
+            peer,
         }
     }
 }
@@ -591,7 +599,7 @@ impl ReplyStream {
         match preamble.kind {
             FrameKind::Data => {
                 let header = DataHeader::decode(&header)?;
-                let meta = Arc::new(IncomingMeta::from_header(&header));
+                let meta = Arc::new(IncomingMeta::from_header(&header, self.conn.peer));
                 Ok(IncomingTransfer::new(recv, meta))
             }
             FrameKind::Error => {
@@ -686,11 +694,11 @@ mod tests {
     fn incoming_meta_ignores_a_malformed_traceparent() {
         let mut header = DataHeader::addressed("/x");
         header.traceparent = Some("not-a-traceparent".into());
-        let meta = IncomingMeta::from_header(&header);
+        let meta = IncomingMeta::from_header(&header, None);
         assert!(meta.trace.is_none());
 
         let good = new_trace_context();
         header.traceparent = Some(good.to_traceparent());
-        assert_eq!(IncomingMeta::from_header(&header).trace, Some(good));
+        assert_eq!(IncomingMeta::from_header(&header, None).trace, Some(good));
     }
 }

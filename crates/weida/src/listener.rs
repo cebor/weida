@@ -134,14 +134,22 @@ impl Listener {
 
     /// Adds a native QUIC binding with its own server identity.
     ///
-    /// The TLS material is loaded and validated here, so a misconfigured
-    /// certificate fails before the socket serves anything. Pass port `0` to
-    /// let the OS choose; read it back with [`Binding::local_addr`].
+    /// `tls` may be a bare [`crate::Identity`] — the binding then accepts
+    /// anonymous peers — or a [`ServerTls`] that also requires clients to
+    /// present an identity it trusts. The material is loaded and validated
+    /// here, so a misconfigured certificate fails before the socket serves
+    /// anything. Pass port `0` to let the OS choose; read it back with
+    /// [`Binding::local_addr`].
     ///
     /// Several bindings may serve the same Listener, each with its own
-    /// certificate: the endpoints they expose are the same, the identities they
+    /// identity: the endpoints they expose are the same, the identities they
     /// present need not be.
-    pub async fn bind_quic(&self, addr: SocketAddr, tls: ServerTls) -> Result<Binding, Error> {
+    pub async fn bind_quic(
+        &self,
+        addr: SocketAddr,
+        tls: impl Into<ServerTls>,
+    ) -> Result<Binding, Error> {
+        let tls = tls.into();
         let limits = self.inner.runtime.config.limits;
         let server_config =
             tls::server_config(&tls, &limits, self.inner.runtime.config.idle_timeout)?;

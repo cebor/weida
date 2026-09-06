@@ -10,7 +10,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
-use weida_core::Error;
+use weida_core::{Error, Fingerprint};
 
 use crate::config::{ClientTls, RuntimeConfig};
 use crate::conn::{ConnCtx, ConnHandle, conn_error};
@@ -21,10 +21,11 @@ pub(crate) struct ClientPool {
     state: Mutex<PoolState>,
 }
 
-/// Keyed by authority **and** trust anchors. Two endpoints dialling the same
-/// `host:port` with different trust must not share a connection: the
-/// certificate was validated against one of them, not both.
-type PoolKey = (String, u16, Arc<ClientTls>);
+/// Keyed by authority, trust configuration **and** the fingerprint the
+/// address named. Two endpoints dialling the same `host:port` on different
+/// terms must not share a connection: the peer was authenticated on one set
+/// of terms, not both.
+type PoolKey = (String, u16, Arc<ClientTls>, Option<Fingerprint>);
 
 #[derive(Default)]
 struct PoolState {
@@ -46,8 +47,9 @@ impl ClientPool {
         state.endpoint.take()
     }
 
-    /// Returns a live connection to `host:port` authenticated against `tls`,
-    /// dialling if necessary.
+    /// Returns a live connection to `host:port` authenticated on `tls`'s
+    /// terms — and, when the address named one, as `expected` — dialling if
+    /// necessary.
     ///
     /// The returned handle has completed the HELLO exchange, so callers never
     /// have to think about negotiation.
@@ -57,8 +59,9 @@ impl ClientPool {
         host: &str,
         port: u16,
         tls: &Arc<ClientTls>,
+        expected: Option<Fingerprint>,
     ) -> Result<ConnHandle, Error> {
-        let key: PoolKey = (host.to_owned(), port, Arc::clone(tls));
+        let key: PoolKey = (host.to_owned(), port, Arc::clone(tls), expected);
         let mut state = self.state.lock().await;
 
         if let Some(existing) = state.connections.get(&key) {
@@ -77,16 +80,31 @@ impl ClientPool {
             }
         };
 
-        let client_config =
-            tls::client_config(tls, &config.limits, config.keep_alive, config.idle_timeout)?;
+        let (client_config, refused) = tls::client_config(
+            tls,
+            expected,
+            &config.limits,
+            config.keep_alive,
+            config.idle_timeout,
+        )?;
 
         let addr = resolve(host, port).await?;
         tracing::debug!(%addr, host, "dialling");
-        let conn = endpoint
+        let connecting = endpoint
             .connect_with(client_config, addr, host)
-            .map_err(|e| Error::Transport(format!("connect to {addr} failed: {e}")))?
-            .await
-            .map_err(conn_error)?;
+            .map_err(|e| Error::Transport(format!("connect to {addr} failed: {e}")))?;
+        let conn = match connecting.await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // The verifier saw the peer before the handshake died: report
+                // who answered, so the operator can decide whether to pin it.
+                let refused = refused.lock().expect("refusal record poisoned").take();
+                return Err(match refused {
+                    Some(presented) => Error::Untrusted(presented),
+                    None => conn_error(e),
+                });
+            }
+        };
 
         // A fresh namespace per client connection: a subscriber registers its
         // path here so fanned-out copies have somewhere to go. It is not the

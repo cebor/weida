@@ -9,18 +9,16 @@ use std::net::SocketAddr;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
-use weida::{
-    ClientTls, Listener, Publisher, Puller, Runtime, RuntimeConfig, ServerTls, TransferMeta,
-};
+use weida::{Identity, Listener, Publisher, Puller, Runtime, RuntimeConfig, TransferMeta, Trust};
 
 const PAYLOAD: usize = 1024;
 
 struct Harness {
     runtime: Runtime,
-    /// The certificate as PEM text. Nothing is written to disk: `criterion`
+    /// The server's fingerprint. Nothing is written to disk: `criterion`
     /// exits the process when the run ends, so `Drop` would not fire and a
     /// key file would survive the benchmark.
-    cert_pem: String,
+    trust: Trust,
     addr: SocketAddr,
     listener: Listener,
     _binding: weida::Binding,
@@ -32,8 +30,8 @@ impl Harness {
         Runtime::new(RuntimeConfig::default()).expect("client runtime")
     }
 
-    fn trust(&self) -> ClientTls {
-        ClientTls::from_pem(self.cert_pem.clone())
+    fn trust(&self) -> Trust {
+        self.trust.clone()
     }
 
     fn url(&self, path: &str) -> String {
@@ -42,24 +40,20 @@ impl Harness {
 }
 
 async fn harness() -> Harness {
-    let generated =
-        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).expect("certificate");
-    let cert_pem = generated.cert.pem();
+    let identity = Identity::generate().expect("identity");
+    let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
 
     let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
     let listener = runtime.listener();
     let binding = listener
-        .bind_quic(
-            "127.0.0.1:0".parse().expect("loopback"),
-            ServerTls::from_pem(cert_pem.clone(), generated.signing_key.serialize_pem()),
-        )
+        .bind_quic("127.0.0.1:0".parse().expect("loopback"), identity)
         .await
         .expect("bind");
     let addr = binding.local_addr();
 
     Harness {
         runtime,
-        cert_pem,
+        trust,
         addr,
         listener,
         _binding: binding,

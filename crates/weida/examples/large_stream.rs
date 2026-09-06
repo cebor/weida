@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run --release -p weida --example large_stream -- \
-//!     --ca /tmp/weida-cert.pem --gib 4 weida://127.0.0.1:7443/echo
+//!     --gib 4 weida://sha256:…@127.0.0.1:7443/echo
 //! ```
 //!
 //! Generates a multi-gigabyte payload, streams it to `/echo`, and checksums
@@ -14,19 +14,19 @@
 use std::path::PathBuf;
 
 use tokio::io::AsyncReadExt;
-use weida::{ClientTls, Error, Runtime, RuntimeConfig, TransferMeta};
+use weida::{Error, Runtime, RuntimeConfig, TransferMeta, Trust};
 
 const CHUNK: usize = 1024 * 1024;
 const GIB: u64 = 1024 * 1024 * 1024;
 
 struct Args {
-    ca: PathBuf,
+    ca: Option<PathBuf>,
     gib: u64,
     url: String,
 }
 
 fn usage() -> ! {
-    eprintln!("usage: large_stream --ca PATH --gib N weida://HOST:PORT/PATH");
+    eprintln!("usage: large_stream [--ca PATH] --gib N weida://[FINGERPRINT@]HOST:PORT/PATH");
     std::process::exit(2);
 }
 
@@ -58,7 +58,7 @@ fn parse_args() -> Args {
         }
     }
     Args {
-        ca: ca.unwrap_or_else(|| usage()),
+        ca,
         gib: gib.unwrap_or_else(|| usage()),
         url: url.unwrap_or_else(|| usage()),
     }
@@ -116,7 +116,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total = args.gib * GIB;
 
     let runtime = Runtime::new(RuntimeConfig::default())?;
-    let requester = runtime.requester(ClientTls::from_pem_file(&args.ca));
+    let trust = match &args.ca {
+        Some(path) => Trust::anchor_file(path),
+        None => Trust::by_address(),
+    };
+    let requester = runtime.requester(trust);
     requester.connect(&args.url).await?;
 
     let (mut transfer, reply) = requester

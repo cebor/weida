@@ -2,8 +2,14 @@
 //!
 //! ```text
 //! printf 'hello weida' | cargo run -p weida --example transform_client -- \
-//!     --ca /tmp/weida-cert.pem weida://127.0.0.1:7443/transform
+//!     weida://sha256:…@127.0.0.1:7443/transform
 //! ```
+//!
+//! The address is the one `transform_server` printed. It names the server's
+//! public key, so the client needs no certificate file: `Trust::by_address`
+//! accepts exactly that key and nothing else. Alternatively `--ca PATH`
+//! trusts a certificate as an anchor and a plain `weida://127.0.0.1:7443/…`
+//! address is verified against its names.
 //!
 //! Streams standard input as the request payload and the reply to standard
 //! output. The delivery receipt and the trace id go to standard error, so the
@@ -18,17 +24,17 @@
 use std::path::PathBuf;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use weida::{ClientTls, Error, Runtime, RuntimeConfig, TransferMeta};
+use weida::{Error, Runtime, RuntimeConfig, TransferMeta, Trust};
 
 const CHUNK: usize = 64 * 1024;
 
 struct Args {
-    ca: PathBuf,
+    ca: Option<PathBuf>,
     url: String,
 }
 
 fn usage() -> ! {
-    eprintln!("usage: transform_client --ca PATH weida://HOST:PORT/PATH");
+    eprintln!("usage: transform_client [--ca PATH] weida://[FINGERPRINT@]HOST:PORT/PATH");
     std::process::exit(2);
 }
 
@@ -48,8 +54,15 @@ fn parse_args() -> Args {
         }
     }
     Args {
-        ca: ca.unwrap_or_else(|| usage()),
+        ca,
         url: url.unwrap_or_else(|| usage()),
+    }
+}
+
+fn trust(ca: Option<&PathBuf>) -> Trust {
+    match ca {
+        Some(path) => Trust::anchor_file(path),
+        None => Trust::by_address(),
     }
 }
 
@@ -59,8 +72,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let runtime = Runtime::new(RuntimeConfig::default())?;
 
-    let requester = runtime.requester(ClientTls::from_pem_file(&args.ca));
-    requester.connect(&args.url).await?;
+    let requester = runtime.requester(trust(args.ca.as_ref()));
+    match requester.connect(&args.url).await {
+        Ok(()) => {}
+        // The one failure worth a dedicated message: the operator can check
+        // this fingerprint out of band and put it into the address.
+        Err(Error::Untrusted(presented)) => {
+            eprintln!(
+                "the peer at {} presented {presented}, which is not trusted",
+                args.url
+            );
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
+    }
 
     let (mut transfer, reply) = requester.open(TransferMeta::default()).await?;
     let trace = transfer.trace();

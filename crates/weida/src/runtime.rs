@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use quinn::VarInt;
-use weida_core::Error;
+use weida_core::{Error, Fingerprint};
 use weida_protocol::codes;
 
 use crate::config::{ClientTls, RuntimeConfig};
@@ -30,14 +30,18 @@ impl RuntimeInner {
             .push(endpoint);
     }
 
-    /// Dials, or reuses a pooled connection to, `host:port` under `tls`.
+    /// Dials, or reuses a pooled connection to, `host:port` on `tls`'s terms,
+    /// accepting only `expected` when the address named a peer.
     pub(crate) async fn connect(
         &self,
         host: &str,
         port: u16,
         tls: &Arc<ClientTls>,
+        expected: Option<Fingerprint>,
     ) -> Result<ConnHandle, Error> {
-        self.pool.connect(&self.config, host, port, tls).await
+        self.pool
+            .connect(&self.config, host, port, tls, expected)
+            .await
     }
 }
 
@@ -74,40 +78,46 @@ impl Runtime {
         Listener::new(Arc::clone(&self.inner))
     }
 
-    /// Creates a raw L0 peer that authenticates its peers against `tls`.
+    /// Creates a raw L0 peer that dials on `tls`'s terms.
     ///
     /// Below the patterns: a [`Peer`] opens unidirectional and bidirectional
     /// streams directly, with exactly QUIC's guarantees and no pattern
     /// vocabulary layered on top.
-    pub fn peer(&self, tls: ClientTls) -> Peer {
-        Peer::new(Arc::clone(&self.inner), Arc::new(tls))
+    ///
+    /// `tls` may be a bare [`crate::Trust`] when the endpoint dials
+    /// anonymously, or a [`ClientTls`] when it also presents an identity.
+    pub fn peer(&self, tls: impl Into<ClientTls>) -> Peer {
+        Peer::new(Arc::clone(&self.inner), Arc::new(tls.into()))
     }
 
-    /// Creates a requester that authenticates peers against `tls`.
+    /// Creates a requester that dials on `tls`'s terms.
     ///
     /// Trust belongs to the dialling endpoint, not to the runtime: one process
     /// may legitimately talk to an internal service behind an internal CA and
     /// to a public one, and it should not need two runtimes to do so. An
-    /// endpoint may still dial many peers — they simply share these anchors.
-    pub fn requester(&self, tls: ClientTls) -> Requester {
-        Endpoint::from_state(ReqState::new(Arc::clone(&self.inner), Arc::new(tls)))
+    /// endpoint may still dial many peers — they simply share these terms.
+    pub fn requester(&self, tls: impl Into<ClientTls>) -> Requester {
+        Endpoint::from_state(ReqState::new(Arc::clone(&self.inner), Arc::new(tls.into())))
     }
 
-    /// Creates a pusher that authenticates peers against `tls`.
-    pub fn pusher(&self, tls: ClientTls) -> Pusher {
-        Endpoint::from_state(PushState::new(Arc::clone(&self.inner), Arc::new(tls)))
+    /// Creates a pusher that dials on `tls`'s terms.
+    pub fn pusher(&self, tls: impl Into<ClientTls>) -> Pusher {
+        Endpoint::from_state(PushState::new(
+            Arc::clone(&self.inner),
+            Arc::new(tls.into()),
+        ))
     }
 
-    /// Creates a subscriber that authenticates peers against `tls`.
+    /// Creates a subscriber that dials on `tls`'s terms.
     ///
     /// Inbound published messages queue up to `Limits::endpoint_queue`; a
     /// subscriber that stops reading therefore stalls its own delivery and,
     /// once the publisher's byte budget for it is exhausted, starts losing
     /// messages rather than slowing the publisher down.
-    pub fn subscriber(&self, tls: ClientTls) -> Subscriber {
+    pub fn subscriber(&self, tls: impl Into<ClientTls>) -> Subscriber {
         Endpoint::from_state(SubState::new(
             Arc::clone(&self.inner),
-            Arc::new(tls),
+            Arc::new(tls.into()),
             self.inner.config.limits.endpoint_queue,
         ))
     }
@@ -152,11 +162,12 @@ impl std::fmt::Debug for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ClientTls, ServerTls};
+    use crate::config::{ClientTls, Identity, Trust};
 
-    /// An endpoint that trusts nothing; every dial through it must fail.
+    /// An endpoint that trusts only what an address names; a plain address
+    /// under it must fail before any packet is sent.
     fn no_trust() -> ClientTls {
-        ClientTls { roots_pem: vec![] }
+        ClientTls::new(Trust::by_address())
     }
 
     #[test]
@@ -182,7 +193,7 @@ mod tests {
         let err = listener
             .bind_quic(
                 "127.0.0.1:0".parse().unwrap(),
-                ServerTls::new("/nonexistent/c.pem", "/nonexistent/k.pem"),
+                Identity::from_pem_files("/nonexistent/c.pem", "/nonexistent/k.pem"),
             )
             .await
             .unwrap_err();
@@ -201,16 +212,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connecting_without_trust_anchors_fails() {
-        let rt = Runtime::new(RuntimeConfig::default()).unwrap();
-        // An endpoint with an empty anchor set cannot authenticate anyone, so
-        // dialling fails rather than trusting whatever answers.
+    async fn connecting_without_trust_fails_unless_the_address_names_the_peer() {
+        // Short idle timeout: the second dial goes to a port nobody answers
+        // on, and QUIC gives up only when the handshake idles out.
+        let rt = Runtime::new(RuntimeConfig {
+            idle_timeout: std::time::Duration::from_millis(200),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        // An endpoint with nothing to trust cannot authenticate anyone, so
+        // dialling a plain address fails rather than trusting whatever answers.
         let requester = rt.requester(no_trust());
         let err = requester
             .connect("weida://127.0.0.1:1/x")
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Tls(_)), "{err:?}");
+
+        // With a fingerprint in the address there is something to check, so
+        // the dial proceeds — and fails on the socket, since nothing listens.
+        let err = requester
+            .connect("weida://sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08@127.0.0.1:1/x")
+            .await
+            .unwrap_err();
+        assert!(!matches!(err, Error::Tls(_)), "{err:?}");
     }
 
     #[tokio::test]

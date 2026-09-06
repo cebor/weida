@@ -1,45 +1,54 @@
 //! Reference prototype server (master doc §83).
 //!
 //! ```text
-//! cargo run -p weida --example transform_server -- \
-//!     --bind 127.0.0.1:7443 --cert-out /tmp/weida-cert.pem
+//! cargo run -p weida --example transform_server -- --bind 127.0.0.1:7443
 //! ```
 //!
 //! Serves two endpoints:
 //!
-//! * `/transform` — uppercases the request payload, streaming in 64 KiB chunks
-//!   and opening the reply stream as soon as the first chunk arrives, before
-//!   the request has finished;
+//! * `/transform` — uppercases the request payload, streaming in 64 KiB
+//!   chunks and opening the reply stream as soon as the first chunk arrives,
+//!   before the request has finished;
 //! * `/echo` — returns the payload unchanged.
 //!
-//! A self-signed certificate is generated on every start, valid for
-//! `localhost`, `127.0.0.1` and `::1`. Only the certificate is published: it is
-//! written to `--cert-out` for clients to trust.
+//! On start the server prints one line per endpoint of the form
+//! `weida://sha256:…@127.0.0.1:7443/transform`. That address is the whole
+//! client configuration: it says where to dial and which public key must
+//! answer. No certificate file changes hands.
 //!
-//! The private key never touches the filesystem: `ServerTls::from_pem` takes
-//! the key as bytes, so it lives only inside the process and no key material is
-//! left beside the published certificate for someone to pick up later.
+//! Without `--identity` a fresh identity is generated on every start and the
+//! address changes with it. With `--identity PATH` the identity is loaded
+//! from `PATH`, or generated and written there (owner-only) on first use, so
+//! the address is stable across restarts. The private key is otherwise never
+//! written anywhere.
+//!
+//! `--cert-out PATH` additionally writes the certificate, for a client that
+//! prefers to trust it as an anchor (`transform_client --ca PATH`, plain
+//! address). The certificate names `localhost`, `127.0.0.1` and `::1`, which
+//! is what the anchor path checks against.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use tokio::io::AsyncReadExt;
-use weida::{IncomingRequest, Replier, Runtime, RuntimeConfig, ServerTls, TransferMeta};
+use weida::{Identity, IncomingRequest, Replier, Runtime, RuntimeConfig, TransferMeta};
 
 const CHUNK: usize = 64 * 1024;
 
 struct Args {
     bind: SocketAddr,
-    cert_out: PathBuf,
+    identity: Option<PathBuf>,
+    cert_out: Option<PathBuf>,
 }
 
 fn usage() -> ! {
-    eprintln!("usage: transform_server --bind ADDR --cert-out PATH");
+    eprintln!("usage: transform_server --bind ADDR [--identity PATH] [--cert-out PATH]");
     std::process::exit(2);
 }
 
 fn parse_args() -> Args {
     let mut bind = None;
+    let mut identity = None;
     let mut cert_out = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -55,6 +64,7 @@ fn parse_args() -> Args {
                         }),
                 )
             }
+            "--identity" => identity = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--cert-out" => cert_out = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--help" | "-h" => usage(),
             other => {
@@ -65,8 +75,37 @@ fn parse_args() -> Args {
     }
     Args {
         bind: bind.unwrap_or_else(|| usage()),
-        cert_out: cert_out.unwrap_or_else(|| usage()),
+        identity,
+        cert_out,
     }
+}
+
+/// Loads the identity at `path`, or generates one and stores it there.
+fn load_or_create_identity(path: &PathBuf) -> Result<Identity, Box<dyn std::error::Error>> {
+    if path.exists() {
+        let identity = Identity::from_pem_file(path);
+        // Read it now so a corrupt file fails here, with the path in hand.
+        identity.fingerprint()?;
+        tracing::info!(path = %path.display(), "loaded identity");
+        return Ok(identity);
+    }
+    let identity = Identity::generate_for(["localhost", "127.0.0.1", "::1"])?;
+    write_private(path, identity.to_pem()?.as_bytes())?;
+    tracing::info!(path = %path.display(), "generated and stored a new identity");
+    Ok(identity)
+}
+
+/// Writes `bytes` to `path` readable by the owner only.
+fn write_private(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
 }
 
 #[tokio::main]
@@ -76,38 +115,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,weida=debug")),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let args = parse_args();
 
-    let generated = rcgen::generate_simple_self_signed(vec![
-        "localhost".to_owned(),
-        "127.0.0.1".to_owned(),
-        "::1".to_owned(),
-    ])?;
-    std::fs::write(&args.cert_out, generated.cert.pem())?;
-    tracing::info!(
-        cert = %args.cert_out.display(),
-        "generated a self-signed certificate"
-    );
+    let identity = match &args.identity {
+        Some(path) => load_or_create_identity(path)?,
+        None => Identity::generate_for(["localhost", "127.0.0.1", "::1"])?,
+    };
+    if let Some(path) = &args.cert_out {
+        // Only the certificate is published; the key stays in the process.
+        std::fs::write(path, identity.certificate_pem()?)?;
+        tracing::info!(cert = %path.display(), "wrote the certificate");
+    }
+    let fingerprint = identity.fingerprint()?;
 
     let runtime = Runtime::new(RuntimeConfig::default())?;
     let listener = runtime.listener();
-    // Only the certificate is published. The key is handed over as bytes and
-    // never becomes a file, so there is nothing to protect or unlink.
-    let binding = listener
-        .bind_quic(
-            args.bind,
-            ServerTls::from_pem(
-                std::fs::read(&args.cert_out)?,
-                generated.signing_key.serialize_pem(),
-            ),
-        )
-        .await?;
+    let binding = listener.bind_quic(args.bind, identity).await?;
 
     let transform = listener.replier("/transform")?;
     let echo = listener.replier("/echo")?;
-    tracing::info!(addr = %binding.local_addr(), "serving /transform and /echo");
+
+    // The addresses go to stdout: they are the output of this program, in
+    // the sense that a client needs nothing else to talk to it.
+    let host = binding.local_addr().ip();
+    let port = binding.local_addr().port();
+    for path in ["/transform", "/echo"] {
+        println!("weida://{fingerprint}@{host}:{port}{path}");
+    }
 
     tokio::spawn(serve(transform, Transform::Uppercase));
     tokio::spawn(serve(echo, Transform::Identity));

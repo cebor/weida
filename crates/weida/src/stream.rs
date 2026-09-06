@@ -40,6 +40,11 @@ struct PeerEntry {
 /// Peers accumulate: connecting again adds a peer rather than replacing one
 /// (master doc §5). Shared by every dialling pattern — the policy differs (Req
 /// and Push pick one, Sub addresses all of them), the set does not.
+///
+/// Dead peers are reaped whenever a live one is added, so a process that
+/// reconnects after every loss holds at most one dead entry per loss until
+/// its next `connect` — bounded by the application's own reconnect rate,
+/// never growing with uptime.
 pub(crate) struct PeerSet {
     peers: std::sync::Mutex<Vec<PeerEntry>>,
     cursor: AtomicUsize,
@@ -54,17 +59,22 @@ impl PeerSet {
     }
 
     fn add(&self, conn: ConnHandle, path: &str) {
+        let mut peers = self.peers.lock().expect("peer list poisoned");
+        peers.retain(|p| p.conn.conn.close_reason().is_none());
+        peers.push(PeerEntry {
+            conn,
+            path: Arc::from(path),
+        });
+    }
+
+    /// Number of peers whose connection is still open.
+    fn len(&self) -> usize {
         self.peers
             .lock()
             .expect("peer list poisoned")
-            .push(PeerEntry {
-                conn,
-                path: Arc::from(path),
-            });
-    }
-
-    fn len(&self) -> usize {
-        self.peers.lock().expect("peer list poisoned").len()
+            .iter()
+            .filter(|p| p.conn.conn.close_reason().is_none())
+            .count()
     }
 
     /// Picks the next live peer, round-robin.
@@ -114,18 +124,24 @@ impl Peer {
         }
     }
 
-    /// Connects to `weida://host:port/path`.
+    /// Connects to `weida://[fingerprint@]host:port/path`.
     ///
-    /// Connections are pooled per `host:port` *and* trust anchors, so several
-    /// endpoints addressing the same peer share one QUIC connection while two
-    /// different trust configurations never do. Returns once the HELLO
-    /// exchange has been negotiated, so the first stream cannot race
-    /// negotiation.
+    /// Connections are pooled per `host:port`, trust configuration and the
+    /// fingerprint the address names, so several endpoints addressing the
+    /// same peer on the same terms share one QUIC connection while two
+    /// different sets of terms never do. Returns once the HELLO exchange has
+    /// been negotiated, so the first stream cannot race negotiation.
+    ///
+    /// A peer that answers with an identity the terms do not cover fails with
+    /// [`Error::Untrusted`] carrying the fingerprint it presented.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
         self.dial(url).await.map(|_| ())
     }
 
-    /// Number of connected peers.
+    /// Number of peers whose connection is still open.
+    ///
+    /// A peer that went away no longer counts; nothing reconnects it, so the
+    /// number drops until the application calls [`Peer::connect`] again.
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
@@ -171,7 +187,7 @@ impl Peer {
         let addr = EndpointAddr::parse(url)?;
         let conn = self
             .runtime
-            .connect(&addr.host, addr.port, &self.tls)
+            .connect(&addr.host, addr.port, &self.tls, addr.peer)
             .await?;
         self.peers.add(ConnHandle::clone(&conn), &addr.path);
         Ok((conn, Arc::from(addr.path.as_str())))
