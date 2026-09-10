@@ -1,7 +1,7 @@
 # 0001: Sequence field — scope and layer
 
-Status: draft, awaiting decision
-Date: 2026-09-10
+Status: accepted
+Date: 2026-09-10 (drafted), 2026-09-10 (accepted)
 Relates to: SYNTHESIS §8.4; P8, P9, P5, P16
 
 ## 1. The question
@@ -16,8 +16,8 @@ protocol addition rather than something to imply from the current behaviour"
 
 SYNTHESIS §8.4 turns that into an open decision with two axes: **what the number is scoped to**
 — per producer, per key, per stream — and **which layer carries it**, the L0 wire or L2 only
-[SYNTHESIS §8.4]. This note lays out the options with their sourced costs; it makes no
-recommendation.
+[SYNTHESIS §8.4]. Sections 2-6 lay out the options with their sourced costs as they were
+drafted; §7 records the decision taken on them.
 
 ## 2. What the wire has today
 
@@ -296,45 +296,87 @@ L0 carries it as an opaque passthrough, or not at all until then.
   or writes its own — MOQT relays read object metadata [prior-art §4], weida's L2 broker is
   Phase 6 [ARCHITECTURE §1].
 
-## 7. Questions for the decider
+## 7. Decision
 
-1. **Is the field's purpose ordering, or identity?** Ordering means a monotone counter, so
-   Option B or C [ARCHITECTURE §6a]. Identity — dedup, caching, replay-safe 0-RTT — needs only
-   a name, which admits Option D and the MOQT triple [prior-art §8 lesson 12]. Both means the
-   wire pays for two mechanisms.
-2. **Must a Pub/Sub subscriber be able to detect a drop?** Today it cannot, by construction
-   [PATTERNS §4]. Yes forces the field onto the L0 wire and rules out Option E, since the drop
-   happens at the publisher's L0 fan-out; no leaves drop counting a publisher-local metric
-   [GUARANTEES §6].
-3. **What names the producer across a reconnect?** If the connection fingerprint suffices,
-   Option B costs one uint and no new identity concept [GUARANTEES §6]. If the sequence must
-   survive a reconnect, weida needs a session or a stable producer name — the part every sheet
-   says breaks [SYNTHESIS D8] — a larger decision than a header key.
-4. **Is per-key ordering in scope, or only per-producer?** `PerKey` is in the vocabulary
-   [GUARANTEES §3], but only Kafka has a key concept and there "key order exists only while a
-   stable key-to-partition mapping holds" [kafka §12/P8], [SYNTHESIS D4]. Yes implies a
-   partition-like binding weida does not have; no closes `PerKey` as unreachable in the core.
-5. **May a receiver hold a message back to deliver it in order?** Yes means reassembly:
-   head-of-line blocking above QUIC [prior-art §8 lesson 2] plus a bounded buffer [INVARIANTS].
-   No makes the field a *detector* — the `OUT_OF_ORDER_SEQUENCE_NUMBER` shape, an alarm rather
-   than a repair [kafka §11].
-6. **What bounds receiver state, and what happens at the bound?** A time window like
-   JetStream's, where "an identifier reused after its window is not suppressed" [nats §7]; a
-   count like Artemis's 20000-entry cache [amqp10 §7]; or a disconnect like ZRE's, which "SHALL
-   treat the peer as invalid, and disconnect the peer" on a gap [zeromq §7]. Each is a different
-   promise when the bound is hit.
-7. **Reserved key space `0..=63`, or extension space `64+`?** Reserved makes the field part of
-   the specification and of the golden vectors [PROTOCOL §5], [PROTOCOL §8]; the extension space
-   keeps it optional. If a receiver must *understand* it rather than skip it, that is a
-   `required_capabilities` code, which by construction fails negotiation against a v0 peer
-   [PROTOCOL §2.3].
-8. **Which guarantee dimension moves off `None`, and is that stated as a guarantee?** A
-   requested guarantee "MUST NEVER be silently weakened" and invalid combinations "MUST be
-   rejected… at configuration time, not silently at runtime" [GUARANTEES §4], so the choice
-   must be a configuration the runtime can validate and refuse — including when the peer
-   does not support it.
+1. **Purpose: both, as two separate mechanisms.** A monotone per-producer counter answers
+   ordering and gap detection — Option B's shape [ARCHITECTURE §6a], [kafka §6] — and a
+   separate identity answers deduplication and caching [prior-art §8 lesson 12]. They are two
+   distinct header keys and two distinct guarantee dimensions, `Ordering` and `Deduplication`
+   [GUARANTEES §3]; neither implies the other, and one may be enabled without the other.
+2. **Pub/Sub drop detection is required.** A subscriber MUST be able to observe that it missed
+   a message, which today it cannot: the drop is silent on the wire and only counted at the
+   publisher [PATTERNS §4], [GUARANTEES §6]. Because the drop happens at the publisher's L0
+   fan-out, the counter therefore lives in the **L0 DATA header**, and Option E — an L2-only
+   sequence with a merely reserved L0 key — is rejected for the counter.
+3. **Producer naming is use-dependent, therefore configurable.** The default is Option B as
+   written: the proved connection fingerprint names the producer [GUARANTEES §6],
+   [PATTERNS §1.9], and the counter restarts per connection. An application-supplied stable
+   producer name is the optional variant that lets the counter survive a reconnect, and the
+   criterion for choosing is cost: *is it cheaper or permitted to start a new query, or is it
+   better to spend memory on reconnects* — that is, whether re-querying from scratch is
+   acceptable versus keeping resumption state. The stable-name variant requires a session
+   concept weida does not have (§6), [SYNTHESIS D8], so it is a **separate later decision**;
+   what is decided now is only the *field shape*: the producer name MUST be able to come from
+   somewhere other than the fingerprint.
+4. **`PerKey` is out of scope for the core.** It is closed as unreachable at L0 and expected to
+   arrive with the broker at L2, since key order exists only under a stable key-to-partition
+   binding weida does not have [kafka §12/P8], [SYNTHESIS D4], [GUARANTEES §3].
+5. **Reassembly versus detection is configuration, and both modes exist.** *Detector*: report
+   the gap and deliver messages as they arrive — the `OUT_OF_ORDER_SEQUENCE_NUMBER` shape
+   [kafka §11]. *Reassembly*: hold messages back up to a bounded buffer, accepting head-of-line
+   blocking above QUIC [prior-art §8 lesson 2], [INVARIANTS]. The reasoning: *especially in
+   streaming, order is often less important, but in many cases it is*. **Default: detector.**
+   Reassembly is opt-in and the bound on its buffer is part of the configuration.
+6. **Receiver state is bounded by a time window**, the JetStream shape, where "an identifier
+   reused after its window is not suppressed" [nats §7]. The window length is configuration,
+   not a constant of the protocol.
+7. **Both fields take reserved keys in `0..=63`.** They become part of the specification and of
+   the golden vectors [PROTOCOL §5], [PROTOCOL §8]. They remain **always optional at the
+   decoder**, so a v0 peer skips them as unknown keys [PROTOCOL §5], and they are **never**
+   expressed as a `required_capabilities` code [PROTOCOL §2.3]. Whether a peer *acts* on the
+   fields is settled by decision 8, not by the key space.
+8. **Both sides declare in HELLO; validation is against the intersection.** The model is
+   RabbitMQ's split of responsibilities — the consumer declares the queue, the producer
+   declares the exchange [rabbitmq-amqp091 §4] — adapted to weida's primitives: each side
+   declares in its HELLO which guarantee levels it offers and requests, at minimum the ordering
+   mode (`none` | `detect` | `reassemble`), deduplication (on/off plus window) and producer
+   naming (`fingerprint` | `stable`). A level a peer does not offer is refused at negotiation
+   time, per the rule that invalid combinations are "rejected… at configuration time, not
+   silently at runtime" and a requested guarantee "MUST NEVER be silently weakened"
+   [GUARANTEES §4]. This extends the HELLO negotiation of [PROTOCOL §2.3] with guarantee
+   flags, which is a protocol change recorded in §8.
 
-## 8. Sources
+## 8. Consequences and follow-ups
+
+- **[PROTOCOL.md](../PROTOCOL.md).** Two new reserved DATA keys beside the six of §6.2: a
+  sequence `uint`, and a producer/identity key whose exact encoding stays open — naming it is a
+  follow-up, and the shape must admit a producer name that is not the fingerprint (§7.3). HELLO
+  (§2.3, §6.1) gains guarantee-declaration fields and the negotiation function gains the
+  intersection check of §7.8. Golden vectors (§8) must be added for every new field and for the
+  extended HELLO.
+- **[GUARANTEES.md](../GUARANTEES.md) §3 and §6.** `Ordering` gains `PerProducer` in two modes,
+  detect and reassemble (§7.5); `Deduplication` gains `Bounded` with a time window (§7.6);
+  `PerKey` is marked L2-only (§7.4). The v0 support table in §6 changes from `None`/`None` for
+  the two dimensions to the negotiated levels, and the performance implication of each level
+  must be documented as §3 requires.
+- **[PATTERNS.md](../PATTERNS.md) §4.** Subscriber-side drop detection becomes possible: the
+  sentence that "making loss observable needs a sequence field the wire does not have" is
+  superseded, and the Pub/Sub failure-mode table gains an observable-loss row for a subscriber
+  running in detect or reassemble mode.
+- **[INVARIANTS.md](../INVARIANTS.md).** The reassembly buffer and the dedup window are new
+  remote-influenced allocations under "no remote input can cause unbounded memory allocation";
+  both need named caps in the v0 mechanical-checks table, alongside `max_header_bytes` and the
+  stream budgets. "Disabled guarantees should not participate in the hot path" additionally
+  requires that a connection negotiating `none` allocate neither structure and write no key.
+- **Session and stable producer name.** The variant of §7.3 that survives a reconnect needs a
+  session concept weida does not have; it is a new open decision to record in
+  [SYNTHESIS.md](../research/SYNTHESIS.md) §8, distinct from §8.4 which this note closes.
+- **Measurements before the wire change lands.** The two unmeasured costs of §6 become tasks:
+  header cost at high message rates on QUIC [quic-standards §11.9], and reassembly-buffer cost
+  under reordering across streams [quic-standards §2.2], [prior-art §8 lesson 2]. Neither has a
+  published number, so both must be measured on weida itself before the fields ship.
+
+## 9. Sources
 
 weida documents: [PROTOCOL.md](../PROTOCOL.md) §2.3, §3.1, §4, §5, §6.2, §6.3, §8;
 [GUARANTEES.md](../GUARANTEES.md) §1, §2, §3, §4, §6; [PATTERNS.md](../PATTERNS.md) §1.7, §1.8,
