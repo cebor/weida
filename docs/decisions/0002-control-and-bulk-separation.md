@@ -1,7 +1,7 @@
 # 0002: Control and bulk traffic — separation against head-of-line coupling
 
-Status: draft, awaiting decision
-Date: 2026-09-10
+Status: accepted
+Date: 2026-09-10 (drafted), 2026-09-10 (accepted)
 Relates to: SYNTHESIS §8.2; P4, P12; decision 0001 §7.8
 
 ## 1. The question
@@ -21,8 +21,8 @@ has processed the peer's HELLO frame", and a peer HELLO missing `hello_timeout` 
 the connection with `NEGOTIATION_FAILED` ([PROTOCOL.md](../PROTOCOL.md) §2.2). And
 detect/reassemble ordering plus the bounded dedup window add receiver state whose lifetime is
 coupled to when the application reads [0001 §7.5], [0001 §7.6] — withheld reads being exactly
-what consumes the shared connection window [quic-standards §3.2]. This note lays out the
-options with their sourced costs; it makes no recommendation.
+what consumes the shared connection window [quic-standards §3.2]. Sections 2-5 lay out the
+options with their sourced costs as they were drafted; §6 records the decision taken on them.
 
 ## 2. What couples today
 
@@ -268,44 +268,91 @@ endpoints to one authority under the same terms deliberately share a connection
   and a bulk connection bind into one logical session, and weida has no session concept
   [PATTERNS §1.8], [0001 §7.3].
 
-## 6. Questions for the decider
+## 6. Decision
 
-1. **Is "control never stalls behind bulk" a guarantee weida offers, or an operational
-   property?** A guarantee is declarable and validatable, which under 0001's model puts it in
-   the HELLO declaration set [0001 §7.8] and closes Options A and D, neither of which can
-   promise it. A property leaves it documented [PATTERNS §1.3] and pushes the fix into
-   deployment.
-2. **Is cross-endpoint isolation in scope, or only control-versus-bulk?** Only Option E gives
-   the former [PATTERNS §1.3]; B and C give the latter; "both" costs both.
-3. **Connections or stream classes — and does the answer cover the stream budget too?**
-   Connections inherit hard isolation, flow control being per connection
-   [quic-standards §3.1], at the price of handshakes, pool entries and timers
-   [ARCHITECTURE §5]. Stream classes keep one connection and rest on a local scheduling API
-   QUIC will not enforce [quic-standards §12 item 3]. Either way the byte window and the
-   stream budget exhaust independently — the budget binds at `open` whatever the window says
-   [PATTERNS §1.4], [quic-standards §2.8] — so a bytes-only reservation still lets bulk take
-   every stream slot control needs.
-4. **If a budget is reserved, what is the split and who sets it?** It divides
-   `connection_receive_window` and `max_concurrent_uni_streams` [PROTOCOL §10]; constant,
-   configuration knob and negotiated value are three different answers, and AMQP 1.0's
-   experience is that relative sizing is "where brokers differ most" [amqp10 §5.3].
-5. **What does a control-starvation event look like to the application?** MOQT names an
-   outcome for a subscriber that cannot keep up, `PUBLISH_DONE` with `TOO_FAR_BEHIND`
-   [prior-art §4 flow control], and NATS core disconnects the slow consumer [SYNTHESIS P4].
-   weida has neither: the window simply blocks [PATTERNS §1.3] and a missed HELLO closes the
-   connection with `NEGOTIATION_FAILED` [PROTOCOL §2.2]. Making starvation a named, reported
-   condition is a separate choice from preventing it.
-6. **Does 0001's reassembly read eagerly (paying memory) or withhold credit (paying window)?**
-   Eager reads follow RFC 9308's mitigation and need their own accountability bound
-   [quic-standards §3.3], [INVARIANTS]; withholding keeps the memory bound where it is and
-   makes reassembly a direct contributor to this coupling [0001 §7.5].
-7. **What must an adapter be able to promise?** MQTT's rule is absolute — acknowledgements,
-   subscriptions and pings "never stall behind a blocked publish path" [mqtt5 §5] — and the
-   invariant forbids inventing it [INVARIANTS]. If adapters must honour it on a *shared*
-   weida connection, Option A is closed; if one connection per foreign session is acceptable,
-   A suffices and the cost lands in the adapter [SYNTHESIS §7.2].
+The decider answered the seven questions of the draft as follows; the result is Option B
+combined with Option E, plus three properties no single option carried.
 
-## 7. Sources
+1. **"Control never stalls behind bulk" is a guarantee weida offers**, not an operational
+   property. It is declarable and validatable, so it joins the HELLO declaration set of
+   [0001 §7.8]; a peer that cannot provide it is refused at negotiation, per the rule that a
+   requested guarantee "MUST NEVER be silently weakened" ([GUARANTEES.md](../GUARANTEES.md)
+   §4). Options A and D are closed: neither can promise it [§4].
+2. **Isolation is in scope at both granularities**: control against bulk, and endpoint
+   against endpoint. Only Option E gives the latter [PATTERNS §1.3], so the connection
+   granularity becomes the dialled path: one bulk QUIC connection per `(host, port, terms,
+   path)`, replacing the pool key that deliberately excluded the path [ARCHITECTURE §5]. The
+   precedent is iroh's one connection per ALPN [prior-art §2].
+3. **Control gets its own connection per peer**, Option B's shape rather than Option C's
+   stream classes: one control connection per `(host, port, terms)` carrying HELLO,
+   SUBSCRIBE/UNSUBSCRIBE and future control frames, beside the per-path bulk connections of
+   decision 2. The reasons are the ones §3 records: flow control and the stream budget are per
+   connection, so the isolation is QUIC's own [quic-standards §3.1], [quic-standards §2.8],
+   whereas stream priority is local and unenforceable on the wire [quic-standards §12 item 3]
+   and the projects that rely on it report the interface as the weak link [prior-art §8
+   lesson 7]. The control and bulk connections of one peer are bound together by the proved
+   fingerprint, which is already the identity the pool keys on [PATTERNS §1.9],
+   [ARCHITECTURE §5]; a bulk connection whose fingerprint differs from the control
+   connection's is not the same peer. The named cost is accepted: one extra handshake, pool
+   entry and timer pair per peer, and the invariant "transfer-related control messages do not
+   require a permanent control stream" ([INVARIANTS.md](../INVARIANTS.md)) must be restated so
+   that a control *connection* is permitted while a multiplexed control *stream* remains
+   forbidden.
+4. **Limits are configuration per runtime**, not protocol constants and not negotiated:
+   `RuntimeConfig` carries two `Limits` profiles, `control` and `bulk`, with their own
+   receive windows, stream budgets, idle timeout and keep-alive. QUIC's windows are the
+   receiver's own transport parameters in any case [quic-standards §3.1], so the peer sees
+   only what it is granted; AMQP 1.0's experience that relative sizing is "where brokers
+   differ most" [amqp10 §5.3] argues against fixing it in the protocol.
+5. **Overload is a named, reported condition**, separate from its prevention. A bulk reader
+   that withholds credit still stalls the other writers on its own connection [PATTERNS §1.3];
+   weida reports that state to the application as an error and a metric rather than leaving
+   it to idle timeouts and `NEGOTIATION_FAILED` [PROTOCOL §2.2]. The shape follows MOQT's
+   `PUBLISH_DONE` with `TOO_FAR_BEHIND` [prior-art §4 flow control]; whether it also gets a
+   stop code on the wire is left to the protocol change that introduces it.
+6. **0001's reassembly reads eagerly** into an application-owned buffer with its own named
+   cap in bytes and count — RFC 9308's mitigation, accepting its caveat that "the receiver
+   then needs another way to hold the peer accountable for that memory"
+   [quic-standards §3.3]. Transport credit is released as soon as the transfer is read, so
+   reassembly never contributes to the coupling this note is about [0001 §7.5].
+7. **Adapters may multiplex foreign sessions onto shared weida connections** and still
+   promise MQTT's rule that acknowledgements, subscriptions and pings "never stall behind a
+   blocked publish path" [mqtt5 §5], because decisions 1-3 make the rule true of the
+   transport. One connection per foreign session is no longer required of an adapter
+   [SYNTHESIS §7.2].
+
+## 7. Consequences and follow-ups
+
+- **[ARCHITECTURE.md](../ARCHITECTURE.md) §5.** The client pool gains two tiers: a control
+  connection per `(host, port, ClientTls, Option<Fingerprint>)` and bulk connections per that
+  key plus path. `Peer::connect` dials the control connection first, negotiates HELLO there,
+  then opens the path's bulk connection; a bulk connection with a fingerprint different from
+  the control connection's is refused as a different peer. Server side, `Binding` accepts both
+  kinds; how a bulk connection names its control connection (a HELLO field, or the fingerprint
+  alone) is a follow-up for [PROTOCOL.md](../PROTOCOL.md) §2.
+- **[PROTOCOL.md](../PROTOCOL.md) §2 and §10.** HELLO moves to the control connection and
+  gains, beside 0001's guarantee declarations, a `control_isolated` declaration; the limits
+  table splits into control and bulk profiles with their defaults. Whether ALPN distinguishes
+  the two connection kinds (Zenoh's `zenoh-ms` shape [prior-art §1]) or a HELLO field does is
+  part of the same follow-up.
+- **[GUARANTEES.md](../GUARANTEES.md) §6 and [PATTERNS.md](../PATTERNS.md) §1.3.** The
+  sentence "one slow reader stalls every writer on the connection" is narrowed to "every bulk
+  writer on the same path's connection"; control traffic and other paths are isolated by
+  construction. The new overload condition of decision 5 joins the failure tables.
+- **[INVARIANTS.md](../INVARIANTS.md).** Restate the control-stream invariant to permit a
+  control connection; add the reassembly buffer cap and the per-peer connection count (control
+  plus one per dialled path, against `max_connections`) to the named bounds.
+- **`weida-core::Limits` and `RuntimeConfig`.** Two profiles, `control` and `bulk`; the
+  defaults for `control` are small (header-sized windows, a modest stream budget) so that a
+  hostile peer's control connection pins little memory.
+- **[SYNTHESIS.md](../research/SYNTHESIS.md) §8.2** is closed by this note. Decision 3's
+  binding of two connections to one peer is the first concrete use of the fingerprint as a
+  session-like identity and feeds the open session decision recorded by 0001.
+- **Measurement before the change lands.** The cost of the second handshake and of per-path
+  connections at the shipped defaults is unmeasured [§5]; both are tasks on weida itself,
+  alongside the two from 0001.
+
+## 8. Sources
 
 weida documents: [PROTOCOL.md](../PROTOCOL.md) §2.1, §2.2, §2.3, §2.4, §9.5, §10;
 [PATTERNS.md](../PATTERNS.md) §1.3, §1.4, §1.8, §1.9, §4; [ARCHITECTURE.md](../ARCHITECTURE.md)
