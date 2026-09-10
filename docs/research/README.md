@@ -125,7 +125,13 @@ through this list; the synthesis compares the answers side by side.
 | `nanomsg-nng.md` | nanomsg / NNG scalability protocols | done |
 | `kafka.md` | Apache Kafka protocol and client semantics | done |
 | `ipc.md` | Inter-process and in-process transports per platform | done |
+| `quic-standards.md` | QUIC RFCs, extensions, drafts and measurement literature | done |
+| `prior-art.md` | Messaging systems on and near QUIC: Zenoh, iroh, EMQX, MoQ, libp2p and others | done |
 | `SYNTHESIS.md` | The problem catalogue answered side by side, plus what weida takes from each | done |
 
 The synthesis — the same problems answered side by side, and what weida takes from each — is
 `SYNTHESIS.md`, written only after the sheets are complete.
+
+`quic-standards.md` and `prior-art.md` use their own layouts rather than the template above,
+because one describes a transport and the other surveys existing systems rather than describing a
+single protocol; `SYNTHESIS.md` predates both and does not yet incorporate them.
