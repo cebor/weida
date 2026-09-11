@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::identity::RoutingId;
-use crate::message::DEFAULT_MAX_MESSAGE_SIZE;
+use crate::message::{DEFAULT_MAX_MESSAGE_FRAMES, DEFAULT_MAX_MESSAGE_SIZE, MessageLimits};
 use crate::pipe::PipeConfig;
 
 /// `ZMQ_RECONNECT_IVL` default: 100 ms (`docs/research/zeromq.md` §11).
@@ -125,6 +125,10 @@ pub struct SocketOptions {
     /// so that a ROUTER peer can address it by a name it chose rather than
     /// by a generated one (`docs/research/zeromq.md` §4.2).
     pub routing_id: Option<RoutingId>,
+    /// Frames one inbound message may have — not a libzmq option, because
+    /// 37/ZMTP has no such limit and an unbounded frame count is unbounded
+    /// memory. See [`DEFAULT_MAX_MESSAGE_FRAMES`].
+    pub max_message_frames: usize,
     /// `ZMQ_SNDHWM`/`ZMQ_RCVHWM` and the mute action, per peer.
     pub pipe: PipeConfig,
     /// See [`DEFAULT_MAX_RESOLVED_ADDRESSES`].
@@ -141,6 +145,7 @@ impl Default for SocketOptions {
             immediate: false,
             backlog: DEFAULT_BACKLOG,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_message_frames: DEFAULT_MAX_MESSAGE_FRAMES,
             heartbeat_ivl: None,
             heartbeat_timeout: None,
             heartbeat_ttl: None,
@@ -170,6 +175,11 @@ impl SocketOptions {
                  request be reported as the reply to the one that superseded it; libzmq \
                  documents that hazard and this library refuses it"
                     .into(),
+            ));
+        }
+        if self.max_message_frames == 0 {
+            return Err(Error::EINVAL(
+                "max_message_frames is zero, so every message would be refused".into(),
             ));
         }
         if self.max_resolved_addresses == 0 {
@@ -214,6 +224,12 @@ impl SocketOptions {
             ));
         }
         Ok(())
+    }
+
+    /// What bounds one inbound message: `ZMQ_MAXMSGSIZE` and the frame
+    /// ceiling, which the session hands to every connection it drives.
+    pub const fn message_limits(&self) -> MessageLimits {
+        MessageLimits::new(self.max_message_size, self.max_message_frames)
     }
 
     /// The next reconnect interval after `previous`, doubling towards

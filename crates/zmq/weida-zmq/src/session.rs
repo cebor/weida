@@ -41,7 +41,7 @@ use weida_zmtp::{
 use crate::engine::{Connection, Session, SessionFuture};
 use crate::error::{Error, Result};
 use crate::identity::RoutingId;
-use crate::message::{Decoded, Multipart};
+use crate::message::{Decoded, MessageLimits, Multipart};
 use crate::options::SocketOptions;
 use crate::pipe::{Queue, Sent};
 
@@ -109,7 +109,7 @@ async fn drive(ours: SocketType, connection: Connection) -> Result<()> {
         role: _,
     } = connection;
 
-    let mut wire = Wire::new(stream, options.max_message_size);
+    let mut wire = Wire::new(stream, options.message_limits());
     let negotiated = handshake_on(&mut wire, ours, &options).await?;
     // The engine's ZMQ_HANDSHAKE_IVL stops counting here.
     handshake.complete();
@@ -401,18 +401,19 @@ pub struct Wire<S> {
     /// allocation, and separate from `buf` so that a cancelled read cannot
     /// change what is parsed.
     scratch: Vec<u8>,
-    max_message_bytes: u64,
+    limits: MessageLimits,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
-    /// Wraps `io`, bounding every inbound message at `max_message_bytes`
-    /// (`ZMQ_MAXMSGSIZE`).
-    pub fn new(io: S, max_message_bytes: u64) -> Wire<S> {
+    /// Wraps `io`, bounding every inbound message by `limits`:
+    /// `ZMQ_MAXMSGSIZE` in octets — frame headers included — and a ceiling on
+    /// the frame count. Both are needed; see [`Multipart::decode`].
+    pub fn new(io: S, limits: MessageLimits) -> Wire<S> {
         Wire {
             io,
             buf: Vec::new(),
             scratch: vec![0u8; CHUNK],
-            max_message_bytes,
+            limits,
         }
     }
 
@@ -427,7 +428,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     /// its last frame has arrived.
     pub async fn read_next(&mut self) -> Result<Incoming> {
         loop {
-            match Multipart::decode(&self.buf, self.max_message_bytes)? {
+            match Multipart::decode(&self.buf, self.limits)? {
                 Decoded::Message { message, consumed } => {
                     self.buf.drain(..consumed);
                     return Ok(Incoming::Message(message));

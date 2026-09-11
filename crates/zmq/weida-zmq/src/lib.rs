@@ -116,7 +116,10 @@ pub use engine::{
 };
 pub use error::{Cause, Error, Result};
 pub use identity::{MAX_ROUTING_ID_BYTES, RoutingId};
-pub use message::{DEFAULT_MAX_MESSAGE_SIZE, Decoded, Message, Multipart};
+pub use message::{
+    DEFAULT_MAX_MESSAGE_FRAMES, DEFAULT_MAX_MESSAGE_SIZE, Decoded, Message, MessageLimits,
+    Multipart,
+};
 pub use options::{
     DEFAULT_BACKLOG, DEFAULT_HANDSHAKE_IVL, DEFAULT_MAX_RESOLVED_ADDRESSES, DEFAULT_RECONNECT_IVL,
     SocketOptions,
