@@ -63,8 +63,9 @@ marked *spec ahead of code*.
 - "FIN" means the QUIC stream final offset, i.e. clean end of stream.
 - "tstr" and "uint" are the CBOR (RFC 8949) major types 3 (text string) and 0 (unsigned
   integer) respectively.
-- "peer" means the other side of a QUIC connection, regardless of which side is the QUIC
-  client and which the QUIC server.
+- "peer" means the other side of a connection, regardless of which side opened it. On the
+  network transport that is a QUIC connection; on a local transport it is the socket, pipe or
+  channel of §2.1.
 
 ---
 
@@ -72,11 +73,45 @@ marked *spec ahead of code*.
 
 ### 2.1 Transport
 
-The transport is QUIC. The reference implementation uses `quinn`.
+**The network transport is QUIC.** The reference implementation uses `quinn`.
 
 The TLS ALPN token MUST be exactly `weida/0`. A peer MUST offer this token and MUST NOT
 accept a connection that negotiated any other token. An ALPN mismatch MUST fail the TLS
 handshake; it is not signalled at the weida protocol layer.
+
+**A local transport carries the same protocol without TLS**
+([decisions/0010](decisions/0010-local-transport.md)). In-process channels, `AF_UNIX`
+`SOCK_STREAM` sockets and Windows named pipes in message mode carry the same frames (§4), the
+same headers (§6), the same HELLO exchange (§2.2) and the same negotiation (§2.3). Three
+differences, and only three:
+
+- **There is no TLS and therefore no ALPN.** The version fence moves to where the real work
+  was always done: the `versions` intersection of §2.3. A local peer MUST still send HELLO and
+  MUST still fail the connection with `NEGOTIATION_FAILED` on an empty intersection.
+- **The OS connection is the stream.** A local transport has no stream multiplexing, so one
+  transfer is one local connection and a transfer's lifetime is that connection's
+  [0010 §4.2]. Nothing in §3-§9 changes: a preamble and a header still open every stream,
+  because the stream *is* the connection. There is consequently no per-connection window, so
+  the shared-window coupling of §10 does not arise locally.
+
+  One consequence is worth stating rather than deriving. A local connection is bidirectional
+  by nature, so it carries no equivalent of QUIC's stream kind, and the dispatch of §9.4 —
+  today a function of the stream kind *and* the addressed path — is locally a function of the
+  **path alone**: the pattern registered there says whether a reply is expected. A replier path
+  answers on the same connection; a puller or publisher path never writes back, and the
+  initiator MUST NOT wait for a reply on it. The mismatch case is unchanged and already
+  specified: a transfer addressed to a path whose pattern cannot serve it is refused with
+  `UNSUPPORTED` (§9.4).
+- **The peer is proved by the kernel, not by a key.** `SO_PEERCRED` on Linux, `LOCAL_PEERCRED`
+  on macOS — which carries no PID — and the client's token through
+  `ImpersonateNamedPipeClient` on Windows; an in-process peer has no identity at all, because
+  there is nobody else to prove [0010 §4.4]. A PID is an observation and MUST NOT be
+  authorized on.
+
+A local transport is named by its own URL scheme, never by `weida://`
+([ARCHITECTURE.md](ARCHITECTURE.md) §3): the transport is part of the address, and there is no
+automatic fallback from one to another, because that would change who may connect and what
+proves them without saying so [0010 §4.6], [0010 §4.8].
 
 ### 2.2 HELLO exchange
 

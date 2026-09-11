@@ -175,10 +175,14 @@ Listeners.
 
 ### Binding
 
-A Binding represents one concrete externally reachable transport of **this** protocol.
-Native QUIC is the reference transport; the Web adapter (master doc §38, §39) is the
-framework's way into browsers and exposes the same namespace over WebSocket or
-WebTransport. This semantic division between Listener and Binding is mandatory.
+A Binding represents one concrete reachable transport of **this** protocol. Native QUIC is the
+reference transport and the only externally reachable one; the local transports of
+[decisions/0010](decisions/0010-local-transport.md) — in-process, `AF_UNIX`, Windows named
+pipes — are bindings too, reachable only on the machine and carrying the same frames without
+TLS (§3, [PROTOCOL.md](PROTOCOL.md) §2.1). The Web adapter (master doc §38, §39) is the
+framework's way into browsers and exposes the same namespace over WebSocket or WebTransport.
+This semantic division between Listener and Binding is mandatory, and it is what lets one
+Listener answer on a QUIC port and a UNIX socket at once.
 
 A binding must be able to carry weida's addressing model: an opaque endpoint path inside a
 namespace, several endpoints per binding. That is what makes QUIC and Web bindings of one
@@ -238,6 +242,19 @@ Identity is symmetric on the wire. Whatever a peer proved in the handshake is su
 receiving application as `IncomingMeta::peer` — `None` for a client that dialled
 anonymously. It comes from the handshake and never from a header, so it cannot be claimed,
 only proved (master doc §47).
+
+**There are two kinds of proof, and a local peer uses the other one**
+([decisions/0010](decisions/0010-local-transport.md) §4.4). A local transport runs no TLS, so
+there is no key to present; the prover is the kernel instead, which is a stronger statement
+than a certificate makes about a process on the same machine. `IncomingMeta::peer` therefore
+carries either a **key** — the fingerprint above — or a **local principal**: `uid`/`gid`/`pid`
+from `SO_PEERCRED` on Linux, effective `uid` and groups from `LOCAL_PEERCRED` on macOS, which
+carries **no PID**, or the client's token through `ImpersonateNamedPipeClient` on Windows. An
+in-process peer is `None`, like an anonymous client, because there is nobody else to prove.
+Three rules travel with it: the credential is the one captured when the connection was made,
+not when a transfer was sent; a PID is an observation and MUST NOT be the thing authorized on;
+and the rule this amends is only the *count* — 0008 §4.1 said the fingerprint was the only
+identity, and what survives unchanged is that an identity is proved and never claimed.
 
 ### Endpoint
 
@@ -316,6 +333,37 @@ Pattern-specific filtering — for example Pub/Sub subscription matching — hap
 Endpoint has been reached and has nothing to do with endpoint routing.
 
 Port is required. IPv6 literals use bracket form, e.g. `weida://[::1]:7443/x`.
+
+### Local addresses
+
+A local transport is named by its own scheme, because the transport is part of the address and
+weida never falls back from one to another on its own
+([decisions/0010](decisions/0010-local-transport.md) §4.6, §4.8):
+
+```text
+weida+inproc://<bus>/<path>            in-process, one bus name per process
+weida+unix://<percent-encoded>/<path>  AF_UNIX SOCK_STREAM, Linux and macOS
+weida+pipe://<name>/<path>             \\.\pipe\<name>, Windows, never a UNC path
+```
+
+The endpoint path keeps every rule above: opaque, leading `/`, 1..=512 bytes. What changes is
+the authority, and each form has one validation rule that is not optional:
+
+- **`weida+inproc`** — the bus name is at most 256 bytes, which is the budget libzmq uses for
+  the same thing, and is unique within the process. Two processes may use the same name and
+  will not meet.
+- **`weida+unix`** — the socket path is **percent-encoded**, because it contains the same
+  separator the endpoint path uses. After decoding it MUST fit the platform's budget: **107
+  bytes** on Linux and **104** on macOS, both including the terminating NUL. The check happens
+  before `bind` and before `connect`, on the *expanded* path, since a container or App Group
+  prefix consumes most of the budget.
+- **`weida+pipe`** — the name maps to `\\.\pipe\<name>` and MUST NOT be a UNC path naming
+  another host; that is the address-level half of `PIPE_REJECT_REMOTE_CLIENTS`.
+
+**The `sha256:<hex>@` form is rejected on all three.** There is no key to pin, because there is
+no TLS handshake to prove one; who may connect is stated in the binding's configuration as
+accepted local principals. An address that looks authenticated and is not would be worse than
+one that plainly is not [0010 §4.8].
 
 ---
 
