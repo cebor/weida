@@ -14,6 +14,7 @@
 - A socket owns zero or more listener and dialer endpoints; endpoints create pipes, which are message-oriented connected streams and commonly map 1:1 to TCP or IPC connections. [2]
 - Either role may listen, dial, or do both; endpoint direction does not prescribe request/reply or other application role. [2][7]
 - `nng_dial()` is synchronous by default: a refused first connection is returned immediately and no retry is started. `NNG_FLAG_NONBLOCK` makes that first attempt asynchronous, after which failures retry periodically. [7]
+- Observed: the synchronous `nng_dial()` returns only after the peer's 8-octet protocol header has arrived, not when the TCP connection is established — the call blocks through the greeting exchange. A program that calls it from the same thread that must answer a greeting therefore deadlocks until the socket timeout fires. [30]
 - After a dialer pipe closes, its dialer attempts reconnection; retry delay begins at `NNG_OPT_RECONNMINT` and grows exponentially to `NNG_OPT_RECONNMAXT` when the latter is nonzero. [7][6]
 - The SP TCP mapping opens one full-duplex TCP connection and begins with an 8-octet greeting carrying SP version and protocol identifiers; incompatible peers must disconnect. [3]
 - TCP keepalive is a transport option, not a common SP heartbeat; ZeroTier alone documents ping-time/ping-tries liveness probing. [12][15]
@@ -41,8 +42,64 @@
 - PUB/SUB uses the initial bytes of the body as a topic; they are neither a separate wire field nor typed metadata. [21]
 - REQ/REP headers are a stack of big-endian 32-bit IDs: final request ID has MSB set, preceding forwarder peer IDs have MSB clear. [5]
 - SURVEY headers use the equivalent stack with a final survey ID (MSB set) and preceding peer IDs. [22]
-- PAIR v1 has one 32-bit header whose low-order byte is a hop count, initialized to one and incremented at each node. [18]
+- PAIR v1 has one 32-bit header whose low-order byte is a hop count, "initialized to one and incremented at each node" [18]. The implementation disagrees with that prose: a cooked NNG send originates the count `0` and each receiving node increments, and a raw send whose count is already `0xff` is rejected as malformed (`src/sp/protocol/pair1/pair.c`). The two differ by one, and a peer implements one or the other. [18][30]
 - BUS cooked messages have no protocol header; a raw BUS receive carries the incoming pipe ID in its sole header element. [17]
+
+### Wire layouts, octet by octet
+
+The RFCs state the greeting, the framing and the header stacks in prose; the octets below are
+those layouts written out, taken from the RFCs and confirmed against what NNG 1.4.0-rc.0 puts
+on a TCP connection. [3][30]
+
+**Protocol header**, 8 octets, sent by both sides immediately after the TCP handshake and
+awaited by both before anything else:
+
+```
+0x00 0x53 0x50 | version | type-hi type-lo | 0x00 0x00
+     "SP"          0x00      16-bit type      reserved
+```
+
+A peer whose first three octets, version or reserved field differ is disconnected, and the
+disconnection is the whole error report: there is no reply, no reason code and no round trip
+in the mapping at all. [3][30]
+
+**Endpoint type ids.** The 16-bit type field is a 12-bit protocol ID plus a 4-bit endpoint
+role. The RFCs assign the protocol IDs and leave the role nibble to the per-protocol RFCs,
+which never published it; the values below are NNG's registry
+(`NNI_PROTO(major, minor) = major * 16 + minor`, `src/core/protocol.h`) and are what NNG and
+mangos put on the wire. [30]
+
+| Endpoint | Protocol, role | Type | Full header |
+| --- | --- | --- | --- |
+| PAIR v0 | 1, 0 | `0x0010` | `00 53 50 00 00 10 00 00` |
+| PAIR v1 | 1, 1 | `0x0011` | `00 53 50 00 00 11 00 00` |
+| PUB | 2, 0 | `0x0020` | `00 53 50 00 00 20 00 00` |
+| SUB | 2, 1 | `0x0021` | `00 53 50 00 00 21 00 00` |
+| REQ | 3, 0 | `0x0030` | `00 53 50 00 00 30 00 00` |
+| REP | 3, 1 | `0x0031` | `00 53 50 00 00 31 00 00` |
+| PUSH | 5, 0 | `0x0050` | `00 53 50 00 00 50 00 00` |
+| PULL | 5, 1 | `0x0051` | `00 53 50 00 00 51 00 00` |
+| SURVEYOR | 6, 2 | `0x0062` | `00 53 50 00 00 62 00 00` |
+| RESPONDENT | 6, 3 | `0x0063` | `00 53 50 00 00 63 00 00` |
+| BUS | 7, 0 | `0x0070` | `00 53 50 00 00 70 00 00` |
+
+Surveyor and respondent are roles 2 and 3 rather than 0 and 1 because the first two are
+retired. [30]
+
+**Message framing.** A message is a big-endian 64-bit octet count followed by exactly that
+many octets of body, with nothing else on the wire: no type tag, no flags, no continuation
+bit and therefore no multipart form. An empty message is the eight zero octets and nothing
+after them. The count is declared before any of the body arrives, which is what makes
+`RECVMAXSZ` (§11) checkable from the length field alone. [3][30]
+
+**REQ/REP and survey tag stacks** are big-endian 32-bit words carried before the body: zero or
+more forwarder peer IDs with the most significant bit clear, then the request or survey ID
+with that bit set. A stack with no terminating word is malformed. A reply repeats the stack it
+arrived with; each forwarder pops its own word to choose the reverse pipe, so the originator
+sees only its own ID. [5][22][30]
+
+**PAIR v1** prefixes the body with one big-endian 32-bit word whose low-order octet is the hop
+count described above. PAIR v0 has no header at all. [18][30]
 
 ## 4. Patterns and topologies
 
@@ -53,12 +110,14 @@
 - **PAIR v1 polyamorous.** `nng_pair1_open_poly()` permits multiple direct peers. The sender chooses a pipe with `nng_msg_set_pipe()` (often from received `nng_msg_get_pipe()`); without one it selects any available peer. A directed unavailable pipe discards silently to avoid head-of-line blocking, and cannot route through devices. This deprecated mode should not be chosen for new designs. [18]
 - **PUB/SUB v0.** PUB broadcasts every message to every connected SUB; each SUB filters locally by prefix subscription, so subscriptions do not reduce link bandwidth. PUB cannot receive and SUB cannot send. [20][21]
 - With an empty subscription a SUB accepts all messages. A subscriber queue full condition drops the oldest message by default (`SUB_PREFNEW=true`) or rejects the new one when false. [21]
+- Observed: the consequence of receiver-side filtering is visible on the link rather than in the API. A SUB socket that has subscribed to nothing is still sent every publication and discards each one after inspecting its prefix, and a SUB that subscribes to one prefix receives the others too. A publisher's egress is therefore the message size times the number of connected subscribers regardless of what they asked for, and a subscription is a receiver-side cost saving only. [21][30]
 - **PUSH/PULL v0.** A PUSH selects one connected puller able to receive, round-robin among available peers; unavailable peers are excluded by flow control. With no eligible peer, the send waits or times out. [19]
 - PULL receives as messages arrive. If two peers have messages ready, their order is undefined; PULL cannot send and PUSH cannot receive. [19]
 - **REQ/REP v0.** A cooked REQ sends one outstanding request per socket context and normally spreads requests among peer REP sockets; the selected REP receives then replies. REQ automatically resends until reply or timeout. [5][23]
 - A cooked REP may send only after receiving its corresponding request and may have only one pending receive per context; REQ may receive only after a request. Violations return `NNG_ESTATE`. [5][23]
 - A new REQ send cancels the earlier request locally and discards its later reply, but cannot cancel processing already performed by a REP. [5]
 - REQ contexts each carry one independent outstanding request, retry configuration, and request ID; REP contexts likewise each process one independent request. [5][23][10]
+- Observed: a cooked REP socket accepts and answers requests from a peer that never retransmits. Nothing in the exchange makes a REP aware of the requester's resend timer — the tag stack and the reply are the entire contract — so a peer that sends each request exactly once is served normally. [30]
 - REQ/REP forwarding: a device prepends its local peer ID on request reception; the REP copies the header to the reply; each forwarder pops its ID to select the reverse pipe; the original REQ finally sees only its request ID. [5]
 - **SURVEYOR/RESPONDENT v0.** A surveyor broadcasts a survey to every respondent, then accepts at most one response per respondent; a respondent may decline by not replying. Duplicates remain possible in some topologies. [22][24]
 - Each cooked surveyor context permits one active survey. Starting another cancels its prior survey; its `SURVEYTIME` starts on send, late replies are discarded, blocked receive expires as `NNG_ETIMEDOUT`, and later receives with no survey return `NNG_ESTATE`. [22]
@@ -207,6 +266,7 @@ a forwarding topology needs. [2][5][18]
 - REQ’s reply is the only built-in completion signal: receipt of a matching reply stops periodic retransmission. It does not prove a remote side effect occurred exactly once. [5]
 - A reply lost after the REP processed the request causes REQ retransmission; requests therefore need idempotent semantics. [5]
 - Survey responses are best effort, optional, and not acknowledgements of broadcast delivery. [22][24]
+- Observed: there is no refusal, error or reject frame anywhere in the mapping. A peer that will not or cannot take a message has exactly two ways to say so — close the pipe, or stay silent — and the two are indistinguishable from a sender that is waiting for something. A message dropped for size, for hop count, or for a protocol state violation is dropped without any signal to its sender at all. Every diagnosis on the sending side is therefore an inference from a close or from a timeout. [3][30]
 
 ## 7. Ordering and duplicates
 
@@ -229,6 +289,7 @@ a forwarding topology needs. [2][5][18]
 | PUB/SUB subscriber buffer full | Each SUB removes oldest by default, or rejects a new message with `SUB_PREFNEW=false`; publisher has no receipt. [21] |
 | Oversized remote message | `RECVMAXSZ` discards it; limit zero accepts unlimited size. inproc does not enforce this option. [6][16] |
 | Survey deadline expires | Later responses are discarded; waiting receive returns `NNG_ETIMEDOUT`, then a receive without an outstanding survey is `NNG_ESTATE`. [22] |
+| Reply past the local hop ceiling | Dropped on receipt, the pipe kept, and nothing is sent back: the originator observes only the absence of a reply until its own timeout. A ceiling reached at a forwarder is invisible to the peers on either side of it. [18][30] |
 | Pipe closes in flight | The pipe is removed and cannot communicate after `REM_POST`; generic NNG gives no delivery outcome, while outstanding REQ is resent. [9][5] |
 | TLS handshake/auth failure | Dial can report `NNG_EPEERAUTH` or `NNG_EPROTO`; no pipe is usable until connection/negotiation succeeds. [7][9] |
 | WebSocket handshake/frame violation | The SP protocol needs binary frames; a compliant WebSocket peer discards invalid UTF-8 TEXT data and breaks the connection. [14] |
@@ -259,6 +320,7 @@ a forwarding topology needs. [2][5][18]
 - Socket send and receive queues are individually bounded to 0–8192 messages when supported. Positive buffers do not eliminate additional transport buffering. [6]
 - `RECVMAXSZ` is unlimited at zero; a nonzero maximum is the primary inbound-size defence, except on trusted inproc. [6][16]
 - `MAXTTL` is 1–255; supported forwarding protocols commonly default to 8, but each node checks its own setting. [6]
+- Observed: the `MAXTTL` range the manual documents and the range the implementation accepts are not the same. `NNI_MAX_MAX_TTL` is **15** (`src/core/defs.h`), and the source comment gives buffer sizing as the reason, so a stack that the specification's 255 permits is refused by a real node at 16. An implementation that takes 255 as the bound accepts stacks its peers drop; one that takes 15 silently narrows the specification. [6][30]
 - SUB topics are arbitrary-size byte arrays and are maintained locally; the manual gives no subscription-count limit. [21]
 - A REQ/REP context has at most one active request; a surveyor context has one active survey; creating contexts multiplies their independent timers/state. [5][22][23]
 - A raw mode application owns headers, retries, matching, and loop controls itself; this removes protocol safeguards rather than adding resource bounds. [2][10]
@@ -313,6 +375,8 @@ a forwarding topology needs. [2][5][18]
 - **nanomsg/libnanomsg.** Original C implementation with nanomsg 1.0 API; NNG documents its compatibility layer as a transition aid and discourages its use for new applications. [4]
 - **mangos.** Go implementation specifically named by NNG as a conforming interoperable implementation for the common SP subset. [2]
 - **Rust.** `nng` is the Rust binding for NNG; `runng` is an asynchronous Rust binding/wrapper; `nanomsg-rs` targets the legacy nanomsg library. These are bindings, not independent SP wire specifications. [26][27][28]
+- **What the `nng` crate is, measured.** Version 1.0.1 is a thin binding over `nng-sys` 1.4.0-rc.0, which builds the NNG C library from vendored sources: the wire behaviour under it is the C implementation's, not the crate's, and the library version is therefore the one to cite. It builds with a C toolchain and no system NNG package. Its socket calls are blocking, `Socket::recv` included, so a program driving it beside an event loop must keep those calls off the loop's threads; `RecvTimeout` and `SendTimeout` are the options that turn a stalled exchange into an error instead of a hang. [30]
+- **A binding is not a second opinion.** `nng`, `runng` and `nanomsg-rs` all terminate in a C library, so agreement between two of them says nothing about the wire. mangos remains the only independent conforming implementation the project names, and what "the common SP subset" excludes is stated nowhere, so a disagreement between NNG and mangos has no published tie-breaker. [2][26][30]
 - **Other bindings.** NNG directs non-C users to the nanomsg site’s bindings list; binding maintenance is independent of NNG’s C release cadence. [2][29]
 - **Compatibility boundary.** PAIR v0 is recommended for legacy nanomsg/mangos interoperability; PAIR v1, polyamorous mode, NNG-specific URL forms, inproc, and ZeroTier are not automatically portable. [18][12][15][16]
 - **Historical note.** The nanomsg comparison page is maintainer-written historical material (last updated 2018-02-07), not a current normative specification; it says nanomsg’s REQ retry was designed to avoid the named limitation of ZeroMQ REQ. [25]
@@ -348,3 +412,4 @@ a forwarding topology needs. [2][5][18]
 27. `runng` Rust crate, crates.io, accessed 2026-09-08: https://crates.io/crates/runng.
 28. `nanomsg-rs` Rust crate, crates.io, accessed 2026-09-08: https://crates.io/crates/nanomsg.
 29. nanomsg bindings list, accessed 2026-09-08: https://nanomsg.org/documentation.html.
+30. The `nng` Rust crate 1.0.1 over `nng-sys` 1.4.0-rc.0 (vendored NNG C library 1.4.0-rc.0), exercised on Linux x86-64 in 2026-09 against an independent SP implementation written from the RFCs: `Req0`/`Rep0`, `Push0`/`Pull0` and `Pub0`/`Sub0` sockets over `tcp://`, with the C sources `src/core/protocol.h`, `src/core/defs.h` and `src/sp/protocol/pair1/pair.c` read for the values the manual does not publish. Used for: the dial behaviour of §1, the wire layouts and endpoint type ids of §3, the fan-out and REQ observations of §4, the refusal behaviour of §6 and §8, the hop ceiling of §11, and the crate facts of §13. Everything attributed to this source is what NNG 1.4.0-rc.0 did on that machine, not a claim about the specification or about a later release.

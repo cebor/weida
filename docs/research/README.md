@@ -122,7 +122,7 @@ through this list; the synthesis compares the answers side by side.
 | `amqp10.md` | AMQP 1.0 (ISO/IEC 19464) | done |
 | `mqtt5.md` | MQTT 5.0, with 3.1.1 differences | done |
 | `nats.md` | NATS core and JetStream | done |
-| `nanomsg-nng.md` | nanomsg / NNG scalability protocols | done |
+| `nanomsg-nng.md` | nanomsg / NNG scalability protocols | done; §1, §3, §4, §6, §8, §11 and §13 carry what an implementation run against NNG 1.4.0-rc.0 through `nng` 1.0.1 observed [30], including the byte-level layouts the RFCs leave in prose |
 | `kafka.md` | Apache Kafka protocol and client semantics | done |
 | `ipc.md` | Inter-process and in-process transports per platform | done |
 | `quic-standards.md` | QUIC RFCs, extensions, drafts and measurement literature | done |

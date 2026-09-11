@@ -599,25 +599,21 @@ Rejection vectors, for the decoder and the fuzz target:
 
 ## 11. Open questions
 
-- **Whether an NNG `REP` minds a requester that never retransmits.** The outbound bridge
-  announces endpoint type `REQ` (`0x30`) and behaves as a raw one: correct tags, one write
-  per exchange, no resend timer (§1). Nothing in the sheet or the RFCs says a REP peer
-  inspects requester behaviour — a REP "may send only after receiving its corresponding
-  request" and nothing more [nanomsg-nng §4] — so this should be indistinguishable from a
-  cooked REQ whose timer never fires. Only §10 item 4 against a real NNG socket settles it,
-  and if it turns out otherwise the choice is between announcing a raw type and accepting
-  the duplicates §9.11 refuses.
-- **The sheet has no byte-level layouts.** It states the 8-byte greeting, the header stacks and
-  the PAIR hop count in prose [nanomsg-nng §1, §3] but gives neither the octets nor the numeric
-  endpoint type IDs, so §3 and §10.1 had to go to the SP RFCs and the NNG source directly. The
-  research item that settles this is an update to
-  [nanomsg-nng.md](../research/nanomsg-nng.md) §1/§3 carrying the octets with their RFC
-  sections.
-- **PAIR v1's initial hop count.** The sheet says the counter is "initialized to one and
-  incremented at each node" [nanomsg-nng §4]; NNG's current source appends `0` on a cooked send
-  and increments on receipt [nng-src], which is what vectors 18 and 19 encode. The two differ by
-  one, and interoperability depends on which the peer implements. Settled by testing against a
-  real NNG peer (§10 item 3), which is the first thing the bench should check.
+- **Closed — an NNG `REP` does not mind a requester that never retransmits.** The outbound
+  bridge announces endpoint type `REQ` (`0x30`) and behaves as a raw one: correct tags, one
+  write per exchange, no resend timer (§1). A real `Rep0` socket answers it normally, which
+  §10 item 7's chain exercises on every run; the sheet now records the observation
+  [nanomsg-nng §4]. Announcing a raw type, and the duplicates §9.11 refuses, stay unnecessary.
+- **Closed — the sheet now has the byte-level layouts.** §3 of
+  [nanomsg-nng.md](../research/nanomsg-nng.md) carries the 8-octet protocol header, all eleven
+  endpoint type ids with their full headers, the 64-bit framing, the tag stacks and the PAIR v1
+  word, each with its RFC section and with NNG's registry named where the RFCs delegate and
+  never published [nanomsg-nng §3]. §3 and §10.1 here no longer stand alone on `[nng-src]`.
+- **PAIR v1's initial hop count: recorded, not yet observed on a wire.** The sheet now states
+  both readings side by side — the prose's "initialized to one" and NNG's cooked send of `0`,
+  which is what vectors 18 and 19 encode [nanomsg-nng §3]. What is still missing is a live PAIR
+  exchange: no chain uses the pattern, so the disagreement is documented rather than settled,
+  and the decoder's tolerance of both is what makes that safe.
 - **No row group in [0007](../decisions/0007-topic-namespace.md) §5.** §6's rows are proposed
   here; whether receiver-side prefix filtering deserves its own rows in that table, given that
   it differs from ZMTP's only in *where* matching happens, is the decision owner's call.
