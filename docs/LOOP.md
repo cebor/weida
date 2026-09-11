@@ -178,18 +178,33 @@ A8 Runtime ownership (`Runtime::owned`, `with_handle`), spawn/timer/DNS centrali
 A9 Local transports: inproc binding first; then `AF_UNIX` (Linux, macOS) and named pipes
    (Windows) per `docs/research/ipc.md` §11, peer credentials as the identity.
 
-**Phase B — adapters.** Each foreign protocol is its own crate under `crates/adapters/`, built
-in these slices in this order: (1) sans-I/O codec with golden vectors and a fuzz target;
-(2) `docs/adapters/<proto>.md` — stream mapping, credit mapping, guarantee mapping, transfer
-points and named losses, derived from the research sheet; (3) inbound bridge (foreign clients
-into weida); (4) outbound (weida into a foreign broker or peer); (5) interop bench against
-the upstream implementation as a dev-dependency — pure Rust first (`zeromq`, `nng`,
-`rumqttc`/`rumqttd`), system daemons only via the supervisor and `#[ignore]` when absent;
-(6) cross-adapter test: a message enters through one adapter and leaves through another,
+**Phase B — the competitor implementations, and the helpers that marry them to weida.**
+Each foreign protocol family is its own directory under `crates/<family>/` and produces two
+products: a **standalone library** that a user of that protocol can use with no weida in the
+picture, and a **forwarder** between a weida endpoint and that library's sockets
+([decisions/0013](decisions/0013-competitor-libraries.md)). Six slices in this order:
+(1) sans-I/O codec with golden vectors and a fuzz target, with an empty `[dependencies]`;
+(2) `docs/adapters/<proto>.md` — stream, credit and guarantee mapping, transfer points and
+named losses, derived from the research sheet;
+(3) **the library**, in named sub-slices: 3a context, endpoints and error vocabulary on
+`weida-runtime`; 3b messages, per-peer queues and the high-water marks; 3c the connection
+engine with reconnect; 3d the pattern socket types, one sub-slice per family; 3e security
+and authorization; 3f options, monitoring and the devices;
+(4) **the marriage helpers** — the forwarder in both directions, rebuilt on the library,
+stating its guarantee set on the weida side and the foreign side's losses;
+(5) interop bench in both roles against the upstream implementations — pure Rust always,
+the C reference behind `#[ignore]` when absent — plus the numbers;
+(6) cross-adapter test: a message enters through one protocol and leaves through another,
 with the guarantees of both mapping documents asserted.
-B1 ZMTP 3.1: REQ/REP, DEALER/ROUTER, PUSH/PULL, PUB/SUB; NULL then CURVE.
-B2 NNG/SP: req/rep, pipeline, pub/sub, pair, bus, survey.
+Slice 3 is where the mass is: for ZeroMQ it is about eight times the three bridge slices it
+replaces. Slices 1, 2 and the bridges already exist for B1 and B2 and are not rebuilt from
+zero — [0013](decisions/0013-competitor-libraries.md) §5.2 says which code moves where.
+B1 ZeroMQ/ZMTP 3.1: `weida-zmq`, complete to the definition of done of
+   [0013](decisions/0013-competitor-libraries.md) §4.7.
+B2 nanomsg/NNG SP: `weida-nng`, the same six slices in the same order.
 B3 MQTT 5, server side first: sessions, QoS 0/1/2, shared subscriptions, retained messages.
+   It stays an adapter rather than a library until Phase D, because an MQTT server is a
+   broker and the broker is Phase D.
 B4 AMQP 1.0 client (link credit onto the L2 credit of 0003), then NATS core client.
 After every Phase B slice, one research item: update that protocol's sheet with what the
 implementation taught, or open the next protocol's unknowns.

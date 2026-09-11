@@ -418,7 +418,7 @@ Applied to LOOP.md §9 on acceptance.
 > with the guarantees of both mapping documents asserted.
 > Slice 3 is where the mass is: for ZeroMQ it is about eight times the three bridge slices it
 > replaces. Slices 1, 2 and the bridges already exist for B1 and B2 and are not rebuilt from
-> zero — §5.2 says which code moves where.
+> zero — [0013](decisions/0013-competitor-libraries.md) §5.2 says which code moves where.
 > B1 ZeroMQ/ZMTP 3.1: `weida-zmq`, complete to the definition of done of
 >    [0013](decisions/0013-competitor-libraries.md) §4.7.
 > B2 nanomsg/NNG SP: `weida-nng`, the same six slices in the same order.

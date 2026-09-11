@@ -22,8 +22,13 @@ open question in it, what a
 local `open` does at its ceiling, is answered: it **waits for a slot**, so `Block` means the
 same thing on every transport (B-059). **Phase B has two protocols complete** — ZMTP and SP,
 all six slices each, both interoperating with the real upstream (`zeromq`, and the `nng` C
-library), and the sixth slice is one test crate they share. MQTT is next and starts with a
-document, because it is the first protocol with a session and weida deliberately has none.
+library), and the sixth slice is one test crate they share. **Phase B is redefined by
+[decision 0013](decisions/0013-competitor-libraries.md)**: each foreign protocol now produces
+a standalone library beside weida — `weida-zmq`, then `weida-nng` — and the bridges shrink to
+forwarders that terminate both sides, which is about 36 hours of item time for ZeroMQ alone
+(B-070..B-095). B1 and B2 are therefore **complete as bridges and reopen as libraries**, and
+the boxes above say so. MQTT is next among the mapping documents, because it is the first
+protocol with a session and weida deliberately has none.
 Phase C's prerequisite (`Runtime::owned`) exists; its first slice is parked until MQTT.
 AMQP 0-9-1 (RabbitMQ) is deliberately not a Phase B adapter: its clients come with the broker (D2), and B4's AMQP 1.0 client already reaches RabbitMQ 4.x.
 
