@@ -11,10 +11,10 @@
 //! catch a decoder that is wrong in the same way, which is the failure mode
 //! that matters when the other end of the wire is libzmq and not us.
 
-use weida_zmtp::error::CommandError;
+use weida_zmtp::error::{CommandError, CurveError};
 use weida_zmtp::{
-    Command, FrameHeader, FrameKind, Greeting, Mechanism, Metadata, SocketType, VERSION, frame,
-    greeting,
+    Command, CurveCommand, FrameHeader, FrameKind, Greeting, InitiatePlaintext, Mechanism,
+    Metadata, SocketType, VERSION, curve, frame, greeting, z85,
 };
 
 /// The cap every vector is decoded under: the adapter's own
@@ -264,4 +264,205 @@ fn golden_unknown_command_names_are_refused_by_name() {
     let bytes: &[u8] = b"\x04\x0A\x04JOINgroup1";
     let (_, body, _) = frame::decode(bytes, CAP).expect("the frame is well formed");
     assert_eq!(Command::decode(body), Err(CommandError::UnknownName));
+}
+
+/// Asserts one CURVE command vector, the way [`assert_command`] does for the
+/// other mechanisms: the whole frame encodes to `expected`, and `expected`
+/// decodes back to the same command.
+#[track_caller]
+fn assert_curve(command: CurveCommand<'_>, expected: &[u8]) {
+    let frame_bytes = command.encode().expect("encode");
+    assert_eq!(frame_bytes, expected, "{}: frame bytes", command.name());
+
+    let (header, body, used) = frame::decode(expected, CAP).expect("decode");
+    assert_eq!(header.kind, FrameKind::Command, "{}", command.name());
+    assert_eq!(used, expected.len(), "{}: octets consumed", command.name());
+    assert_eq!(
+        header.len as usize,
+        expected.len() - (used - body.len()),
+        "{}: declared length",
+        command.name()
+    );
+    assert_eq!(
+        CurveCommand::decode(body).expect("decode body"),
+        command,
+        "{}: decoded value",
+        command.name()
+    );
+}
+
+/// A run of `count` equal octets - the `00×8` of the published table.
+fn run(octet: u8, count: usize) -> Vec<u8> {
+    vec![octet; count]
+}
+
+/// The vector's octets, written as the table writes them.
+fn vector(parts: &[&[u8]]) -> Vec<u8> {
+    parts.concat()
+}
+
+const CLIENT_KEY: [u8; 32] = [0xC1; 32];
+
+#[test]
+fn golden_curve_hello_has_seventy_two_octets_of_padding() {
+    // 26/CURVEZMQ: `hello = %d5 "HELLO" version padding client-key nonce
+    // signature-box`, 6 + 2 + 72 + 32 + 8 + 80 = 200 = 0xC8. The padding is
+    // the ABNF's 72 and not the prose's 70, which is the only reading under
+    // which the specification's own total of 200 comes out.
+    let signature = run(0x5A, curve::SIGNATURE_BOX_LEN);
+    let expected = vector(&[
+        b"\x04\xC8",
+        b"\x05HELLO",
+        b"\x01\x00",
+        &run(0x00, 72),
+        &CLIENT_KEY,
+        b"\x00\x00\x00\x00\x00\x00\x00\x01",
+        &signature,
+    ]);
+    assert_eq!(expected.len(), 2 + 200);
+    assert_curve(
+        CurveCommand::Hello {
+            client_key: &CLIENT_KEY,
+            nonce: 1,
+            signature_box: &signature.clone().try_into().expect("80 octets"),
+        },
+        &expected,
+    );
+
+    // The other reading, published as a vector of its own because it is what
+    // a peer written from the prose puts on the wire: 198 octets, refused
+    // rather than read two octets out of phase.
+    let mut prose = expected.clone();
+    prose.drain(10..12);
+    prose[1] = 198;
+    let (_, body, _) = frame::decode(&prose, CAP).expect("the frame is well formed");
+    assert_eq!(
+        CurveCommand::decode(body),
+        Err(CurveError::BadLength {
+            name: "HELLO",
+            expected: 200,
+            actual: 198
+        })
+    );
+}
+
+#[test]
+fn golden_curve_welcome_is_smaller_than_hello() {
+    // `welcome = %d7 "WELCOME" long-nonce welcome-box`, 8 + 16 + 144 = 168 =
+    // 0xA8. Smaller than the 200-octet HELLO on purpose: that is the
+    // anti-amplification property the padding buys.
+    let nonce = [0x11; curve::LONG_NONCE_LEN];
+    let welcome_box = run(0xB0, curve::WELCOME_BOX_LEN);
+    let expected = vector(&[b"\x04\xA8", b"\x07WELCOME", &nonce, &welcome_box]);
+    assert_eq!(expected.len(), 2 + 168);
+    assert_curve(
+        CurveCommand::Welcome {
+            nonce: &nonce,
+            welcome_box: &welcome_box.clone().try_into().expect("144 octets"),
+        },
+        &expected,
+    );
+    const { assert!(curve::WELCOME_LEN < curve::HELLO_LEN) };
+}
+
+#[test]
+fn golden_curve_initiate_is_the_smallest_long_command_frame() {
+    // `initiate = %d8 "INITIATE" cookie nonce initiate-box`, 9 + 96 + 8 +
+    // 144 = 257 with no metadata - two octets past the short size field, so
+    // an INITIATE is always a long frame: flags 0x06, then eight size
+    // octets. The cookie is `cookie-nonce cookie-box`, 16 + 80.
+    let cookie = curve::join_nonce_box(&[0x22; 16], &run(0xCB, 80).try_into().expect("80 octets"));
+    let initiate_box = run(0x1B, curve::INITIATE_BOX_MIN_LEN);
+    let expected = vector(&[
+        b"\x06\x00\x00\x00\x00\x00\x00\x01\x01",
+        b"\x08INITIATE",
+        &cookie,
+        b"\x00\x00\x00\x00\x00\x00\x00\x02",
+        &initiate_box,
+    ]);
+    assert_eq!(expected.len(), 9 + 257);
+    assert_curve(
+        CurveCommand::Initiate {
+            cookie: &cookie,
+            nonce: 2,
+            initiate_box: &initiate_box,
+        },
+        &expected,
+    );
+}
+
+#[test]
+fn golden_curve_ready_and_message_are_at_their_minima() {
+    // `ready = %d5 "READY" nonce ready-box`, 6 + 8 + 16 = 30 = 0x1E: a box
+    // over no metadata at all is still 16 octets, because that is what
+    // sealing costs.
+    let ready_box = run(0xBD, curve::READY_BOX_MIN_LEN);
+    assert_curve(
+        CurveCommand::Ready {
+            nonce: 3,
+            ready_box: &ready_box,
+        },
+        &vector(&[
+            b"\x04\x1E",
+            b"\x05READY",
+            b"\x00\x00\x00\x00\x00\x00\x00\x03",
+            &ready_box,
+        ]),
+    );
+
+    // `message = %d7 "MESSAGE" nonce message-box`, 8 + 8 + 17 = 33 = 0x21.
+    // The box is never empty: its plaintext starts with the flags octet that
+    // carries MORE, so even a zero-length message payload is 17 octets.
+    let message_box = run(0xE7, curve::MESSAGE_BOX_MIN_LEN);
+    assert_curve(
+        CurveCommand::Message {
+            nonce: 4,
+            message_box: &message_box,
+        },
+        &vector(&[
+            b"\x04\x21",
+            b"\x07MESSAGE",
+            b"\x00\x00\x00\x00\x00\x00\x00\x04",
+            &message_box,
+        ]),
+    );
+}
+
+#[test]
+fn golden_curve_initiate_plaintext_is_key_vouch_metadata() {
+    // What the INITIATE box holds once somebody else has opened it: `C +
+    // vouch + metadata`, 32 + 96 + *. The client's long-term key C is in
+    // there and not on the wire - that is CURVE's client-identity protection,
+    // and it is also the credential a ZAP handler is given.
+    let vouch = curve::join_nonce_box(&[0x33; 16], &run(0xBC, 80).try_into().expect("80 octets"));
+    let plaintext = InitiatePlaintext {
+        client_key: &CLIENT_KEY,
+        vouch: &vouch,
+        metadata: Metadata::new().with_socket_type(SocketType::Dealer),
+    };
+    let mut encoded = Vec::new();
+    plaintext.encode(&mut encoded).expect("encode");
+    let expected = vector(&[
+        &CLIENT_KEY,
+        &vouch,
+        b"\x0BSocket-Type\x00\x00\x00\x06DEALER",
+    ]);
+    assert_eq!(encoded, expected);
+    assert_eq!(
+        InitiatePlaintext::decode(&expected).expect("decode"),
+        plaintext
+    );
+}
+
+#[test]
+fn golden_z85_goes_both_ways() {
+    // 32/Z85's own test vector.
+    const BINARY: [u8; 8] = [0x86, 0x4F, 0xD2, 0x6F, 0xB5, 0x59, 0xF7, 0x5B];
+    assert_eq!(z85::encode(&BINARY).expect("encode"), "HelloWorld");
+    assert_eq!(z85::decode("HelloWorld").expect("decode"), BINARY);
+
+    // A CURVE key is 40 characters: the HELLO vector's C', written down.
+    const TEXT: &str = ".ni$7.ni$7.ni$7.ni$7.ni$7.ni$7.ni$7.ni$7";
+    assert_eq!(z85::encode_key(&CLIENT_KEY), TEXT);
+    assert_eq!(z85::decode_key(TEXT).expect("decode"), CLIENT_KEY);
 }
