@@ -125,7 +125,7 @@ acceptance: `Exec::resolve` (or its caller in `crates/weida/src/pool.rs`) short-
 note: no new test — `resolves_ip_literals_without_dns` in `runtime.rs` already pins the contract for both literal families and now exercises the short-circuit, and the whole suite dials `127.0.0.1`, so the branch is covered 222 times over. The proof is the bench: 1.05-1.09 ms, `change: −11.6 % (p = 0.00)`.
 
 ### B-026 — Decision 0009: a bounded drain at shutdown
-kind: research | size: 45 | status: ready | needs: []
+kind: research | size: 45 | status: in_progress 2026-09-11T07:28Z | needs: []
 acceptance: `docs/decisions/0009-drain.md`, accepted, closing SYNTHESIS §8.6: whether `Runtime::shutdown` gains a bounded drain and whether the drain belongs to the runtime or to L2, decided against the evidence the entry already names — ZeroMQ's `ZMQ_LINGER` with its infinite default that can hang forever, RabbitMQ's requeue-on-channel-close, AMQP 1.0's `drain`/`echo` quiescence point, NATS Lame Duck Mode, and D12's finding that none of them is a drain *acknowledgement*; a bound in wall-clock time is mandatory if a drain exists at all, because an unbounded one is the ZeroMQ failure mode; SYNTHESIS §8.6 closed, README row added, and the consequences name what PATTERNS §1.1 and the ZMTP mapping's loss L9 must then say.
 
 ### B-027 — Decision 0010: the local transport, per platform
