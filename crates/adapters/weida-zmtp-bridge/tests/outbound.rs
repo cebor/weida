@@ -477,3 +477,78 @@ async fn the_configuration_refusals_happen_before_serving() {
         .expect("a sound configuration binds");
     ok.runtime().clone().shutdown().await;
 }
+
+/// Claim: the bridge holds a bounded number of exchanges waiting for a reply,
+/// and one past the ceiling is refused **immediately** rather than parked until
+/// the deadline.
+///
+/// The bound the B-051 review pass found missing: each waiting exchange holds a
+/// request and its body, and how many there are is whatever weida clients
+/// choose to open. The peer here answers nothing until the end, so the ceiling
+/// is the only thing that can decide the excess — and the last assertion is
+/// what makes the test about a *ceiling* rather than about a refusal: the
+/// exchanges inside it are still there, and still get their replies.
+#[tokio::test]
+async fn an_exchange_past_the_pending_ceiling_is_refused_at_once() {
+    const CEILING: usize = 2;
+
+    let (addr, zmq) = Peer::listen().await;
+    let mut config = OutboundConfig::new(
+        addr,
+        "127.0.0.1:0".parse().expect("loopback"),
+        "/rpc",
+        Dialling::Dealer,
+    );
+    config.max_pending_exchanges = CEILING;
+    // Long enough that a parked exchange would outlive this test: if the
+    // ceiling did not refuse, the third request would hang here rather than
+    // return an error.
+    config.reply_deadline = Duration::from_secs(60);
+    let (url, bridge_runtime) = bridge(config).await;
+    let mut peer = Peer::accept(&zmq, SocketType::Rep).await;
+
+    let client = client();
+    let requester = Arc::new(client.requester(ClientTls::new(Trust::by_address())));
+    within(requester.connect(&url)).await.expect("connect");
+
+    // Fill the ceiling: the peer reads each request and answers none.
+    let mut inside = Vec::new();
+    let mut envelopes = Vec::new();
+    for i in 0..CEILING {
+        let requester = Arc::clone(&requester);
+        let body = format!("req-{i}");
+        inside.push(tokio::spawn(async move {
+            requester.request(body.as_bytes()).await
+        }));
+        let parts = within(peer.read_message()).await.expect("a request");
+        envelopes.push(parts[0].clone());
+    }
+
+    // One more. Nothing of it may reach the peer, and the requester must be
+    // told now.
+    let refused = within(requester.request(b"over-the-ceiling")).await;
+    assert!(
+        matches!(refused, Err(Error::Rejected)),
+        "the exchange past the ceiling must be refused, got {refused:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), peer.read_message())
+            .await
+            .is_err(),
+        "a refused exchange must not be forwarded to the ZeroMQ peer"
+    );
+
+    // The ceiling is a ceiling, not a wall: what was admitted still completes.
+    for (i, (task, envelope)) in inside.into_iter().zip(envelopes).enumerate() {
+        peer.send_message(&[&envelope, &[], format!("re-{i}").as_bytes()])
+            .await;
+        let reply = within(task).await.expect("task").expect("a reply");
+        assert_eq!(
+            within(reply.collect(64)).await.expect("collect"),
+            format!("re-{i}").as_bytes()
+        );
+    }
+
+    client.shutdown().await;
+    bridge_runtime.shutdown().await;
+}
