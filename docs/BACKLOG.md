@@ -26,7 +26,7 @@ acceptance: `docs/decisions/0008-session-identity.md`, accepted: the proved fing
 note: 0008 §5 records that SYNTHESIS §8 never received the session entry 0001 §8 promised, so nothing is struck out there; the question and its answer live in 0001 §8 plus this note. Verified against the acceptance line, which asks only for the 0001 §8 item.
 
 ### B-006 — Spec sync: PROTOCOL.md on the decided state
-kind: spec | size: 45 | status: ready | needs: [B-001, B-004, B-005]
+kind: spec | size: 45 | status: in_progress 2026-09-11T04:30Z | needs: [B-001, B-004, B-005]
 acceptance: reserved DATA keys 6 (sequence) and 7 (producer identity, encoding per 0008) in §6.2 with "optional, skipped by v0"; HELLO §2.3/§6.1 gains guarantee declarations and the intersection rule; §2 states the control connection and per-path bulk connections of 0002; §9 topic filter grammar per 0007; §10 split into control and bulk limits; §11 reserves the L2 credit frame kind (0003) and lists what is deferred; wire version stays 0 with the changes marked "spec ahead of code".
 
 ### B-007 — Spec sync: GUARANTEES.md
@@ -38,7 +38,7 @@ kind: spec | size: 45 | status: ready | needs: [B-006, B-007]
 acceptance: PATTERNS §1.3 narrowed to "bulk writers on the same path's connection", §1.4 states the stream budget is the L0 message credit, §1.6 cites 0005, §4 gains subscriber-side drop detection and segmented filters; INVARIANTS permits a control connection while forbidding a multiplexed control stream, adds the reassembly cap and per-peer connection count to the named bounds; ARCHITECTURE §5 describes the two pool tiers and two Limits profiles; SYNTHESIS §8 entries carry their decision numbers.
 
 ### B-019 — Spec sync: FAILURE_MODEL.md per 0005
-kind: spec | size: 30 | status: ready | needs: []
+kind: spec | size: 30 | status: in_progress (delegated) 2026-09-11T04:30Z | needs: []
 acceptance: §4 keeps "a refusal can lose the race with the transport" and gains 0005 §4.4's consequence — no sender outcome exists for a refusal observed after the receipt resolved, and none is added — plus 0005 §4.3's two deterministic constructions (payload beyond the peer's stream receive window, or an exchange) with the note number; the three 2 MiB tests named in 0005 §2 get a doc-comment sentence saying their payload size is what makes the refusal deterministic; `grep` shows no document still calling the race an open question.
 
 ### B-009 — Measure: DATA header cost at high message rate
