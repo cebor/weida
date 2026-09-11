@@ -78,6 +78,20 @@ blocking = ["dep:futures"]
 libzmq-interop = ["dep:zmq"]
 
 [[example]]
+# The zguide's Lazy Pirate, chapter 4.
+name = "lazy_pirate"
+required-features = ["blocking"]
+
+[[example]]
+# The zguide's Simple Pirate over the chapter 3 load-balancing broker.
+name = "simple_pirate"
+required-features = ["blocking"]
+
+[[example]]
+# The zguide's Paranoid Pirate, queue and worker, both async.
+name = "paranoid_pirate"
+
+[[example]]
 # The zguide's Hello World, in the shape its C original has.
 name = "hello_world"
 required-features = ["blocking"]
