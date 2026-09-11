@@ -113,3 +113,116 @@ fn a_req_rep_round_trip_runs_without_a_tokio_executor() {
         runtime.shutdown().await;
     });
 }
+
+#[test]
+fn a_push_pull_transfer_runs_without_a_tokio_executor() {
+    assert!(
+        tokio::runtime::Handle::try_current().is_err(),
+        "this test must run with no ambient tokio runtime"
+    );
+
+    let certs = Certs::generate();
+    let runtime = Runtime::owned(RuntimeConfig::default()).expect("owned runtime");
+    let listener = runtime.listener();
+    let puller = listener.puller("/jobs").expect("puller");
+
+    within(async {
+        let binding = listener
+            .bind_quic(
+                "127.0.0.1:0".parse().expect("loopback address"),
+                certs.server_tls(),
+            )
+            .await
+            .expect("bind");
+        let url = format!("weida://127.0.0.1:{}/jobs", binding.local_addr().port());
+
+        let pusher = runtime.pusher(certs.client_tls());
+        pusher.connect(&url).await.expect("connect");
+
+        // Fire-and-forget on one side, `futures-io` on the other. Both halves
+        // run on this executor, which owns no reactor.
+        let send = async {
+            let mut transfer = pusher
+                .open(TransferMeta::default())
+                .await
+                .expect("open the transfer");
+            AsyncWriteExt::write_all(&mut transfer, b"job one")
+                .await
+                .expect("write the payload");
+            // The receipt is dropped: `finish` is synchronous and needs no
+            // executor of its own.
+            transfer.finish().expect("finish the transfer");
+        };
+
+        let receive = async {
+            let mut incoming = puller.recv().await.expect("recv");
+            let mut body = Vec::new();
+            incoming
+                .read_to_end(&mut body)
+                .await
+                .expect("read the payload");
+            body
+        };
+
+        let ((), body) = futures::future::join(send, receive).await;
+        assert_eq!(body, b"job one");
+
+        runtime.shutdown().await;
+    });
+}
+
+#[test]
+fn a_pub_sub_fan_out_runs_without_a_tokio_executor() {
+    assert!(
+        tokio::runtime::Handle::try_current().is_err(),
+        "this test must run with no ambient tokio runtime"
+    );
+
+    let certs = Certs::generate();
+    let runtime = Runtime::owned(RuntimeConfig::default()).expect("owned runtime");
+    let listener = runtime.listener();
+    let publisher = listener.publisher("/md").expect("publisher");
+
+    within(async {
+        let binding = listener
+            .bind_quic(
+                "127.0.0.1:0".parse().expect("loopback address"),
+                certs.server_tls(),
+            )
+            .await
+            .expect("bind");
+        let url = format!("weida://127.0.0.1:{}/md", binding.local_addr().port());
+
+        let subscriber = runtime.subscriber(certs.client_tls());
+        subscriber.connect(&url).await.expect("connect");
+        // The empty filter matches every topic under both the byte-prefix rule
+        // the code implements today and the segmented grammar of
+        // `docs/decisions/0007-topic-namespace.md`, so this test does not move
+        // when the matcher does. Filtering itself is `tests/pubsub.rs`'s job.
+        subscriber.subscribe("").await.expect("subscribe");
+
+        // SUBSCRIBE is a stream of its own, so it may still be in flight when
+        // `publish` runs. Retrying until one subscriber is reached needs no
+        // timer — which matters, because a timer would need the reactor this
+        // test refuses to have.
+        let mut reached = 0;
+        while reached == 0 {
+            reached = publisher.publish("px.eur", &b"4.02"[..]).expect("publish");
+            if reached == 0 {
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(reached, 1);
+
+        let mut incoming = subscriber.recv().await.expect("recv");
+        assert_eq!(incoming.meta().topic.as_deref(), Some("px.eur"));
+        let mut body = Vec::new();
+        incoming
+            .read_to_end(&mut body)
+            .await
+            .expect("read the payload");
+        assert_eq!(body, b"4.02");
+
+        runtime.shutdown().await;
+    });
+}
