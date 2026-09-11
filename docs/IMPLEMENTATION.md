@@ -269,6 +269,36 @@ No new bound was needed for [INVARIANTS.md](INVARIANTS.md): a guarantee set is f
 remote-influenced allocation. Nothing in `crates/weida` declares anything yet; the runtime
 still sends `Hello::v0`, which is why the wire is unchanged.
 
+**Delivered in the sixth increment — detector-mode ordering (B-015):**
+
+`RuntimeConfig::guarantees` is the configuration surface: one set, offered *and* required,
+so a peer that cannot match it fails the handshake and the local set is therefore the
+effective one. Configured with `OrderingMode::PerProducerDetect`, a runtime numbers its
+one-way transfers in DATA key `6` — per dialled path for `Peer::open` and Push, per **topic**
+for a published message, assigned once before fan-out — and the receiving connection reports
+what is missing through `IncomingMeta::gap` (`Gap { expected, seen }`, `missed()`), delivering
+every message as it arrives. Exchanges are not numbered: a reply carries no endpoint and the
+stream is the correlation.
+
+Both halves live in `crates/weida/src/ordering.rs` (`Sequencer`, `GapDetector`) and both are
+inert under `core`. The hot-path invariant is checked rather than claimed: two unit tests
+drive a thousand calls through a disabled sequencer and a disabled detector and assert the
+backing tables' `capacity() == 0`, so an endpoint that negotiated nothing allocates nothing.
+The detector's scope table is remote-influenced — the peer names the paths and topics — so it
+is capped by the new `Limits::max_sequence_scopes` (1024); at the cap a new scope is left
+untracked rather than inserted, which a unit test pins.
+
+The end-to-end proof is `a_dropped_fan_out_copy_shows_up_as_a_gap` in
+`crates/weida/tests/pubsub.rs`: a subscriber whose byte budget is exhausted loses copies, and
+the next copy it receives carries a gap whose `missed()` equals `Publisher::dropped()`. That
+is the capability [0001](decisions/0001-sequence-field.md) §7.2 required and the wire could
+not express before B-013.
+
+**Deduplication is not part of this increment.** `Bounded(window)` is declared, negotiated
+and rejected-if-unmatched by the wire work above, and no runtime implements it; the dedup
+window therefore stays in the "named but not yet implemented" bounds of
+[INVARIANTS.md](INVARIANTS.md).
+
 **Deliberately deferred** (recorded now, not discovered later):
 
 - Connecting publishers and binding pushers; v0 fixes Pub/Pull as binders and Sub/Push as
