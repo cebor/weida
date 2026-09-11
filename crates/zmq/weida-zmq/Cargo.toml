@@ -1,0 +1,23 @@
+[package]
+name = "weida-zmq"
+description = "A ZeroMQ implementation in Rust: contexts, sockets and endpoints, usable with no weida in the picture"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+# The machine room only: the reactor, the resolver, the AF_UNIX hygiene and
+# the name registry, plus one OS-error vocabulary at the boundary. `weida` and
+# `weida-protocol` MUST NOT appear here
+# (`docs/decisions/0013-competitor-libraries.md` §4.2).
+weida-core.workspace = true
+weida-runtime.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# Drives the owned-context doctest and tests from an executor that is not
+# tokio, which is what `Context::owned` exists for.
+futures.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

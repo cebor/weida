@@ -1973,6 +1973,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "weida-zmq"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "tokio",
+ "weida-core",
+ "weida-runtime",
+]
+
+[[package]]
 name = "weida-zmtp"
 version = "0.1.0"
 

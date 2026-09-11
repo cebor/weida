@@ -5,6 +5,7 @@ members = [
     "crates/protocol",
     "crates/runtime",
     "crates/weida",
+    "crates/zmq/weida-zmq",
     "crates/adapters/weida-zmtp",
     "crates/adapters/weida-zmtp-bridge",
     "crates/adapters/weida-sp",
@@ -23,6 +24,7 @@ weida-protocol = { path = "crates/protocol", version = "0.1.0" }
 weida-runtime = { path = "crates/runtime", version = "0.1.0" }
 weida = { path = "crates/weida", version = "0.1.0" }
 weida-zmtp = { path = "crates/adapters/weida-zmtp", version = "0.1.0" }
+weida-zmq = { path = "crates/zmq/weida-zmq", version = "0.1.0" }
 weida-sp = { path = "crates/adapters/weida-sp", version = "0.1.0" }
 
 quinn = "0.11"
