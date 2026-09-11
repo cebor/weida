@@ -707,7 +707,7 @@ Recorded deliberately, not discovered later.
   `quinn::ConnectionError`, so an idle timeout, a peer SHUTDOWN and a transport error are
   indistinguishable there. `conn_error` has the richer mapping; through the pattern APIs it is
   unreachable once every peer entry is closed. An application deciding whether to reconnect or
-  to give up cannot tell why it lost the peer.
+  to give up cannot tell why it lost the peer. Filed as B-028.
 - **No automatic reconnect.** A dead peer is never redialled by the library; the application
   calls `connect` again, and dead entries are reaped at that moment (`PeerSet::add`), not
   before.
@@ -715,10 +715,11 @@ Recorded deliberately, not discovered later.
   exist. What ships is authentication plus the identity: applications decide on
   `IncomingMeta::peer`, and the only built-in allow list is a `Trust` pin list on a binding,
   which is connection-wide and all-or-nothing.
-- **The resolver takes the first address.** `pool::resolve` uses the first entry
+- **The resolver takes the first address.** `Exec::resolve` uses the first entry
   `lookup_host` returns, so `weida://localhost:…` on a host where `localhost` resolves to
   `::1` only cannot reach a server bound to `127.0.0.1`. Use the IP literal until address
-  selection learns to try more than one.
+  selection learns to try more than one — which is also the cheap path now, since a literal
+  is resolved in place with no task at all (B-025). Filed as B-029.
 - **`stream_receive_window` is not a payload budget.** The DATA header spends the same window
   as the payload, and a receiver announces more window only per eighth of it, so a payload
   sized exactly to the window cannot be written until the application starts reading (§4).

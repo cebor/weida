@@ -924,8 +924,10 @@ Type by type:
   skip-verification path in v0.
 - **`ServerTls`** — a binding's `Identity` plus an optional client `Trust`. A bare `Identity`
   converts into it; `require_client(trust)` makes the binding authenticate its clients.
-- **`Runtime`** — the process-level container of §2. `Clone`, sharing an `Arc` inner. Needs
-  an ambient tokio runtime; construction fails with `Error::Runtime` if there is none.
+- **`Runtime`** — the process-level container of §2. `Clone`, sharing an `Arc` inner. It
+  holds the reactor rather than requiring one: `new` takes the ambient tokio runtime and
+  fails with `Error::Runtime` when there is none, `with_handle` takes somebody else's, and
+  `owned` creates and owns one (§5, Runtime ownership).
 - **`Listener`** — one logical messaging namespace, owning the endpoint `Namespace` shared by
   all of its bindings.
 - **`Binding`** — one concrete QUIC binding; exposes its resolved local address, which is how
