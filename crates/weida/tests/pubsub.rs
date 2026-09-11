@@ -50,8 +50,10 @@ async fn recv_one(sub: &Subscriber) -> (String, Vec<u8>) {
     (topic, body)
 }
 
+/// The segmented grammar over a real connection: one-segment `*`, trailing
+/// `#`, and the boundary a byte prefix could not see.
 #[tokio::test]
-async fn subscribe_prefix_filters_topics() {
+async fn subscribe_filters_topics_by_segment() {
     let server = Server::start().await;
     let publisher = server.listener.publisher("/md").expect("publisher");
 
@@ -60,33 +62,119 @@ async fn subscribe_prefix_filters_topics() {
     within(sub.connect(&server.url("/md")))
         .await
         .expect("connect");
-    within(sub.subscribe("px.")).await.expect("subscribe px.");
-    within(sub.subscribe("ctl.")).await.expect("subscribe ctl.");
-    await_filters(&publisher, 2).await;
+    within(sub.subscribe("px.*")).await.expect("subscribe px.*");
+    within(sub.subscribe("ctl.#"))
+        .await
+        .expect("subscribe ctl.#");
+    within(sub.subscribe("sensors.temp"))
+        .await
+        .expect("subscribe sensors.temp");
+    await_filters(&publisher, 3).await;
 
+    // `px.*` takes exactly one segment.
     assert_eq!(
         publisher.publish("px.eur", &b"one"[..]).expect("publish"),
         1
     );
-    // No filter matches `fx.`, so this reaches nobody.
     assert_eq!(
-        publisher.publish("fx.usd", &b"two"[..]).expect("publish"),
+        publisher
+            .publish("px.eur.spot", &b"too deep"[..])
+            .expect("publish"),
+        0
+    );
+    assert_eq!(
+        publisher.publish("px", &b"too short"[..]).expect("publish"),
+        0
+    );
+    // No filter matches `fx` at all.
+    assert_eq!(
+        publisher
+            .publish("fx.usd", &b"nobody"[..])
+            .expect("publish"),
+        0
+    );
+    // The boundary a byte prefix over-matched: `sensors.temp` must not select
+    // `sensors.temperature`. This assertion fails on the old matcher.
+    assert_eq!(
+        publisher
+            .publish("sensors.temperature", &b"not mine"[..])
+            .expect("publish"),
         0
     );
     assert_eq!(
         publisher
-            .publish("ctl.end", &b"three"[..])
+            .publish("sensors.temp", &b"mine"[..])
+            .expect("publish"),
+        1
+    );
+    // `ctl.#` takes the parent and everything under it.
+    assert_eq!(
+        publisher.publish("ctl", &b"parent"[..]).expect("publish"),
+        1
+    );
+    assert_eq!(
+        publisher
+            .publish("ctl.end.now", &b"deep"[..])
             .expect("publish"),
         1
     );
 
-    // The per-subscriber writer is FIFO, so receiving the `ctl.end` sentinel
-    // proves `fx.usd` was filtered out rather than merely late.
+    // The per-subscriber writer is FIFO, so the order below also proves the
+    // unmatched topics were filtered out rather than merely late.
     assert_eq!(recv_one(&sub).await, ("px.eur".to_owned(), b"one".to_vec()));
     assert_eq!(
         recv_one(&sub).await,
-        ("ctl.end".to_owned(), b"three".to_vec())
+        ("sensors.temp".to_owned(), b"mine".to_vec())
     );
+    assert_eq!(recv_one(&sub).await, ("ctl".to_owned(), b"parent".to_vec()));
+    assert_eq!(
+        recv_one(&sub).await,
+        ("ctl.end.now".to_owned(), b"deep".to_vec())
+    );
+
+    client.shutdown().await;
+}
+
+/// A published topic is data, not a pattern: its `*` is an ordinary byte.
+#[tokio::test]
+async fn a_topic_containing_a_wildcard_byte_is_literal() {
+    let server = Server::start().await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+
+    let client = server.client_runtime();
+    let sub = client.subscriber(server.trust());
+    within(sub.connect(&server.url("/md")))
+        .await
+        .expect("connect");
+    within(sub.subscribe("px.*")).await.expect("subscribe");
+    await_filters(&publisher, 1).await;
+
+    // `px.*` selects it as one segment, like any other one-segment topic.
+    assert_eq!(publisher.publish("px.*", &b"star"[..]).expect("publish"), 1);
+    assert_eq!(recv_one(&sub).await, ("px.*".to_owned(), b"star".to_vec()));
+
+    client.shutdown().await;
+}
+
+/// A filter the grammar forbids fails locally instead of travelling to the
+/// publisher, which would answer it by closing the connection.
+#[tokio::test]
+async fn an_illegal_filter_is_refused_before_it_reaches_the_wire() {
+    let server = Server::start().await;
+    let _publisher = server.listener.publisher("/md").expect("publisher");
+
+    let client = server.client_runtime();
+    let sub = client.subscriber(server.trust());
+    within(sub.connect(&server.url("/md")))
+        .await
+        .expect("connect");
+    for bad in ["px*", "px.#.eur", "p*x"] {
+        let err = within(sub.subscribe(bad))
+            .await
+            .expect_err("the grammar must refuse it");
+        assert!(matches!(err, Error::Protocol(_)), "{bad}: {err:?}");
+    }
+    assert_eq!(sub.filter_count(), 0);
 
     client.shutdown().await;
 }
@@ -132,8 +220,8 @@ async fn two_subscribers_both_receive() {
     within(b.connect(&server.url("/md")))
         .await
         .expect("connect b");
-    within(a.subscribe("px.")).await.expect("subscribe a");
-    within(b.subscribe("px.")).await.expect("subscribe b");
+    within(a.subscribe("px.#")).await.expect("subscribe a");
+    within(b.subscribe("px.#")).await.expect("subscribe b");
     await_filters(&publisher, 2).await;
     assert_eq!(publisher.subscriber_count(), 2);
 
@@ -158,11 +246,13 @@ async fn unsubscribe_stops_delivery() {
     within(sub.connect(&server.url("/md")))
         .await
         .expect("connect");
-    within(sub.subscribe("px.")).await.expect("subscribe px.");
-    within(sub.subscribe("ctl.")).await.expect("subscribe ctl.");
+    within(sub.subscribe("px.#")).await.expect("subscribe px.#");
+    within(sub.subscribe("ctl.#"))
+        .await
+        .expect("subscribe ctl.#");
     await_filters(&publisher, 2).await;
 
-    within(sub.unsubscribe("px.")).await.expect("unsubscribe");
+    within(sub.unsubscribe("px.#")).await.expect("unsubscribe");
     await_filters(&publisher, 1).await;
 
     assert_eq!(publisher.publish("px.x", &b"gone"[..]).expect("publish"), 0);
@@ -189,7 +279,7 @@ async fn late_publisher_receives_early_subscription() {
     within(sub.connect(&server.url("/md")))
         .await
         .expect("connect");
-    within(sub.subscribe("px.")).await.expect("subscribe");
+    within(sub.subscribe("px.#")).await.expect("subscribe");
 
     // The publisher appears afterwards and still finds the subscription.
     let publisher = server.listener.publisher("/md").expect("publisher");

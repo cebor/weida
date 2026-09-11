@@ -585,6 +585,21 @@ SUB    {endpoint:"/md", filter:"px."}
 
 UNSUB  {endpoint:"/md", filter:"px."}
        57 04 0B  A2 00 63 2F 6D 64 01 63 70 78 2E
+
+DATA   {endpoint:"/md", topic:"px.*"}        (a topic is never a pattern)
+       57 01 0C  A2 00 63 2F 6D 64 05 64 70 78 2E 2A
+
+SUB    {endpoint:"/md", filter:"px.eur"}     (literal filter)
+       57 03 0E  A2 00 63 2F 6D 64 01 66 70 78 2E 65 75 72
+
+SUB    {endpoint:"/md", filter:"sensors.*.temp"}   (one-segment wildcard)
+       57 03 16  A2 00 63 2F 6D 64 01 6E 73 65 6E 73 6F 72 73 2E 2A 2E 74 65 6D 70
+
+SUB    {endpoint:"/md", filter:"ctl.#"}      (rest wildcard, final segment)
+       57 03 0D  A2 00 63 2F 6D 64 01 65 63 74 6C 2E 23
+
+SUB    {endpoint:"/md", filter:""}           (every topic)
+       57 03 08  A2 00 63 2F 6D 64 01 60
 ```
 
 Decoded field lists:
@@ -622,13 +637,25 @@ length is a framing violation (§6.2).
 These two vectors fix an *encoding*, not a match: under the filter grammar of §6.4 the byte
 string `px.` is a two-segment filter `["px", ""]`, so it does **not** select the topic
 `px.eur` of the fan-out vector above — `px.*` or `px.#` does. The vector predates the grammar
-and its bytes are still exactly what an encoder must produce for that filter string. Vectors
-for the grammar itself — a literal filter, a middle-segment `*`, a trailing `#`, the empty
-filter, and a topic containing a literal `*` — land with the matcher
-([decisions/0007](decisions/0007-topic-namespace.md) §6), and a vector for a HELLO carrying a
-guarantee set lands with the HELLO fields. The DATA key `6` and `7` vectors above landed with
-their codec: `weida-protocol` encodes and decodes both, while no v0 sender sets either, so
-the vectors pin an encoding rather than describe traffic.
+and its bytes are still exactly what an encoder must produce for that filter string.
+
+**Filter grammar vectors** — four SUBSCRIBE frames, one per construct of §6.4, all on
+`endpoint = "/md"` and differing only in key `1`: the literal `px.eur`
+(`header_len = 0x0E`), the one-segment wildcard `sensors.*.temp` (`0x16`), the rest wildcard
+`ctl.#` (`0x0D`), and the empty filter (`0x08`, value `0x60` — the empty text string, present
+because absent and empty must stay distinguishable). UNSUBSCRIBE carries the same header
+under kind `0x04`. Each fixes an encoding; what each *selects* is the matcher's business, and
+the pairs are pinned together in `crates/weida/src/pubsub.rs`.
+
+**Literal-wildcard topic vector** — magic `0x57`, kind `0x01` (DATA),
+`header_len = 0x0C` (12 bytes), CBOR map of 2 entries: key `0` `endpoint = "/md"`, key `5`
+`topic = "px.*"`. A **`topic` is never a pattern** (§6.2, §6.4): the `*` here is an ordinary
+byte, and the filter `px.*` selects this topic exactly as it selects `px.eur`.
+
+The remaining deferral is a vector for a HELLO carrying a guarantee set, which lands with
+the HELLO fields. The DATA key `6` and `7` vectors above landed with their codec:
+`weida-protocol` encodes and decodes both, while no v0 sender sets either, so those two pin
+an encoding rather than describe traffic.
 
 **HELLO vector** — magic `0x57`, kind `0x00` (HELLO), `header_len = 0x10` (16 bytes),
 CBOR map of 5 entries: key `0` `versions = [0]`, key `1` `max_header_bytes = 16384`,

@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use bytes::Bytes;
 use tokio::sync::{Semaphore, mpsc};
 use weida_core::{Error, Limits, TraceContext};
-use weida_protocol::DataHeader;
+use weida_protocol::{DataHeader, filter};
 
 use crate::conn::{ConnHandle, write_error};
 use crate::transfer::write_data_preamble;
@@ -31,12 +31,48 @@ const WRITER_QUEUE: usize = 1024;
 
 /// Does `topic` match `filter`?
 ///
-/// A filter is a byte prefix, not a pattern: no character in it is special, and
-/// the empty filter matches everything. Master doc §4's `"important*"` is
-/// illustrative; treating `*` as a wildcard here would make topics with a
-/// literal `*` unaddressable and would put a matching language in the hot path.
+/// The segmented grammar of `docs/PROTOCOL.md` §6.4: segments split on `.`,
+/// `*` for exactly one whole segment, a trailing `#` for zero or more, every
+/// other byte literal, and the empty filter matching everything.
+///
+/// The objection this function used to carry was that treating `*` as a
+/// wildcard "would make topics with a literal `*` unaddressable and would put
+/// a matching language in the hot path". Both halves were true and both are
+/// accepted deliberately
+/// ([decisions/0007](../../../docs/decisions/0007-topic-namespace.md) §4.6): a
+/// filter can no longer select a segment containing `.`, `*` or `#`
+/// literally — there is no escape character, and no sheet reports a use for
+/// one — while a byte prefix could not express a boundary at all, so
+/// `sensors.temp` also selected `sensors.temperature`. The hot-path half is
+/// answered by the shape rather than by the choice: `#` is legal only as the
+/// final segment, so this is one left-to-right walk with no backtracking, no
+/// allocation and work bounded by the 256 B filter cap.
+///
+/// A `topic` is never a pattern: `*` and `#` in a published topic are literal
+/// bytes here, exactly like any other.
 pub(crate) fn matches_filter(topic: &str, filter: &str) -> bool {
-    topic.as_bytes().starts_with(filter.as_bytes())
+    if filter.is_empty() {
+        return true;
+    }
+    let mut topic_segments = topic.split(filter::SEPARATOR);
+    let mut filter_segments = filter.split(filter::SEPARATOR);
+    loop {
+        let Some(pattern) = filter_segments.next() else {
+            // The filter is spent: it matches only if the topic is too.
+            return topic_segments.next().is_none();
+        };
+        // Only ever the final segment — `filter::validate` rejects anything
+        // else at the codec boundary — so everything left over matches.
+        if pattern == filter::REST {
+            return true;
+        }
+        let Some(segment) = topic_segments.next() else {
+            return false;
+        };
+        if pattern != filter::ONE_SEGMENT && pattern != segment {
+            return false;
+        }
+    }
 }
 
 /// One message queued for one subscriber.
@@ -314,22 +350,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_filter_is_a_byte_prefix_not_a_pattern() {
-        assert!(matches_filter("px.eur", "px."));
+    fn a_literal_filter_matches_whole_segments_only() {
         assert!(matches_filter("px.eur", "px.eur"));
         assert!(!matches_filter("px.eur", "px.eur.spot"));
-        assert!(!matches_filter("fx.usd", "px."));
-        // The empty filter is the "everything" subscription.
+        assert!(!matches_filter("fx.usd", "px.eur"));
+        // The boundary a byte prefix could not see: `px.` used to select
+        // everything under `px`, and `sensors.temp` used to select
+        // `sensors.temperature`.
+        assert!(!matches_filter("px.eur", "px."));
+        assert!(!matches_filter("sensors.temperature", "sensors.temp"));
+    }
+
+    #[test]
+    fn the_empty_filter_and_the_rest_wildcard_take_everything() {
         assert!(matches_filter("", ""));
-        assert!(matches_filter("anything", ""));
-        // No wildcard interpretation: `*` is an ordinary byte.
-        assert!(!matches_filter("px.eur", "px*"));
-        assert!(matches_filter("px*eur", "px*"));
+        assert!(matches_filter("anything.at.all", ""));
+        assert!(matches_filter("anything.at.all", "#"));
+        assert!(matches_filter("", "#"));
+    }
+
+    #[test]
+    fn one_segment_wildcard_matches_exactly_one() {
+        assert!(matches_filter("px.eur", "px.*"));
+        assert!(matches_filter("sensors.a.temp", "sensors.*.temp"));
+        assert!(matches_filter("px.eur", "*.eur"));
+        // Exactly one: neither none nor two.
+        assert!(!matches_filter("px", "px.*"));
+        assert!(!matches_filter("px.eur.spot", "px.*"));
+    }
+
+    #[test]
+    fn the_rest_wildcard_matches_zero_or_more_trailing_segments() {
+        assert!(matches_filter("px", "px.#"));
+        assert!(matches_filter("px.eur", "px.#"));
+        assert!(matches_filter("px.eur.spot", "px.#"));
+        assert!(!matches_filter("fx", "px.#"));
+        assert!(!matches_filter("pxx", "px.#"));
+    }
+
+    #[test]
+    fn a_topic_is_never_a_pattern() {
+        // `*` and `#` in a published topic are ordinary bytes.
+        assert!(matches_filter("px.*", "px.*"));
+        assert!(!matches_filter("px.*", "px.eur"));
+        assert!(matches_filter("px.#", "px.#"));
+        assert!(matches_filter("px.*", "*.*"));
+    }
+
+    #[test]
+    fn empty_segments_match_only_empty_segments() {
+        assert!(matches_filter("px.", "px."));
+        assert!(!matches_filter("px.eur", "px."));
+        assert!(matches_filter("px.", "px.*"));
     }
 
     #[test]
     fn matching_is_byte_exact_not_case_folded() {
-        assert!(!matches_filter("PX.EUR", "px."));
-        assert!(!matches_filter("px.eur", "PX."));
+        assert!(!matches_filter("PX.EUR", "px.*"));
+        assert!(!matches_filter("px.eur", "PX.*"));
     }
 }

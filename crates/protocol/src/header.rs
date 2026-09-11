@@ -90,6 +90,54 @@ mod subscription_key {
     pub const FILTER: u64 = 1;
 }
 
+/// The topic filter grammar of `docs/PROTOCOL.md` §6.4.
+///
+/// A topic and a filter are byte strings split on [`filter::SEPARATOR`] into
+/// segments. The two wildcards are whole-segment tokens, and everything else
+/// is literal: there is no escape character, no normalization and no case
+/// folding ([decisions/0007](../../../docs/decisions/0007-topic-namespace.md)
+/// §4.2). The matcher lives with the fan-out it serves, in
+/// `weida::pubsub`; what belongs here is the rule that says which filters may
+/// exist at all, so an illegal one is refused at the codec boundary instead of
+/// reaching a matcher that would have to cope with it.
+pub mod filter {
+    use super::HeaderError;
+
+    /// Segment separator: `.`, one byte.
+    pub const SEPARATOR: char = '.';
+    /// Matches exactly one whole segment.
+    pub const ONE_SEGMENT: &str = "*";
+    /// Matches zero or more trailing segments; legal only as the last segment.
+    pub const REST: &str = "#";
+
+    /// Checks `filter` against the grammar.
+    ///
+    /// The empty filter is legal and matches every topic. One pass, no
+    /// allocation.
+    pub fn validate(filter: &str) -> Result<(), HeaderError> {
+        let mut segments = filter.split(SEPARATOR).peekable();
+        while let Some(segment) = segments.next() {
+            let is_last = segments.peek().is_none();
+            if segment.contains(ONE_SEGMENT) && segment != ONE_SEGMENT {
+                return Err(HeaderError::InvalidFilter(
+                    "`*` must occupy a whole segment",
+                ));
+            }
+            if segment.contains(REST) {
+                if segment != REST {
+                    return Err(HeaderError::InvalidFilter(
+                        "`#` must occupy a whole segment",
+                    ));
+                }
+                if !is_last {
+                    return Err(HeaderError::InvalidFilter("`#` must be the final segment"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Why a header was rejected. Every variant is a protocol violation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeaderError {
@@ -127,6 +175,8 @@ pub enum HeaderError {
     DepthExceeded,
     /// Bytes remained after the header map.
     TrailingBytes,
+    /// A topic filter violated the grammar of `docs/PROTOCOL.md` §6.4.
+    InvalidFilter(&'static str),
 }
 
 impl std::fmt::Display for HeaderError {
@@ -154,6 +204,7 @@ impl std::fmt::Display for HeaderError {
             }
             HeaderError::DepthExceeded => f.write_str("unknown field nested too deeply"),
             HeaderError::TrailingBytes => f.write_str("trailing bytes after the header"),
+            HeaderError::InvalidFilter(why) => write!(f, "invalid topic filter: {why}"),
         }
     }
 }
@@ -719,13 +770,15 @@ impl ErrorHeader {
 /// SUBSCRIBE and UNSUBSCRIBE header.
 ///
 /// Both frames carry the same two keys: the publisher path to (un)subscribe on
-/// and the topic filter. The filter is a byte prefix, not a pattern: an empty
-/// filter matches every topic, and no character in it is special.
+/// and the topic filter. The filter is a segmented pattern, not a byte prefix
+/// ([`filter`]): the empty filter matches every topic, `*` matches one whole
+/// segment and a trailing `#` matches zero or more.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionHeader {
     /// Publisher endpoint path.
     pub endpoint: String,
-    /// Topic prefix; the empty string matches everything.
+    /// Topic filter; the empty string matches everything. A decoded header's
+    /// filter has passed [`filter::validate`].
     pub filter: String,
 }
 
@@ -772,10 +825,16 @@ impl SubscriptionHeader {
             m.require(subscription_key::ENDPOINT)?;
             m.require(subscription_key::FILTER)?;
         }
+        // The grammar is checked here, at the codec boundary, so no matcher
+        // ever sees a filter it would have to interpret twice; an illegal one
+        // closes the connection with `PROTOCOL_VIOLATION`
+        // (`docs/PROTOCOL.md` §6.4).
+        let filter = filter.expect("presence checked above");
+        filter::validate(&filter)?;
         finish(&d)?;
         Ok(SubscriptionHeader {
             endpoint: endpoint.expect("presence checked above"),
-            filter: filter.expect("presence checked above"),
+            filter,
         })
     }
 }
@@ -1240,6 +1299,50 @@ mod tests {
             bytes.contains(&0x60),
             "the empty filter is encoded: {bytes:?}"
         );
+    }
+
+    #[test]
+    fn the_filter_grammar_accepts_what_docs_protocol_6_4_permits() {
+        for ok in [
+            "",
+            "#",
+            "px",
+            "px.eur",
+            "px.*",
+            "*.eur",
+            "sensors.*.temp",
+            "px.#",
+            "px.",
+            "a..b",
+        ] {
+            assert_eq!(filter::validate(ok), Ok(()), "{ok:?} must be legal");
+        }
+    }
+
+    #[test]
+    fn the_filter_grammar_rejects_partial_and_misplaced_wildcards() {
+        for bad in [
+            "px*", "*px", "p*x.eur", "px.e*ur", "#.px", "px.#.eur", "px#",
+        ] {
+            assert!(
+                matches!(filter::validate(bad), Err(HeaderError::InvalidFilter(_))),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn an_illegal_filter_is_rejected_at_the_codec_boundary() {
+        // Encoding does not validate — a test may build any bytes — but
+        // decoding does, which is what makes the grammar enforceable against
+        // a peer (`docs/PROTOCOL.md` §6.4).
+        let bytes = SubscriptionHeader::new("/md", "px.#.eur").encode();
+        assert!(matches!(
+            SubscriptionHeader::decode(&bytes),
+            Err(HeaderError::InvalidFilter(_))
+        ));
+        let e: Error = HeaderError::InvalidFilter("`#` must be the final segment").into();
+        assert!(e.to_string().contains("invalid topic filter"));
     }
 
     #[test]

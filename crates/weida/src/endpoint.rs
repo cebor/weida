@@ -427,12 +427,27 @@ impl Subscriber {
         self.state.peer.peer_count()
     }
 
-    /// Registers interest in every topic starting with `filter`.
+    /// Registers interest in every topic `filter` matches.
     ///
-    /// The filter is a byte prefix, not a pattern: `""` receives everything and
-    /// no character is special. Subscribing twice to the same filter is
-    /// idempotent.
+    /// The filter is a **segmented pattern** ([`PROTOCOL.md`] §6.4): segments
+    /// are split on `.`, `*` matches exactly one whole segment, a trailing
+    /// `#` matches zero or more segments and must be the last one, and every
+    /// other byte is literal — no escape character, no normalization, no case
+    /// folding. `""` receives everything, and so does `#`. A published topic
+    /// is never a pattern: `*` in a topic is an ordinary byte.
+    ///
+    /// So `sensors.*.temp` selects one segment in the middle, `sensors.#`
+    /// selects `sensors` and everything under it, and `sensors.temp` does
+    /// **not** select `sensors.temperature`.
+    ///
+    /// Subscribing twice to the same filter is idempotent. A filter that
+    /// violates the grammar fails here with [`Error::Protocol`] rather than
+    /// travelling to the publisher, which would answer it by closing the
+    /// connection.
+    ///
+    /// [`PROTOCOL.md`]: https://github.com/tuco86/weida/blob/main/docs/PROTOCOL.md
     pub async fn subscribe(&self, filter: &str) -> Result<(), Error> {
+        weida_protocol::filter::validate(filter)?;
         let fresh = self
             .state
             .filters
