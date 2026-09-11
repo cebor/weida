@@ -1,26 +1,29 @@
 //! The inbound direction: foreign ZeroMQ peers, weida onward.
 //!
-//! One listener, one socket type presented, one weida endpoint. Each accepted
-//! connection is a task that drives the ZMTP handshake and then one of three
-//! loops, chosen by what the bridge presents.
+//! One `weida-zmq` socket bound on the ZeroMQ side, one weida endpoint, and
+//! one loop per socket type. **The protocol is not here any more**
+//! ([0013](https://github.com/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! §5.2): the greeting, the socket-type check, the framing, the envelope a
+//! pattern defines, `PING`/`PONG`, the subscription wire forms and their
+//! reference counting are `weida-zmq`'s, and what remains is the mapping.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
-use tokio::net::{TcpListener, TcpStream};
 use weida::{ClientTls, GuaranteeSet, Runtime, RuntimeConfig};
-use weida_zmtp::{Command, SocketType};
+use weida_zmq::{
+    Context, ContextConfig, Endpoint, Message, Multipart, PullSocket, RepSocket, SocketOptions,
+    TcpHost, XPubSocket, subscriptions::read_message_form,
+};
 
 use crate::error::BridgeError;
-use crate::subscriptions::{Change, MidSegment, Subscriptions};
-use crate::wire::{DropQueue, Incoming, Session, answer, answer_command, sanitize};
+use crate::subscriptions::{Filters, MidSegment, translate};
 
 /// Which ZeroMQ socket type the bridge presents to whoever connects.
 ///
 /// Three, because these are the three weida patterns exist for and the three
 /// whose ZeroMQ counterparts bind rather than connect
 /// (`docs/ARCHITECTURE.md` §6c.4). The peer's own type is checked against this
-/// one with the specification's table.
+/// one by the library, with the specification's table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Presenting {
     /// `REP`: a `REQ` or `DEALER` peer's messages become weida Req/Rep
@@ -30,17 +33,12 @@ pub enum Presenting {
     Pull,
     /// `PUB`: a `SUB` peer's subscriptions become weida filters and the
     /// published messages travel to it.
+    ///
+    /// The socket underneath is an **XPUB**, because the subscriptions have to
+    /// reach this application to be translated — which is what XPUB is for,
+    /// and what libzmq's own last-value-cache recipe does with it. A ZeroMQ
+    /// `SUB` peer cannot tell the difference: XPUB is PUB on the wire.
     Pub,
-}
-
-impl Presenting {
-    fn socket_type(self) -> SocketType {
-        match self {
-            Presenting::Rep => SocketType::Rep,
-            Presenting::Pull => SocketType::Pull,
-            Presenting::Pub => SocketType::Pub,
-        }
-    }
 }
 
 /// How to bridge one ZeroMQ address onto one weida endpoint.
@@ -55,22 +53,20 @@ pub struct InboundConfig {
     /// Largest whole ZMTP message the bridge will hold, in octets, summed over
     /// a message's frames.
     ///
-    /// This is the bound `docs/adapters/zmtp.md` §3 requires: ZMTP grants no
-    /// credit and its grammar allows 2^63-1 octets per frame, and a ZeroMQ
-    /// peer cannot be handed a body before it is complete, so the bridge
-    /// buffers whole messages and this is what keeps a remote peer from
-    /// choosing the allocation. It also bounds the other direction: a weida
+    /// This is the bound `docs/adapters/zmtp.md` §3 requires, and it is now
+    /// `ZMQ_MAXMSGSIZE` on the socket (`SocketOptions::max_message_size`):
+    /// ZMTP grants no credit and its grammar allows 2^63-1 octets per frame,
+    /// so a declared length past the cap is refused from the frame header,
+    /// before the body is read. It also bounds the other direction: a weida
     /// payload beyond it is refused rather than truncated.
     ///
     /// **1 MiB, from the interop bench** (B-043). The cost through the bridge
     /// is linear in message size with no cliff anywhere — a megabyte costs
     /// 3.37 ms round-trip against 439 µs for a direct ZeroMQ pair — so the
     /// number is not a latency choice but a memory one, and the memory is
-    /// `max_message_bytes` per direction per connection against
-    /// `max_connections`. At the previous 8 MiB and a default 1024 connections
-    /// that product was 8 GiB, which nobody had chosen; 1 MiB is
-    /// `stream_receive_window`, the weida per-stream budget the bridge's own
-    /// reads already live inside [PROTOCOL §10].
+    /// `max_message_bytes` per direction per connection against the socket's
+    /// own `max_peers`. 1 MiB is `stream_receive_window`, the weida per-stream
+    /// budget the bridge's own reads already live inside [PROTOCOL §10].
     pub max_message_bytes: u64,
     /// What to do with a subscription whose byte prefix does not end at a
     /// segment boundary (loss L2).
@@ -81,11 +77,13 @@ pub struct InboundConfig {
     /// fan-out, so both sides agree that a slow subscriber loses messages
     /// rather than stalling anyone.
     ///
-    /// Bytes rather than a message count, and 8 MiB: the count was the other
-    /// half of the 8 GiB above, since a depth times `max_message_bytes` is
-    /// what a slow subscriber can really pin. 8 MiB is
-    /// `subscriber_buffer_bytes`, which bounds exactly this on the weida side,
-    /// so the two ends of the chain now have comparable ceilings [PROTOCOL §10].
+    /// **Bytes here, messages on the socket.** `ZMQ_SNDHWM` counts messages,
+    /// which is libzmq's unit and the one the library keeps, so this byte
+    /// budget becomes a per-peer high-water mark of
+    /// `queue_bytes / max_message_bytes` messages, at least one. The product
+    /// is what a slow subscriber can really pin, and it is the product this
+    /// number names: 8 MiB, which is `subscriber_buffer_bytes`, the weida-side
+    /// ceiling on exactly the same thing [PROTOCOL §10].
     pub queue_bytes: usize,
     /// The weida runtime configuration.
     ///
@@ -110,18 +108,63 @@ impl InboundConfig {
             runtime: RuntimeConfig::default(),
         }
     }
+
+    /// The ZeroMQ socket this configuration asks for, with the bounds it
+    /// names.
+    ///
+    /// The per-peer subscription ceilings come from here too: 256 prefixes of
+    /// at most 256 octets, which is what weida's own `max_subscriptions` and
+    /// the 256 B filter cap of `docs/PROTOCOL.md` §10 allow one connection —
+    /// the bridge is the side a stranger talks to, so it sets them rather
+    /// than taking the library's more generous defaults.
+    fn socket_options(&self) -> SocketOptions {
+        let mut options = SocketOptions {
+            max_message_size: self.max_message_bytes + FRAME_HEADER_ALLOWANCE,
+            max_subscriptions: 256,
+            max_subscription_bytes: 256,
+            ..SocketOptions::default()
+        };
+        let depth = usize::try_from(self.max_message_bytes)
+            .map(|cap| self.queue_bytes / cap.max(1))
+            .unwrap_or(1);
+        options.pipe.outgoing.hwm = depth.max(1);
+        options
+    }
 }
 
-/// A running bridge: a TCP listener and the weida runtime behind it.
+/// What `ZMQ_MAXMSGSIZE` gets above [`InboundConfig::max_message_bytes`].
+///
+/// The two numbers count different things, and the difference belongs to the
+/// bridge rather than to either side. `max_message_bytes` is a **payload**
+/// budget — "the largest whole ZMTP message, summed over a message's frames" —
+/// while `ZMQ_MAXMSGSIZE` in this library counts the frame headers too, which
+/// is the honest thing for a bound whose purpose is to cap what a peer can
+/// make this side hold. A message this bridge maps has at most three frames,
+/// so 32 octets is more header than one can carry: a payload of exactly
+/// `max_message_bytes` still fits, which is what a caller who set that number
+/// meant.
+const FRAME_HEADER_ALLOWANCE: u64 = 32;
+
+/// The bound ZeroMQ socket, whichever type the configuration asked for.
+enum Presented {
+    Rep(RepSocket),
+    Pull(PullSocket),
+    Pub(XPubSocket),
+}
+
+/// A running bridge: one ZeroMQ socket and the weida runtime behind it.
 pub struct Inbound {
-    listener: TcpListener,
+    presented: Presented,
+    bound: Endpoint,
     runtime: Runtime,
-    config: Arc<InboundConfig>,
-    tls: Arc<ClientTls>,
+    config: InboundConfig,
+    tls: ClientTls,
+    /// The ZeroMQ context the socket lives in, kept alive beside it.
+    _context: Context,
 }
 
 impl Inbound {
-    /// Binds the ZeroMQ-side listener and prepares the weida side.
+    /// Binds the ZeroMQ-side socket and prepares the weida side.
     ///
     /// Refuses, before anything is served:
     ///
@@ -147,19 +190,55 @@ impl Inbound {
         let _ = weida::EndpointAddr::parse(&config.weida_url)?;
 
         let runtime = Runtime::new(config.runtime.clone())?;
-        let listener = TcpListener::bind(config.listen).await?;
+        let context = Context::new(ContextConfig::default())?;
+        let options = config.socket_options();
+        let endpoint = format!("tcp://{}", config.listen);
+        let (presented, bound) = match config.presenting {
+            Presenting::Rep => {
+                let socket = RepSocket::with_options(&context, options)?;
+                let bound = socket.bind(&endpoint).await?;
+                (Presented::Rep(socket), bound)
+            }
+            Presenting::Pull => {
+                let socket = PullSocket::with_options(&context, options)?;
+                let bound = socket.bind(&endpoint).await?;
+                (Presented::Pull(socket), bound)
+            }
+            Presenting::Pub => {
+                let socket = XPubSocket::with_options(&context, options)?;
+                let bound = socket.bind(&endpoint).await?;
+                (Presented::Pub(socket), bound)
+            }
+        };
         Ok(Inbound {
-            listener,
+            presented,
+            bound,
             runtime,
-            config: Arc::new(config),
-            tls: Arc::new(tls),
+            config,
+            tls,
+            _context: context,
         })
     }
 
     /// The address the ZeroMQ side is listening on, with the port the OS chose
     /// when the configuration asked for zero.
+    ///
+    /// This is `ZMQ_LAST_ENDPOINT` read back, which is the only way to learn a
+    /// wildcard port.
     pub fn local_addr(&self) -> Result<SocketAddr, BridgeError> {
-        Ok(self.listener.local_addr()?)
+        match &self.bound {
+            Endpoint::Tcp {
+                host: TcpHost::Ip(ip),
+                port,
+            } => Ok(SocketAddr::new(*ip, *port)),
+            Endpoint::Tcp { host, port } => Err(BridgeError::Configuration(format!(
+                "the bound endpoint names no address to report: {host}:{port}"
+            ))),
+            other => Err(BridgeError::Configuration(format!(
+                "a ZMTP bridge binds tcp, and this is {}",
+                other.transport()
+            ))),
+        }
     }
 
     /// The weida runtime this bridge dials with, for shutting it down.
@@ -167,72 +246,43 @@ impl Inbound {
         &self.runtime
     }
 
-    /// Accepts and serves ZeroMQ peers until the listener fails.
+    /// Serves ZeroMQ peers until the socket or the weida side ends.
     ///
-    /// One task per connection, and a connection that fails takes nothing else
-    /// with it: a ZMTP peer is expected to reconnect, and the bridge holds no
-    /// state on its behalf (`docs/adapters/zmtp.md` §3, and reconnection is
-    /// not re-registration — `docs/decisions/0008-session-identity.md` §4.5).
+    /// **One socket for every peer**, where this used to be one task per
+    /// connection: accepting, the handshake and the fair queue across peers
+    /// are the socket's job now. A peer that ends its connection costs
+    /// nothing, and a message this bridge cannot carry ends the *socket*,
+    /// because a ZeroMQ socket has no API to drop one peer and libzmq has none
+    /// either — the difference is written down in `docs/adapters/zmtp.md` §9.2
+    /// rather than absorbed.
     pub async fn serve(self) -> Result<(), BridgeError> {
-        loop {
-            let (socket, from) = self.listener.accept().await?;
-            let config = Arc::clone(&self.config);
-            let tls = Arc::clone(&self.tls);
-            let runtime = self.runtime.clone();
-            tokio::spawn(async move {
-                if let Err(e) = serve_one(socket, runtime, config, tls).await {
-                    match e {
-                        BridgeError::PeerClosed => {
-                            tracing::debug!(%from, "ZeroMQ peer closed the connection");
-                        }
-                        e => tracing::warn!(%from, error = %e, "bridged connection ended"),
-                    }
-                }
-            });
+        let Inbound {
+            presented,
+            runtime,
+            config,
+            tls,
+            ..
+        } = self;
+        match presented {
+            Presented::Rep(socket) => serve_rep(socket, &runtime, &config, &tls).await,
+            Presented::Pull(socket) => serve_pull(socket, &runtime, &config, &tls).await,
+            Presented::Pub(socket) => serve_pub(socket, &runtime, &config, &tls).await,
         }
     }
 }
 
-/// Drives one accepted ZeroMQ connection.
-async fn serve_one(
-    socket: TcpStream,
-    runtime: Runtime,
-    config: Arc<InboundConfig>,
-    tls: Arc<ClientTls>,
-) -> Result<(), BridgeError> {
-    // Nagle off: a bridge writes whole messages and a delayed small frame is a
-    // delayed message, which is what the ZeroMQ side notices.
-    socket.set_nodelay(true)?;
-    let mut session = Session::new(socket, config.max_message_bytes);
-    let ours = config.presenting.socket_type();
-    let (theirs, version) = session.handshake(ours).await?;
-    tracing::debug!(
-        presenting = ours.as_str(),
-        peer = theirs.as_str(),
-        version = %version,
-        "ZMTP handshake complete"
-    );
-
-    match config.presenting {
-        Presenting::Rep => serve_rep(session, runtime, &config, &tls).await,
-        Presenting::Pull => serve_pull(session, runtime, &config, &tls).await,
-        Presenting::Pub => serve_pub(session, runtime, &config, &tls).await,
-    }
-}
-
-/// The body of one inbound message, with the pattern's own envelope consumed.
+/// The body of one inbound message.
 ///
-/// REQ prepends an empty delimiter frame and REP strips it, so `[empty, body]`
-/// is the shape a REQ socket puts on the wire and the delimiter is envelope
-/// rather than payload (`docs/adapters/zmtp.md` §2). A DEALER peer leaves the
-/// envelope to its application, so a bare `[body]` is accepted too. Anything
-/// else is a genuine multipart message: refused, because concatenating it
-/// would invent an application protocol weida does not have — loss L1.
-fn body_of(parts: Vec<Vec<u8>>, envelope: bool) -> Result<(Vec<u8>, bool), BridgeError> {
-    let mut parts = parts;
-    match parts.len() {
-        1 => Ok((parts.remove(0), false)),
-        2 if envelope && parts[0].is_empty() => Ok((parts.remove(1), true)),
+/// The pattern's own envelope is already gone: a REP socket "removes and
+/// stores the address envelope, including the delimiter" and puts it back on
+/// the reply, which is 28/REQREP's rule and now the library's code rather than
+/// this bridge's (§2). What is left must be a single frame — anything else is
+/// a genuine multipart message, refused because concatenating it would invent
+/// an application protocol weida does not have (loss L1).
+fn body_of(message: Multipart) -> Result<Vec<u8>, BridgeError> {
+    let mut frames = message.into_frames();
+    match frames.len() {
+        1 => Ok(frames.remove(0).as_slice().to_vec()),
         n => Err(BridgeError::Protocol(format!(
             "a multipart message of {n} frames has no weida representation, and concatenating it \
              would invent an application protocol (loss L1); configure the ZeroMQ side to send \
@@ -243,39 +293,28 @@ fn body_of(parts: Vec<Vec<u8>>, envelope: bool) -> Result<(Vec<u8>, bool), Bridg
 
 /// `REP`: one weida Req/Rep exchange per inbound message.
 ///
-/// REQ is lockstep — "SHALL send and then receive exactly one message at a
-/// time" — so this loop is too, and deliberately: weida could run the
-/// exchanges concurrently, but the peer cannot produce a second request, so
-/// concurrency here would buy nothing and hide the REQ state machine.
+/// The lockstep is the socket's: a REP socket "SHALL receive and then send
+/// exactly one message at a time", and this loop is that alternation with a
+/// weida exchange in the middle.
 async fn serve_rep(
-    mut session: Session<TcpStream>,
-    runtime: Runtime,
+    mut socket: RepSocket,
+    runtime: &Runtime,
     config: &InboundConfig,
     tls: &ClientTls,
 ) -> Result<(), BridgeError> {
     let requester = runtime.requester(tls.clone());
     requester.connect(&config.weida_url).await?;
+    let cap = usize::try_from(config.max_message_bytes).unwrap_or(usize::MAX);
 
     loop {
-        let parts = match session.read_next().await? {
-            Incoming::Message(message) => message.0,
-            // PING is answered; anything else a REP peer sends is ignored, as
-            // a command it has no use for.
-            Incoming::Command(body) => {
-                answer_command(&mut session, &body).await?;
-                continue;
-            }
-        };
-        let (body, had_envelope) = body_of(parts, true)?;
+        let body = body_of(socket.recv().await?)?;
         let reply = requester.request(&body).await?;
-        let payload = reply
-            .collect(usize::try_from(config.max_message_bytes).unwrap_or(usize::MAX))
-            .await?;
-        if had_envelope {
-            session.write_message(&[&[], &payload]).await?;
-        } else {
-            session.write_message(&[&payload]).await?;
-        }
+        let payload = reply.collect(cap).await?;
+        // What a vanished originator costs is the socket's rule — "SHALL
+        // silently discard the reply, or return an error, if the originating
+        // peer is no longer connected" — and it is reported rather than
+        // hidden.
+        socket.send(Multipart::single(payload)).await?;
     }
 }
 
@@ -283,12 +322,12 @@ async fn serve_rep(
 ///
 /// Backpressure is end to end by construction. PUSH blocks at its high-water
 /// mark and "SHALL NOT discard"; weida's Push/Pull backpressure is `Block`. The
-/// loop awaits the weida send before reading again, so a stalled weida puller
-/// stops the bridge reading, which closes the TCP window, which blocks the
-/// PUSH socket — one policy, three layers.
+/// loop awaits the weida send before receiving again, so a stalled weida
+/// puller stops the socket reading, which closes the TCP window, which blocks
+/// the PUSH socket — one policy, three layers.
 async fn serve_pull(
-    mut session: Session<TcpStream>,
-    runtime: Runtime,
+    mut socket: PullSocket,
+    runtime: &Runtime,
     config: &InboundConfig,
     tls: &ClientTls,
 ) -> Result<(), BridgeError> {
@@ -296,14 +335,7 @@ async fn serve_pull(
     pusher.connect(&config.weida_url).await?;
 
     loop {
-        let parts = match session.read_next().await? {
-            Incoming::Message(message) => message.0,
-            Incoming::Command(body) => {
-                answer_command(&mut session, &body).await?;
-                continue;
-            }
-        };
-        let (body, _) = body_of(parts, false)?;
+        let body = body_of(socket.recv().await?)?;
         pusher.send(&body).await?;
     }
 }
@@ -311,75 +343,91 @@ async fn serve_pull(
 /// `PUB`: the peer's subscriptions become weida filters, and what the weida
 /// publisher fans out travels to the peer.
 ///
-/// Two directions on one connection, so one `select!` over the socket and the
-/// weida subscriber. Both halves are cancel-safe: the session buffers its own
-/// bytes, and a `Subscriber::recv` that is dropped leaves the message in its
-/// queue.
+/// Two directions on one `select!`: the XPUB's subscription stream and the
+/// weida subscriber. Both halves are cancel-safe — a socket that is not read
+/// leaves its message queued, and a `Subscriber::recv` that is dropped leaves
+/// the message in its queue.
 ///
 /// The topic travels as its **own frame**, ahead of the payload. That is the
 /// zguide's envelope convention, and it is what makes the peer's own prefix
 /// match land on the topic rather than on the payload — "the match won't cross
-/// a frame boundary" (`docs/adapters/zmtp.md` §6).
+/// a frame boundary" (`docs/adapters/zmtp.md` §6). It is also what does the
+/// local re-filter of [`MidSegment::BoundaryAndRefilter`]: the socket holds
+/// the prefix the peer sent and matches it against that frame, so a topic the
+/// widened weida filter brought in and the peer never asked for is dropped by
+/// 29/PUBSUB's ordinary publisher-side filtering.
 async fn serve_pub(
-    mut session: Session<TcpStream>,
-    runtime: Runtime,
+    mut socket: XPubSocket,
+    runtime: &Runtime,
     config: &InboundConfig,
     tls: &ClientTls,
 ) -> Result<(), BridgeError> {
     let subscriber = runtime.subscriber(tls.clone());
     subscriber.connect(&config.weida_url).await?;
-    let mut subs = Subscriptions::default();
-    let mut queue = DropQueue::new(config.queue_bytes);
+    let mut filters = Filters::default();
     let cap = usize::try_from(config.max_message_bytes).unwrap_or(usize::MAX);
 
     loop {
         tokio::select! {
-            inbound = session.read_next() => match inbound? {
-                Incoming::Command(body) => {
-                    if let Err(e) = apply_subscription(&mut session, &mut subs, &subscriber, &body, config).await {
-                        if e.is_fatal() {
-                            return Err(e);
-                        }
-                        // A refused subscription costs the peer that
-                        // subscription; whether it costs the connection is the
-                        // peer's choice, since an incoming ERROR is fatal by
-                        // specification. This side keeps serving either way.
-                        tracing::info!(error = %e, "subscription refused");
+            control = socket.recv() => {
+                let message = control?;
+                let frames = message.frames();
+                // An XPUB's application reads subscriptions, and only
+                // subscriptions: a SUB or XSUB peer may not send anything
+                // else, so a message that is not one is a peer speaking a
+                // protocol this bridge does not.
+                let Some((subscribe, prefix)) = frames
+                    .first()
+                    .filter(|_| frames.len() == 1)
+                    .and_then(|frame| read_message_form(frame.as_slice()))
+                else {
+                    return Err(BridgeError::Protocol(
+                        "a SUB peer sent a message that is not a subscription, which its socket \
+                         type cannot do"
+                            .into(),
+                    ));
+                };
+                let prefix = prefix.to_vec();
+                if let Err(e) = apply_change(
+                    &mut socket,
+                    &mut filters,
+                    &subscriber,
+                    subscribe,
+                    &prefix,
+                    config,
+                )
+                .await
+                {
+                    if e.is_fatal() {
+                        return Err(e);
                     }
+                    // A refused subscription costs the peer that
+                    // subscription; whether it costs the connection is the
+                    // peer's choice, since an incoming ERROR is fatal by
+                    // specification. This side keeps serving either way.
+                    tracing::info!(error = %e, "subscription refused");
                 }
-                Incoming::Message(message) => match legacy_subscription(&message.0) {
-                    Some((subscribe, prefix)) => {
-                        if let Err(e) = apply_change(&mut session, &mut subs, &subscriber, subscribe, prefix, config).await {
-                            if e.is_fatal() {
-                                return Err(e);
-                            }
-                            tracing::info!(error = %e, "subscription refused");
-                        }
-                    }
-                    None => {
-                        return Err(BridgeError::Protocol(
-                            "a SUB peer sent a message that is not a subscription, which its \
-                             socket type cannot do".into(),
-                        ));
-                    }
-                },
-            },
+            }
             published = subscriber.recv() => match published {
                 Ok(transfer) => {
                     let topic = transfer.meta().topic.clone().unwrap_or_default();
                     let payload = transfer.collect(cap).await?;
-                    if subs.wants(&topic) {
-                        if queue.push(payload) {
-                            tracing::warn!(
-                                dropped = queue.dropped(),
-                                budget = config.queue_bytes,
-                                "the ZeroMQ subscriber is not keeping up; dropped its oldest \
-                                 queued messages to make room"
-                            );
-                        }
-                        while let Some(message) = queue.pop() {
-                            session.write_message(&[topic.as_bytes(), &message]).await?;
-                        }
+                    // Which subscribers want it, and what happens to the ones
+                    // that are not keeping up, are the socket's: it matches
+                    // the topic frame against each peer's prefixes and drops
+                    // at the high-water mark, which is 29/PUBSUB's rule and
+                    // weida's fan-out policy at once.
+                    let report = socket.publish(Multipart::new(vec![
+                        Message::from(topic.into_bytes()),
+                        Message::from(payload),
+                    ])?);
+                    if report.dropped > 0 {
+                        tracing::warn!(
+                            dropped = report.dropped,
+                            budget = config.queue_bytes,
+                            "a ZeroMQ subscriber is not keeping up; its oldest queued messages \
+                             were dropped to make room"
+                        );
                     }
                 }
                 // The weida publisher went away. Reconnecting re-sends the
@@ -411,7 +459,7 @@ fn reconnectable(e: &weida::Error) -> bool {
 /// outage from the ZeroMQ side, and the ZeroMQ side has its own reconnect loop
 /// that is better at it — a ZMTP peer reconnects automatically, and on a fresh
 /// connection the bridge rebuilds everything from that peer's own
-/// subscriptions. So this tries a few times and then lets the ZMTP connection
+/// subscriptions. So this tries a few times and then lets the ZeroMQ socket
 /// fail, which is the honest signal.
 async fn reconnect(
     subscriber: &weida::Subscriber,
@@ -444,78 +492,48 @@ async fn reconnect(
         .unwrap_or(BridgeError::PeerClosed))
 }
 
-/// Applies one `SUBSCRIBE` or `CANCEL`, or answers another command.
-async fn apply_subscription(
-    session: &mut Session<TcpStream>,
-    subs: &mut Subscriptions,
-    subscriber: &weida::Subscriber,
-    body: &[u8],
-    config: &InboundConfig,
-) -> Result<(), BridgeError> {
-    match Command::decode(body)? {
-        Command::Subscribe(prefix) => {
-            apply_change(session, subs, subscriber, true, prefix, config).await
-        }
-        Command::Cancel(prefix) => {
-            apply_change(session, subs, subscriber, false, prefix, config).await
-        }
-        other => answer(session, other).await,
-    }
-}
-
-/// The **legacy** subscription form: a one-frame message whose first octet is
-/// `1` to subscribe or `0` to cancel, the rest being the prefix.
+/// Subscribes or cancels one prefix on the weida side.
 ///
-/// This is ZMTP 2.0's wire form, and it is also how libzmq presents
-/// subscriptions to an XPUB application — "byte 1 (for subscriptions) or byte
-/// 0 (for unsubscriptions) followed by the subscription body" [zeromq §6].
-/// 3.x has the `SUBSCRIBE`/`CANCEL` commands instead, and this bridge sends
-/// those; it **accepts** both, because the pure-Rust `zeromq` crate announces
-/// 3.0 and sends the legacy form, and refusing it would mean refusing every
-/// real subscriber that crate has. The decode is unambiguous: a SUB or XSUB
-/// peer may not send application messages at all, so a message from one is a
-/// subscription or an error.
-fn legacy_subscription(parts: &[Vec<u8>]) -> Option<(bool, &[u8])> {
-    let [frame] = parts else { return None };
-    match frame.split_first() {
-        Some((1, prefix)) => Some((true, prefix)),
-        Some((0, prefix)) => Some((false, prefix)),
-        _ => None,
-    }
-}
-
-/// Subscribes or cancels one prefix, whichever form it arrived in.
+/// The socket has already applied it to its own table — the count, the
+/// deduplication and both wire forms are 37/ZMTP's rules and the library's
+/// code. What is left is the translation and its refusal:
+///
+/// * a prefix that translates is held in the ledger, and the weida side is
+///   told the first time that filter is needed;
+/// * a prefix that does not is answered with an `ERROR` naming the reason and
+///   taken back out of the socket's table, so the socket matches nothing for
+///   it. The peer is told because a silently ignored subscription is a
+///   subscriber that waits forever for messages nobody will send, and ZMTP has
+///   no per-subscription error channel — it may well treat the `ERROR` as
+///   fatal and close, which is the protocol's own price (§9.3).
 async fn apply_change(
-    session: &mut Session<TcpStream>,
-    subs: &mut Subscriptions,
+    socket: &mut XPubSocket,
+    filters: &mut Filters,
     subscriber: &weida::Subscriber,
     subscribe: bool,
     prefix: &[u8],
     config: &InboundConfig,
 ) -> Result<(), BridgeError> {
-    let change = if subscribe {
-        match subs.subscribe(prefix, config.mid_segment) {
-            Ok(change) => change,
-            Err(e) => {
-                // The peer is told, because a silently ignored subscription is
-                // a subscriber that waits forever for messages nobody will
-                // send. It may well treat the ERROR as fatal and close —
-                // "the peer SHALL treat an incoming ERROR command as fatal" —
-                // which is the protocol's own price for having no per-
-                // subscription error channel (`docs/adapters/zmtp.md` §9.3).
-                session
-                    .write_command(&Command::Error(&sanitize(&e.to_string())))
-                    .await?;
-                return Err(e);
+    let translated = match translate(prefix, config.mid_segment) {
+        Ok(translated) => translated,
+        Err(e) => {
+            if subscribe {
+                socket.refuse(&e.to_string())?;
+                // Refused on the weida side, so refused on this one too:
+                // otherwise the socket would keep matching a prefix no filter
+                // ever brings messages for, and a later subscription that
+                // widens the weida side would start delivering it.
+                let _ = socket.unsubscribe(prefix);
             }
+            return Err(e);
         }
-    } else {
-        subs.cancel(prefix, config.mid_segment)
     };
-    match change {
-        Change::Subscribe(filter) => subscriber.subscribe(&filter).await?,
-        Change::Unsubscribe(filter) => subscriber.unsubscribe(&filter).await?,
-        Change::None => {}
+    if subscribe {
+        if filters.hold(&translated.filter) {
+            subscriber.subscribe(&translated.filter).await?;
+        }
+    } else if filters.release(&translated.filter) {
+        subscriber.unsubscribe(&translated.filter).await?;
     }
     Ok(())
 }
@@ -523,64 +541,68 @@ async fn apply_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weida_zmtp::SocketType;
 
     #[test]
     fn the_socket_types_are_the_ones_the_mapping_table_names() {
         // Each presented type must accept exactly the peers
-        // `docs/adapters/zmtp.md` §2 maps onto it, which is the specification's
-        // own table in `weida-zmtp`.
+        // `docs/adapters/zmtp.md` §2 maps onto it, which is the
+        // specification's own table in `weida-zmtp` — and the check is made
+        // at the handshake by `weida-zmq`, so this pins the table the library
+        // uses rather than a rule of the bridge's own.
         assert!(SocketType::Rep.accepts(SocketType::Req));
         assert!(SocketType::Rep.accepts(SocketType::Dealer));
         assert!(SocketType::Pull.accepts(SocketType::Push));
         assert!(SocketType::Pub.accepts(SocketType::Sub));
         assert!(SocketType::Pub.accepts(SocketType::XSub));
+        // The presented PUB is an XPUB socket, which must accept the same
+        // peers or a SUB peer would be turned away by the substitution.
+        assert!(SocketType::XPub.accepts(SocketType::Sub));
+        assert!(SocketType::XPub.accepts(SocketType::XSub));
 
         // And the crossings §9.1 refuses are refused by the table itself, so
         // the bridge needs no rule of its own for them.
         assert!(!SocketType::Pull.accepts(SocketType::Sub));
-        assert!(!SocketType::Pub.accepts(SocketType::Push));
+        assert!(!SocketType::XPub.accepts(SocketType::Push));
         assert!(!SocketType::Rep.accepts(SocketType::Sub));
     }
 
     #[test]
-    fn a_pattern_envelope_is_consumed_and_a_real_multipart_is_refused() {
-        // REQ's empty delimiter: envelope, consumed, and remembered so the
-        // reply carries one back.
-        let (body, envelope) =
-            body_of(vec![Vec::new(), b"request".to_vec()], true).expect("REQ shape");
+    fn a_real_multipart_message_is_refused() {
+        // One frame is a body. The pattern's envelope never reaches here any
+        // more: a REP socket strips the delimiter and restores it on the
+        // reply, which is why this function no longer takes an `envelope`
+        // argument — that rule is `weida-zmq`'s, tested there.
+        let body = body_of(Multipart::single(b"request".to_vec())).expect("one frame");
         assert_eq!(body, b"request");
-        assert!(envelope);
 
-        // A DEALER peer that sends no delimiter.
-        let (body, envelope) = body_of(vec![b"request".to_vec()], true).expect("bare shape");
-        assert_eq!(body, b"request");
-        assert!(!envelope);
-
-        // Two non-empty frames are a genuine multipart message.
-        let err = body_of(vec![b"a".to_vec(), b"b".to_vec()], true).expect_err("loss L1");
-        assert!(matches!(err, BridgeError::Protocol(_)), "{err:?}");
-
-        // And on a pattern with no envelope, even the delimiter shape is
-        // multipart.
-        let err = body_of(vec![Vec::new(), b"b".to_vec()], false).expect_err("loss L1");
-        assert!(matches!(err, BridgeError::Protocol(_)), "{err:?}");
+        // Two frames are a genuine multipart message, whatever they hold.
+        for parts in [
+            vec![b"a".to_vec(), b"b".to_vec()],
+            vec![Vec::new(), b"b".to_vec()],
+        ] {
+            let message =
+                Multipart::new(parts.into_iter().map(Message::from).collect()).expect("a message");
+            let err = body_of(message).expect_err("loss L1");
+            assert!(matches!(err, BridgeError::Protocol(_)), "{err:?}");
+        }
     }
 
     #[test]
-    fn an_error_reason_survives_being_put_on_the_wire() {
-        // `ERROR` carries printable ASCII only, and the reasons here are
-        // written for a human: the ones that quote a filter contain quotes and
-        // may contain anything the peer sent.
-        let reason = sanitize("the prefix \"px.\u{1}\" is not printable");
-        assert!(reason.is_ascii());
-        assert!(
-            reason.bytes().all(|b| (0x20..=0x7E).contains(&b)),
-            "{reason}"
+    fn the_queue_budget_becomes_a_message_high_water_mark() {
+        // The socket counts messages, the configuration bounds bytes: the
+        // product is what a slow subscriber pins, so the depth is the budget
+        // divided by the cap.
+        let mut config = InboundConfig::new(
+            "127.0.0.1:0".parse().expect("loopback"),
+            "weida://127.0.0.1:7443/feed",
+            Presenting::Pub,
         );
-        assert!(Command::Error(&reason).encode().is_ok());
+        assert_eq!(config.socket_options().pipe.outgoing.hwm, 8);
 
-        let long = sanitize(&"x".repeat(400));
-        assert_eq!(long.len(), 255, "an ERROR reason is at most 255 octets");
-        assert!(Command::Error(&long).encode().is_ok());
+        // And a budget smaller than one message still holds one, because a
+        // high-water mark of zero means *no limit* in libzmq.
+        config.queue_bytes = 1;
+        assert_eq!(config.socket_options().pipe.outgoing.hwm, 1);
     }
 }

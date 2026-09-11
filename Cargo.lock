@@ -2317,6 +2317,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "weida",
+ "weida-zmq",
  "weida-zmtp",
  "zeromq",
 ]

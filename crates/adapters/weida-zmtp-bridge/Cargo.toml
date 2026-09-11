@@ -13,8 +13,11 @@ version.workspace = true
 # manifest.
 [dependencies]
 weida.workspace = true
+weida-zmq.workspace = true
+# Still here, and only for the socket-type table the tests pin and the
+# metadata names: the framing and the handshake are `weida-zmq`'s now.
 weida-zmtp.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
