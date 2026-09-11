@@ -43,24 +43,23 @@ the subsystem they constrain does not exist.
 | Transfer-related control messages do not require a permanent control stream | ERROR rides the reply half of the exchange it concerns and nothing else; SUBSCRIBE and UNSUBSCRIBE are short header-only unidirectional streams; cancellation is `RESET_STREAM`/`STOP_SENDING`, transport signalling rather than a message. There is no multiplexed control stream anywhere in the implementation. A **control connection** per peer ([decisions/0002](decisions/0002-control-and-bulk-separation.md), [PROTOCOL.md](PROTOCOL.md) §2.5) does not violate this: the invariant forbids a permanent multiplexed control *stream* inside a connection, where transfer frames would queue behind each other; a separate connection carries its own short streams and is what removes that coupling rather than creating it |
 | All guarantees are defined against the immediate next hop | `Delivery::delivered()` is defined strictly as "the next hop's **transport** acknowledged every byte and the FIN", explicitly not "the application read it" — quinn's `stopped()` says "although not necessarily the processing of it" ([GUARANTEES.md](GUARANTEES.md), [FAILURE_MODEL.md](FAILURE_MODEL.md) §4) |
 | Disabled guarantees should not participate in the hot path | `finish()` is synchronous and dropping the returned `Delivery` is free, so a fire-and-forget sender registers nothing, allocates no waiter and awaits nothing; the payload path is `write` to the quinn `SendStream` with no task hop and no lock |
-| No remote input can cause unbounded memory allocation | `header_len` is compared against `max_header_bytes` **before** allocating ([PROTOCOL.md](PROTOCOL.md) §3.1); CBOR skip is iterative with `max_depth = 8`; QUIC `stream_receive_window`, `connection_receive_window`, `max_concurrent_uni_streams` and `max_concurrent_bidi_streams` bound buffered payload and concurrent stream state; `max_connections` bounds accepted connections; a peer's subscriptions are bounded by `max_subscriptions` filters per connection, each capped at 256 B, and dropped wholesale when the connection closes; payload queued for one subscriber is bounded by `subscriber_buffer_bytes`; the gap detector's per-connection scope table is bounded by `max_sequence_scopes` (1024), and at the cap a new scope is left untracked rather than inserted; the dedup window's identity table is bounded in time by the negotiated window **and** in count by `max_dedup_entries` (4096), evicting its oldest entry at the cap, so a peer that sends fast buys itself missed suppression rather than memory; worst-case hostile per-connection header memory is `max_header_bytes * (max_concurrent_uni_streams + max_concurrent_bidi_streams)` = **48 MiB** ([PROTOCOL.md](PROTOCOL.md) §10) |
+| No remote input can cause unbounded memory allocation | `header_len` is compared against `max_header_bytes` **before** allocating ([PROTOCOL.md](PROTOCOL.md) §3.1); CBOR skip is iterative with `max_depth = 8`; QUIC `stream_receive_window`, `connection_receive_window`, `max_concurrent_uni_streams` and `max_concurrent_bidi_streams` bound buffered payload and concurrent stream state; `max_connections` bounds accepted connections; a peer's subscriptions are bounded by `max_subscriptions` filters per connection, each capped at 256 B, and dropped wholesale when the connection closes; payload queued for one subscriber is bounded by `subscriber_buffer_bytes`; the per-connection scope table of the gap detector and of the reassembler is bounded by `max_sequence_scopes` (1024), and at the cap a new scope is left untracked rather than inserted; the reassembly hold is bounded by `max_reorder_hold` (256) transfers over all scopes, enforced by releasing the oldest held transfer out of order with its gap reported, never by growing — a held transfer is an unread stream, so the bytes it pins are quinn's and are bounded again by `connection_receive_window`; the dedup window's identity table is bounded in time by the negotiated window **and** in count by `max_dedup_entries` (4096), evicting its oldest entry at the cap, so a peer that sends fast buys itself missed suppression rather than memory; worst-case hostile per-connection header memory is `max_header_bytes * (max_concurrent_uni_streams + max_concurrent_bidi_streams)` = **48 MiB** ([PROTOCOL.md](PROTOCOL.md) §10) |
 
-Two bounds are **named but not yet implemented**, because the decisions that create the
-allocations are accepted and the code is not written. Each is named here first so that no
-implementation of them can land without one:
+One bound is **named but not yet implemented**, because the decision that creates the
+allocation is accepted and the code is not written. It is named here first so that no
+implementation of it can land without one:
 
 | Bound | What it caps | Why the number matters |
 | --- | --- | --- |
 | `max_connections_per_peer` | connections one peer may hold across the control and bulk tiers ([PROTOCOL.md](PROTOCOL.md) §2.5, §10.1) | one connection per dialled path means a peer chooses the count; 64 connections to one peer measured ~50 MiB of transport state on the pair ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-011), so the path count cannot be the only bound |
-| the reassembly hold | transfers held back by the reassemble level of `PerProducer` ([GUARANTEES.md](GUARANTEES.md) §3, [decisions/0001](decisions/0001-sequence-field.md) §7.5) | the hold is bounded only by the transfers in flight: reverse-order completion reached N − 1, and 84 of 256 were held with no adversarial pattern ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-010). An eager reassembler must be capped by construction and must release or refuse at the cap, never grow |
 
-The hot-path invariant binds both structures that now exist: a connection that negotiated
-`Ordering = None` and `Deduplication = None` — which is every connection that declares
-nothing, since `core` is the default guarantee set — allocates neither. That is checked
-rather than asserted: the unit tests of `crates/weida/src/ordering.rs` and
-`crates/weida/src/dedup.rs` drive a thousand calls through the disabled forms and assert
-that the backing tables' capacity is still zero ([GUARANTEES.md](GUARANTEES.md) §3,
-[PROTOCOL.md](PROTOCOL.md) §6.5).
+The hot-path invariant binds all three structures that now exist: a connection that
+negotiated `Ordering = None` and `Deduplication = None` — which is every connection that
+declares nothing, since `core` is the default guarantee set — allocates none of them. That
+is checked rather than asserted: the unit tests of `crates/weida/src/ordering.rs` and
+`crates/weida/src/dedup.rs` drive a thousand calls through the disabled sequencer, detector,
+reassembler and dedup window and assert that the backing tables' capacity is still zero
+([GUARANTEES.md](GUARANTEES.md) §3, [PROTOCOL.md](PROTOCOL.md) §6.5).
 
 Invariants deferred with their subsystems: brokerless/brokered API parity, broker cluster
 as one logical broker, Raft scope, stream-oriented payload replication, and adapter
