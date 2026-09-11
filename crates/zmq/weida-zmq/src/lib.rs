@@ -111,11 +111,21 @@
 //!   named. Nothing is silently ignored, and the two deliberate default
 //!   changes are rows in that table.
 //!
-//! What remains is the monitor events and the devices [0013 §5.3]. They are
-//! named here so that a reader knows what this crate is for and what it does
-//! not do yet; nothing stands in for them, and in particular there is no
-//! default [`Session`] beyond [`ZmtpSession`]: a socket that handed its
-//! peers to a no-op would be a ZeroMQ implementation that speaks nothing.
+//! - [`Monitor`] and [`MonitorEvent`] — `zmq_socket_monitor`'s event set as
+//!   a typed stream **and**, through [`monitor::serve_pair`], over the
+//!   two-frame `inproc://` PAIR form the Espresso recipe reads. One
+//!   publisher, two renderings, and one place where the octets are decided.
+//! - [`proxy`](proxy()) and [`proxy_steerable`] — the devices, over the
+//!   typed socket surfaces behind [`Device`]: both directions, a capture
+//!   socket that gets a copy of every message, one message held at a time,
+//!   and PAUSE/RESUME/TERMINATE/STATISTICS on a control socket with
+//!   libzmq's eight counters.
+//!
+//! What remains is the blocking facade [0013 §5.3]. It is named here so that
+//! a reader knows what this crate is for and what it does not do yet;
+//! nothing stands in for it, and in particular there is no default
+//! [`Session`] beyond [`ZmtpSession`]: a socket that handed its peers to a
+//! no-op would be a ZeroMQ implementation that speaks nothing.
 //!
 //! # Rules this crate keeps
 //!
@@ -164,6 +174,7 @@ pub mod optiontable;
 pub mod pair;
 pub mod pipe;
 pub mod pipeline;
+pub mod proxy;
 pub mod pubsub;
 pub mod reqrep;
 pub mod session;
@@ -209,6 +220,10 @@ pub use pipe::{
     DEFAULT_RCVHWM, DEFAULT_SNDHWM, MuteAction, Pipe, PipeConfig, Queue, QueueConfig, Sent,
 };
 pub use pipeline::{PullSocket, PushSocket};
+pub use proxy::{
+    CONTROL_PAUSE, CONTROL_RESUME, CONTROL_STATISTICS, CONTROL_TERMINATE, Counter, Device,
+    ProxyStatistics, Steer, proxy, proxy_steerable,
+};
 pub use pubsub::{PubSocket, Published, SubSocket};
 pub use reqrep::{RepSocket, ReqSocket};
 pub use session::{Incoming, Negotiated, Wire, ZmtpSession};
