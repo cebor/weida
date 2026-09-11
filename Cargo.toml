@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/protocol", "crates/weida"]
+members = ["crates/core", "crates/protocol", "crates/weida", "crates/adapters/weida-zmtp"]
 
 [workspace.package]
 edition = "2024"

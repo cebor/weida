@@ -1,7 +1,8 @@
 # ZMTP 3.1 — adapter mapping
 
-Status: mapping document. No adapter crate exists yet; this is the design a
-`crates/adapters/weida-zmtp` must implement, and the contract its documentation owes its user
+Status: mapping document; slice 1 (the codec) implemented as `crates/adapters/weida-zmtp`.
+The rest is the design the bridge slices must implement, and the contract the adapter's
+documentation owes its user
 ([LOOP.md](../LOOP.md) §9 Phase B slice 2, [0006](../decisions/0006-guarantee-sets.md) §4.9).
 Date: 2026-09-11
 Derived from: [docs/research/zeromq.md](../research/zeromq.md) (ZMTP 3.1, libzmq 4.3.x, the
@@ -302,14 +303,16 @@ the process supervisor with a `ready` condition and is stopped in the same item 
 
 **The bench itself.**
 
-1. **Golden vectors, no I/O.** The 64-octet greeting, a NULL `READY` with `Socket-Type`
-   metadata, short and long frames at the 255/256-octet boundary, a two-frame multipart
-   message, `SUBSCRIBE`/`CANCEL`, `PING` with a TTL and its `PONG` echo [zeromq §1],
-   [zeromq §3]. Byte-exact in both directions, the shape [PROTOCOL §8] already requires of the
-   weida codec.
+1. **Golden vectors, no I/O** — *done, slice 1*: §10.1 below publishes the octets and
+   `crates/adapters/weida-zmtp/tests/golden_vectors.rs` asserts every one of them in both
+   directions [zeromq §1], [zeromq §3]. Byte-exact both ways, the shape [PROTOCOL §8] already
+   requires of the weida codec.
 2. **Fuzz target** over the ZMTP decoder, cap-before-allocate on the declared frame size —
    a frame may declare up to 2^63-1 octets and `ZMQ_MAXMSGSIZE` is the only defence
-   [zeromq §11] — mirroring `max_header_bytes`'s rule [PROTOCOL §3.1].
+   [zeromq §11] — mirroring `max_header_bytes`'s rule [PROTOCOL §3.1]. *Done, slice 1*: five
+   `cargo fuzz` targets under `crates/adapters/weida-zmtp/fuzz` (frame, frame stream, command,
+   metadata, greeting) and a stable-Rust `fuzz_smoke.rs` that runs the same properties in
+   `cargo test`, including a long header with an arbitrary 64-bit length and no body.
 3. **Inbound matrix.** zmq.rs REQ → adapter → weida `Replier`; zmq.rs PUSH → adapter →
    `Puller`; zmq.rs SUB ← adapter ← weida `Publisher`, including a boundary-aligned prefix and
    a rejected mid-segment prefix (L2).
@@ -327,6 +330,46 @@ the process supervisor with a `ready` condition and is stopped in the same item 
 7. **Cross-adapter test** (Phase B slice 6, once a second adapter exists): a message enters
    through ZMTP and leaves through the other protocol, with the guarantees of both mapping
    documents asserted [LOOP §9].
+
+### 10.1 The vectors
+
+Published here so that a reader can check an implementation — this one, libzmq, or a
+reimplementation — rather than trust it. Hex; the frame header and the body are separate
+columns, and a run of equal octets is written `00×8`.
+
+Two places where 37/ZMTP disagrees with itself or with its reference implementation were found
+while writing the codec, and the vectors take a side:
+
+- **Command names are length-prefixed.** The prose says a command contains "a printable
+  command name, a null octet separator, and data"; the ABNF says
+  `command-name = short-size 1*255command-name-char`, and libzmq puts `05 READY` on the wire.
+  The grammar and the reference implementation agree against the prose, so the vectors use the
+  length octet and no separator.
+- **An `ERROR` reason may contain spaces.** `error-reason = short-size 0*255VCHAR` excludes
+  the space octet, while libzmq's own reasons read like "Unknown mechanism". The codec accepts
+  printable ASCII including space and refuses everything else, in both directions.
+
+| Vector | Frame header | Body |
+| --- | --- | --- |
+| Greeting, NULL, as-server 0 | — | `FF 00×8 7F` `03 01` `4E 55 4C 4C 00×16` `00` `00×31`, 64 octets: signature, version, mechanism, as-server, filler |
+| Partial greeting (version sniff) | — | `FF 00×8 7F 03`, 11 octets |
+| `READY`, `Socket-Type=REQ` | `04 19` | `05 READY 0B "Socket-Type" 00 00 00 03 "REQ"` |
+| `READY`, no properties | `04 06` | `05 READY` |
+| `ERROR "bad socket type"` | `04 16` | `05 ERROR 0F "bad socket type"` |
+| `SUBSCRIBE "px.eur"` | `04 10` | `09 SUBSCRIBE "px.eur"` |
+| `CANCEL "px.eur"` | `04 0D` | `06 CANCEL "px.eur"` |
+| `SUBSCRIBE ""` (matches everything) | `04 0A` | `09 SUBSCRIBE` |
+| `PING`, TTL 300 (30.0 s), context `ctx` | `04 0A` | `04 PING 01 2C "ctx"` |
+| `PONG`, context `ctx` | `04 08` | `04 PONG "ctx"` |
+| Message frame, 255-octet body | `00 FF` | 255 octets — the largest short frame |
+| Message frame, 256-octet body | `02 00 00 00 00 00 00 01 00` | 256 octets — the smallest long frame |
+| Multipart `A`, `B` | `01 01` then `00 01` | `41`, then `42` — MORE on all but the last |
+| Long command frame | `06` + eight-octet size | a `READY` beyond 255 octets |
+
+The encoder always picks the shortest size field, which is what the specification recommends;
+the decoder accepts a long size for a short body, because a peer that sends one is odd rather
+than wrong. That asymmetry is itself a vector: `02 00 00 00 00 00 00 00 01 78` decodes to the
+one-octet body `x`.
 
 ## 11. Open questions
 

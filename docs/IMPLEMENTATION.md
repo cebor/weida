@@ -24,7 +24,7 @@ chaotically across phases.
 | 6 | Standalone broker | not started |
 | 7 | Broker clustering | not started |
 | 8 | Web adapter | not started |
-| 9 | Legacy adapters | not started |
+| 9 | Legacy adapters | in progress |
 | 10 | Language bindings | not started |
 | 11 | CLI and administration | not started |
 | 12 | Documentation/site/stabilization | not started |
@@ -36,6 +36,12 @@ identities and pinned the stream semantics with measured probes. Router/Dealer a
 as emergent rather than implemented, see [ARCHITECTURE.md](ARCHITECTURE.md) §6a. Phases 4
 and later remain out of scope; Phase 6 gained the acknowledgement vocabulary that used to
 sit in the core.
+
+Phase 9 is open out of order, deliberately and narrowly: the ZMTP codec
+(`crates/adapters/weida-zmtp`, [adapters/zmtp.md](adapters/zmtp.md) §10.1) is a self-contained
+foreign-protocol codec with no weida dependency, so it needs nothing from phases 4-8 and
+building it now is what turns the adapter mapping document from a design into a checked
+claim. The bridge slices, which do need the patterns, wait for their place in the order.
 
 ### Phase 0 — Architecture/specification
 
@@ -862,6 +868,19 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | `shutdown_timeout` | `RuntimeConfig::shutdown_timeout`, default 1 s (B-031) | `shutdown` closes every endpoint and then waited for the sockets to go idle **without a bound**, so the length of a process's exit was decided by the path rather than by the caller: measured against a peer that has gone silent, the draining period alone is **96 ms** on loopback and grows with round-trip time and loss. One second is generous on any network where a clean close was possible at all. The bound is one budget for the whole shutdown, not one per endpoint, because what a caller waits for is the call ([decisions/0009](decisions/0009-drain.md) §4.4). |
 | Address selection | try every resolved address in order, capped by `Limits::max_resolved_addresses` (8), each attempt but the last bounded by `RuntimeConfig::connect_attempt_timeout` (250 ms) (B-029) | Taking the first address made `weida://localhost:…` unreachable wherever `localhost` resolves to `::1` before `127.0.0.1`, which is the common Linux ordering and this machine's. Sequential attempts with a per-attempt bound rather than RFC 8305's parallel happy-eyeballs: the failure being fixed is an address that answers *nothing*, where QUIC has no refusal to observe, and 250 ms is RFC 8305's own Connection Attempt Delay for exactly that case. Measured on the regression test: **30 s before, 1.3 s after**. The last address keeps the full handshake budget, so an IP literal and a single-address name behave exactly as before. |
 | Loss cause | `Error::ConnectionLost(LossCause)` — `IdleTimeout`, `PeerClosed`, `LocallyClosed`, `Reset`, `TransportError` (B-028) | `PeerSet::pick` reported a bare `ConnectionLost` for every closed peer, and `conn_error` mapped `TimedOut`, `Reset` and an unrecognized application close to the same value, so the distinction did not exist anywhere in the API. A payload rather than new top-level variants: the *outcome* is identical in all five cases — nothing in flight completed, `is_definite_failure()` stays true — and only the next action differs, so a second outcome vocabulary would have been the wrong shape ([FAILURE_MODEL.md](FAILURE_MODEL.md) §4). Five causes because each one changes what an application should do; `pick` now reports the cause of the peer it rejected. |
+
+---
+
+### ZMTP codec decisions (Phase 9 slice 1, B-030)
+
+| Decision | Value | Rationale |
+| --- | --- | --- |
+| Dependencies | **none**, not even `weida-core` | The half of an adapter that can be checked against a foreign specification must not be able to reach for weida's types, limits or error vocabulary, or the check becomes a check against our reading of the specification. `Cargo.toml` has an empty `[dependencies]` on purpose, and the crate carries its own error vocabulary rather than borrowing `weida_core::Error`. |
+| Where the cap lives | an argument to every decode entry point, never a constant | ZMTP grants no credit, a long frame may declare 2^63-1 octets, and `ZMQ_MAXMSGSIZE` is unlimited by default, so the local limit is the whole defence. Passing it in means a bridge can use the weida-side number it already has (`subscriber_buffer_bytes`, 8 MiB) instead of a second, unrelated default invented here — which is [adapters/zmtp.md](adapters/zmtp.md) §11's open question, left open rather than answered by accident. The effective cap is `min(argument, 2^63-1)`, so a caller cannot switch the check off. |
+| What a decoder returns | borrowed slices (`Command<'a>`, `Metadata<'a>`) | A decoded frame body is a slice of the caller's buffer and a command points into that body, so the only allocation on the way in is a `READY`'s property list. It is also what lets a bridge hand a payload to a weida transfer without a copy. |
+| Illegal flag combinations | unrepresentable | MORE "SHALL be zero on command frames", so `FrameKind` is `Message { more }` or `Command` — the combination has no value in either direction, rather than a runtime check on the way out. |
+| Incomplete versus violated | separate per layer | A frame header can legitimately be short (read more); a command body arrives whole, so a field running past its end is a violation with nothing to wait for. Three error types, each answering `is_violation()`, rather than one type whose `Incomplete` means different things at different depths. |
+| Where the specification contradicts itself | follow the ABNF and libzmq, and say so | Command names are length-prefixed, not null-separated; an `ERROR` reason may contain spaces although `VCHAR` excludes them. Both are recorded in [adapters/zmtp.md](adapters/zmtp.md) §10.1 and in the crate docs, because an interop bug found later must be traceable to a decision rather than to an accident. |
 
 ---
 

@@ -371,21 +371,29 @@ one that plainly is not [0010 §4.8].
 
 ```text
 crates/
-    core/       →  weida-core       I/O-free model
-    protocol/   →  weida-protocol   wire codec, no I/O
-    weida/      →  weida            runtime + QUIC transport + stream core + patterns
+    core/                  →  weida-core       I/O-free model
+    protocol/              →  weida-protocol   wire codec, no I/O
+    weida/                 →  weida            runtime + QUIC transport + stream core + patterns
+    adapters/weida-zmtp/   →  weida-zmtp       ZMTP 3.1 codec, no I/O and no weida dependency
 ```
+
+`weida-zmtp` is the first slice of the ZeroMQ adapter
+([adapters/zmtp.md](adapters/zmtp.md)) and depends on **nothing at all** — not even
+`weida-core`. That is deliberate and stronger than the rule below: the half of an adapter
+that can be checked byte-for-byte against a foreign specification must not be able to reach
+for weida's types, limits or error vocabulary, or the check quietly becomes a check against
+our reading of the specification. The bridge slices depend on both sides.
 
 Planned, not yet present: `weida-broker` (the L2 semantics of §1 — queues, publisher
 confirms, consumer acknowledgements with redelivery — Phase 6), `weida-web` (the Web
-binding, Phase 8) and the legacy-protocol adapter crates `weida-zeromq`, `weida-mqtt`,
+binding, Phase 8) and the remaining legacy-protocol adapters `weida-mqtt` and
 `weida-amqp091` (Phase 9). The broker is a separate crate because it is a separate layer:
 it depends on the patterns, nothing in the core may depend on it, and a brokerless
 deployment must not link it. The adapters are separate crates because they are separately
 useful: each is a native Rust implementation of a foreign protocol, hosted by this runtime
-or an extension of it, and each must be usable on its own — `weida-zeromq` without a weida
-deployment at all, and later repackaged for other languages. They depend on `weida-core`
-and `weida-protocol`; the core never depends on them.
+or an extension of it, and each must be usable on its own — the ZMTP codec without a weida
+deployment at all, and later repackaged for other languages. They may depend on
+`weida-core` and `weida-protocol`; the core never depends on them.
 
 ### `weida-core`
 
