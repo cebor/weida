@@ -94,7 +94,7 @@ acceptance: `Runtime::owned(config)` (multi-thread, `worker_threads` configurabl
 note: built by the parallel worker on branch `b016-runtime` in the worktree `../weida-b016` (commits 6dee879 code, bfc5fee docs), merged here `--no-ff` as 2741dfd with no conflicts, and gated in this tree: fmt clean, clippy in both feature configurations, 222 tests pass with 1 ignored (the new `foreign_executor` suite among them), rustdoc with `-D warnings`. Verified against the acceptance line: `Runtime::owned` rejects `worker_threads: 0`, `Exec` in `runtime.rs` is the only place calling `tokio::spawn`, `tokio::time::sleep` or `lookup_host`, `futures_io::AsyncWrite`/`AsyncRead` are implemented on both transfer types, and `a_req_rep_round_trip_runs_without_a_tokio_executor` is a plain `#[test]`.
 
 ### B-017 — Control connection per peer, bulk per path
-kind: code | size: 90 | status: ready | needs: [B-014, B-011, B-012]
+kind: code | size: 90 | status: in_progress 2026-09-11T11:50Z | needs: [B-014, B-011, B-012]
 acceptance: pool tiers per 0002 §7; HELLO on the control connection; bulk connections keyed by path and bound by fingerprint per 0008 §4.2, with a fingerprint mismatch refused and a test for that refusal in `crates/weida/tests/identity.rs`, and anonymous clients (no proved fingerprint) never treated as one peer; `Limits` profiles `control` and `bulk` in `RuntimeConfig` with defaults chosen from B-011/B-012 numbers; stream probes updated; `a_stalled_stream_does_not_block_its_siblings` extended to show a control frame crossing while bulk is stalled.
 
 ### B-018 — Research: ZMTP adapter mapping document
