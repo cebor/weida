@@ -22,35 +22,36 @@
 //! negotiation, with the version fenced by `versions` instead of ALPN
 //! (§2.1, [0010 §4.3]).
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
-use weida_core::{Error, LossCause};
+use weida_core::{Error, LossCause, MAX_BUS_BYTES};
 use weida_protocol::codes;
-
-/// Longest bus name, in bytes: libzmq's budget for the same thing
-/// ([0010 §4.8], `docs/research/ipc.md` §8.1).
-pub const MAX_BUS_BYTES: usize = 256;
+use weida_runtime::NameRegistry;
 
 /// No code: the sentinel for "nothing signalled here yet".
 const NO_CODE: u64 = u64::MAX;
 
 /// Every bus bound in this process. A bus name is unique to the process and
 /// two processes using the same name never meet [0010 §4.8].
-static BUSES: LazyLock<StdMutex<HashMap<String, mpsc::UnboundedSender<LocalConn>>>> =
-    LazyLock::new(|| StdMutex::new(HashMap::new()));
+///
+/// The registry is `weida-runtime`'s, with the byte budget passed in: an
+/// in-process namespace of bound names is not weida's idea and libzmq's
+/// `inproc://` is the same object under another name
+/// (`docs/research/ipc.md` §8.1).
+static BUSES: LazyLock<NameRegistry<LocalConn>> =
+    LazyLock::new(|| NameRegistry::new(MAX_BUS_BYTES));
 
 /// Validates a bus name.
+///
+/// The length and the control bytes are the registry's rule; the separator is
+/// weida's, because a bus name is one field of `weida+inproc://<bus>/<path>`
+/// and a `/` in it would name a different endpoint.
 pub fn validate_bus(bus: &str) -> Result<(), Error> {
-    if bus.is_empty() || bus.len() > MAX_BUS_BYTES {
-        return Err(Error::InvalidAddress(format!(
-            "inproc bus name must be 1..={MAX_BUS_BYTES} bytes: {bus:?}"
-        )));
-    }
-    if bus.bytes().any(|b| b < 0x20 || b == b'/') {
+    BUSES.validate(bus)?;
+    if bus.as_bytes().contains(&b'/') {
         return Err(Error::InvalidAddress(format!(
             "invalid byte in inproc bus name: {bus:?}"
         )));
@@ -61,30 +62,20 @@ pub fn validate_bus(bus: &str) -> Result<(), Error> {
 /// Registers `bus` and returns the queue of connections dialled to it.
 pub(crate) fn bind(bus: &str) -> Result<mpsc::UnboundedReceiver<LocalConn>, Error> {
     validate_bus(bus)?;
-    let mut buses = BUSES.lock().expect("inproc registry poisoned");
-    if buses.contains_key(bus) {
-        return Err(Error::AlreadyRegistered);
-    }
-    let (tx, rx) = mpsc::unbounded_channel();
-    buses.insert(bus.to_owned(), tx);
-    Ok(rx)
+    BUSES.bind(bus)
 }
 
 /// Removes `bus` from the registry; the binding's own drop calls this.
 pub(crate) fn unbind(bus: &str) {
-    BUSES.lock().expect("inproc registry poisoned").remove(bus);
+    BUSES.unbind(bus);
 }
 
 /// Dials `bus`, handing the far half to whoever bound it.
 pub(crate) fn dial(bus: &str, max_streams: usize, buffer: usize) -> Result<LocalConn, Error> {
     validate_bus(bus)?;
-    let tx = {
-        let buses = BUSES.lock().expect("inproc registry poisoned");
-        buses.get(bus).cloned()
-    };
     // Nothing is bound here: the same outcome a dial to a closed port has,
     // reported before anything is allocated.
-    let Some(tx) = tx else {
+    let Some(tx) = BUSES.lookup(bus) else {
         return Err(Error::ConnectionLost(LossCause::PeerClosed));
     };
     let (dialled, accepted) = LocalConn::pair(max_streams, buffer);

@@ -43,17 +43,17 @@
 //! fan-out already gives an exhausted subscriber budget [0012 §4.4].
 
 use std::collections::{HashMap, VecDeque};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use weida_core::{Error, LocalPrincipal, LossCause, PeerIdentity};
 use weida_protocol::codes;
+use weida_runtime::peer_credentials;
 
 /// First byte of a control connection.
 const KIND_CONTROL: u8 = 0x01;
@@ -66,75 +66,7 @@ const KIND_REVERSE: u8 = 0x03;
 /// Length of a group token [0012 §4.2].
 const TOKEN_LEN: usize = 16;
 
-/// Mode of a bound socket file.
-///
-/// Set explicitly after bind, never inherited: a new socket file gets every
-/// permission bit `umask` does not mask, so the default is whatever the
-/// process happened to inherit (`docs/research/ipc.md` §1.2, [0010 §4.5]).
-const SOCKET_MODE: u32 = 0o600;
-
 const NO_CODE: u64 = u64::MAX;
-
-/// A bound `AF_UNIX` socket: the local counterpart of a QUIC binding.
-#[derive(Debug)]
-pub(crate) struct UnixBinding {
-    path: PathBuf,
-}
-
-impl UnixBinding {
-    /// Binds `path`, replacing a stale socket file left by a crash.
-    ///
-    /// **The directory is load-bearing.** Closing a socket does not remove its
-    /// node, so a crash leaves one and `bind()` then fails with `EADDRINUSE`;
-    /// unlink-then-bind is the usual answer and it opens a substitution race
-    /// that is closed only "unless directory ownership and permissions prevent
-    /// endpoint substitution" (`docs/research/ipc.md` §1.2, §7). This function
-    /// therefore removes a stale node and sets the mode explicitly, and the
-    /// caller MUST place the socket in a directory it owns and that no other
-    /// user may write. The mode is `0600`; it is set after bind because a
-    /// socket file is created with whatever `umask` allows [0010 §4.5].
-    pub(crate) fn bind(path: &Path) -> Result<(UnixBinding, TokioUnixListener), Error> {
-        // A stale node is a socket nobody is listening on. Anything else at
-        // that path is not ours to remove.
-        match std::fs::metadata(path) {
-            Ok(meta) if is_socket(&meta) => std::fs::remove_file(path).map_err(Error::Io)?,
-            Ok(_) => {
-                return Err(Error::InvalidAddress(format!(
-                    "{} exists and is not a socket",
-                    path.display()
-                )));
-            }
-            Err(_) => {}
-        }
-        let listener = TokioUnixListener::bind(path).map_err(Error::Io)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))
-            .map_err(Error::Io)?;
-        Ok((
-            UnixBinding {
-                path: path.to_path_buf(),
-            },
-            listener,
-        ))
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for UnixBinding {
-    fn drop(&mut self) {
-        // Leaving the node behind is what forces the next bind into
-        // unlink-then-bind; removing it on the way out keeps the common case
-        // free of that race.
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn is_socket(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    meta.file_type().is_socket()
-}
 
 /// The peers a binding has admitted, keyed by their group token.
 #[derive(Default)]
@@ -283,7 +215,7 @@ pub(crate) enum Accepted {
 }
 
 pub(crate) async fn read_accepted(mut stream: UnixStream) -> Result<Accepted, Error> {
-    let principal = principal_of(&stream)?;
+    let principal = peer_credentials(&stream)?;
     let mut kind = [0u8; 1];
     stream.read_exact(&mut kind).await.map_err(Error::Io)?;
     match kind[0] {
@@ -301,21 +233,6 @@ pub(crate) async fn read_accepted(mut stream: UnixStream) -> Result<Accepted, Er
             "unknown local connection kind {other:#04x}"
         ))),
     }
-}
-
-/// The credentials the kernel attributes to the peer of `stream`.
-///
-/// Taken at accept/connect time, which is when `SO_PEERCRED` captures them;
-/// they are not re-read per message (`docs/research/ipc.md` §1.5).
-fn principal_of(stream: &UnixStream) -> Result<LocalPrincipal, Error> {
-    let cred = stream.peer_cred().map_err(Error::Io)?;
-    Ok(LocalPrincipal {
-        uid: cred.uid(),
-        gid: cred.gid(),
-        // macOS reports no PID at all, and a PID is an observation even where
-        // it exists [0010 §4.4].
-        pid: cred.pid().map(|pid| pid as u32),
-    })
 }
 
 /// Serves one accepted control connection: issues the token and builds the
@@ -393,7 +310,7 @@ pub(crate) async fn dial(
             }
             _ => Error::Io(e),
         })?;
-    let principal = principal_of(&stream)?;
+    let principal = peer_credentials(&stream)?;
     stream.write_all(&[KIND_CONTROL]).await.map_err(Error::Io)?;
     let mut token = [0u8; TOKEN_LEN];
     stream.read_exact(&mut token).await.map_err(Error::Io)?;
