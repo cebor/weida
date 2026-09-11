@@ -65,11 +65,15 @@
 //!   [`Subscriptions`], drop-not-block at the high-water mark, and both
 //!   subscription wire forms accepted with the sent one chosen by
 //!   [`SubscriptionForm`].
+//! - [`XPubSocket`] and [`XSubSocket`] — the raw pair a pub/sub proxy is
+//!   built from: subscriptions delivered to the application in the `1`/`0`
+//!   form with `ZMQ_XPUB_VERBOSE`, `_VERBOSER`, `_MANUAL` and
+//!   `_WELCOME_MSG`, an unsubscribe synthesized when a subscriber vanishes,
+//!   and messages and subscriptions sent upstream.
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
 //!
-//! The remaining socket types — `XPubSocket` and `XSubSocket` — are the
-//! next slice, as are security and
+//! What remains is as are security and
 //! authorization and the rest of the option surface [0013 §5.3]. They are
 //! named here so that a reader knows what this crate is for and what it does
 //! not do yet; nothing stands in for them, and in particular there is no
@@ -123,6 +127,7 @@ pub mod session;
 pub mod socket;
 pub mod subscriptions;
 pub mod transport;
+pub mod xpubxsub;
 
 pub use context::{
     Context, ContextConfig, DEFAULT_CLOSE_BUDGET, DEFAULT_MAX_SOCKETS, InprocDial, SocketId,
@@ -149,9 +154,12 @@ pub use pipe::{
     DEFAULT_RCVHWM, DEFAULT_SNDHWM, MuteAction, Pipe, PipeConfig, Queue, QueueConfig, Sent,
 };
 pub use pipeline::{PullSocket, PushSocket};
-pub use pubsub::{PubSocket, SubSocket};
+pub use pubsub::{PubSocket, Published, SubSocket};
 pub use reqrep::{RepSocket, ReqSocket};
 pub use session::{Incoming, Negotiated, Wire, ZmtpSession};
 pub use socket::{Delivered, SocketCore};
-pub use subscriptions::{SubscriptionForm, Subscriptions};
+pub use subscriptions::{
+    DEFAULT_MAX_SUBSCRIPTION_BYTES, DEFAULT_MAX_SUBSCRIPTIONS, SubscriptionForm, Subscriptions,
+};
 pub use transport::Stream;
+pub use xpubxsub::{XPubSocket, XSubSocket};

@@ -164,6 +164,15 @@ async fn drive(
         }
     }
 
+    if ours == SocketType::XPub
+        && let Some(welcome) = &options.xpub_welcome_msg
+    {
+        // ZMQ_XPUB_WELCOME_MSG: "sent on connect and reconnect", so it is
+        // sent here — a session is exactly one connection.
+        wire.write_message(&Multipart::single(welcome.clone()))
+            .await?;
+    }
+
     if options.probe_router {
         // ZMQ_PROBE_ROUTER: "send an empty message on every new connection",
         // so the peer's ROUTER learns this peer exists before it has
@@ -315,7 +324,8 @@ async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
                             // thing such a message may be is a subscription
                             // in ZMTP 2.0's form, which is how a 3.0 peer
                             // asks.
-                            apply_message_form(ours, subscriptions, &incoming, &message).await?;
+                            apply_message_form(ours, subscriptions, &incoming, options, &message)
+                                .await?;
                         } else if incoming.send(message).await? == Sent::Dropped {
                             tracing::trace!(
                                 "dropped an inbound message: the queue is at its high-water mark"
@@ -323,7 +333,7 @@ async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                     Incoming::Command(body) => {
-                        answer(wire, ours, subscriptions, &incoming, &body).await?;
+                        answer(wire, ours, subscriptions, &incoming, options, &body).await?;
                     }
                 }
             }
@@ -367,14 +377,15 @@ async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
     ours: SocketType,
     subscriptions: &Arc<Subscriptions>,
     incoming: &Arc<Queue>,
+    options: &SocketOptions,
     body: &[u8],
 ) -> Result<()> {
     match Command::decode(body).map_err(command_error)? {
         Command::Subscribe(prefix) if publishes(ours) => {
-            apply_subscription(ours, subscriptions, incoming, true, prefix).await
+            apply_subscription(ours, subscriptions, incoming, options, true, prefix).await
         }
         Command::Cancel(prefix) if publishes(ours) => {
-            apply_subscription(ours, subscriptions, incoming, false, prefix).await
+            apply_subscription(ours, subscriptions, incoming, options, false, prefix).await
         }
         Command::Ping { context, .. } => {
             // "When a peer receives a PING command it SHALL respond with a
@@ -444,10 +455,17 @@ async fn apply_subscription(
     ours: SocketType,
     subscriptions: &Arc<Subscriptions>,
     incoming: &Arc<Queue>,
+    options: &SocketOptions,
     subscribe: bool,
     prefix: &[u8],
 ) -> Result<()> {
-    let changed = if subscribe {
+    // ZMQ_XPUB_MANUAL: the application decides what this socket matches, so
+    // the subscription is reported and *not* applied. A broker that
+    // authorizes subscriptions needs exactly that.
+    let manual = ours == SocketType::XPub && options.xpub_manual;
+    let changed = if manual {
+        true
+    } else if subscribe {
         match subscriptions.subscribe(prefix) {
             Some(first) => first,
             None => {
@@ -463,12 +481,25 @@ async fn apply_subscription(
     };
 
     if ours == SocketType::XPub {
-        // XPUB delivers subscriptions to the application. Whether a repeat is
-        // delivered is `ZMQ_XPUB_VERBOSE`'s business, which is the next
-        // slice; deduplicating is libzmq's default and what `changed` is.
-        if changed {
+        // XPUB hands subscriptions to its application in the `%x01`/`%x00`
+        // form. Which ones: the first for a prefix by default — 29/PUBSUB's
+        // normalization "so that multiple identical subscriptions result in
+        // a single command only" — every subscribe under ZMQ_XPUB_VERBOSE,
+        // and every subscribe *and* unsubscribe under ZMQ_XPUB_VERBOSER.
+        let deliver = if options.xpub_verboser {
+            true
+        } else if options.xpub_verbose {
+            subscribe || changed
+        } else {
+            changed
+        };
+        if deliver {
             let frame = subscriptions::write_message_form(subscribe, prefix);
-            let _ = incoming.try_send(Multipart::single(frame));
+            if incoming.try_send(Multipart::single(frame)).is_err() {
+                tracing::debug!(
+                    "dropped a subscription notification: the application is not reading"
+                );
+            }
         }
     }
     Ok(())
@@ -480,14 +511,26 @@ async fn apply_message_form(
     ours: SocketType,
     subscriptions: &Arc<Subscriptions>,
     incoming: &Arc<Queue>,
+    options: &SocketOptions,
     message: &Multipart,
 ) -> Result<()> {
     if message.len() == 1
         && let Some((subscribe, prefix)) =
             subscriptions::read_message_form(message.frames()[0].as_slice())
     {
-        return apply_subscription(ours, subscriptions, incoming, subscribe, prefix).await;
+        return apply_subscription(ours, subscriptions, incoming, options, subscribe, prefix).await;
     }
+    if ours == SocketType::XPub {
+        // "XPUB: as PUB plus … inbound messages fair-queued to the
+        // application", and "messages without a sub/unsub prefix are also
+        // received, but have no effect on subscription status" — which is how
+        // an XSUB sends upstream through a proxy.
+        if incoming.send(message.clone()).await? == Sent::Dropped {
+            tracing::trace!("dropped an inbound message: the queue is at its high-water mark");
+        }
+        return Ok(());
+    }
+    // "PUB SHALL silently discard any messages that subscribers send it."
     tracing::debug!(
         frames = message.len(),
         "a publisher discarded a message a subscriber sent it"
@@ -849,6 +892,7 @@ mod tests {
             identity: crate::engine::AnnouncedIdentity::default(),
             subscriptions: Arc::new(Subscriptions::new(
                 crate::subscriptions::DEFAULT_MAX_SUBSCRIPTIONS,
+                crate::subscriptions::DEFAULT_MAX_SUBSCRIPTION_BYTES,
             )),
         };
         let session = ZmtpSession::new(ours);

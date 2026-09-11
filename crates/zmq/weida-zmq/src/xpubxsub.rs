@@ -1,0 +1,716 @@
+//! XPUB and XSUB: the raw pub/sub types a proxy is built from.
+//!
+//! 29/PUBSUB, through `docs/research/zeromq.md` §4.3:
+//!
+//! - **XPUB** is "as PUB plus a double queue per subscriber, inbound
+//!   messages fair-queued to the application, subscription commands
+//!   delivered to the application, optional normalization so that multiple
+//!   identical subscriptions result in a single command only", and it
+//!   "SHALL, if the subscriber peer disconnects prematurely, generate a
+//!   suitable unsubscribe request for the calling application".
+//! - **XSUB** is "as SUB plus sending messages and subscriptions upstream";
+//!   it "SHALL send all messages to all connected publishers", silently
+//!   drops on a full outgoing queue and never blocks.
+//!
+//! **Subscriptions are messages here.** `zmq_socket(3)`: "byte 1 (for
+//! subscriptions) or byte 0 (for unsubscriptions) followed by the
+//! subscription body. Messages without a sub/unsub prefix are also received,
+//! but have no effect on subscription status." That is what makes the pub/sub
+//! proxy possible: an XPUB's application reads a subscription and writes it
+//! into an XSUB, which puts it on the wire in whichever form that socket is
+//! configured for.
+//!
+//! **The synthesized unsubscribe is the socket's memory, not the peer's.** A
+//! subscriber's table dies with its connection, so an XPUB remembers what
+//! each peer held and, when the peer goes, hands its application one `%x00`
+//! per prefix — otherwise a proxy would keep forwarding a subscription
+//! nobody holds any more. What that remembers is bounded by the same product
+//! as everything else: `max_peers` peers times `max_subscriptions` prefixes.
+
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+
+use weida_zmtp::SocketType;
+
+use crate::context::Context;
+use crate::engine::PeerId;
+use crate::error::{Error, Result};
+use crate::message::{Message, Multipart};
+use crate::options::SocketOptions;
+use crate::pipe::MuteAction;
+use crate::pubsub::Published;
+use crate::session::ZmtpSession;
+use crate::socket::{SocketCore, socket_endpoints};
+use crate::subscriptions::{self, Subscriptions};
+
+/// An XPUB socket: a PUB whose application sees the subscriptions.
+#[derive(Debug)]
+pub struct XPubSocket {
+    core: SocketCore,
+    /// What each peer was last seen holding, so that a departure can be
+    /// turned into unsubscribes for the application.
+    remembered: HashMap<PeerId, Vec<Vec<u8>>>,
+    /// Unsubscribes synthesized for peers that have gone, waiting to be
+    /// handed over.
+    synthesized: VecDeque<Multipart>,
+    /// The peer whose subscription was delivered most recently, which is what
+    /// `ZMQ_XPUB_MANUAL`'s `subscribe` applies to — libzmq applies it to the
+    /// last pipe too.
+    last_subscriber: Option<PeerId>,
+}
+
+impl XPubSocket {
+    /// An XPUB socket on `context`, with libzmq's defaults.
+    pub fn new(context: &Context) -> Result<XPubSocket> {
+        XPubSocket::with_options(context, SocketOptions::default())
+    }
+
+    /// An XPUB socket with `options`.
+    pub fn with_options(context: &Context, mut options: SocketOptions) -> Result<XPubSocket> {
+        options.pipe.outgoing.mute = MuteAction::Drop;
+        Ok(XPubSocket {
+            core: SocketCore::new(context, SocketType::XPub, options)?,
+            remembered: HashMap::new(),
+            synthesized: VecDeque::new(),
+            last_subscriber: None,
+        })
+    }
+
+    /// Publishes to every subscriber whose subscriptions match the first
+    /// frame — PUB's rule, and PUB's drop at the high-water mark.
+    pub fn publish(&mut self, message: impl Into<Multipart>) -> Published {
+        let message = message.into();
+        let topic = message.frames()[0].as_slice().to_vec();
+        let mut report = Published {
+            delivered: 0,
+            dropped: 0,
+            unmatched: 0,
+        };
+        for peer in self.core.peers() {
+            if !peer.subscriptions.matches(&topic) {
+                report.unmatched += 1;
+                continue;
+            }
+            let queue = peer.pipe.outgoing();
+            if queue.has_room() && queue.try_send(message.clone()).is_ok() {
+                report.delivered += 1;
+            } else {
+                report.dropped += 1;
+            }
+        }
+        report
+    }
+
+    /// Receives the next subscription or message from a subscriber.
+    ///
+    /// A subscription arrives in the `%x01`/`%x00` form; a message a
+    /// subscriber sent arrives as it was sent, since "messages without a
+    /// sub/unsub prefix are also received"; and an unsubscribe synthesized
+    /// for a peer that vanished arrives the same way a real one would, which
+    /// is the point of synthesizing it.
+    ///
+    /// Bounded by `ZMQ_RCVTIMEO`.
+    pub async fn recv(&mut self) -> Result<Multipart> {
+        let limit = self.core.options().recv_timeout;
+        let exec = self.core.exec().clone();
+        match limit {
+            None => self.next_event().await,
+            Some(limit) => match exec.within(limit, self.next_event()).await {
+                Some(result) => result,
+                None => Err(Error::EAGAIN(
+                    format!("nothing arrived within {limit:?} (ZMQ_RCVTIMEO)").into(),
+                )),
+            },
+        }
+    }
+
+    /// The `ZMQ_DONTWAIT` form.
+    pub fn try_recv(&mut self) -> Result<Multipart> {
+        self.reconcile();
+        if let Some(synthesized) = self.synthesized.pop_front() {
+            return Ok(synthesized);
+        }
+        let (peer, message) = self.core.try_recv_fair()?;
+        self.note(peer, &message);
+        Ok(message)
+    }
+
+    /// Receives under an explicit wall-clock bound.
+    pub async fn recv_timeout(&mut self, limit: Duration) -> Result<Multipart> {
+        let exec = self.core.exec().clone();
+        match exec.within(limit, self.next_event()).await {
+            Some(result) => result,
+            None => Err(Error::EAGAIN(
+                format!("nothing arrived within {limit:?}").into(),
+            )),
+        }
+    }
+
+    /// Applies a subscription on this socket's own authority, for
+    /// `ZMQ_XPUB_MANUAL`.
+    ///
+    /// The subscription goes to the peer whose subscription was delivered
+    /// most recently — libzmq applies it to the last pipe, and this is that
+    /// rule stated. Fails with `EINVAL` when no subscription has been
+    /// delivered yet, because there is no peer to apply it to.
+    pub fn subscribe(&mut self, prefix: impl AsRef<[u8]>) -> Result<()> {
+        let peer = self.subscriber()?;
+        if peer.subscriptions.subscribe(prefix.as_ref()).is_none() {
+            return Err(Error::EINVAL(
+                "that subscriber is at its subscription ceiling".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Removes a subscription on this socket's own authority.
+    pub fn unsubscribe(&mut self, prefix: impl AsRef<[u8]>) -> Result<()> {
+        let peer = self.subscriber()?;
+        match peer.subscriptions.cancel(prefix.as_ref()) {
+            Some(_) => Ok(()),
+            None => Err(Error::EINVAL(
+                "that subscriber does not hold that subscription".into(),
+            )),
+        }
+    }
+
+    /// Subscribers this socket has.
+    pub fn subscriber_count(&self) -> usize {
+        self.core.peers().len()
+    }
+
+    /// Whether any subscriber's table would take `topic`.
+    pub fn anybody_wants(&self, topic: &[u8]) -> bool {
+        self.core
+            .peers()
+            .iter()
+            .any(|peer| peer.subscriptions.matches(topic))
+    }
+
+    async fn next_event(&mut self) -> Result<Multipart> {
+        loop {
+            self.reconcile();
+            if let Some(synthesized) = self.synthesized.pop_front() {
+                return Ok(synthesized);
+            }
+            if let Ok((peer, message)) = self.core.try_recv_fair() {
+                self.note(peer, &message);
+                return Ok(message);
+            }
+            // Nothing queued and nothing synthesized. An XPUB must wake on a
+            // peer **going away** as well as on a message, because a
+            // departure is an event it owes its application — so this waits
+            // for either and loops rather than parking on a receive.
+            self.core.wait_for_activity().await;
+        }
+    }
+
+    fn subscriber(&self) -> Result<crate::engine::Peer> {
+        let peers = self.core.peers();
+        let wanted = self.last_subscriber;
+        peers
+            .into_iter()
+            .find(|peer| Some(peer.id) == wanted)
+            .ok_or_else(|| {
+                Error::EINVAL(
+                    "no subscription has been delivered yet, so there is no subscriber to apply \
+                     this to"
+                        .into(),
+                )
+            })
+    }
+
+    /// Remembers what a peer holds, and which peer spoke last.
+    fn note(&mut self, peer: PeerId, message: &Multipart) {
+        if message.len() == 1
+            && subscriptions::read_message_form(message.frames()[0].as_slice()).is_some()
+        {
+            self.last_subscriber = Some(peer);
+        }
+        if let Some(current) = self
+            .core
+            .peers()
+            .into_iter()
+            .find(|current| current.id == peer)
+        {
+            self.remembered
+                .insert(peer, current.subscriptions.prefixes());
+        }
+    }
+
+    /// Turns departures into unsubscribes, and keeps the memory in step with
+    /// the live peers so that it cannot grow past `max_peers` entries.
+    fn reconcile(&mut self) {
+        let live = self.core.engine().peers();
+        for peer in &live {
+            if let Some(known) = self.remembered.get_mut(&peer.id) {
+                let current = peer.subscriptions.prefixes();
+                if !current.is_empty() {
+                    *known = current;
+                }
+            } else {
+                self.remembered
+                    .insert(peer.id, peer.subscriptions.prefixes());
+            }
+        }
+        let gone: Vec<PeerId> = self
+            .remembered
+            .keys()
+            .copied()
+            .filter(|id| !live.iter().any(|peer| peer.id == *id))
+            .collect();
+        for id in gone {
+            let prefixes = self.remembered.remove(&id).unwrap_or_default();
+            for prefix in prefixes {
+                // "SHALL, if the subscriber peer disconnects prematurely,
+                // generate a suitable unsubscribe request for the calling
+                // application."
+                self.synthesized.push_back(Multipart::single(Message::from(
+                    subscriptions::write_message_form(false, &prefix),
+                )));
+            }
+            if self.last_subscriber == Some(id) {
+                self.last_subscriber = None;
+            }
+        }
+    }
+}
+
+socket_endpoints!(XPubSocket);
+
+/// An XSUB socket: a SUB that can also speak upstream.
+#[derive(Debug)]
+pub struct XSubSocket {
+    core: SocketCore,
+    mine: Arc<Subscriptions>,
+}
+
+impl XSubSocket {
+    /// An XSUB socket on `context`, with libzmq's defaults.
+    pub fn new(context: &Context) -> Result<XSubSocket> {
+        XSubSocket::with_options(context, SocketOptions::default())
+    }
+
+    /// An XSUB socket with `options`.
+    ///
+    /// Its outgoing queue drops rather than blocks, because XSUB "never
+    /// blocks" on sending upstream, and its incoming queue drops, which is
+    /// 29/PUBSUB's rule for a receiving subscriber.
+    pub fn with_options(context: &Context, mut options: SocketOptions) -> Result<XSubSocket> {
+        options.pipe.outgoing.mute = MuteAction::Drop;
+        options.pipe.incoming.mute = MuteAction::Drop;
+        let mine = Arc::new(Subscriptions::new(
+            options.max_subscriptions,
+            options.max_subscription_bytes,
+        ));
+        let session = ZmtpSession::subscribing(SocketType::XSub, Arc::clone(&mine));
+        Ok(XSubSocket {
+            core: SocketCore::with_session(context, SocketType::XSub, options, Arc::new(session))?,
+            mine,
+        })
+    }
+
+    /// Subscribes to `prefix`, forwarding it to every publisher — and to
+    /// every publisher this socket connects or reconnects to later, because
+    /// the set travels with the session.
+    pub fn subscribe(&mut self, prefix: impl AsRef<[u8]>) -> Result<()> {
+        let prefix = prefix.as_ref();
+        if self.mine.subscribe(prefix).is_none() {
+            return Err(Error::EINVAL(
+                format!(
+                    "this socket already holds its ceiling of {} distinct subscriptions",
+                    self.mine.len()
+                )
+                .into(),
+            ));
+        }
+        self.forward(subscriptions::write_message_form(true, prefix));
+        Ok(())
+    }
+
+    /// Removes one subscription to `prefix`, forwarding the cancellation.
+    pub fn unsubscribe(&mut self, prefix: impl AsRef<[u8]>) -> Result<()> {
+        let prefix = prefix.as_ref();
+        match self.mine.cancel(prefix) {
+            None => Err(Error::EINVAL(
+                "this socket is not subscribed to that prefix".into(),
+            )),
+            Some(_) => {
+                self.forward(subscriptions::write_message_form(false, prefix));
+                Ok(())
+            }
+        }
+    }
+
+    /// The prefixes this socket holds, each once.
+    pub fn subscriptions(&self) -> Vec<Vec<u8>> {
+        self.mine.prefixes()
+    }
+
+    /// Sends a message upstream to **every** connected publisher.
+    ///
+    /// "SHALL send all messages to all connected publishers", dropping for a
+    /// publisher whose queue is full and never blocking. Returns how many
+    /// took it and how many dropped it, for the same reason `PubSocket`
+    /// does: a fan-out that returned nothing would hide the loss.
+    ///
+    /// A message whose first frame is a `%x01`/`%x00` subscription travels as
+    /// a subscription, since that is what the form means on this socket type
+    /// — which is exactly how a proxy forwards what its XPUB read.
+    pub fn send(&mut self, message: impl Into<Multipart>) -> Published {
+        let message = message.into();
+        let mut report = Published {
+            delivered: 0,
+            dropped: 0,
+            unmatched: 0,
+        };
+        for peer in self.core.peers() {
+            let queue = peer.pipe.outgoing();
+            if queue.has_room() && queue.try_send(message.clone()).is_ok() {
+                report.delivered += 1;
+            } else {
+                report.dropped += 1;
+            }
+        }
+        report
+    }
+
+    /// Receives the next published message, fair-queued across publishers.
+    pub async fn recv(&mut self) -> Result<Multipart> {
+        let limit = self.core.options().recv_timeout;
+        let exec = self.core.exec().clone();
+        match limit {
+            None => self.core.recv_fair().await.map(|(_, message)| message),
+            Some(limit) => match exec.within(limit, self.core.recv_fair()).await {
+                Some(result) => result.map(|(_, message)| message),
+                None => Err(Error::EAGAIN(
+                    format!("nothing was published within {limit:?} (ZMQ_RCVTIMEO)").into(),
+                )),
+            },
+        }
+    }
+
+    /// The `ZMQ_DONTWAIT` form.
+    pub fn try_recv(&mut self) -> Result<Multipart> {
+        self.core.try_recv_fair().map(|(_, message)| message)
+    }
+
+    /// Receives under an explicit wall-clock bound.
+    pub async fn recv_timeout(&mut self, limit: Duration) -> Result<Multipart> {
+        let exec = self.core.exec().clone();
+        match exec.within(limit, self.core.recv_fair()).await {
+            Some(result) => result.map(|(_, message)| message),
+            None => Err(Error::EAGAIN(
+                format!("nothing was published within {limit:?}").into(),
+            )),
+        }
+    }
+
+    fn forward(&self, frame: Vec<u8>) {
+        let message = Multipart::single(Message::from(frame));
+        for peer in self.core.peers() {
+            let _ = peer.pipe.outgoing().try_send(message.clone());
+        }
+    }
+}
+
+socket_endpoints!(XSubSocket);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ContextConfig;
+    use crate::pubsub::{PubSocket, SubSocket};
+
+    fn context() -> Context {
+        Context::new(ContextConfig::default()).expect("context")
+    }
+
+    fn bytes(message: &Multipart) -> Vec<u8> {
+        message.frames()[0].as_slice().to_vec()
+    }
+
+    async fn wait_for(mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "condition never held");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn next(socket: &mut XPubSocket) -> Vec<u8> {
+        let message = tokio::time::timeout(Duration::from_secs(10), socket.recv())
+            .await
+            .expect("an event arrived")
+            .expect("event");
+        bytes(&message)
+    }
+
+    /// Claim: an XPUB hands its application each subscription in the
+    /// `1`/`0` form, deduplicated by default — 29/PUBSUB's normalization, so
+    /// "multiple identical subscriptions result in a single command only".
+    #[tokio::test]
+    async fn xpub_delivers_subscriptions_in_the_one_zero_form() {
+        let ctx = context();
+        let mut broker = XPubSocket::new(&ctx).expect("xpub");
+        let endpoint = broker.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut subscriber = SubSocket::new(&ctx).expect("sub");
+        subscriber.connect(&endpoint.to_string()).expect("connect");
+        wait_for(|| broker.subscriber_count() == 1).await;
+
+        subscriber.subscribe("news").expect("subscribe");
+        subscriber.subscribe("news").expect("again");
+        assert_eq!(next(&mut broker).await, b"\x01news".to_vec());
+
+        // The second subscribe changed nothing, so nothing more is
+        // delivered; the unsubscribe that empties the prefix is.
+        subscriber.unsubscribe("news").expect("one");
+        subscriber.unsubscribe("news").expect("two");
+        assert_eq!(next(&mut broker).await, b"\x00news".to_vec());
+    }
+
+    /// Claim: `ZMQ_XPUB_VERBOSE` delivers every subscription and
+    /// `ZMQ_XPUB_VERBOSER` every unsubscription too — the counts a proxy
+    /// needs to forward faithfully, which the default deduplication loses.
+    #[tokio::test]
+    async fn verbose_and_verboser_deliver_the_repeats() {
+        let ctx = context();
+        let mut verbose = XPubSocket::with_options(
+            &ctx,
+            SocketOptions {
+                xpub_verbose: true,
+                ..SocketOptions::default()
+            },
+        )
+        .expect("xpub");
+        let endpoint = verbose.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut subscriber = SubSocket::new(&ctx).expect("sub");
+        subscriber.connect(&endpoint.to_string()).expect("connect");
+        wait_for(|| verbose.subscriber_count() == 1).await;
+        subscriber.subscribe("a").expect("one");
+        subscriber.subscribe("a").expect("two");
+        assert_eq!(next(&mut verbose).await, b"\x01a".to_vec());
+        assert_eq!(
+            next(&mut verbose).await,
+            b"\x01a".to_vec(),
+            "verbose delivers the repeat"
+        );
+
+        let mut verboser = XPubSocket::with_options(
+            &ctx,
+            SocketOptions {
+                xpub_verboser: true,
+                ..SocketOptions::default()
+            },
+        )
+        .expect("xpub");
+        let endpoint = verboser.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut subscriber = SubSocket::new(&ctx).expect("sub");
+        subscriber.connect(&endpoint.to_string()).expect("connect");
+        wait_for(|| verboser.subscriber_count() == 1).await;
+        // Two subscribes and one cancel: the cancel leaves the publisher
+        // still holding the prefix, so it changed nothing — and that is the
+        // event the default would swallow.
+        subscriber.subscribe("b").expect("one");
+        subscriber.subscribe("b").expect("two");
+        subscriber.unsubscribe("b").expect("one off");
+        assert_eq!(next(&mut verboser).await, b"\x01b".to_vec());
+        assert_eq!(next(&mut verboser).await, b"\x01b".to_vec());
+        assert_eq!(
+            next(&mut verboser).await,
+            b"\x00b".to_vec(),
+            "verboser delivers an unsubscribe that changed nothing"
+        );
+        assert!(
+            verboser.anybody_wants(b"b.still"),
+            "and the prefix is still held, which is what made it a no-change"
+        );
+    }
+
+    /// Claim: `ZMQ_XPUB_MANUAL` reports subscriptions without applying them,
+    /// so the application decides what this socket matches — which is how a
+    /// broker authorizes a subscription instead of honouring it.
+    #[tokio::test]
+    async fn manual_reports_without_applying() {
+        let ctx = context();
+        let mut broker = XPubSocket::with_options(
+            &ctx,
+            SocketOptions {
+                xpub_manual: true,
+                ..SocketOptions::default()
+            },
+        )
+        .expect("xpub");
+        let endpoint = broker.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut subscriber = SubSocket::new(&ctx).expect("sub");
+        subscriber.connect(&endpoint.to_string()).expect("connect");
+        wait_for(|| broker.subscriber_count() == 1).await;
+
+        subscriber.subscribe("secret").expect("ask");
+        assert_eq!(next(&mut broker).await, b"\x01secret".to_vec());
+        assert!(
+            !broker.anybody_wants(b"secret.plans"),
+            "a manual XPUB must not have applied it"
+        );
+        assert_eq!(broker.publish("secret.plans").unmatched, 1);
+
+        // The application decides to allow it.
+        broker.subscribe("secret").expect("authorize");
+        assert!(broker.anybody_wants(b"secret.plans"));
+        assert_eq!(broker.publish("secret.plans").delivered, 1);
+        assert_eq!(
+            bytes(&subscriber.recv().await.expect("recv")),
+            b"secret.plans".to_vec()
+        );
+    }
+
+    /// Claim: `ZMQ_XPUB_WELCOME_MSG` reaches a subscriber as soon as it
+    /// connects, with no subscription and no publish — "sent on connect and
+    /// reconnect".
+    #[tokio::test]
+    async fn a_welcome_message_greets_every_subscriber() {
+        let ctx = context();
+        let broker = XPubSocket::with_options(
+            &ctx,
+            SocketOptions {
+                xpub_welcome_msg: Some(b"welcome".to_vec()),
+                ..SocketOptions::default()
+            },
+        )
+        .expect("xpub");
+        let endpoint = broker.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+        let mut subscriber = SubSocket::new(&ctx).expect("sub");
+        subscriber.connect(&endpoint.to_string()).expect("connect");
+        let greeting = tokio::time::timeout(Duration::from_secs(10), subscriber.recv())
+            .await
+            .expect("the welcome arrived")
+            .expect("welcome");
+        assert_eq!(bytes(&greeting), b"welcome".to_vec());
+    }
+
+    /// Claim: when a subscriber disconnects, its subscriptions come back to
+    /// the application as unsubscribes — 29/PUBSUB's "generate a suitable
+    /// unsubscribe request", without which a proxy would forward a
+    /// subscription nobody holds.
+    #[tokio::test]
+    async fn a_departure_becomes_an_unsubscribe() {
+        let ctx = context();
+        let mut broker = XPubSocket::new(&ctx).expect("xpub");
+        let endpoint = broker.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut subscriber = SubSocket::new(&ctx).expect("sub");
+        subscriber.connect(&endpoint.to_string()).expect("connect");
+        wait_for(|| broker.subscriber_count() == 1).await;
+        subscriber.subscribe("gone.soon").expect("subscribe");
+        assert_eq!(next(&mut broker).await, b"\x01gone.soon".to_vec());
+
+        subscriber.close();
+        drop(subscriber);
+        assert_eq!(
+            next(&mut broker).await,
+            b"\x00gone.soon".to_vec(),
+            "the departure must be reported as an unsubscribe"
+        );
+        assert_eq!(broker.subscriber_count(), 0);
+    }
+
+    /// Claim: an XSUB forwards its subscriptions upstream — to a plain PUB,
+    /// which knows nothing of XSUB — and re-sends them when the publisher
+    /// comes back, because the set travels with the session.
+    #[tokio::test]
+    async fn xsub_forwards_upstream_and_resends_on_reconnect() {
+        let ctx = context();
+        let publisher = PubSocket::new(&ctx).expect("pub");
+        let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut subscriber = XSubSocket::with_options(
+            &ctx,
+            SocketOptions {
+                reconnect_ivl: Some(Duration::from_millis(20)),
+                ..SocketOptions::default()
+            },
+        )
+        .expect("xsub");
+        subscriber.connect(&endpoint.to_string()).expect("connect");
+        wait_for(|| publisher.subscriber_count() == 1).await;
+
+        subscriber.subscribe("feed").expect("subscribe");
+        wait_for(|| publisher.anybody_wants(b"feed.1")).await;
+        let mut publisher = publisher;
+        assert_eq!(publisher.publish("feed.1 hello").delivered, 1);
+        assert_eq!(
+            bytes(&subscriber.recv().await.expect("recv")),
+            b"feed.1 hello".to_vec()
+        );
+
+        // The publisher goes away and another takes the endpoint.
+        publisher.close();
+        drop(publisher);
+        let mut second = PubSocket::new(&ctx).expect("second pub");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match second.bind(&endpoint.to_string()).await {
+                Ok(_) => break,
+                Err(e) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the endpoint never came free: {e}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+        wait_for(|| second.anybody_wants(b"feed.2")).await;
+        assert_eq!(second.publish("feed.2 again").delivered, 1);
+    }
+
+    /// Claim: an XSUB's messages go upstream to every publisher and reach an
+    /// XPUB's application — "SHALL send all messages to all connected
+    /// publishers" meeting "inbound messages fair-queued to the
+    /// application", which together are what a pub/sub proxy is made of.
+    #[tokio::test]
+    async fn xsub_sends_messages_upstream_to_an_xpub() {
+        let ctx = context();
+        let mut broker = XPubSocket::new(&ctx).expect("xpub");
+        let endpoint = broker.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut upstream = XSubSocket::new(&ctx).expect("xsub");
+        upstream.connect(&endpoint.to_string()).expect("connect");
+        wait_for(|| broker.subscriber_count() == 1).await;
+
+        let report = upstream.send("not a subscription");
+        assert_eq!(report.delivered, 1);
+        assert_eq!(next(&mut broker).await, b"not a subscription".to_vec());
+
+        // And a subscription travels as a subscription, which is how the
+        // proxy forwards what its XPUB read.
+        upstream.subscribe("relayed").expect("subscribe");
+        wait_for(|| broker.anybody_wants(b"relayed.thing")).await;
+    }
+
+    /// Claim: the `ZMQ_XPUB_*` options are XPUB's, and a socket type that
+    /// cannot honour them is told at construction.
+    #[tokio::test]
+    async fn the_xpub_options_belong_to_xpub() {
+        let ctx = context();
+        let err = XSubSocket::with_options(
+            &ctx,
+            SocketOptions {
+                xpub_verbose: true,
+                ..SocketOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), "EINVAL", "{err}");
+
+        let err = PubSocket::with_options(
+            &ctx,
+            SocketOptions {
+                xpub_welcome_msg: Some(b"hello".to_vec()),
+                ..SocketOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), "EINVAL", "{err}");
+    }
+}

@@ -24,7 +24,9 @@ use crate::error::{Error, Result};
 use crate::identity::RoutingId;
 use crate::message::{DEFAULT_MAX_MESSAGE_FRAMES, DEFAULT_MAX_MESSAGE_SIZE, MessageLimits};
 use crate::pipe::PipeConfig;
-use crate::subscriptions::{DEFAULT_MAX_SUBSCRIPTIONS, SubscriptionForm};
+use crate::subscriptions::{
+    DEFAULT_MAX_SUBSCRIPTION_BYTES, DEFAULT_MAX_SUBSCRIPTIONS, SubscriptionForm,
+};
 
 /// `ZMQ_RECONNECT_IVL` default: 100 ms (`docs/research/zeromq.md` §11).
 pub const DEFAULT_RECONNECT_IVL: Duration = Duration::from_millis(100);
@@ -177,9 +179,36 @@ pub struct SocketOptions {
     /// buy N table entries with N commands and 37/ZMTP bounds neither the
     /// count nor the length. The exposure is this times `max_peers`.
     pub max_subscriptions: usize,
+    /// Longest subscription prefix one peer may send this socket.
+    ///
+    /// **Not a libzmq option** either: 37/ZMTP's `subscription = *OCTET`
+    /// bounds nothing, so a count ceiling without a length ceiling is not a
+    /// bound at all. See [`DEFAULT_MAX_SUBSCRIPTION_BYTES`].
+    pub max_subscription_bytes: usize,
     /// Which wire form this socket **sends** subscriptions in; both are
     /// accepted on receive. See [`SubscriptionForm`].
     pub subscription_form: SubscriptionForm,
+    /// `ZMQ_XPUB_VERBOSE`: deliver **every** subscription to the
+    /// application, not only the first for a prefix.
+    ///
+    /// libzmq's default deduplicates — 29/PUBSUB's optional normalization
+    /// "so that multiple identical subscriptions result in a single command
+    /// only" — which loses the count a proxy needs to forward upstream
+    /// faithfully (`docs/research/zeromq.md` §4.3).
+    pub xpub_verbose: bool,
+    /// `ZMQ_XPUB_VERBOSER`: deliver every subscription **and** every
+    /// unsubscription, including the ones that changed nothing.
+    pub xpub_verboser: bool,
+    /// `ZMQ_XPUB_MANUAL`: deliver subscriptions without applying them.
+    ///
+    /// The application decides what this socket will match, with
+    /// [`crate::XPubSocket::subscribe`] — which is how a broker
+    /// authorizes subscriptions instead of honouring whatever a peer asks
+    /// for.
+    pub xpub_manual: bool,
+    /// `ZMQ_XPUB_WELCOME_MSG`: a message sent to every subscriber as soon as
+    /// it connects, and again on every reconnect.
+    pub xpub_welcome_msg: Option<Vec<u8>>,
     /// Peers this socket will admit from **accepted** connections.
     ///
     /// **Not a libzmq option**, and the parity table says so in those terms:
@@ -212,7 +241,12 @@ impl Default for SocketOptions {
             max_message_frames: DEFAULT_MAX_MESSAGE_FRAMES,
             max_peers: DEFAULT_MAX_PEERS,
             max_subscriptions: DEFAULT_MAX_SUBSCRIPTIONS,
+            max_subscription_bytes: DEFAULT_MAX_SUBSCRIPTION_BYTES,
             subscription_form: SubscriptionForm::default(),
+            xpub_verbose: false,
+            xpub_verboser: false,
+            xpub_manual: false,
+            xpub_welcome_msg: None,
             heartbeat_ivl: None,
             heartbeat_timeout: None,
             heartbeat_ttl: None,
@@ -244,6 +278,12 @@ impl SocketOptions {
                 "ZMQ_REQ_RELAXED without ZMQ_REQ_CORRELATE lets a late reply to an abandoned \
                  request be reported as the reply to the one that superseded it; libzmq \
                  documents that hazard and this library refuses it"
+                    .into(),
+            ));
+        }
+        if self.max_subscription_bytes == 0 {
+            return Err(Error::EINVAL(
+                "max_subscription_bytes is zero, so only the empty subscription could be sent"
                     .into(),
             ));
         }
@@ -339,6 +379,20 @@ impl SocketOptions {
                 .into(),
             ));
         }
+        if (self.xpub_verbose
+            || self.xpub_verboser
+            || self.xpub_manual
+            || self.xpub_welcome_msg.is_some())
+            && socket_type != SocketType::XPub
+        {
+            return Err(Error::EINVAL(
+                format!(
+                    "the ZMQ_XPUB_* options are XPUB's; a {} socket cannot honour them",
+                    socket_type.as_str()
+                )
+                .into(),
+            ));
+        }
         if (self.req_correlate || self.req_relaxed) && socket_type != SocketType::Req {
             return Err(Error::EINVAL(
                 format!(
@@ -350,6 +404,11 @@ impl SocketOptions {
             ));
         }
         Ok(())
+    }
+
+    /// The two ceilings one peer's subscription table lives under.
+    pub const fn subscription_limits(&self) -> (usize, usize) {
+        (self.max_subscriptions, self.max_subscription_bytes)
     }
 
     /// What bounds one inbound message: `ZMQ_MAXMSGSIZE` and the frame

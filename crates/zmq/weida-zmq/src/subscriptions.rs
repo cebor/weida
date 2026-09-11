@@ -37,12 +37,28 @@ pub const CANCEL_PREFIX: u8 = 0;
 /// **Not a libzmq option.** 37/ZMTP bounds a subscription neither in length
 /// nor in count, and subscriptions are non-idempotent, so "N repeated
 /// `SUBSCRIBE` commands cost N entries" is a memory cost a peer chooses
-/// (`docs/research/zeromq.md` §11). The ZMTP bridge needed the same ceiling
-/// for the same reason (B-051, `docs/INVARIANTS.md`). 1024 is far above any
-/// real topic set — the zguide's examples subscribe to one or a handful — and
-/// what it bounds is the product: 1024 prefixes per peer, times `max_peers`
-/// peers.
+/// (`docs/research/zeromq.md` §11). The ZMTP bridge needed the same ceilings
+/// for the same reason (B-051, B-054, `docs/INVARIANTS.md`). 1024 is far
+/// above any real topic set — the zguide's examples subscribe to one or a
+/// handful.
+///
+/// **A count alone is not a bound**, which is the correction B-103 made:
+/// with the length unbounded, 1024 prefixes of a megabyte each are a
+/// megabyte times 1024 per peer. Both dimensions are capped, so the product
+/// is `DEFAULT_MAX_SUBSCRIPTIONS × DEFAULT_MAX_SUBSCRIPTION_BYTES` per peer
+/// — 256 KiB — times `max_peers` peers.
 pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 1024;
+
+/// Longest subscription prefix, in bytes, by default.
+///
+/// **Also not a libzmq option**, and 37/ZMTP's grammar is explicitly
+/// unbounded here — "subscription = *OCTET" (`docs/research/zeromq.md` §11)
+/// — so the number is ours to choose and to state. 256 B is what the ZMTP
+/// bridge took for the same quantity (B-054), from `docs/PROTOCOL.md` §10's
+/// filter bound, and it is far above any real topic: the longest prefix in
+/// the zguide's examples is a handful of characters, and weida's own filters
+/// live under the same ceiling.
+pub const DEFAULT_MAX_SUBSCRIPTION_BYTES: usize = 256;
 
 /// Which wire form a socket **sends** its subscriptions in.
 ///
@@ -67,6 +83,7 @@ pub enum SubscriptionForm {
 #[derive(Debug)]
 pub struct Subscriptions {
     max: usize,
+    max_bytes: usize,
     state: Mutex<State>,
 }
 
@@ -79,22 +96,39 @@ struct State {
 }
 
 impl Subscriptions {
-    /// An empty table holding at most `max` distinct prefixes.
-    pub fn new(max: usize) -> Subscriptions {
+    /// An empty table holding at most `max` distinct prefixes, each at most
+    /// `max_bytes` long.
+    ///
+    /// Both bounds are needed: a count without a length lets one peer hold
+    /// `max` prefixes of any size at all.
+    pub fn new(max: usize, max_bytes: usize) -> Subscriptions {
         Subscriptions {
             max,
+            max_bytes,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// The longest prefix this table accepts.
+    pub const fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     /// Adds one subscription to `prefix`.
     ///
     /// Returns whether this is the **first** subscription to that prefix,
     /// which is what a deduplicating XPUB reports to its application, and
-    /// `None` when the table is at its ceiling and the subscription was
-    /// refused.
+    /// `None` when the subscription was refused — either because the table
+    /// is at its count ceiling or because the prefix is longer than
+    /// [`Subscriptions::max_bytes`].
     pub fn subscribe(&self, prefix: &[u8]) -> Option<bool> {
         let mut state = self.lock();
+        if prefix.len() > self.max_bytes {
+            // A prefix's length is as much a peer's choice as its count, and
+            // 37/ZMTP bounds neither.
+            state.refused += 1;
+            return None;
+        }
         match state.counts.get_mut(prefix) {
             Some(count) => {
                 *count += 1;
@@ -217,7 +251,7 @@ mod tests {
     /// have lost.
     #[test]
     fn subscriptions_are_additive_and_not_idempotent() {
-        let subs = Subscriptions::new(DEFAULT_MAX_SUBSCRIPTIONS);
+        let subs = Subscriptions::new(DEFAULT_MAX_SUBSCRIPTIONS, DEFAULT_MAX_SUBSCRIPTION_BYTES);
         assert_eq!(subs.subscribe(b"topic"), Some(true), "the first is new");
         assert_eq!(subs.subscribe(b"topic"), Some(false), "the second is not");
         assert_eq!(subs.len(), 1, "one prefix, twice");
@@ -234,7 +268,7 @@ mod tests {
     /// takes nothing.
     #[test]
     fn the_match_is_a_binary_prefix() {
-        let subs = Subscriptions::new(DEFAULT_MAX_SUBSCRIPTIONS);
+        let subs = Subscriptions::new(DEFAULT_MAX_SUBSCRIPTIONS, DEFAULT_MAX_SUBSCRIPTION_BYTES);
         assert!(
             !subs.matches(b"anything"),
             "a fresh subscriber filters everything out"
@@ -258,7 +292,7 @@ mod tests {
     /// count is the peer's choice.
     #[test]
     fn the_table_has_a_ceiling() {
-        let subs = Subscriptions::new(2);
+        let subs = Subscriptions::new(2, DEFAULT_MAX_SUBSCRIPTION_BYTES);
         assert_eq!(subs.subscribe(b"a"), Some(true));
         assert_eq!(subs.subscribe(b"b"), Some(true));
         assert_eq!(subs.subscribe(b"c"), None, "past the ceiling");
@@ -269,6 +303,31 @@ mod tests {
         // nothing new.
         assert_eq!(subs.subscribe(b"a"), Some(false));
         assert!(!subs.matches(b"c"));
+    }
+
+    /// Claim: **a prefix is bounded in length as well as in count.** One at
+    /// the ceiling is accepted and still filters; one octet more is refused,
+    /// because 37/ZMTP's `subscription = *OCTET` bounds nothing and a
+    /// count-only ceiling would let one peer hold `max` prefixes of any size.
+    #[test]
+    fn a_prefix_is_bounded_in_length() {
+        let subs = Subscriptions::new(DEFAULT_MAX_SUBSCRIPTIONS, 8);
+        assert_eq!(subs.max_bytes(), 8);
+
+        let longest = vec![b'x'; 8];
+        assert_eq!(subs.subscribe(&longest), Some(true), "at the ceiling");
+        let mut matching = longest.clone();
+        matching.extend_from_slice(b" and more");
+        assert!(
+            subs.matches(&matching),
+            "a prefix at the ceiling must still filter"
+        );
+
+        let over = vec![b'x'; 9];
+        assert_eq!(subs.subscribe(&over), None, "one octet too many");
+        assert_eq!(subs.refused(), 1);
+        assert_eq!(subs.len(), 1, "and nothing was stored for it");
+        assert!(!subs.matches(&[b'y'; 9]));
     }
 
     /// Claim: the message form round-trips, and anything else is not a
