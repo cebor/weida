@@ -215,15 +215,33 @@ receiving *application's* dispatch, while the peer's transport acknowledges byte
 A one-way transfer small enough to fit in flight may therefore be acknowledged before the
 application refuses it, and `Delivery::delivered()` then resolves `Ok(())` for a transfer that
 was discarded a moment later — truthfully, because a transport receipt says nothing about the
-application, including that it said no ([GUARANTEES.md](GUARANTEES.md) §3). The refusal is
-guaranteed to be observed only where the transfer cannot complete without the application
-acting — a payload beyond the peer's stream receive window, so that flow control makes the
-writer wait for a reader that never comes — or in Req/Rep, where the ERROR frame rides the
-reply half and is therefore ordered after the decision. That is why
-`push_to_rep_path_is_unsupported` and `push_to_an_unknown_path_is_reported` in
+application, including that it said no ([GUARANTEES.md](GUARANTEES.md) §3). This is decided
+behaviour rather than a gap in this document:
+[decisions/0005](decisions/0005-refusal-race.md) closes the race as documented, and no
+application-level signal is added to the L0 wire to order a refusal ahead of the receipt.
+
+**Two constructions make a refusal deterministic, and there is no third** [0005 §4.3]:
+
+- a payload beyond the peer's stream receive window, so that flow control makes the writer
+  wait for a reader that never comes; or
+- an exchange, whose ERROR frame is written by the receiving application on the reply half
+  and takes precedence over the request half's receipt (Precedence, above).
+
+An application that must observe a refusal therefore uses Req/Rep.
+
+**No sender outcome exists for a refusal observed after the receipt resolved, and none is
+added** [0005 §4.4]. The outcome rules above are complete as written: once `delivered()` has
+resolved `Ok(())` the `Delivery` is consumed, so a later `STOP_SENDING` reaches no observer,
+and no counter, metric or late error is invented for it. Nothing in the vocabulary contradicts
+a receipt after the fact, because the receipt was true when it resolved — it asserted what the
+peer's transport held, and never what its application did.
+
+That is why `push_to_rep_path_is_unsupported` and `push_to_an_unknown_path_is_reported` in
 `crates/weida/tests/pushpull.rs` and `a_publisher_path_refuses_inbound_transfers` in
 `crates/weida/tests/pubsub.rs` push 2 MiB instead of a few bytes: at that size the write
-cannot finish unless the peer acts, so the refusal is deterministic rather than racy.
+cannot finish unless the peer acts, so the refusal is deterministic rather than racy. Their
+payload size is load-bearing and must not be reduced — a smaller one would make the tests
+racy rather than make the code wrong [0005 §5].
 
 ### Connection teardown
 
