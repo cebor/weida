@@ -9,7 +9,7 @@ kind: research | size: 45 | status: done 56ead42 | needs: []
 acceptance: `docs/decisions/0004-durability-levels.md`, Status accepted, defining `Stored(Written|Flushed)` and `Replicated(n, flushed: bool)` from rabbitmq-amqp091 §6d, kafka §6, nats §6, amqp10 §6.5; SYNTHESIS §8.3 marked closed.
 
 ### B-002 — Decision 0005: refusal race closed as documented behaviour
-kind: research | size: 30 | status: in_progress (delegated) 2026-09-11T02:05Z | needs: []
+kind: research | size: 30 | status: done edabf00 | needs: []
 acceptance: `docs/decisions/0005-refusal-race.md`, accepted; cites RFC 9000 §3.2 via quic-standards §12 item 8 and PATTERNS §1.6; SYNTHESIS §8.5 closed.
 
 ### B-003 — Decision 0006: guarantee sets and the adapter edge
@@ -17,19 +17,20 @@ kind: research | size: 45 | status: done 052e741 | needs: []
 acceptance: `docs/decisions/0006-guarantee-sets.md`, accepted: a default guarantee set plus a configurable superset inside the weida network, validated at configuration time; at an adapter edge the chain ends at the protocol's transfer point (SYNTHESIS §4) and any degradation is named in configuration; SYNTHESIS §8.7 closed.
 
 ### B-004 — Decision 0007: segmented topics, opaque paths
-kind: research | size: 45 | status: in_progress (delegated) 2026-09-11T02:05Z | needs: []
+kind: research | size: 45 | status: done c06c072 | needs: []
 acceptance: `docs/decisions/0007-topic-namespace.md`, accepted: endpoint paths stay opaque (INVARIANTS), Pub/Sub filters become segmented patterns with a separator, a one-segment wildcard and a rest wildcard; ZeroMQ byte-prefix subscriptions map to a segment boundary as a named loss; mapping table for MQTT `+`/`#`, NATS `*`/`>`, AMQP `*`/`#`; SYNTHESIS §8.9 closed.
 
 ### B-005 — Decision 0008: session identity by fingerprint
-kind: research | size: 30 | status: in_progress (delegated) 2026-09-11T02:05Z | needs: []
+kind: research | size: 30 | status: done 7d3d31b | needs: []
 acceptance: `docs/decisions/0008-session-identity.md`, accepted: the proved fingerprint is the peer identity across connections (binds 0002's control and bulk connections; is the default producer name of 0001 §7.3); no L0 session state; subscription and sequence resumption is L2 work; the open item from 0001 §8 is closed.
+note: 0008 §5 records that SYNTHESIS §8 never received the session entry 0001 §8 promised, so nothing is struck out there; the question and its answer live in 0001 §8 plus this note. Verified against the acceptance line, which asks only for the 0001 §8 item.
 
 ### B-006 — Spec sync: PROTOCOL.md on the decided state
 kind: spec | size: 45 | status: ready | needs: [B-001, B-004, B-005]
 acceptance: reserved DATA keys 6 (sequence) and 7 (producer identity, encoding per 0008) in §6.2 with "optional, skipped by v0"; HELLO §2.3/§6.1 gains guarantee declarations and the intersection rule; §2 states the control connection and per-path bulk connections of 0002; §9 topic filter grammar per 0007; §10 split into control and bulk limits; §11 reserves the L2 credit frame kind (0003) and lists what is deferred; wire version stays 0 with the changes marked "spec ahead of code".
 
 ### B-007 — Spec sync: GUARANTEES.md
-kind: spec | size: 45 | status: ready | needs: [B-001, B-003]
+kind: spec | size: 45 | status: in_progress (delegated) 2026-09-11T03:20Z | needs: [B-001, B-003]
 acceptance: §3 ordering `PerProducer(detect|reassemble)`, dedup `Bounded(window)`, `PerKey` L2-only; `Stored`/`Replicated` with durability levels; §6 rows for backpressure name the two L0 credit units and the absence of application credit; a new subsection on guarantee sets per 0006; §3 receipt paragraph cites RFC 9000 §3.2 per 0005.
 
 ### B-008 — Spec sync: PATTERNS.md, INVARIANTS.md, ARCHITECTURE.md
@@ -74,5 +75,5 @@ kind: code | size: 90 | status: ready | needs: [B-014, B-011, B-012]
 acceptance: pool tiers per 0002 §7; HELLO on the control connection; bulk connections keyed by path and bound by fingerprint; `Limits` profiles `control` and `bulk` in `RuntimeConfig` with defaults chosen from B-011/B-012 numbers; stream probes updated; `a_stalled_stream_does_not_block_its_siblings` extended to show a control frame crossing while bulk is stalled.
 
 ### B-018 — Research: ZMTP adapter mapping document
-kind: research | size: 60 | status: ready | needs: [B-004]
+kind: research | size: 60 | status: in_progress (delegated) 2026-09-11T03:20Z | needs: [B-004]
 acceptance: `docs/adapters/zmtp.md` derived from `docs/research/zeromq.md`: socket type to weida pattern table, stream mapping, HWM to credit, NULL/CURVE to Identity/Trust, transfer points, named losses (byte-prefix subscriptions, multipart), and the interop bench plan against the pure-Rust `zeromq` crate.
