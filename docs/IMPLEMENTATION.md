@@ -501,6 +501,42 @@ than against the worst case alone. The probe asserts only the invariants — eve
 arrives exactly once, the buffer drains empty, the peak stays below N — because QUIC promises
 no ordering across streams and a test that pinned 84 would pin an accident of this machine.
 
+### Verified results — what a connection to a peer costs (B-011)
+
+The figure [0002](decisions/0002-control-and-bulk-separation.md) needs: what the *second*
+connection to a peer that is already connected costs, in latency and in memory. The bench is
+`crates/weida/benches/connections.rs`, loopback, pinned trust, no client identity (mTLS off).
+
+The pool keys on `(host, port, ClientTls, address fingerprint)`, so a second connection to one
+server on the same terms cannot be dialled from one runtime today — which is precisely why
+0002 needs a second pool tier. The memory figures therefore use one client runtime per
+connection against one server, with both ends in this process, and they separate the two
+deltas: runtimes are built and measured *before* anything is dialled, so the per-connection
+number excludes the per-runtime quinn endpoint and UDP socket.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Cold handshake | `cargo bench -p weida --bench connections -- --warm-up-time 1 --measurement-time 3` | `connect/cold_handshake` **1.04-1.10 ms** over three runs (fresh runtime per iteration, only `connect` timed) |
+| Pooled dial | same | `connect/pooled_dial` **3.8 µs** (3.27-4.36 µs): dialling a peer the pool already holds does no handshake and is ~**280x** cheaper than one |
+| Handshakes in series | same, printed by the bench | 64 handshakes in **65.6-73.9 ms**, i.e. ~1.0-1.2 ms each with no measurable degradation: the first is 1.2-1.9 ms and the sixty-fourth 0.81-0.97 ms |
+| Memory per idle runtime | same | **0-4 KiB** RSS: a `Runtime` that has dialled nothing holds nothing worth counting |
+| Memory per live connection | same | **488-596 KiB** at 2 connections, **750-850 KiB** at 64 (46-53 MiB for 64), covering **both** ends. The single-connection figure is 1196-1260 KiB because it also pays the one-off crypto and endpoint state |
+
+What this says for 0002's two tiers: a control connection beside a bulk connection costs about
+**one millisecond of handshake and under a megabyte of resident memory for both ends
+together**, and the handshake is the whole cost — there is no per-connection cost that grows
+with the number of connections held. Against that, the head-of-line coupling 0002 removes is
+unbounded: one slow reader stalls every writer on the connection
+([PATTERNS.md](PATTERNS.md) §1.3). The numbers therefore support 0002's default rather than
+arguing for a lazily created control connection. They also set the scale for the `Limits`
+profiles of B-017: 64 connections to one peer is ~50 MiB of transport state on the pair, so a
+per-peer connection count belongs in the named bounds
+([INVARIANTS.md](INVARIANTS.md)) rather than being left to the path count.
+
+RSS is read from `/proc/self/status` `VmRSS` and the allocator does not return everything
+between measurements, so each row's baseline is the previous row's residue; the per-connection
+deltas are the trustworthy part and the absolute totals are not.
+
 ---
 
 ## 5. Decisions

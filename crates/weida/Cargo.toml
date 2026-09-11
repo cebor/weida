@@ -43,5 +43,9 @@ harness = false
 name = "patterns"
 harness = false
 
+[[bench]]
+name = "connections"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"
