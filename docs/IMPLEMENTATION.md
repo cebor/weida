@@ -294,10 +294,45 @@ the next copy it receives carries a gap whose `missed()` equals `Publisher::drop
 is the capability [0001](decisions/0001-sequence-field.md) §7.2 required and the wire could
 not express before B-013.
 
-**Deduplication is not part of this increment.** `Bounded(window)` is declared, negotiated
-and rejected-if-unmatched by the wire work above, and no runtime implements it; the dedup
-window therefore stays in the "named but not yet implemented" bounds of
-[INVARIANTS.md](INVARIANTS.md).
+**Deduplication is not part of this increment** — it landed in the next one, below.
+
+**Delivered in the seventh increment — bounded deduplication (B-025):**
+
+A runtime configured `Deduplication::Bounded` with a `dedup_window_ms` suppresses a
+repeated `(producer, scope, sequence)` inside that window. The producer is the connection's
+proved fingerprint unless DATA key `7` names another, per
+[0008](decisions/0008-session-identity.md) §4.4; the scope is the topic for a published copy
+and the endpoint path otherwise, the same scope the sequencer numbers. The window lives in
+`crates/weida/src/dedup.rs` (`DedupWindow`) and sits between the wire and the application in
+`handle_data`: a suppressed transfer is read to EOF and discarded rather than dropped, so the
+sender sees an ordinary transport receipt and never reads the suppression as a refusal.
+Suppressions are counted per runtime and exposed as `Runtime::suppressed_duplicates`, which
+is where drops are already visible on the publishing side.
+
+Bounded is bounded twice. In time by the negotiated window, and in count by the new
+`Limits::max_dedup_entries` (4096), because a time window bounds how long an identity is kept
+and not how many arrive within it — the reason [INVARIANTS.md](INVARIANTS.md) named this bound
+before the code existed. At the cap the oldest entry is evicted, so a peer that floods buys
+itself missed suppression rather than memory. Both bounds are pinned by unit tests, as is the
+hot-path invariant: a thousand calls through a disabled window leave the table's
+`capacity() == 0`.
+
+The end-to-end proof is `crates/weida/tests/dedup.rs`, which replays from the raw wire —
+the library's own sequencer is monotone and cannot produce a repeat. Three tests: the same
+numbered transfer twice inside the window arrives once and increments the counter, with an
+unsuppressed sentinel behind it proving suppression rather than delay; the same identity
+after the window arrives again; and under `core` the same replay arrives twice, because
+nothing was negotiated.
+
+**One bug in B-015, found by thinking about replays.** `GapDetector::observe` advanced its
+position to `max(expected, seen) + 1` on every arrival, including one *below* the expected
+number. A late or repeated number therefore consumed a number that had not arrived and
+silenced its gap: with `0, 2, 1` the detector reported the hole at 1 and then skipped 3
+without a word. A below-expected arrival now moves the position nowhere, which is what the
+method's own doc comment already claimed, and `an_out_of_order_arrival_is_not_a_gap` pins it
+by asserting that the hole after the late arrival is still reported. The suppression check
+is also placed ahead of the detector, so a duplicate the receiver never accepted cannot
+shift the receiver's idea of where the producer is.
 
 **Deliberately deferred** (recorded now, not discovered later):
 

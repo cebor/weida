@@ -857,6 +857,7 @@ remote peer can cause to be allocated (master doc §50, §81 rule 17).
 | `max_subscriptions` | `256` | subscription filters one peer connection may hold, summed over paths; exceeding it closes the connection with `LIMIT_EXCEEDED` (§6.4) |
 | `subscriber_buffer_bytes` | 8 MiB | payload bytes a publisher will hold queued for one subscriber; a message that does not fit is dropped for that subscriber (§9.5) |
 | `max_sequence_scopes` | `1024` | producer scopes — paths and topics — a receiver tracks per connection for gap detection under `PerProducer` ordering; the peer names the scopes, so at the cap a new one is simply not tracked |
+| `max_dedup_entries` | `4096` | identities a receiver remembers per connection under `Bounded` deduplication; the negotiated window bounds how long an identity is kept and this bounds how many, evicting the oldest at the cap (§6.5) |
 | `max_connections_per_peer` | *spec ahead of code* | connections one peer may hold across both tiers of §10.1; exceeding it closes the excess connection with `LIMIT_EXCEEDED` |
 
 Worst-case hostile per-connection header memory is bounded by
