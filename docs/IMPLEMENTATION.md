@@ -417,13 +417,18 @@ to be told would have to answer, which is the application acknowledgement
 **What the drain waits on, and why it had to be parked.** The only completion signal L0 has
 is `SendStream::stopped()`, and a fire-and-forget sender drops the `Delivery` that holds
 it, taking the last handle to the acknowledgement with it. `Delivery::drop` now hands that
-receipt to `crates/weida/src/drain.rs` instead of dropping it; a receipt the application
-awaits itself is never parked. Published fan-out copies, which never had a `Delivery` at
-all, are parked at `finish()` in `pubsub::write_one`. The parked set is bounded twice: by
-reaping settled receipts on the way in — one poll with `Waker::noop()`, no task and no
-registration — and by the stream budgets already in `Limits`, which is why
+receipt to **its own connection's** parked set (`ConnDrain` in
+`crates/weida/src/drain.rs`, beside the sequencer and the gap detector in `ConnCtx`)
+instead of dropping it; a receipt the application awaits itself is never parked. Published
+fan-out copies, which never had a `Delivery` at all, are parked the same way at `finish()`
+in `pubsub::write_one`. Parking is a lock and a push and nothing else — the set is walked
+only when it is full, where settled receipts are reaped with one `Waker::noop()` poll
+before anything is thrown away, and once more at drain time, when `DrainState::take` walks
+the connections the runtime registered (once per connection, never per message). The cap
+is that connection's stream budgets from `Limits`, which is why
 [INVARIANTS.md](INVARIANTS.md) needs no new number for it. A receipt evicted at that cap
-is counted as outstanding by the next drain rather than assumed delivered.
+is counted as outstanding by the next drain rather than assumed delivered. What the first
+cut got wrong, and what the numbers for it are, is §4 (B-032).
 
 **What a slow reader cannot show, and the test that says so.** QUIC acknowledges bytes into
 the receive window whether or not the application reads them, so a slow *reader* never
@@ -690,6 +695,36 @@ producer key is omitted entirely in the default case and the default pays only t
 32-byte digest, 35 B instead of 74 B, and the hex string stays presentation only. B-013
 landed exactly that codec and its golden vectors; the measured frame above is unchanged,
 because the runtime still sets both fields to `None` (§1, fourth increment).
+
+### Verified results — what parking a receipt costs the send path (B-032)
+
+The drain of [0009](decisions/0009-drain.md) parks the receipt of every finished transfer
+nobody is waiting on, which puts work on a path B-009 measured. Review asked for the number
+before the design was accepted, so here it is, on the same bench, same machine, release
+profile, loopback: `cargo bench -p weida --bench patterns -- header --warm-up-time 1
+--measurement-time 3`, two runs per tree, throughput in Kmsg/s.
+
+| Tree | `push_64b_keys0` | `push_64b_keys2` |
+| --- | --- | --- |
+| Before the drain (`9a82f4c`) | 163.0, 162.5 | 152.3, 153.6 |
+| First cut: one runtime-wide `Mutex<VecDeque>`, reaping under the lock | 163.9, 162.7 | 147.6, 149.6 |
+| Per connection: one uncontended lock, push only | 155.7, 162.2 | 147.6, 152.1 |
+
+The first cut was the wrong shape regardless of the number — a structure shared by every
+connection and every worker thread, plus a poll of quinn's connection lock under it, for an
+operation that runs once at shutdown — and the restructure moved the parked set onto the
+connection beside the sequencer and the gap detector, leaving the runtime-wide state with
+only the admission flag, the connection list and the eviction counter.
+
+**What the numbers do and do not show.** The keys2 column shows the first cut ~3 % below
+the baseline in both runs and the per-connection version back inside it; that is the signal
+that motivated the restructure. Nothing sharper than that is available from this bench:
+this machine's run-to-run spread today is **wider** than the ±3 % B-009 recorded — the same
+tree produced 155.7 and 162.2 Kmsg/s in consecutive keys0 runs, and lengthening the
+measurement to 10 s per run did not settle it (baseline 149.0 and 162.4; per-connection
+160.9, 163.6, 156.7). So the honest statement is: **the residual cost of parking is not
+resolvable against this bench's noise**, and the claim in the code is worded as what it
+does — one uncontended lock and a push, once per transfer — not as "free".
 
 ### Verified results — reassembly buffer under cross-stream reordering (B-010)
 

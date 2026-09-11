@@ -1,9 +1,14 @@
 //! Transfer handles.
 //!
 //! These own their `quinn` streams outright: payload bytes go straight to the
-//! socket without passing through the connection actor, so a transfer costs no
-//! task hop and takes no lock (master doc §49). The actor is involved only for
-//! the two control frames a destructor may still need to emit.
+//! socket without passing through the connection actor, so writing and reading
+//! a transfer costs no task hop and takes no lock (master doc §49). The actor
+//! is involved only for the two control frames a destructor may still need to
+//! emit — and `finish()` costs one more thing, paid once at the end of a
+//! transfer rather than per write: an unawaited `Delivery` hands its receipt
+//! to the connection's parked set on drop, which is one uncontended lock and
+//! a push, so that a drain can wait for it
+//! (`docs/decisions/0009-drain.md` §4.2).
 //!
 //! Nothing here materializes a payload. `AsyncRead`/`AsyncWrite` are the
 //! primitive API; `collect(max_bytes)` is an opt-in convenience with an
