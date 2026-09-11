@@ -1,14 +1,30 @@
 # ZMTP 3.1 — adapter mapping
 
 Status: mapping document; slice 1 (the codec) implemented as `crates/adapters/weida-zmtp` and
-slices 2 and 3 (both bridge directions) as `crates/adapters/weida-zmtp-bridge`. What is left
-is the interop bench (slice 5) and the contract the adapter's documentation owes its user
+slices 2, 3 and 5 (both bridge directions and the interop run against an independent ZeroMQ)
+as `crates/adapters/weida-zmtp-bridge`. What is left is the contract the adapter's
+documentation owes its user
 ([LOOP.md](../LOOP.md) §9 Phase B, [0006](../decisions/0006-guarantee-sets.md) §4.9).
 Date: 2026-09-11
 Derived from: [docs/research/zeromq.md](../research/zeromq.md) (ZMTP 3.1, libzmq 4.3.x, the
 zguide, CURVE/ZAP). Every ZeroMQ claim below carries that sheet's section; every weida claim
 carries the weida document or decision it comes from. Where the two cannot be made to
 coincide, §8 names the loss instead of hiding it.
+
+**What the interop slice changed, and it is the reason the slice exists.** Three things this
+document assumed were wrong against a real implementation, and all three were wrong in *our*
+code rather than in the reading of the specification:
+
+1. **A ZMTP 3.0 peer was refused.** The codec's 3.1 floor is what the specification asks a
+   peer to accept, and the same sentence permits a downgrade — which a bridge must take,
+   because the pure-Rust `zeromq` crate announces 3.0 and it is not alone. The negotiated
+   version is now returned by the handshake and carried through §3's heartbeat.
+2. **`PING` was sent to a peer that cannot decode it.** PING/PONG are 3.1 commands, and a 3.0
+   peer that meets one answers "Unknown command received" and closes. The heartbeat is now
+   gated on the negotiated version, whatever the configuration asked for.
+3. **Subscriptions arrived in a form the bridge refused.** Real subscribers send ZMTP 2.0's
+   one-frame `1`/`0` form rather than the 3.x `SUBSCRIBE` command, so a PUB-side bridge that
+   accepts only commands has no subscribers at all (§6 records both forms now).
 
 ## 1. Scope
 
@@ -130,6 +146,20 @@ ZeroMQ sockets rather than relying on TCP, whose timeout "can be roughly 30 minu
 [zeromq §8], and it does not translate either timer into the other: they bound different
 hops.
 
+**But only with a 3.1 peer.** `PING`/`PONG` arrived in 3.1, so the heartbeat is gated on the
+version the greeting negotiated and a 3.0 peer gets none — configuration asks, the version
+decides, and the suppression is logged once rather than left silent. The slice-5 run is why
+this is stated rather than assumed: `zeromq` 0.6 announces 3.0 and answers any command but
+`READY` with "Unknown command received", then closes, so an ungated heartbeat does not
+degrade liveness detection — it *is* the connection loss it was meant to detect.
+
+**Version negotiation.** A 3.0 peer is accepted by downgrading, which the specification
+permits ("a peer MAY downgrade to a lower protocol version") and a bridge has to take: the
+alternative is refusing every implementation that never adopted 3.1. Below major 3 there is
+no downgrade, because 2.0 and 1.0 have different framing and a different subscription form,
+and the specification detects them by abusing the padding field rather than by the version
+octets [zeromq §1].
+
 **Reconnect.** ZeroMQ reconnects automatically to the same endpoint [zeromq §1]; weida does
 not reconnect at all — "the application calls `connect` again" [PATTERNS §1.8]. The adapter
 owns the weida-side reconnect loop. It must also honour the rule both sheets state
@@ -196,6 +226,17 @@ frame, because "Subscription is a prefix match" and the envelope prevents accide
 matches since "the match won't cross a frame boundary" [zeromq §4.3]. An envelope frame is a
 segment boundary by construction, so a bridge that requires the envelope convention loses
 nothing. It MUST say so in its configuration rather than assume it.
+
+**Two wire forms, and a bridge meets both.** 3.x carries a subscription in the
+`SUBSCRIBE`/`CANCEL` **commands** [zeromq §1]; ZMTP 2.0 carried it as a one-frame **message**
+beginning `%x01` to subscribe or `%x00` to cancel, which is also the shape libzmq presents to
+an XPUB *application* — "byte 1 (for subscriptions) or byte 0 (for unsubscriptions) followed
+by the subscription body" [zeromq §6]. The slice-5 run found that the distinction is not
+historical: `zeromq` 0.6 announces ZMTP 3.0 and sends **and reads only the legacy form**, so
+a PUB-side bridge that accepts commands alone has no subscribers from that implementation at
+all. The adapter therefore **accepts both and sends the command**, with the legacy form
+available as configuration. Accepting both is unambiguous rather than generous: a SUB or XSUB
+peer may not send application messages, so a message from one is a subscription or an error.
 
 ## 7. Transfer points and guarantee mapping
 
@@ -322,18 +363,26 @@ disclaimer — "This codebase does not implement all of ZeroMQ's feature set", w
 "working and tested against the reference implementation" [zeromq §13] — which bounds what the
 bench can prove.
 
-**What the pure-Rust upstream can cover.** Greeting and version negotiation, the NULL
-handshake with `READY` metadata, framing including MORE and COMMAND flags, `SUBSCRIBE`/`CANCEL`,
-`PING`/`PONG`, and the six socket pairings of the table above that both sides implement
-[zeromq §1], [zeromq §3], [zeromq §13].
+**What the pure-Rust upstream can cover — and what the run found it cannot.** In plan:
+greeting and version negotiation, the NULL handshake with `READY` metadata, framing including
+MORE and COMMAND flags, `SUBSCRIBE`/`CANCEL`, `PING`/`PONG`, and the six socket pairings of
+the table above that both sides implement [zeromq §1], [zeromq §3], [zeromq §13]. In fact
+`zeromq` 0.6 announces ZMTP **3.0** and decodes exactly one command, `READY`: `PING`, `PONG`
+and `ERROR` are all "Unknown command received" and end the connection, and subscriptions
+travel in ZMTP 2.0's message form rather than as commands. So the run covers the greeting, the
+handshake, framing, both subscription paths and the socket pairings, and it cannot cover
+`PING`/`PONG` at all — the heartbeat's 3.1 gate is the *consequence* of that, tested by
+holding a connection open across several suppressed intervals rather than by observing a PONG.
 
-**What it cannot, and what happens then.** PAIR, the thread-safe draft family
+**What it cannot cover, and what happens then.** PAIR, the thread-safe draft family
 (CLIENT/SERVER, RADIO/DISH, SCATTER/GATHER, PEER/CHANNEL), `ws`/`wss` and everything beyond
-TCP/IPC are absent from zmq.rs [zeromq §13]. Those cases go against libzmq through the `zmq`
-crate (rust-zmq, C bindings, tracks libzmq releases [zeromq §13]) as an optional dev-dependency,
-and are `#[ignore]` with the install command in the doc comment where libzmq is absent
-[LOOP §2], [LOOP §5]. A libzmq daemon or example process, if one is needed, runs only under
-the process supervisor with a `ready` condition and is stopped in the same item [LOOP §2].
+TCP/IPC are absent from zmq.rs [zeromq §13]. Those cases would go against libzmq through the
+`zmq` crate (rust-zmq, C bindings [zeromq §13]) as an optional dev-dependency, `#[ignore]`
+with the install command in the doc comment where libzmq is absent [LOOP §2], [LOOP §5] —
+not built here, because none of the patterns this adapter maps needs them. The pure-Rust
+upstream is a **library dev-dependency**, so the bench needs no supervised process, no install
+step and no ignored tests: it runs in `cargo test` and `cargo bench` like everything else,
+which is the outcome [LOOP §2]'s supervisor rule was there to make safe.
 
 **The bench itself.**
 
@@ -349,28 +398,33 @@ the process supervisor with a `ready` condition and is stopped in the same item 
    `cargo test`, including a long header with an arbitrary 64-bit length and no body.
 3. **Inbound matrix.** zmq.rs REQ → adapter → weida `Replier`; zmq.rs PUSH → adapter →
    `Puller`; zmq.rs SUB ← adapter ← weida `Publisher`, including a boundary-aligned prefix and
-   a rejected mid-segment prefix (L2). *Slice 2 has all three, and the losses, against a peer
-   built on this repository's own codec* (`crates/adapters/weida-zmtp-bridge/tests/inbound.rs`).
-   What is left for this item is the only thing that peer cannot be: **independent**. A codec
-   that is byte-exact against the golden vectors is a faithful ZMTP peer and still shares every
-   assumption with the code under test, so the zmq.rs run is what turns "we agree with
-   ourselves" into interoperability.
+   a rejected mid-segment prefix (L2). *Done, slice 5*
+   (`crates/adapters/weida-zmtp-bridge/tests/interop.rs`), against the pure-Rust `zeromq`
+   crate as an independent implementation; slice 2's own matrix stays, against a peer built on
+   this repository's codec, because the two catch different things — a faithful peer pins the
+   bridge's behaviour, and a foreign one pins its assumptions. Three of those assumptions were
+   wrong and are listed at the head of this document.
 4. **Outbound matrix.** The same four with the directions reversed, plus DEALER/ROUTER against
-   weida's concurrent exchanges [ARCHITECTURE §6b]. *Slice 3 has all of them, against the same
-   non-independent peer* (`crates/adapters/weida-zmtp-bridge/tests/outbound.rs`): a weida
-   `Requester` through a foreign REP with four concurrent exchanges answered in reverse, a
-   `Pusher` through a foreign PULL, a `Subscriber` fed by a foreign PUB, and the envelope
-   frames consumed rather than forwarded. The zmq.rs run is owed here for the same reason as
-   item 3.
+   weida's concurrent exchanges [ARCHITECTURE §6b]. *Done, slice 5*: a weida `Requester`
+   through a real `RepSocket`, a `Pusher` through a real `PullSocket`, a `Subscriber` fed by a
+   real `PubSocket`, and a real `RouterSocket` that drops a request silently. Slice 3's
+   four-concurrent-exchange correlation test stays where it is, since `zeromq`'s REP socket is
+   lockstep and cannot produce out-of-order replies to measure against.
 5. **Loss assertions, not just happy paths.** Each named loss of §8 that is observable gets a
-   test: a multipart message is refused rather than flattened (L1); a duplicate SUBSCRIBE is
-   reference-counted, and one CANCEL does not unsubscribe (L3); a ROUTER that drops a request
-   silently reaches the requester as `ERROR{NO_REPLY}` rather than as a hang (L5); a weida
-   payload beyond `max_message_bytes` is refused rather than truncated (§3).
+   test: a multipart message is refused rather than flattened (L1); a byte prefix that stops
+   mid-segment selects nothing and is refused (L2); a duplicate SUBSCRIBE is reference-counted,
+   and one CANCEL does not unsubscribe (L3); a ROUTER that drops a request silently reaches
+   the requester as `ERROR{NO_REPLY}` rather than as a hang (L5); a weida payload beyond
+   `max_message_bytes` is refused rather than truncated (§3). *Done*: L1, L2, L5 and the cap
+   against the independent peer in slice 5, L3 against the faithful peer in slice 2 — `zeromq`
+   0.6 collapses duplicate subscriptions in its own client before they reach the wire, so it
+   cannot exercise a reference count.
 6. **Numbers.** Round-trip latency and messages per second for REQ/REP and PUSH/PULL through
    the adapter against a direct zmq.rs pair on loopback, recorded in
    [IMPLEMENTATION.md](../IMPLEMENTATION.md) verified results with the command that produced
-   them [LOOP §5 measure].
+   them [LOOP §5 measure]. *Done, slice 5*:
+   `cargo bench -p weida-zmtp-bridge --bench interop`, and the two numbers §11 was holding
+   open are decided there.
 7. **Cross-adapter test** (Phase B slice 6, once a second adapter exists): a message enters
    through ZMTP and leaves through the other protocol, with the guarantees of both mapping
    documents asserted [LOOP §9].
@@ -417,16 +471,20 @@ one-octet body `x`.
 
 ## 11. Open questions
 
-- **Where the adapter's `max_message_bytes` default comes from.** Nothing is measured; the
-  weida-side neighbours are `subscriber_buffer_bytes` 8 MiB and `stream_receive_window` 1 MiB
-  [PROTOCOL §10], and the ZeroMQ side has no default at all (`ZMQ_MAXMSGSIZE` is -1)
-  [zeromq §11].
-- **What the outbound reply deadline should be.** A foreign ROUTER that drops a request
-  silently (L5) is indistinguishable from one that is merely slow, so the outbound bridge has
-  to choose a duration after which it calls the exchange lost. The default is currently the
-  one number in this crate that is neither measured nor derived from a weida limit, and the
-  slice-5 bench is where a request's real round trip through the adapter becomes known
-  (§10 item 6).
+- **`max_message_bytes`** is no longer open: the slice-5 bench measured the bridge's cost as
+  **linear in message size with no cliff** (1 KiB round trip 81 µs, 1 MiB 3.37 ms, against
+  20.5 µs and 439 µs for a direct ZeroMQ pair), so the number bounds **memory** and not
+  latency. The default is **1 MiB** = `stream_receive_window` [PROTOCOL §10], because the
+  bridge holds one whole message per direction per connection and the exposure is therefore
+  the cap times `max_connections` — 8 GiB at the 8 MiB this document used to suggest. The same
+  arithmetic moved the PUB-side queue from 1024 *messages* to 8 MiB of *bytes*, which is
+  `subscriber_buffer_bytes`: a depth multiplies by the cap, and nobody chose the product.
+  Recorded in [IMPLEMENTATION.md](../IMPLEMENTATION.md) verified results with the command.
+- **The outbound reply deadline** is no longer open either, and the answer is that the
+  existing number survives: **10 s**, now justified as ~3000× the slowest exchange the cap
+  allows (3.37 ms at 1 MiB). A deadline that far above the working range cannot fire on a
+  merely slow peer, and that asymmetry is the whole argument — a request lost to a silent
+  ROUTER costs one exchange, a deadline that fires early costs correct ones.
 - **Whether a weida-native ZMTP codec should implement CURVE at all**, given that the weida
   side is already authenticated and encrypted by TLS and the adapter is the trust boundary
   (§5, L6). CURVE is documented "when using TCP transport" only [zeromq §10].

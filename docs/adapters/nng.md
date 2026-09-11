@@ -242,40 +242,89 @@ SP has no producer sequence to carry (§9.2).
 
 ## 8. Named losses
 
+Each is a thing the adapter cannot carry. Phase B1's lesson is that naming a loss is not
+enough: the two ZMTP losses the interop bench later corrected were the two nobody had checked
+against a real implementation ([adapters/zmtp.md](zmtp.md) §8, B-043). So every entry below
+says **how it would be observed** — the experiment that shows the loss is real, and the
+observation that would show this document is wrong about it. The bench items of §10 are those
+experiments.
+
 1. **Subscription filtering changes sides.** SP filters at the subscriber, after every copy has
    crossed every link [nanomsg-nng §4]; weida filters at the publisher [ARCHITECTURE §6c.2].
    Inbound this is an improvement and still a change: a foreign PUB expects its bandwidth to be
-   spent, and an operator measuring links will see different numbers. Outbound, the adapter
-   must deliver everything its SUB peers could want, so a weida filter cannot reduce SP-side
-   traffic.
+   spent. Outbound, the adapter must deliver everything its SUB peers could want, so a weida
+   filter cannot reduce SP-side traffic.
+   *Observed as:* an outbound bridge with one weida filter `px.#` and an SP SUB peer
+   subscribed to `fx`, with a byte counter on the SP socket — the counter rises on every
+   published message, not only the matching ones. Inbound, the mirror: the SP link carries
+   every publication while the weida `Publisher` counts `dropped` for a non-matching
+   subscriber [GUARANTEES §6]. *This document is wrong if* an NNG PUB socket turns out to
+   apply subscriptions at the publisher after all — the manual says it does not
+   [nanomsg-nng §4], but only the bench with a real peer settles it (§10 item 3).
 2. **Streaming does not survive.** NNG delivers whole messages only [nanomsg-nng §2]; a weida
    payload may be a stream [INVARIANTS]. The adapter buffers whole messages under
    `max_message_bytes` (§3).
+   *Observed as:* a weida sender that writes the first half of a payload and then pauses —
+   nothing appears on the SP socket until FIN, because the 64-bit size prefix cannot be
+   written before the size is known [rfc-tcp §3]. Measurable as first-byte latency equal to
+   whole-payload latency, and as a refusal (`STOP_SENDING(REJECTED)`) rather than a truncation
+   when the payload passes the cap (§10 item 5, L2).
 3. **REQ's automatic retry has no weida counterpart.** weida reports a failed exchange; SP
    silently tries again [nanomsg-nng §4, §6]. Outbound, a weida requester's single attempt
    becomes a single SP request — the adapter does not retry on its behalf, because a retry is
-   an application decision weida deliberately leaves to the application [FAILURE_MODEL §4].
+   an application decision weida leaves to the application [FAILURE_MODEL §4].
+   *Observed as:* an outbound exchange against a REP peer that never answers. The weida
+   requester sees one failure after its own deadline and the SP wire shows exactly one request
+   — whereas a native NNG REQ against the same peer shows a request per `REQ_RESENDTIME`
+   [nanomsg-nng §4]. Counting frames on the wire is the whole experiment.
 4. **REQ retries arrive as duplicate requests.** Under `core` they are delivered
    [nanomsg-nng §6], [GUARANTEES §6]; see §7 and §9.3.
+   *Observed as:* an inbound bridge in front of a weida `Replier` that delays its reply past
+   the peer's `REQ_RESENDTIME`; the replier is entered twice with the same body, and the two
+   requests carry the same 32-bit request tag [nanomsg-nng §3] on the wire. That tag is what
+   makes the duplicate *recognizable* to a reader of the capture and still does not deduplicate
+   it, which is the loss.
 5. **A survey deadline is not carried.** `SURVEYTIME` starts when the survey is sent and a late
    reply is discarded, which makes "no answer" indistinguishable from slow, unreachable or
    deliberately silent [nanomsg-nng §4]. weida has no deadline-scoped fan-out of exchanges
    [ARCHITECTURE §6b], so the adapter must impose the deadline itself and report expiry as its
    own observation.
+   *Observed as:* three respondents, one answering after the deadline. The surveyor collects
+   two answers and the late one is discarded with no error anywhere — the adapter's own
+   expiry counter is the only record that a third respondent existed. *This document is wrong
+   if* a real NNG surveyor reports the late reply in any form; the manual says it is discarded
+   [nanomsg-nng §4].
 6. **PAIR's exclusivity is not representable.** A PAIR peer rejects a second connection while
    paired [nanomsg-nng §4]; weida's `Acceptor` admits every peer that reaches the path, bounded
    only by `max_connections_per_peer` [PROTOCOL §10]. An adapter that presents a PAIR socket
    must enforce the one-peer rule itself and name it as adapter policy.
+   *Observed as:* two SP PAIR peers dialling the adapter. Against a native NNG PAIR the second
+   is rejected at connection time [nanomsg-nng §4 matrix]; against the adapter the second is
+   accepted by weida and must be closed by the adapter's own rule, which is a different moment
+   and a different error the peer sees. The experiment is to record *when* and *how* the second
+   peer learns it lost.
 7. **BUS is one hop, and weida has no mesh.** BUS reaches only directly connected peers and
    needs a fully connected mesh to behave like a bus, with delivery to "some, all, or none"
    [nanomsg-nng §4]. Nothing in weida reproduces that membership model; §9.5 refuses it.
+   *Observed as:* three BUS peers in a line A-B-C. A's message reaches B and never C, with no
+   error at A [nanomsg-nng §4]. Any bridge that made C receive it would have invented a
+   forwarding guarantee BUS does not have — which is exactly what the refusal prevents, and
+   what a test of the refusal (§10 item 5) records.
 8. **Who binds is the adapter's choice.** SP lets either role listen or dial [nanomsg-nng §1];
    weida fixes bind/connect per pattern in v0 [ARCHITECTURE §6c.4]. An SP topology that relies
    on the opposite direction needs the adapter to bind on both sides, which is a configuration,
    not a translation.
+   *Observed as:* a configuration failure, not a runtime one — an SP deployment where the REP
+   side dials cannot be pointed at an adapter that only dials too. It surfaces the moment
+   someone writes the configuration, which is where it should surface [0006 §4.7]; the
+   observation to record is that the error names the direction rather than timing out.
 9. **`RECVMAXSZ = 0` cannot be honoured.** Zero means unlimited [nanomsg-nng §5, §11]; weida
    may not allocate on unbounded remote input [INVARIANTS]. The adapter always has a finite cap
    (§9.6).
+   *Observed as:* a configuration refusal with the cap named, and — on the wire — a peer that
+   declares a 2^64-1 size being disconnected before a single payload byte is read (R4 in
+   §10.1). The negative observation that matters: memory does not move when the declaration
+   arrives.
 
 ## 9. Configurations the adapter refuses
 

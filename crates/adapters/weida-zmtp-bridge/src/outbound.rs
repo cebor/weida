@@ -93,6 +93,11 @@ pub struct OutboundConfig {
     /// Which socket type to present to the ZeroMQ side.
     pub dialling: Dialling,
     /// Largest whole ZMTP message the bridge will hold, in octets.
+    ///
+    /// 1 MiB, the same number and the same reasoning as the inbound
+    /// direction's: the interop bench (B-043) found the cost linear in message
+    /// size with no cliff, so the number bounds memory rather than latency,
+    /// and the exposure is this cap per direction per connection.
     pub max_message_bytes: u64,
     /// How long an exchange may wait for its ZMTP reply before the weida
     /// requester is told there will not be one.
@@ -100,9 +105,16 @@ pub struct OutboundConfig {
     /// Mandatory and finite, for the reason the module documents: a ROUTER
     /// drops an unroutable request **silently** by default (loss L5), so the
     /// absence of a reply is the only observation available and a bridge
-    /// without a deadline would park the exchange forever. Ten seconds by
-    /// default, which is generous for a local ZeroMQ peer and short enough
-    /// that a caller notices.
+    /// without a deadline would park the exchange forever.
+    ///
+    /// **Ten seconds stays, and the interop bench is why** (B-043). A full
+    /// round trip through this bridge measured 81 µs at 1 KiB and 3.37 ms at
+    /// 1 MiB, so the default is some 3000 times the slowest exchange the
+    /// adapter's own cap allows: a deadline this far above the working range
+    /// cannot misfire on a merely slow peer, which is the only failure mode
+    /// that would matter here — a lost request costs one exchange, a deadline
+    /// that fires early costs correct ones. The measurement is what turns
+    /// "generous" into a number with a ratio behind it.
     pub reply_deadline: Duration,
     /// Prefixes to subscribe with when presenting `SUB`.
     ///
@@ -143,7 +155,7 @@ impl OutboundConfig {
             weida_listen,
             weida_path: weida_path.into(),
             dialling,
-            max_message_bytes: 8 * 1024 * 1024,
+            max_message_bytes: 1024 * 1024,
             reply_deadline: Duration::from_secs(10),
             subscribe: Vec::new(),
             subscription_form: SubscriptionForm::default(),

@@ -105,12 +105,13 @@ cargo run -p weida --example owned_runtime   # a full exchange from a plain `fn 
 ```
 cargo test --workspace
 cargo test -p weida --test streams               # QUIC stream mechanics, measured
-cargo test -p weida --test transports            # one pattern suite over QUIC and inproc
+cargo test -p weida --test transports            # one pattern suite over QUIC, inproc and AF_UNIX
 cargo test -p weida --test identity              # pins, anchors, addresses, client identity
 cargo test -p weida --test large -- --ignored     # 1 GiB echo, asserts bounded peak RSS
 cargo test -p weida-zmtp                         # ZMTP golden vectors and hostile input
-cargo test -p weida-zmtp-bridge                  # ZeroMQ peers and weida endpoints through the bridge
+cargo test -p weida-zmtp-bridge                  # both bridge directions, plus a real ZeroMQ peer
 cargo bench                                      # codec and loopback QUIC throughput
+cargo bench -p weida-zmtp-bridge --bench interop # the bridge's cost against no bridge
 ```
 
 No license file yet.

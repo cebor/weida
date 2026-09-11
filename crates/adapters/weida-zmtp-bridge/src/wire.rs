@@ -324,23 +324,33 @@ pub(crate) fn sanitize(reason: &str) -> String {
 /// must not stall the weida subscriber feeding it — which is exactly ZeroMQ's
 /// own rule for PUB, "SHALL silently drop the message if the queue for a
 /// subscriber is full" [zeromq §4.3].
+///
+/// **The bound is bytes, not messages**, and that is a correction the interop
+/// bench forced: a message count multiplies by `max_message_bytes` into the
+/// real exposure, and a depth of 1024 at a megabyte a message is a gigabyte
+/// per slow subscriber that nobody chose. Bytes make the ceiling the number
+/// the operator actually cares about, and it has a weida neighbour to be
+/// compared against — `subscriber_buffer_bytes`, which bounds exactly this on
+/// the weida side [PROTOCOL §10].
 pub(crate) struct DropQueue {
     queue: VecDeque<Vec<u8>>,
-    max_messages: usize,
+    queued_bytes: usize,
+    max_bytes: usize,
     dropped: u64,
 }
 
 impl DropQueue {
-    pub(crate) fn new(max_messages: usize) -> DropQueue {
+    pub(crate) fn new(max_bytes: usize) -> DropQueue {
         DropQueue {
             queue: VecDeque::new(),
-            max_messages,
+            queued_bytes: 0,
+            max_bytes,
             dropped: 0,
         }
     }
 
-    /// Enqueues, dropping the **oldest** at the bound, and reports whether it
-    /// had to.
+    /// Enqueues, dropping the **oldest** until the new message fits, and
+    /// reports whether it had to drop anything.
     ///
     /// Oldest rather than newest: a subscriber that has fallen behind wants
     /// the freshest data it can still be given, which is the choice ZeroMQ's
@@ -348,21 +358,74 @@ impl DropQueue {
     /// that the drop is *counted and logged* rather than silent — ZeroMQ's PUB
     /// drops silently and the zguide names that as a debugging problem, while
     /// weida counts its fan-out drops [GUARANTEES §6].
+    ///
+    /// A message larger than the whole budget is still queued, alone: it
+    /// arrived inside `max_message_bytes`, so refusing it here would drop a
+    /// message the configuration accepted, and it cannot be split — a ZMTP
+    /// message is delivered atomically or not at all [zeromq §1].
     pub(crate) fn push(&mut self, message: Vec<u8>) -> bool {
-        let dropped = self.queue.len() >= self.max_messages;
-        if dropped {
-            self.queue.pop_front();
-            self.dropped += 1;
+        let mut dropped_any = false;
+        while !self.queue.is_empty() && self.queued_bytes + message.len() > self.max_bytes {
+            if let Some(evicted) = self.queue.pop_front() {
+                self.queued_bytes -= evicted.len();
+                self.dropped += 1;
+                dropped_any = true;
+            }
         }
+        self.queued_bytes += message.len();
         self.queue.push_back(message);
-        dropped
+        dropped_any
     }
 
     pub(crate) fn pop(&mut self) -> Option<Vec<u8>> {
-        self.queue.pop_front()
+        let message = self.queue.pop_front()?;
+        self.queued_bytes -= message.len();
+        Some(message)
     }
 
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The queue never holds more than its byte budget, and what it evicts to
+    /// stay there is counted. A message count could not express this: three
+    /// 400-byte messages fit a 1 KiB budget, a fourth does not, and the
+    /// oldest leaves.
+    #[test]
+    fn the_queue_holds_a_byte_budget_and_counts_what_it_evicts() {
+        let mut queue = DropQueue::new(1024);
+        assert!(!queue.push(vec![b'a'; 400]));
+        assert!(!queue.push(vec![b'b'; 400]));
+        assert!(queue.push(vec![b'c'; 400]), "the third does not fit");
+        assert_eq!(queue.dropped(), 1);
+
+        // What is left is the freshest data, in order.
+        assert_eq!(queue.pop(), Some(vec![b'b'; 400]));
+        assert_eq!(queue.pop(), Some(vec![b'c'; 400]));
+        assert_eq!(queue.pop(), None);
+
+        // Draining returned the budget rather than leaking it: the same three
+        // pushes behave identically the second time.
+        assert!(!queue.push(vec![b'd'; 400]));
+        assert!(!queue.push(vec![b'e'; 400]));
+        assert!(queue.push(vec![b'f'; 400]));
+        assert_eq!(queue.dropped(), 2);
+    }
+
+    /// A message bigger than the whole budget is queued alone rather than
+    /// dropped: it already passed `max_message_bytes`, and a ZMTP message
+    /// cannot be split.
+    #[test]
+    fn a_message_larger_than_the_budget_is_still_delivered() {
+        let mut queue = DropQueue::new(1024);
+        queue.push(vec![b'a'; 10]);
+        assert!(queue.push(vec![b'b'; 4096]), "the small one made way");
+        assert_eq!(queue.pop(), Some(vec![b'b'; 4096]));
+        assert_eq!(queue.pop(), None);
     }
 }
