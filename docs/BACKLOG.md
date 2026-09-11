@@ -146,7 +146,7 @@ kind: adapter | size: 90 | status: ready | needs: [B-018]
 acceptance: `crates/adapters/weida-zmtp`, no I/O and no weida dependency in the codec itself: the 64-octet greeting, version negotiation, the NULL handshake with `READY` metadata, short and long frames with the MORE and COMMAND flags, `SUBSCRIBE`/`CANCEL`, `PING`/`PONG`; the golden vectors of `docs/adapters/zmtp.md` §10 byte-exact in both directions, including the 255/256-octet frame boundary; a fuzz target over the decoder that caps before allocating, since a ZMTP frame may declare up to 2^63-1 octets and `ZMQ_MAXMSGSIZE` is the only defence; no bridge, no sockets, no interop bench yet — those are slices 3 to 5.
 
 ### B-031 — Bound every wait in shutdown
-kind: code | size: 30 | status: ready | needs: []
+kind: code | size: 30 | status: in_progress 2026-09-11T07:48Z | needs: []
 acceptance: `Runtime::shutdown` stops awaiting `wait_idle()` without a bound — today it can hang on a peer's behaviour, which is the one failure mode the whole catalogue warns about ([0009](decisions/0009-drain.md) §4.4, [zeromq §12/P17]); the wait is capped (QUIC's own closing and draining periods are "at least three times the current PTO interval", so a cap in the hundreds of milliseconds is generous), the cap is a `RuntimeConfig` field with a stated default, and a test proves that shutdown returns even when the peer never acknowledges — a server whose process is suspended or a connection to a black hole. This is a defect in shipped code and does not wait for B-032.
 
 ### B-032 — `Runtime::drain(Duration)`
