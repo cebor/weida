@@ -25,6 +25,7 @@ all six slices each, both interoperating with the real upstream (`zeromq`, and t
 library), and the sixth slice is one test crate they share. MQTT is next and starts with a
 document, because it is the first protocol with a session and weida deliberately has none.
 Phase C's prerequisite (`Runtime::owned`) exists; its first slice is parked until MQTT.
+AMQP 0-9-1 (RabbitMQ) is deliberately not a Phase B adapter: its clients come with the broker (D2), and B4's AMQP 1.0 client already reaches RabbitMQ 4.x.
 
 ## 2. What exists, layer by layer
 

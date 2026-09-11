@@ -64,7 +64,7 @@
   <g transform="translate(20,370)">
     <rect x="0" y="0" width="676" height="46" rx="4" class="todo"/>
     <text x="8" y="18" class="lbl">Broker, durable ACK vocabulary (Accepted / Stored / Replicated / Processed), L2 credit</text>
-    <text x="8" y="34" class="sub">gated on B1–B3 cross-adapter tests and a consumer for the 0003 credit on both ends</text>
+    <text x="8" y="34" class="sub">gated on B1-B3 cross-adapter tests; AMQP 0-9-1 clients for RabbitMQ come with it (D2)</text>
   </g>
 
   <text x="20" y="450" class="sub">Boxes follow the roadmap lines A1–A9, B1–B4, C, D of docs/LOOP.md §9. Item ids refer to docs/BACKLOG.md.</text>

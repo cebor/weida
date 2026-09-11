@@ -200,3 +200,8 @@ foreign adapter, and later binding against binding.
 
 **Phase D — the L2 broker** (master plan Phase 6), only once B1-B3 have green cross-adapter
 tests and the credit of 0003 has a consumer on both ends.
+D2 AMQP 0-9-1 against RabbitMQ, with or directly after the broker: producer and consumer
+clients (publisher confirms onto `Accepted`/`Stored` per 0004, `basic.qos` prefetch onto the
+L2 credit of 0003, topic-exchange bindings per 0007 §5), then weida as a broker for 0-9-1
+clients. Not a Phase B adapter: every 0-9-1 concept presupposes a broker, and the AMQP 1.0
+client of B4 already reaches RabbitMQ 4.x, which speaks 1.0 natively.
