@@ -74,10 +74,32 @@
 //!   exchange.** There is nothing to answer with; a REQ peer's own resend
 //!   timer is its recovery (§8 L3, L10).
 //!
+//! # The other direction
+//!
+//! [`Outbound`] is the mirror: it **binds** on the weida side - Rep, Pull and
+//! Pub bind (`docs/ARCHITECTURE.md` §6c.4) - and dials one foreign SP peer,
+//! presenting `REQ` toward a `REP`, `PUSH` toward a `PULL`, or `SUB` toward a
+//! `PUB`. Three things exist only there:
+//!
+//! * **A request tag this side allocates, and no resend timer.** A cooked REQ
+//!   retransmits by itself (`docs/research/nanomsg-nng.md` §4); a bridge that
+//!   did would be inventing at-least-once for a weida requester that asked
+//!   for one attempt, so the outbound bridge speaks the **raw** REQ header
+//!   shape - one 31-bit id per exchange with the terminal bit
+//!   [rfc-reqrep §5] - and writes each request exactly once.
+//! * **A deadline, because silence is all a peer can say.** SP has no way to
+//!   decline and no error frame (L10), so an unanswered exchange is refused
+//!   with `ERROR{NO_REPLY}` at [`OutboundConfig::reply_deadline`] - and
+//!   immediately, without waiting it out, when the connection closes first.
+//! * **A topic split, because SP has none.** A published body carries its
+//!   topic in its leading bytes and nothing says where they end, so
+//!   [`TopicSplit`] says: a delimiter, a fixed width, or a constant topic.
+//!   The inbound direction writes the same delimiter through
+//!   [`InboundConfig::topic_delimiter`], which is what lets the two be paired.
+//!
 //! # What is not here
 //!
-//! The outbound direction (weida endpoints reaching a foreign SP peer) is
-//! slice 3, and the interop bench against a real NNG peer is slice 5
+//! The interop bench against a real NNG peer is slice 5
 //! (`docs/adapters/nng.md` §10). Everything in this crate is tested against
 //! an SP peer built on [`weida_sp`] itself: byte-exact against the golden
 //! vectors of §10.1, and therefore faithful on the wire - and not an
@@ -88,7 +110,9 @@
 
 mod error;
 mod inbound;
+mod outbound;
 mod wire;
 
 pub use error::BridgeError;
 pub use inbound::{Inbound, InboundConfig, Presenting};
+pub use outbound::{Dialling, Outbound, OutboundConfig, TopicSplit};

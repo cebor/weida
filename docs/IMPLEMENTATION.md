@@ -744,6 +744,64 @@ where a refusal carries a printable reason, is the sharpest thing this slice lea
 `nng` peer (slice 5), which is what would settle §11's PAIR v1 hop-count disagreement and
 L10's "is a close really all a peer learns".
 
+**Delivered in the fifteenth increment — the SP outbound bridge (B-063):**
+
+The other direction of the same crate: `Outbound` binds the weida side and dials one
+foreign SP peer — `REQ` toward a `REP`, `PUSH` toward a `PULL`, `SUB` toward a `PUB`. Nine
+integration tests against a peer built on `weida-sp` over a plain TCP listener, plus five
+unit tests for the topic split and the request-id sequence.
+
+**The decision this slice existed to make: the bridge does not retransmit.** A cooked REQ
+socket resends on its timer, on disconnect, or when a peer becomes available
+([research/nanomsg-nng.md](research/nanomsg-nng.md) §4). Doing that here would manufacture
+at-least-once for a weida requester that asked for one attempt, which is the adapter
+inventing a guarantee its source protocol does not give *in the direction nobody asked for*
+— L3 and L4 of [adapters/nng.md](adapters/nng.md) §8 arriving from the wrong side. So the
+bridge speaks the **raw** REQ header shape: a 31-bit id per exchange, written once with the
+terminal bit [rfc-reqrep §5], matched on the way back. The test asserts the absence —
+exactly one request on the wire and nothing after it — which is the only way an
+un-retransmission can be observed.
+
+**How a weida requester learns that an SP peer will not answer**, the question the loop
+asked for judgement on. SP has no error frame and no way to decline, so silence is the
+whole vocabulary (§4, §6, [rfc-tcp §2]). Two answers rather than one:
+
+1. **A per-exchange deadline**, B-042's answer for ZMTP, reused because the shape is the
+   same even though the cause is not: there a ROUTER *dropped* an unroutable request, here
+   the peer may be deliberately silent. On expiry the requester gets `ERROR{NO_REPLY}`.
+2. **A close ends every pending exchange at once**, which B-042 did not have. A closed
+   connection is the only statement SP can make, so waiting out the deadline after it would
+   be inventing patience: the test parks an exchange behind a 600-second deadline, drops the
+   peer, and expects `Error::NoReply` immediately. This is the slice's one deviation from
+   the ZMTP answer, recorded here because it is a deviation.
+
+**A wrong peer type is told to nobody and reported to everybody.** The dialled peer gets a
+close — L10 again — but the weida side is already bound, so for `refusal_grace` the bridge
+answers every exchange with `ERROR{UNSUPPORTED}`, which reaches a requester as
+`Error::Unsupported` rather than as an endpoint that never existed. A `Puller` has no coded
+refusal, so an arriving transfer is dropped, which resets its stream: weida's own
+per-stream refusal.
+
+**Bounds, again stated as a product.** `max_pending_exchanges × max_message_bytes` =
+64 × 1 MiB = **64 MiB**, and each waiting exchange holds a weida request *and* its body,
+which is why the ceiling is checked **before** the body is read — the cheaper refusal, and
+the shape B-053 had to add to the ZMTP bridge after the fact.
+
+**The topic split became configuration in both directions.** SP has no topic field, so
+`TopicSplit` says what the leading bytes mean — a delimiter, a fixed width, or a constant —
+and the inbound direction gained a matching `topic_delimiter`, so a pair of these bridges
+can round-trip a topic. The default delimiter is `0x00`, the one octet a weida topic cannot
+contain. The `SUB` role's prefixes are applied locally, because SP subscriptions never
+reach the wire, and they are **not** derived from weida filters: that is new loss L11 in
+the mapping document, with the boundary rule of
+[decisions/0007](decisions/0007-topic-namespace.md) §4.5 as the reason only one shape could
+ever translate.
+
+**What is not here:** the interop bench against a real `nng` peer (slice 5), which is what
+would settle §11's PAIR v1 hop-count disagreement, L10's "is a close really all a peer
+learns", and this slice's own new question — whether an NNG `REP` minds a requester that
+never retransmits.
+
 ---
 
 ## 2. Mandatory development loop per phase
