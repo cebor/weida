@@ -174,6 +174,7 @@ impl SubRegistry {
 
         let (tx, rx) = mpsc::channel(WRITER_QUEUE);
         let budget = Arc::new(Semaphore::new(self.limits.subscriber_buffer_bytes));
+        let dropped = Arc::clone(&state.dropped);
         state.subs.push(SubEntry {
             conn_id,
             filters: HashSet::from([filter]),
@@ -183,8 +184,13 @@ impl SubRegistry {
         // One writer task per (connection, path): it serializes this
         // subscriber's messages, which is what makes delivery FIFO per
         // subscriber even though each message rides its own QUIC stream.
-        ctx.exec
-            .spawn(writer(Arc::clone(ctx), Arc::from(path), rx, budget));
+        ctx.exec.spawn(writer(
+            Arc::clone(ctx),
+            Arc::from(path),
+            rx,
+            budget,
+            dropped,
+        ));
         Ok(())
     }
 
@@ -323,6 +329,7 @@ async fn writer(
     path: Arc<str>,
     mut rx: mpsc::Receiver<PubMsg>,
     budget: Arc<Semaphore>,
+    dropped: Arc<AtomicU64>,
 ) {
     loop {
         let msg = tokio::select! {
@@ -335,12 +342,24 @@ async fn writer(
             _ = ctx.conn.closed() => break,
         };
         let len = msg.payload.len();
-        if let Err(e) = write_one(&ctx, &path, &msg).await {
-            tracing::debug!(path = %path, error = %e, "fan-out write failed; subscriber writer ending");
-            budget.add_permits(len);
-            break;
-        }
+        let outcome = write_one(&ctx, &path, &msg).await;
         budget.add_permits(len);
+        match outcome {
+            Ok(()) => {}
+            // The subscriber parked no connection for this copy. That is a
+            // drop of the copy, not a failure of the subscription: the pool
+            // refills and the next message may well go out
+            // ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
+            // §4.4). Counted exactly like an exhausted byte budget.
+            Err(Error::NoParkedConnection) => {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(path = %path, "no parked connection; copy dropped");
+            }
+            Err(e) => {
+                tracing::debug!(path = %path, error = %e, "fan-out write failed; subscriber writer ending");
+                break;
+            }
+        }
     }
     tracing::debug!(path = %path, "subscriber writer ended");
 }

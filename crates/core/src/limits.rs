@@ -69,6 +69,18 @@ pub struct Limits {
     /// tightest platform limit and therefore the one the default respects;
     /// opening past the cap fails with `LimitExceeded` rather than queueing.
     pub max_local_streams: usize,
+    /// Connections a subscriber parks toward a peer it dialled, so that peer
+    /// can open a stream back
+    /// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
+    /// §4.4). An accepted socket cannot be dialled, so fan-out over a local
+    /// socket transport rides connections the subscriber opened and left
+    /// waiting; each is a file descriptor held for a copy that may never
+    /// come, and each counts against `max_local_streams` on both sides. A
+    /// publisher that finds none parked drops that copy and counts it, the
+    /// same answer fan-out already gives an exhausted subscriber budget. Zero
+    /// disables the pool, which makes a subscription over such a transport an
+    /// error at subscribe time rather than a silence.
+    pub max_parked_reverse: usize,
 
     /// Identities a receiver remembers per connection for `Bounded`
     /// deduplication. The window bounds how long an identity is kept, not
@@ -105,6 +117,7 @@ impl Default for Limits {
             max_sequence_scopes: 1024,
             max_reorder_hold: 256,
             max_local_streams: 255,
+            max_parked_reverse: 8,
 
             max_dedup_entries: 4096,
         }
@@ -131,7 +144,7 @@ mod tests {
         assert_eq!(l.max_sequence_scopes, 1024);
         assert_eq!(l.max_reorder_hold, 256);
         assert_eq!(l.max_local_streams, 255);
-
+        assert_eq!(l.max_parked_reverse, 8);
         assert_eq!(l.max_dedup_entries, 4096);
     }
 

@@ -308,25 +308,92 @@ async fn a_transfer_connection_with_an_unknown_token_is_refused() {
     h.shutdown().await;
 }
 
-/// Claim: a subscription a socket transport could never deliver is refused
-/// at `connect`, not accepted and then starved.
+/// Claim: a subscriber that parks nothing learns so at subscribe time.
 ///
-/// Fan-out needs a stream from the accepting side toward the peer, which an
-/// accepted socket does not have; the reverse connections that would carry
-/// it are [0012 §4.4] and are not built. `Unsupported` at the API is the
-/// honest answer, and it is why the Pub/Sub body above runs over QUIC and
-/// inproc only.
+/// The reverse pool is what makes fan-out possible over a socket transport
+/// [0012 §4.4]; a runtime configured with none of it cannot receive a
+/// published copy, and saying so at `connect` is the difference between a
+/// refusal and a silence.
 #[cfg(unix)]
 #[tokio::test]
-async fn pub_sub_over_unix_is_refused_rather_than_starved() {
+async fn a_subscriber_that_parks_nothing_is_refused_at_connect() {
     let h = Harness::start(Transport::Unix).await;
     let _publisher = h.listener.publisher("/md").expect("publisher");
-    let client = h.client();
+    let mut config = weida::RuntimeConfig::default();
+    config.limits.max_parked_reverse = 0;
+    let client = h.client_with(config);
     let subscriber = client.subscriber(h.trust());
+
     let err = within(subscriber.connect(&h.url("/md")))
         .await
-        .expect_err("a socket transport cannot fan out");
+        .expect_err("no pool, no fan-out");
     assert!(matches!(err, weida::Error::Unsupported), "{err:?}");
+
+    client.shutdown().await;
+    h.shutdown().await;
+}
+
+/// Claim: when the pool runs out, the copy is dropped and counted — the
+/// publisher is not stalled and the subscription is not torn down.
+///
+/// A pool of one, and a subscriber that never reads: the first copy takes
+/// the parked connection and sits there unread, so the replacement the
+/// subscriber parks is the only one available for the next copy. Publishing
+/// faster than the pool can refill is exactly the overload [0012 §4.4]
+/// answers with a drop, the same answer an exhausted subscriber budget
+/// already gets.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_exhausted_reverse_pool_drops_the_copy_and_counts_it() {
+    let h = Harness::start(Transport::Unix).await;
+    let publisher = h.listener.publisher("/md").expect("publisher");
+    let mut config = weida::RuntimeConfig::default();
+    config.limits.max_parked_reverse = 1;
+    let client = h.client_with(config);
+    let subscriber = client.subscriber(h.trust());
+    within(subscriber.connect(&h.url("/md")))
+        .await
+        .expect("connect");
+    within(subscriber.subscribe("px.#"))
+        .await
+        .expect("subscribe");
+    within(async {
+        while publisher.filter_count() < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    // Publish without ever reading, and count the attempts: the other two
+    // ways `dropped` can rise need 1024 queued copies (the writer queue) or
+    // 8 MiB of them (the subscriber budget), so a drop within a handful of
+    // five-byte publishes can only be the empty pool.
+    let mut published = 0usize;
+    within(async {
+        while publisher.dropped() == 0 && published < 64 {
+            publisher.publish("px.eur", &b"price"[..]).expect("publish");
+            published += 1;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    assert!(
+        publisher.dropped() >= 1,
+        "a pool of one, outrun by {published} publishes, must have dropped a copy"
+    );
+    // The subscription survives its drops: a copy published after the pool
+    // has recovered still arrives.
+    let arrived = within(async {
+        loop {
+            publisher.publish("px.eur", &b"later"[..]).expect("publish");
+            if let Ok(copy) = subscriber.recv().await {
+                break copy;
+            }
+        }
+    })
+    .await;
+    assert_eq!(arrived.meta().topic.as_deref(), Some("px.eur"));
 
     client.shutdown().await;
     h.shutdown().await;
@@ -345,6 +412,12 @@ async fn push_pull_over_inproc() {
 #[tokio::test]
 async fn pub_sub_over_quic() {
     pub_sub_fan_out(&Harness::start(Transport::Quic).await).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pub_sub_over_unix() {
+    pub_sub_fan_out(&Harness::start(Transport::Unix).await).await;
 }
 
 #[tokio::test]

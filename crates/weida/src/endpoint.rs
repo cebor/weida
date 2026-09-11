@@ -404,19 +404,26 @@ impl Subscriber {
     /// [`Error::AlreadyRegistered`]; fanning one subscription out to several
     /// in-process consumers is the application's business, not the transport's.
     ///
-    /// A transport that gives the accepting side no way to open a stream back
-    /// refuses here with [`Error::Unsupported`], rather than accepting a
-    /// subscription that could never deliver: on `AF_UNIX` the reverse
-    /// connections that would carry fan-out are
-    /// [0012](../../../docs/decisions/0012-local-connection-grouping.md) §4.4
-    /// and do not exist yet.
+    /// On a transport where the accepting side cannot open a stream back,
+    /// this is also where the reverse pool is filled: the subscriber parks
+    /// `Limits::max_parked_reverse` connections and keeps replacing them as
+    /// the publisher spends them
+    /// ([0012](../../../docs/decisions/0012-local-connection-grouping.md)
+    /// §4.4). A subscriber that parks nothing - because the limit is zero,
+    /// or because the peer refused every attempt - cannot receive fan-out at
+    /// all, and learns that here rather than by waiting forever.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
         let (conn, path) = self.state.peer.dial(url).await?;
-        if !conn.conn.carries_reverse_streams() {
+        if conn.conn.needs_reverse_pool() && conn.conn.park_reverse().await? == 0 {
             return Err(Error::Unsupported);
         }
         conn.namespace
             .register(&path, Route::Transfer(self.state.queue_tx.clone()))?;
+        if conn.conn.needs_reverse_pool() {
+            let maintaining = Arc::clone(&conn);
+            conn.exec
+                .spawn(async move { maintaining.conn.maintain_reverse().await });
+        }
 
         let filters: Vec<String> = self
             .state
