@@ -187,28 +187,44 @@ per the connection-loss rules in [FAILURE_MODEL.md](FAILURE_MODEL.md).
 | Idle timeout | 30 s | both sides |
 | `hello_timeout` | 10 s | both sides, until peer HELLO is processed |
 
-### 2.5 Connections per peer (spec ahead of code)
+### 2.5 Connections per peer
 
-A peer pair holds more than one QUIC connection, in two tiers
+A peer pair holds more than one QUIC connection
 ([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.2-§6.3):
 
-- one **control** connection per peer, carrying HELLO, SUBSCRIBE, UNSUBSCRIBE and the
-  reserved credit frame of §11 — everything small and latency-sensitive;
 - one **bulk** connection per dialled endpoint path, carrying that path's transfers.
+  **Implemented**;
+- one **control** connection per peer, carrying HELLO, SUBSCRIBE, UNSUBSCRIBE and the
+  reserved credit frame of §11 — everything small and latency-sensitive. **Not implemented,
+  and deliberately not**: see the paragraph below.
 
 The point is head-of-line coupling: a QUIC connection's receive window is shared, so one slow
-reader can stall every writer on that connection ([PATTERNS.md](PATTERNS.md) §1.3). Separating
-the tiers means no amount of stalled payload can withhold a control frame. Each connection is
-an ordinary weida connection: it performs its own HELLO (§2.2) and its own negotiation (§2.3),
-and nothing on the wire distinguishes the tiers.
+reader can stall every writer on that connection ([PATTERNS.md](PATTERNS.md) §1.3). One
+connection per path means two paths share no window and therefore cannot stall each other,
+which is asserted end to end by `a_stalled_path_does_not_stall_another_path` in
+`crates/weida/tests/streams.rs`. Each connection is an ordinary weida connection: it performs
+its own HELLO (§2.2) and its own negotiation (§2.3), and nothing on the wire distinguishes one
+from another.
 
-**What binds them is the proved fingerprint, and nothing else**
-([decisions/0008](decisions/0008-session-identity.md) §4.2). No HELLO field names a control
-connection. A bulk connection belongs to the control connection that proved the same peer
-fingerprint under the same authority and terms; a connection whose fingerprint differs is a
-different peer and MUST NOT be bound to it. Two connections that proved no fingerprint at all
-— an anonymous client — MUST NOT be treated as one peer, so a binding that accepts anonymous
-clients cannot offer this isolation and a deployment that wants it requires a client identity.
+**Why the control tier is not built yet.** Every connection already does its own HELLO, so a
+control connection would carry no HELLO that protects anything; the credit frame of §11 does
+not exist at wire version 0; and SUBSCRIBE/UNSUBSCRIBE cannot move there until the wire says
+how a server addresses a subscriber's *bulk* connection. A publisher writes fan-out on the
+connection the SUBSCRIBE arrived on, and no field tells it which of a peer's per-path
+connections to use instead — the question 0002 §7 left open as "a HELLO field, or the
+fingerprint alone". A control connection in v0 would therefore cost one handshake per peer
+and carry nothing. Until that is decided, SUBSCRIBE and UNSUBSCRIBE ride the bulk connection
+of the path they name, and the residual coupling is named rather than hidden: an endpoint that
+publishes *and* subscribes on one path can queue its own SUBSCRIBE behind its own payload.
+
+**What binds a peer's connections is the proved fingerprint, and nothing else**
+([decisions/0008](decisions/0008-session-identity.md) §4.2). No HELLO field names a peer's
+other connections. A connection belongs to the peer that proved the same fingerprint under the
+same authority and terms; a connection whose fingerprint differs is a different peer and MUST
+NOT be bound to it — a dialling side MUST refuse it rather than serve a transfer on it. Two
+connections that proved no fingerprint at all — an anonymous client — MUST NOT be treated as
+one peer, which is why `max_connections_per_peer` (§10) counts only connections that proved an
+identity and a deployment that wants that bound requires a client identity.
 
 Nothing is retained between connections: there is no session, no subscription resumption and
 no sequence resumption at wire version 0 (§11). A peer that reconnects is the same *peer* and
@@ -881,8 +897,14 @@ Ordering between exchanges is likewise `None`, for the same reason.
 
 ## 10. Resource limits
 
-All limits live in `weida-core::Limits`. Every limit exists to bound memory or state that a
-remote peer can cause to be allocated (master doc §50, §81 rule 17).
+Limits live in two places, split by what they bound. `weida-core::Limits` is a
+**per-connection** profile: every field applies to one connection, which is what lets a
+runtime hold one profile per connection tier when the control tier of §2.5 arrives. Numbers
+that belong to a runtime rather than to a connection live on `RuntimeConfig`. Every limit
+exists to bound memory or state that a remote peer can cause to be allocated (master doc §50,
+§81 rule 17).
+
+Per connection (`Limits`):
 
 | Field | Default | Bound enforced |
 | --- | --- | --- |
@@ -891,17 +913,25 @@ remote peer can cause to be allocated (master doc §50, §81 rule 17).
 | `max_concurrent_bidi_streams` | `1024` | QUIC `TransportConfig::max_concurrent_bidi_streams`; bounds live exchanges per connection |
 | `stream_receive_window` | 1 MiB | per-stream QUIC flow-control window; bounds unread payload buffered per stream |
 | `connection_receive_window` | 16 MiB | per-connection QUIC flow-control window; bounds unread payload buffered per connection |
-| `max_connections` | `1024` | connections accepted per server binding; excess connections are closed immediately with `LIMIT_EXCEEDED` |
-| `endpoint_queue` | `256` | depth of the accept channel per registered endpoint |
-| `hello_timeout` | 10 s | time a connection may exist without a processed peer HELLO |
+| `keep_alive` | 10 s | QUIC keep-alive interval; sent by the dialling side only, so a binding's value is not read (§2.4) |
+| `idle_timeout` | 30 s | QUIC idle timeout, applied in both directions (§2.4) |
+| `hello_timeout_ms` | 10 s | time a connection may exist without a processed peer HELLO |
 | `max_subscriptions` | `256` | subscription filters one peer connection may hold, summed over paths; exceeding it closes the connection with `LIMIT_EXCEEDED` (§6.4) |
 | `subscriber_buffer_bytes` | 8 MiB | payload bytes a publisher will hold queued for one subscriber; a message that does not fit is dropped for that subscriber (§9.5) |
 | `max_sequence_scopes` | `1024` | producer scopes — paths and topics — a receiver tracks per connection for gap detection or reassembly under `PerProducer` ordering; the peer names the scopes, so at the cap a new one is simply not tracked |
 | `max_reorder_hold` | `256` | transfers a receiver holds back at once, over all scopes, under `PerProducer(reassemble)`; at the cap the oldest held transfer is released out of order with its gap reported (§6.5, [GUARANTEES.md](GUARANTEES.md) §3). A held transfer is an unread stream, so the bytes it pins are bounded again by `stream_receive_window` and `connection_receive_window` |
 | `max_dedup_entries` | `4096` | identities a receiver remembers per connection under `Bounded` deduplication; the negotiated window bounds how long an identity is kept and this bounds how many, evicting the oldest at the cap (§6.5) |
+
+Per runtime (`RuntimeConfig`):
+
+| Field | Default | Bound enforced |
+| --- | --- | --- |
+| `max_connections` | `1024` | connections accepted per server binding; excess connections are closed immediately with `LIMIT_EXCEEDED` |
+| `max_connections_per_peer` | `64` | connections one **peer** may hold on one binding, counted by the fingerprint it proved; the excess connection is closed with `LIMIT_EXCEEDED`. It exists because one connection per dialled path (§2.5) lets the dialling side choose the count, and 64 connections to one peer measured about 50 MiB of transport state on the pair ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-011). Connections that proved no identity are each their own peer and are bounded only by `max_connections` (§2.5) |
+| `endpoint_queue` | `256` | depth of the accept channel per registered endpoint |
 | `max_resolved_addresses` | `8` | addresses a dialling endpoint will try for one hostname, in the resolver's order; a resolver answer is remote input, so its length needs a ceiling |
 | `connect_attempt_timeout` | 250 ms | how long a dial waits on one resolved address before trying the next. Every address but the last is bounded by it; an IP literal and a single-address name keep the full handshake budget. The value is RFC 8305's Connection Attempt Delay, and it exists because an address that answers nothing gives QUIC no refusal to observe |
-| `max_connections_per_peer` | *spec ahead of code* | connections one peer may hold across both tiers of §10.1; exceeding it closes the excess connection with `LIMIT_EXCEEDED` |
+| `shutdown_timeout` | 1 s | how long `Runtime::shutdown` waits for closed sockets to go idle before returning anyway ([decisions/0009](decisions/0009-drain.md) §4.4) |
 
 Worst-case hostile per-connection header memory is bounded by
 
@@ -933,23 +963,26 @@ on its slowest subscriber would let one consumer degrade every other (master doc
 
 ### 10.1 Control and bulk profiles
 
-*Spec ahead of code.* [decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.2-§6.3
-gives a peer pair one **control** connection and one **bulk** connection per dialled path
-(§2.5), and the two carry different traffic: control frames are small, latency-sensitive and
-few; bulk streams are large, many and throughput-sensitive. One set of limits cannot size both,
-so `Limits` becomes two profiles, applied per connection tier rather than per runtime:
+*Spec ahead of code, for the control half only.*
+[decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.2-§6.3 gives a peer pair one
+**control** connection and one **bulk** connection per dialled path (§2.5). The bulk half is
+implemented; the control half is not, and §2.5 says why. The two carry different traffic —
+control frames are small, latency-sensitive and few; bulk streams are large, many and
+throughput-sensitive — so one set of numbers cannot size both, and `Limits` is already a
+per-connection profile so that a second one can be added without moving anything:
 
-| Profile | Sized for | Fields that differ from the table above |
+| Profile | Sized for | Fields that would differ from the table above |
 | --- | --- | --- |
 | `control` | a handful of short frames at a time, never a payload | small `stream_receive_window` and `connection_receive_window`; a `max_concurrent_uni_streams` budget that only has to cover HELLO, SUBSCRIBE, UNSUBSCRIBE and the reserved credit frame of §11; `max_concurrent_bidi_streams` may be `0` |
 | `bulk` | payload transfers on one path | the windows and stream budgets of the table above, which are also the byte and message credit a consumer grants ([decisions/0003](decisions/0003-credit-unit.md) §4.1) |
 
-The numbers are not chosen here. They are chosen with the implementation from the measured cost
-of a connection — a cold handshake of ~1.1 ms and 750-850 KiB of resident state per live
-connection counting both ends ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-011) — and from the
-per-path fan measurement that follows it. What is normative now is the split, the fact that
-`max_connections_per_peer` bounds the pair, and that a peer MUST NOT be charged twice for the
-same limit: the two profiles are separate budgets, not one budget shared.
+The control numbers are not chosen here, and deliberately not in the code either: a profile
+nothing reads would be a number nobody has to justify. They are chosen with the tier, from the
+measured cost of a connection — a cold handshake of ~1.1 ms and 750-850 KiB of resident state
+per live connection counting both ends ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-011) — and
+from the per-path fan measurement that follows it. What is normative now is that a peer MUST
+NOT be charged twice for the same limit: profiles are separate budgets, not one budget shared,
+and `max_connections_per_peer` bounds the connections of a peer whatever tier they belong to.
 
 Both profiles are advertised the same way: `max_header_bytes` in HELLO applies to the
 connection the HELLO arrived on (§2.3), so a control connection may advertise a smaller header

@@ -884,6 +884,18 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 
 ---
 
+### Connection-tier decisions (B-017)
+
+| Decision | Value | Rationale |
+| --- | --- | --- |
+| Pool granularity | one connection per `(authority, terms, expected fingerprint, **path**)` | A QUIC connection's receive window is shared, so the only way two flows cannot stall each other is for them not to share a connection ([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.2). Measured as behaviour, not asserted: `a_stalled_path_does_not_stall_another_path` fills one path's window until a write parks and then sends on another path. Reverting the key to one connection per peer makes that test time out, which is the coupling the decision set out to remove. |
+| The control tier | **not built**, and the reason is recorded rather than the code | In v0 a control connection would carry nothing: every connection performs its own HELLO (§2.2 of [PROTOCOL.md](PROTOCOL.md)), the credit frame of §11 does not exist, and SUBSCRIBE cannot move there because a publisher writes fan-out on the connection the SUBSCRIBE arrived on and no field tells it which per-path connection to use instead — the question 0002 §7 left open. One handshake per peer for nothing is worse than the named residual coupling (a SUBSCRIBE behind payload on the *same* path). Filed as B-044 (the addressing decision) and B-045 (the tier). |
+| `Limits` scope | a **per-connection** profile; runtime-level numbers moved to `RuntimeConfig` | 0002 §6.4 wants one profile per tier. Two profiles are only honest if every field means something in both, so `max_connections`, `endpoint_queue` and `max_resolved_addresses` — per binding, per endpoint, per dial — left `Limits`, and `keep_alive`/`idle_timeout` joined it, because those *are* per connection. The second profile itself waits for the tier: a `Limits::CONTROL` nothing reads would be five numbers nobody has to justify. |
+| Peer binding | compare against the peer's **live** connections, refuse a mismatch with `Error::Untrusted(fp)` | The fingerprint is the only thing that binds a peer's connections ([decisions/0008](decisions/0008-session-identity.md) §4.2), and dialling a second path is dialling the same peer. Live connections rather than a remembered value, because a peer is this peer only while a connection to it lives: once the last one is gone, a replacement server with a new key is a new peer and nothing should still be objecting to it. Proved by swapping a raw server's identity between two handshakes on one socket — the load-balancer case, which two `quinn` endpoints cannot reproduce because they cannot share a port. |
+| `max_connections_per_peer` | 64, counted per proved fingerprint, released on close | One connection per path lets the dialling side choose the count, so `max_connections` alone would let one peer fill a binding. 64 is the number B-011 measured (~50 MiB of transport state across both ends for 64 connections to one peer) and a sixteenth of the default `max_connections`. Anonymous connections are not counted together: two of them cannot be shown to be one peer, so counting them as one would refuse strangers for each other's traffic. |
+
+---
+
 ## 6. Known debt and deferred work
 
 Recorded deliberately, not discovered later.
