@@ -113,11 +113,17 @@ impl Server {
 
     /// Starts a server with explicit limits.
     pub async fn start_with(limits: Limits) -> Server {
-        let certs = Certs::generate();
-        let config = RuntimeConfig {
+        Server::start_with_config(RuntimeConfig {
             limits,
             ..RuntimeConfig::default()
-        };
+        })
+        .await
+    }
+
+    /// Starts a server with a whole runtime configuration, for the tests that
+    /// need more than limits — a guarantee set, for instance.
+    pub async fn start_with_config(config: RuntimeConfig) -> Server {
+        let certs = Certs::generate();
         let runtime = Runtime::new(config).expect("runtime");
         let listener = runtime.listener();
         let binding = listener
@@ -159,11 +165,15 @@ impl Server {
 
     /// A client runtime with explicit limits.
     pub fn client_runtime_with(&self, limits: Limits) -> Runtime {
-        Runtime::new(RuntimeConfig {
+        self.client_runtime_with_config(RuntimeConfig {
             limits,
             ..RuntimeConfig::default()
         })
-        .expect("client runtime")
+    }
+
+    /// A client runtime with a whole configuration.
+    pub fn client_runtime_with_config(&self, config: RuntimeConfig) -> Runtime {
+        Runtime::new(config).expect("client runtime")
     }
 
     /// Trust anchors for this server, to hand to a dialling endpoint.

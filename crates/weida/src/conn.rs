@@ -15,12 +15,14 @@ use std::time::Duration;
 use quinn::VarInt;
 use tokio::sync::{mpsc, watch};
 use weida_core::{Error, ErrorCode, Fingerprint, Limits};
+use weida_protocol::header::GuaranteeSet;
 use weida_protocol::{
     Agreed, DataHeader, ErrorHeader, FrameKind, Hello, MAX_PREAMBLE_LEN, Preamble, PreambleError,
     SubscriptionHeader, codes, encode_frame, negotiate, parse_preamble,
 };
 
 use crate::listener::{Namespace, Route};
+use crate::ordering::{GapDetector, Sequencer};
 use crate::pubsub::SubRegistry;
 use crate::runtime::Exec;
 use crate::stream::Incoming;
@@ -61,6 +63,13 @@ pub(crate) struct ConnCtx {
     pub peer: Option<Fingerprint>,
     /// The runtime this connection's tasks and timers run on.
     pub exec: Exec,
+    /// The guarantee set this side offers and requires. Negotiation refuses a
+    /// peer that cannot match it, so it is also the effective set.
+    pub guarantees: GuaranteeSet,
+    /// Numbers outgoing transfers per scope; inert unless ordering is on.
+    pub sequencer: Sequencer,
+    /// Reports gaps in inbound sequences; inert unless ordering is on.
+    pub gaps: GapDetector,
     agreed: watch::Receiver<Option<Agreed>>,
 }
 
@@ -74,6 +83,7 @@ impl ConnCtx {
         namespace: Arc<Namespace>,
         subs: Option<Arc<SubRegistry>>,
         exec: Exec,
+        guarantees: GuaranteeSet,
     ) -> ConnHandle {
         let (ctl_tx, ctl_rx) = mpsc::channel(CTL_QUEUE);
         let (agreed_tx, agreed_rx) = watch::channel(None);
@@ -87,6 +97,9 @@ impl ConnCtx {
             namespace,
             subs,
             exec: exec.clone(),
+            guarantees,
+            sequencer: Sequencer::new(guarantees.ordering),
+            gaps: GapDetector::new(guarantees.ordering, limits.max_sequence_scopes),
             agreed: agreed_rx,
         });
 
@@ -94,7 +107,7 @@ impl ConnCtx {
         exec.spawn(hello_deadline(Arc::clone(&ctx), Arc::clone(&agreed_tx)));
         exec.spawn(accept_uni_loop(Arc::clone(&ctx), agreed_tx));
         exec.spawn(accept_bi_loop(Arc::clone(&ctx)));
-        exec.spawn(send_hello(conn, limits));
+        exec.spawn(send_hello(conn, limits, guarantees));
         ctx
     }
 
@@ -291,12 +304,26 @@ pub(crate) async fn write_control(
     Ok(())
 }
 
-/// Sends our HELLO.
-async fn send_hello(conn: quinn::Connection, limits: Limits) {
-    let hello = Hello::v0(
-        limits.max_header_bytes,
-        u64::from(limits.max_concurrent_uni_streams),
-    );
+/// The HELLO this side sends: v0 plus the configured guarantee declarations.
+///
+/// Offered and required are the same set: a peer that offers less fails the
+/// handshake, which is what lets the rest of the code treat the local set as
+/// the effective one (`docs/PROTOCOL.md` §2.3 step 6).
+fn hello_for(limits: Limits, guarantees: GuaranteeSet) -> Hello {
+    let declaration = (!guarantees.is_core()).then_some(guarantees);
+    Hello {
+        guarantees_offered: declaration,
+        guarantees_required: declaration,
+        ..Hello::v0(
+            limits.max_header_bytes,
+            u64::from(limits.max_concurrent_uni_streams),
+        )
+    }
+}
+
+/// Sends our HELLO, declaring the configured guarantee set.
+async fn send_hello(conn: quinn::Connection, limits: Limits, guarantees: GuaranteeSet) {
+    let hello = hello_for(limits, guarantees);
     if let Err(e) = write_control(&conn, FrameKind::Hello, &hello.encode()).await {
         tracing::debug!(error = %e, "failed to send HELLO");
     }
@@ -523,10 +550,7 @@ fn handle_hello(
         Ok(h) => h,
         Err(e) => return violation(ctx, &e.to_string()),
     };
-    let ours = Hello::v0(
-        ctx.limits.max_header_bytes,
-        u64::from(ctx.limits.max_concurrent_uni_streams),
-    );
+    let ours = hello_for(ctx.limits, ctx.guarantees);
     match negotiate(&ours, &theirs) {
         Ok(agreed) => {
             tracing::debug!(
@@ -563,9 +587,14 @@ async fn handle_data(
         return violation(ctx, "DATA on a unidirectional stream must name an endpoint");
     };
 
+    // Detect mode: report what is missing and deliver what arrived. The scope
+    // is the topic for a published copy and the path otherwise, which is the
+    // `(producer, endpoint or topic)` scope of decision 0001 §7.1.
+    let scope = header.topic.as_deref().unwrap_or(path.as_str());
+    let gap = header.sequence.and_then(|seq| ctx.gaps.observe(scope, seq));
     let transfer = IncomingTransfer::new(
         stream,
-        Arc::new(IncomingMeta::from_header(&header, ctx.peer)),
+        Arc::new(IncomingMeta::from_header(&header, ctx.peer).with_gap(gap)),
     );
     match ctx.namespace.lookup(&path) {
         // Awaiting a queue slot is the backpressure path: it stalls this

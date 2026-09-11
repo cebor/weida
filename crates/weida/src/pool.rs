@@ -130,6 +130,7 @@ impl ClientPool {
             Arc::new(Namespace::new()),
             None,
             exec.clone(),
+            config.guarantees,
         );
         // Negotiation must complete before the caller can send anything: a
         // DATA frame ahead of our own HELLO would be parked by the peer, and a

@@ -13,6 +13,7 @@ use quinn::VarInt;
 use tokio::sync::mpsc;
 use weida_core::{Error, Limits, validate_endpoint_path};
 use weida_protocol::codes;
+use weida_protocol::header::GuaranteeSet;
 
 use crate::config::ServerTls;
 use crate::conn::ConnCtx;
@@ -123,11 +124,12 @@ pub struct Listener {
 impl Listener {
     pub(crate) fn new(runtime: Arc<RuntimeInner>) -> Listener {
         let limits = runtime.config.limits;
+        let ordering = runtime.config.guarantees.ordering;
         Listener {
             inner: Arc::new(ListenerInner {
                 runtime,
                 namespace: Arc::new(Namespace::new()),
-                subs: Arc::new(SubRegistry::new(limits)),
+                subs: Arc::new(SubRegistry::new(limits, ordering)),
             }),
         }
     }
@@ -170,6 +172,7 @@ impl Listener {
             Arc::clone(&self.inner.subs),
             limits,
             exec.clone(),
+            self.inner.runtime.config.guarantees,
         ));
 
         tracing::info!(%local_addr, "quic binding listening");
@@ -269,6 +272,7 @@ async fn accept_connections(
     subs: Arc<SubRegistry>,
     limits: Limits,
     exec: Exec,
+    guarantees: GuaranteeSet,
 ) {
     let live = Arc::new(AtomicUsize::new(0));
     while let Some(incoming) = endpoint.accept().await {
@@ -309,6 +313,7 @@ async fn accept_connections(
                         namespace,
                         Some(Arc::clone(&subs)),
                         exec_for_conn,
+                        guarantees,
                     );
                     let reason = conn.closed().await;
                     // A peer that goes away takes its subscriptions with it;
