@@ -43,6 +43,18 @@ foreign-protocol codec with no weida dependency, so it needs nothing from phases
 building it now is what turns the adapter mapping document from a design into a checked
 claim. The bridge slices, which do need the patterns, wait for their place in the order.
 
+One increment belongs to no phase: **`weida-runtime` is extracted** (B-070,
+`crates/runtime`). It holds `Exec` — `spawn`, `sleep`, `within`, `enter` and the capped
+resolver with its IP-literal fast path — the three reactor-ownership constructors with the
+background-shutdown discipline, the `AF_UNIX` bind hygiene and `peer_credentials` of
+[0010](decisions/0010-local-transport.md) §4.5, a generic named-endpoint registry with a
+byte budget, and the bounded close budget; `weida` uses it and its public API is unchanged
+([0013](decisions/0013-competitor-libraries.md) §4.2, §5.3). It is the prerequisite of
+0013's standalone libraries, which need a reactor, a resolver and socket hygiene and none of
+weida's frames — so it is neither a phase nor a slice of one, but the crate boundary the two
+product lines share. `weida-runtime` depends on `weida-core` and `tokio` and on nothing
+else.
+
 ### Phase 0 — Architecture/specification
 
 Delivers this documentation set, and only it: no code.

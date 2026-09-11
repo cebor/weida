@@ -388,13 +388,14 @@ crates/
 ```
 
 **This is the layout [decisions/0013](decisions/0013-competitor-libraries.md) §4.1 decided,
-and part of it is ahead of the tree.** `weida-runtime`, `weida-zmq` and `weida-nng` do not
-exist yet; the codecs and bridges live under `crates/adapters/` and the two bridges are still
-named `weida-zmtp-bridge` and `weida-sp-bridge`. B-070 creates the shared crate and B-095
-performs the move and the renames. Directories are named for the **protocol family** rather
-than for the role a crate plays in it, so that the directory list answers "does this
-repository ship a ZeroMQ?" — `crates/adapters/` would answer no, because an adapter is a hop
-at a weida edge ([0006](decisions/0006-guarantee-sets.md) §4.6) and a library has no edge.
+and part of it is ahead of the tree.** `weida-runtime` exists — B-070 created it at
+`crates/runtime`, and `weida` is its first consumer. `weida-zmq` and `weida-nng` do not
+exist yet; the codecs and bridges still live under `crates/adapters/` and the two bridges
+are still named `weida-zmtp-bridge` and `weida-sp-bridge`, which B-095 moves and renames.
+Directories are named for the **protocol family** rather than for the role a crate plays in
+it, so that the directory list answers "does this repository ship a ZeroMQ?" —
+`crates/adapters/` would answer no, because an adapter is a hop at a weida edge
+([0006](decisions/0006-guarantee-sets.md) §4.6) and a library has no edge.
 
 `weida-zmtp` is the first slice of the ZeroMQ adapter
 ([adapters/zmtp.md](adapters/zmtp.md)) and depends on **nothing at all** — not even
@@ -408,11 +409,10 @@ crate rather than a feature of the codec for exactly the reason above: a feature
 weida dependency in the codec's manifest, and the codec's dependency-free manifest is the
 thing that keeps it honest.
 
-Planned, not yet present: `weida-runtime` (B-070), `weida-zmq` and `weida-nng` — the
-standalone competitor implementations of
-[0013](decisions/0013-competitor-libraries.md) — `weida-broker` (the L2 semantics of §1 —
-queues, publisher confirms, consumer acknowledgements with redelivery — Phase 6),
-`weida-web` (the Web binding, Phase 8) and the remaining legacy-protocol adapters
+Planned, not yet present: `weida-zmq` and `weida-nng` — the standalone competitor
+implementations of [0013](decisions/0013-competitor-libraries.md) — `weida-broker` (the L2
+semantics of §1 — queues, publisher confirms, consumer acknowledgements with redelivery —
+Phase 6), `weida-web` (the Web binding, Phase 8) and the remaining legacy-protocol adapters
 `weida-mqtt` and `weida-amqp091` (Phase 9). The broker is a separate crate because it is a
 separate layer: it depends on the patterns, nothing in the core may depend on it, and a
 brokerless deployment must not link it. The foreign-protocol crates are separate because they
@@ -441,12 +441,30 @@ and UNSUBSCRIBE share one — with hand-written CBOR encoders and decoders, the 
 function, and the QUIC application error code constants. Being I/O-free makes it directly
 fuzzable: a fuzz target feeds it arbitrary bytes with no socket in the way.
 
+### `weida-runtime`
+
+The reactor, the resolver and the OS plumbing, with no protocol in it. Public surface, all
+of it documented for a reader with no weida in the picture: `Exec` — `spawn`, `sleep`,
+`within`, `enter` and the capped `resolve` — with `Exec::current`, `Exec::from_handle` and
+`Exec::owned` as the three reactor-ownership constructors and `OwnedReactor` as the
+background-shutdown discipline; `CloseBudget`, a finite budget the phases of one shutdown
+share; `NameRegistry<T>`, an in-process namespace of bound names under a byte budget,
+generic over what a bound name hands its acceptor; and on unix `BoundUnixSocket`, which
+carries the `AF_UNIX` bind hygiene of [0010](decisions/0010-local-transport.md) §4.5
+(`sun_path` budget, socket-type check, unlink-then-bind, explicit `0600`, node removed on
+drop), plus `peer_credentials`. Dependencies: `weida-core` for one error vocabulary, and
+`tokio`. Nothing else.
+
 ### `weida`
 
 The runtime and the native QUIC transport: configuration, TLS setup, the `Runtime`, the
 client connection pool, the per-connection driver, the Listener/Binding/namespace machinery,
 the L0 stream core in module `stream`, the typed endpoints of L1, and the transfer handles
-both layers share. The QUIC-specific code lives in module `transport`.
+both layers share. The QUIC-specific code lives in module `transport`. The reactor it runs
+on, the resolver it dials with, the bus registry it binds names in and the `AF_UNIX`
+hygiene it binds sockets with are `weida-runtime`'s; `Exec` is re-exported `pub(crate)` in
+`runtime.rs`, so every module keeps taking it from the `ConnCtx` or `RuntimeInner` it
+already holds and `weida` has no second way to reach the reactor.
 
 ### Dependency direction
 
@@ -486,16 +504,22 @@ module system. The split becomes worthwhile when a second consumer of the runtim
 
 **The trigger has fired, and the cut is not the one §73 named.** The second consumer arrived
 as the standalone competitor libraries of
-[0013](decisions/0013-competitor-libraries.md), so `weida-runtime` is extracted (B-070). What
-it takes is the **reactor and the OS**: `Exec` with `spawn`, `sleep`, `within`, `enter` and
-the capped resolver, the three reactor-ownership constructors with their background-shutdown
-discipline, the `AF_UNIX` bind hygiene and peer credentials of
-[0010](decisions/0010-local-transport.md) §4.5, a generic named-endpoint registry and the
-bounded close budget. What it deliberately leaves behind is QUIC: §73's `transport-quic`
-still has exactly one dependent, because a ZeroMQ implementation has no use for it, so
-`Link`, the connection pool, the actor and every line of
-[0012](decisions/0012-local-connection-grouping.md) stay here with the protocol they serve.
-No public item of `weida` changes [0013 §4.2].
+[0013](decisions/0013-competitor-libraries.md), so `weida-runtime` **is** extracted: B-070,
+`crates/runtime`, with `weida` as its first consumer. What it takes is the **reactor and
+the OS**: `Exec` with `spawn`, `sleep`, `within`, `enter` and the capped resolver, the three
+reactor-ownership constructors with their background-shutdown discipline, the `AF_UNIX` bind
+hygiene and peer credentials of [0010](decisions/0010-local-transport.md) §4.5, a generic
+named-endpoint registry and the bounded close budget. What it deliberately leaves behind is
+QUIC: §73's `transport-quic` still has exactly one dependent, because a ZeroMQ
+implementation has no use for it, so `Link`, the connection pool, the actor and every line
+of [0012](decisions/0012-local-connection-grouping.md) stay here with the protocol they
+serve. No public item of `weida` changes [0013 §4.2].
+
+That last sentence is checked rather than asserted: the item list `cargo doc` generates for
+`weida` — every page and every rendered signature — is identical before and after the
+extraction, because `Exec` was `pub(crate)`, so publishing it in a new crate added surface
+there and removed none here. The only observable difference for a user of `Runtime` is one
+more node in `cargo tree`.
 
 ---
 
@@ -516,12 +540,24 @@ constructors, differing only in where it comes from:
 An owned runtime lives as long as the last `Runtime` clone and every endpoint made from it.
 It is shut down in the background rather than dropped, because the last handle may go out of
 scope on one of that runtime's own worker threads, where dropping a Tokio runtime panics.
+All three constructors are `weida-runtime`'s — `Exec::current`, `Exec::from_handle` and
+`Exec::owned` — and the background shutdown is its `OwnedReactor`, which `Runtime::owned`
+holds for as long as the runtime that created it.
 
-`Exec` in `runtime.rs` is the crate's **whole** surface onto the async runtime: `spawn`,
-`sleep`, `resolve` (DNS) and `enter`. Nothing outside that file calls `tokio::spawn`,
-`tokio::time` or `lookup_host` — a grep over `crates/weida/src` is the check, and the two
-accept loops, the connection actor, the HELLO deadline and the per-subscriber writer all
-take their `Exec` from the `ConnCtx` they already hold. Three consequences worth stating:
+`Exec` is the **whole** surface onto the async runtime: `spawn`, `sleep`, `within`,
+`resolve` (DNS) and `enter`. It lives in `crates/runtime/src/exec.rs` since B-070 and is
+re-exported `pub(crate)` from `weida`'s `runtime.rs`. Nothing else calls `tokio::spawn`,
+`tokio::time` or `lookup_host`, and the check is two greps — one per crate, because the
+surface moved but the rule did not:
+
+```text
+grep -rn 'tokio::spawn\|tokio::time\|lookup_host' crates/weida/src   # no call outside #[cfg(test)]
+grep -rn 'tokio::spawn\|tokio::time\|lookup_host' crates/runtime/src # only exec.rs calls them
+```
+
+The two accept loops, the connection actor, the HELLO deadline and the per-subscriber writer
+all take their `Exec` from the `ConnCtx` they already hold. Three consequences worth
+stating:
 
 - **A caller's executor need not be Tokio.** `futures::executor::block_on` drives a full
   Req/Rep round trip against an owned runtime (`crates/weida/tests/foreign_executor.rs`),
@@ -550,7 +586,8 @@ task hops and locks. Adding `AF_UNIX` and named pipes is one variant each
 ([decisions/0010](decisions/0010-local-transport.md) §4.1) and no new concept.
 
 The first non-QUIC variant is the in-process transport, `crates/weida/src/inproc.rs`: a
-process-global registry of bus names, and a connection that mints a channel pair per
+process-global registry of bus names — `weida-runtime`'s `NameRegistry<LocalConn>` under
+`weida-core`'s 256-byte budget — and a connection that mints a channel pair per
 stream. That pair *is* the stream, which is §4.2's "the OS connection is the stream" with
 the only object an in-process transport has, and it is why `max_local_streams` bounds live
 transfers there. A local connection carries no TLS, so there is no key and no identity:
