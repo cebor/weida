@@ -441,8 +441,8 @@ Published here so that a reader can check an implementation — this one, libzmq
 reimplementation — rather than trust it. Hex; the frame header and the body are separate
 columns, and a run of equal octets is written `00×8`.
 
-Two places where 37/ZMTP disagrees with itself or with its reference implementation were found
-while writing the codec, and the vectors take a side:
+Three places where a ZeroMQ RFC disagrees with itself or with its reference implementation were
+found while writing the codec, and the vectors take a side:
 
 - **Command names are length-prefixed.** The prose says a command contains "a printable
   command name, a null octet separator, and data"; the ABNF says
@@ -452,6 +452,13 @@ while writing the codec, and the vectors take a side:
 - **An `ERROR` reason may contain spaces.** `error-reason = short-size 0*255VCHAR` excludes
   the space octet, while libzmq's own reasons read like "Unknown mechanism". The codec accepts
   printable ASCII including space and refuses everything else, in both directions.
+- **CURVE's `HELLO` padding is 72 octets, not 70.** 26/CURVEZMQ's ABNF says `hello-padding =
+  72%x00`; its prose says "This SHALL be 70 octets, all zero." Only 72 adds up to the
+  specification's own 200-octet `HELLO`: 6 + 2 + 72 + 32 + 8 + 80 = 200, where 70 gives 198.
+  The vectors use 72 in both directions, and the 198-octet reading is published as a row of
+  its own because refusing it is the behaviour that matters — a reader that accepted it would
+  take the signature box two octets out of phase. The arithmetic is in
+  [zeromq.md](../research/zeromq.md) §10.
 
 | Vector | Frame header | Body |
 | --- | --- | --- |
@@ -473,14 +480,36 @@ while writing the codec, and the vectors take a side:
 | `HELLO`, both fields empty | `04 08` | `05 HELLO 00 00` — the length octets stay |
 | `WELCOME` (PLAIN) | `04 08` | `07 WELCOME` — no data at all |
 | `INITIATE`, `Socket-Type=DEALER` (PLAIN) | `04 1F` | `08 INITIATE 0B "Socket-Type" 00 00 00 06 "DEALER"` |
+| `HELLO` (CURVE), 200 octets | `04 C8` | `05 HELLO` `01 00` `00×72` `C1×32` `00×7 01` `5A×80` — version, padding, C', nonce counter, `Box [64 * %x0](C'->S)` |
+| `HELLO` written from the prose, 198 octets | `04 C6` | the same with `00×70` — **refused**, `CURVE HELLO is 200 octets, not 198` |
+| `WELCOME` (CURVE), 168 octets | `04 A8` | `07 WELCOME` `11×16` `B0×144` — long nonce, `Box [S' + cookie](S->C')` |
+| `INITIATE` (CURVE), 257 octets | `06` `00×6 01 01` | `08 INITIATE` `22×16` `CB×80` `00×7 02` `1B×144` — cookie (nonce and box), nonce counter, `Box [C + vouch + metadata](C'->S')`; always a long frame |
+| `READY` (CURVE), 30 octets | `04 1E` | `05 READY` `00×7 03` `BD×16` — the smallest box there is: sealing costs 16 octets |
+| `MESSAGE` (CURVE), 33 octets | `04 21` | `07 MESSAGE` `00×7 04` `E7×17` — the box holds the flags octet, so it is never empty |
+| `INITIATE` box plaintext, 128+ octets | — | `C1×32` `33×16 BC×80` `0B "Socket-Type" 00 00 00 06 "DEALER"` — C, vouch, metadata |
+| Z85, the RFC's test vector | — | `86 4F D2 6F B5 59 F7 5B` ↔ `HelloWorld` |
+| Z85, a 40-character key | — | `C1×32` ↔ `.ni$7.ni$7.ni$7.ni$7.ni$7.ni$7.ni$7.ni$7` |
 
-The four PLAIN rows are [24/ZMTP-PLAIN]'s grammar rather than 37/ZMTP's: `hello = command-size
+The four PLAIN rows are 24/ZMTP-PLAIN's grammar rather than 37/ZMTP's: `hello = command-size
 %d5 "HELLO" username password` with a one-octet length before each field, `welcome =
 command-size %d7 "WELCOME"` carrying nothing, and `initiate = command-size %d8 "INITIATE"
 metadata` carrying what NULL puts in `READY`. They live in the codec because they are octets;
 the mechanism's own warning — PLAIN is "not robust against even the simplest traffic snooping
 or spoofing attacks" — is a property of the mechanism and not of the encoding, and the codec
 still depends on nothing at all.
+
+The six CURVE rows and the `INITIATE` plaintext are 26/CURVEZMQ's layouts with **every
+cryptographic box an opaque range**: a length and a stated content, never a computed value.
+That is why they are in the codec at all. The boxes are `crypto_box` output, so a vector
+containing one would be a vector of somebody's key material; what can be published, and
+checked against libzmq with a hex dump, is where each box starts and how long it is. The nonces
+are the other half of the layout: a short nonce is the eight-octet counter shown here behind a
+16-octet fixed prefix (`CurveZMQHELLO---`, `CurveZMQINITIATE`, `CurveZMQREADY---`,
+`CurveZMQMESSAGEC` and `CurveZMQMESSAGES`), and a long one is the 16 octets shown here behind
+`WELCOME-`, `COOKIE--` or `VOUCH---`. The two Z85 rows are 32/Z85, which is how a key is
+written down rather than sent: four octets to five characters, so 32 octets to 40. Sealing and
+opening happen in `weida-zmq`, which takes the one cryptographic dependency; `weida-zmtp`'s
+`[dependencies]` is still empty.
 
 The encoder always picks the shortest size field, which is what the specification recommends;
 the decoder accepts a long size for a short body, because a peer that sends one is odd rather
