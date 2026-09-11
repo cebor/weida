@@ -24,7 +24,7 @@ use weida_protocol::{
 
 use crate::dedup::DedupWindow;
 use crate::listener::{Namespace, Route};
-use crate::ordering::{GapDetector, Sequencer};
+use crate::ordering::{GapDetector, Reassembler, Sequencer};
 use crate::pubsub::SubRegistry;
 use crate::runtime::Exec;
 use crate::stream::Incoming;
@@ -70,8 +70,10 @@ pub(crate) struct ConnCtx {
     pub guarantees: GuaranteeSet,
     /// Numbers outgoing transfers per scope; inert unless ordering is on.
     pub sequencer: Sequencer,
-    /// Reports gaps in inbound sequences; inert unless ordering is on.
+    /// Reports gaps in inbound sequences; inert unless detect mode is on.
     pub gaps: GapDetector,
+    /// Holds out-of-order arrivals back; inert unless reassemble mode is on.
+    pub reorder: Reassembler<Held>,
     /// Suppresses repeated identities; inert unless deduplication is on.
     pub dedup: DedupWindow,
     /// Duplicates this runtime suppressed, shared with every connection it
@@ -108,6 +110,11 @@ impl ConnCtx {
             guarantees,
             sequencer: Sequencer::new(guarantees.ordering),
             gaps: GapDetector::new(guarantees.ordering, limits.max_sequence_scopes),
+            reorder: Reassembler::new(
+                guarantees.ordering,
+                limits.max_reorder_hold,
+                limits.max_sequence_scopes,
+            ),
             dedup: DedupWindow::new(
                 guarantees.deduplication,
                 guarantees.dedup_window_ms,
@@ -628,14 +635,51 @@ async fn handle_data(
         return drain(stream).await;
     }
 
+    let meta = IncomingMeta::from_header(&header, ctx.peer);
+
+    // Reassemble mode: hold this arrival if the numbers before it have not
+    // come yet, and dispatch whatever run that completes. Held transfers are
+    // unread streams — nothing is materialized — so what waits is quinn's
+    // receive buffer for them, which is what makes `max_reorder_hold` a
+    // memory bound.
+    if ctx.reorder.enabled() {
+        let held = Held {
+            stream,
+            meta,
+            path: path.clone(),
+        };
+        for (held, gap) in ctx.reorder.admit(scope, header.sequence, held) {
+            let transfer = IncomingTransfer::new(held.stream, Arc::new(held.meta.with_gap(gap)));
+            dispatch(ctx, &held.path, transfer).await;
+        }
+        return Ok(());
+    }
+
     // Detect mode: report what is missing and deliver what arrived.
     let gap = header.sequence.and_then(|seq| ctx.gaps.observe(scope, seq));
+    dispatch(
+        ctx,
+        &path,
+        IncomingTransfer::new(stream, Arc::new(meta.with_gap(gap))),
+    )
+    .await;
+    Ok(())
+}
 
-    let transfer = IncomingTransfer::new(
-        stream,
-        Arc::new(IncomingMeta::from_header(&header, ctx.peer).with_gap(gap)),
-    );
-    match ctx.namespace.lookup(&path) {
+/// One transfer, held with everything needed to deliver it later.
+///
+/// The payload is **not** here: a held transfer is an unread `RecvStream`,
+/// which is what keeps reassembly inside the "core transport does not require
+/// payload materialization" invariant (`docs/INVARIANTS.md`).
+pub(crate) struct Held {
+    stream: quinn::RecvStream,
+    meta: IncomingMeta,
+    path: String,
+}
+
+/// Hands one arrived transfer to whatever is bound at `path`.
+async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
+    match ctx.namespace.lookup(path) {
         // Awaiting a queue slot is the backpressure path: it stalls this
         // stream's task, which stalls the peer through QUIC flow control.
         Some(Route::Transfer(queue)) => {
@@ -664,7 +708,6 @@ async fn handle_data(
             transfer.refuse(codes::UNKNOWN_ENDPOINT);
         }
     }
-    Ok(())
 }
 
 /// Reads a stream to EOF and discards it.

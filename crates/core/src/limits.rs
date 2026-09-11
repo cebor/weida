@@ -40,9 +40,10 @@ pub struct Limits {
     /// publisher never blocks on a slow consumer.
     pub subscriber_buffer_bytes: usize,
     /// Producer scopes — paths and topics — a receiver tracks per connection
-    /// for gap detection, when `PerProducer` ordering is negotiated. The
-    /// peer chooses the scope names, so the table needs a ceiling; at the cap
-    /// a new scope is simply not tracked and no gap is reported for it.
+    /// for gap detection or reassembly, when `PerProducer` ordering is
+    /// negotiated. The peer chooses the scope names, so the table needs a
+    /// ceiling; at the cap a new scope is simply not tracked, no gap is
+    /// reported for it and nothing is held back for it.
     pub max_sequence_scopes: usize,
     /// Addresses a dialling endpoint will try for one hostname, in the order
     /// the resolver returned them. More than one is necessary because the
@@ -50,6 +51,13 @@ pub struct Limits {
     /// both `::1` and `127.0.0.1` — and a ceiling is necessary because a
     /// resolver answer is remote input.
     pub max_resolved_addresses: usize,
+    /// Transfers a receiver may hold back at once, summed over scopes, when
+    /// `PerProducer(reassemble)` ordering is negotiated. A held transfer is
+    /// an unread stream, so the bytes it pins are quinn's — up to
+    /// `stream_receive_window` for it and `connection_receive_window` for the
+    /// hold as a whole. At the cap the oldest held transfer is released out
+    /// of order with its gap reported, never held in a growing buffer.
+    pub max_reorder_hold: usize,
     /// Identities a receiver remembers per connection for `Bounded`
     /// deduplication. The window bounds how long an identity is kept, not
     /// how many arrive within it, so the count needs its own ceiling; at the
@@ -84,6 +92,7 @@ impl Default for Limits {
             subscriber_buffer_bytes: 8 * 1024 * 1024,
             max_sequence_scopes: 1024,
             max_resolved_addresses: 8,
+            max_reorder_hold: 256,
             max_dedup_entries: 4096,
         }
     }
@@ -108,6 +117,7 @@ mod tests {
         assert_eq!(l.subscriber_buffer_bytes, 8 << 20);
         assert_eq!(l.max_sequence_scopes, 1024);
         assert_eq!(l.max_resolved_addresses, 8);
+        assert_eq!(l.max_reorder_hold, 256);
         assert_eq!(l.max_dedup_entries, 4096);
     }
 

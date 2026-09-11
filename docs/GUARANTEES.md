@@ -194,19 +194,45 @@ Total
 sending peer's proved fingerprint and the counter therefore restarts with the connection
 ([decisions/0008](decisions/0008-session-identity.md) §4.3). It has two modes
 ([decisions/0001](decisions/0001-sequence-field.md) §7.5): **detect** reports the gap and
-delivers messages as they arrive, and is the default; **reassemble** holds messages back up to
-a bounded buffer, accepting head-of-line blocking above a transport chosen to avoid it, and
-reads eagerly into an application-owned buffer with a named cap
-([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.6). `PerKey` is
-unreachable at L0 and reserved for the L2 broker, because key order exists only under a stable
-key-to-partition binding weida does not have [0001 §7.4].
+delivers messages as they arrive, and is the default; **reassemble** holds a message back
+until its predecessors have arrived, accepting head-of-line blocking above a transport chosen
+to avoid it. `PerKey` is unreachable at L0 and reserved for the L2 broker, because key order
+exists only under a stable key-to-partition binding weida does not have [0001 §7.4].
+
+**What reassemble does at its bound, normatively.** The hold is bounded by
+`Limits::max_reorder_hold`, counted in transfers over all scopes of one connection. When an
+arrival does not fit, the receiver **releases the oldest held transfer out of order and
+reports the numbers it skipped as a gap** on that transfer; it never refuses the arrival and
+never grows the hold. Degrading to detect-mode behaviour at the bound keeps the rule that a
+requested guarantee is never *silently* weakened (§4): the application is told exactly what
+it would have been told under detect. A hole that is never filled therefore costs
+`max_reorder_hold` transfers of delay before it becomes visible, and a hole at the very end
+of a producer's traffic holds its successors until the connection closes — v0 bounds the hold
+in count only, not in time.
+
+**A repeated number is delivered, not suppressed.** If a number that is already held arrives
+a second time — a producer retransmit, or any repeat on a connection without deduplication —
+the held transfer keeps its place in the run and the repeat is passed to the application
+immediately, out of order. Reassembly never discards a transfer: dropping one would reset a
+stream its sender believes is in flight, and suppressing a repeat is the `Deduplication`
+dimension's job, which is independent of this one [0001 §7.1].
+
+A held transfer is an **unread stream**, not a copy of its payload: reassembly materializes
+nothing ([INVARIANTS.md](INVARIANTS.md)). What it pins is transport memory — one stream of
+the peer's `max_concurrent_uni_streams` budget and up to `stream_receive_window` bytes each,
+the whole hold bounded by `connection_receive_window` — which is where the peer is held
+accountable for it ([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.6 asks
+for eager reads into an application-owned buffer instead; that would require materializing
+the payload, which the core forbids, so the bytes stay in the transport and the cost is paid
+as backpressure).
 
 The performance implications of each level MUST be documented. Measured so far: the two DATA
 keys that carry the sequence and the producer identity cost 80 B on a 135 B frame and 9 % of
 the message rate at a 64-byte payload in their worst case, while the default omits the
 producer key entirely and pays the sequence's 6 B
 ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-009; [decisions/0008](decisions/0008-session-identity.md)
-§4.4). The cost of the reassembly buffer under cross-stream reordering is not yet measured.
+§4.4). Reassembly adds no per-message allocation beyond one map entry per held transfer; its
+cost under cross-stream reordering in bytes is the pinned receive windows above.
 
 ### Deduplication
 
@@ -407,7 +433,7 @@ name a level that is decided and specified but not yet implemented.
 | --- | --- | --- |
 | Acknowledgement | transport receipt only | `Delivery::delivered()` resolves `Ok(())` when the peer's **transport** holds every byte and the FIN — explicitly not "the application read it" (§3). There is no application acknowledgement anywhere in the v0 core: `Accepted`, `Stored`, `Replicated` and `Processed` are reserved for the L2 broker layer and have no wire representation, not even a reserved code point ([PROTOCOL.md](PROTOCOL.md) §11). |
 | Delivery | `BestEffort` only | v0 performs no retries. A failed or indeterminate transfer is reported to the application, which decides. `AtMostOnce` and `AtLeastOnce` require retry and dedup machinery that does not exist yet. |
-| Ordering | `None` by default; `PerProducer(detect)` **implemented**, opt-in | QUIC guarantees byte order **within** one stream. A one-way transfer is one stream, and each half of an exchange is one stream, so a single payload is ordered end to end. Across streams there is no ordering guarantee of any kind, which is what `PerProducer` addresses: a runtime configured with it (`RuntimeConfig::guarantees`) numbers its one-way transfers per (producer, path or topic) in DATA key `6` and reports what is missing through `IncomingMeta::gap`, delivering every message as it arrives. The level is declared in HELLO and negotiated, so both ends agree or the handshake fails ([PROTOCOL.md](PROTOCOL.md) §2.3). *Spec ahead of code:* `PerProducer(reassemble)` is decided ([decisions/0001](decisions/0001-sequence-field.md) §7.5) and not implemented; `PerKey` is L2-only by decision [0001 §7.4]; `Total` is not specified. Exchanges are not numbered: a reply carries no endpoint, and the stream is the correlation. |
+| Ordering | `None` by default; `PerProducer` **implemented in both modes**, opt-in | QUIC guarantees byte order **within** one stream. A one-way transfer is one stream, and each half of an exchange is one stream, so a single payload is ordered end to end. Across streams there is no ordering guarantee of any kind, which is what `PerProducer` addresses: a runtime configured with it (`RuntimeConfig::guarantees`) numbers its one-way transfers per (producer, path or topic) in DATA key `6`. In **detect** mode the receiver reports what is missing through `IncomingMeta::gap` and delivers every message as it arrives; in **reassemble** mode it holds an arrival whose predecessors are missing and releases the run in sequence order, bounded by `Limits::max_reorder_hold` and releasing out of order with a reported gap at the bound (§3). The level is declared in HELLO and negotiated, so both ends agree or the handshake fails ([PROTOCOL.md](PROTOCOL.md) §2.3). *Spec ahead of code:* `PerKey` is L2-only by decision [0001 §7.4]; `Total` is not specified. Exchanges are not numbered: a reply carries no endpoint, and the stream is the correlation. |
 | Deduplication | `None` by default; `Bounded(window)` **implemented**, opt-in | Under `core` there are no idempotency ids and no dedup window, and nothing on the wire names a transfer, so a receiver could not deduplicate even if it wanted to. A runtime configured `Bounded` with a window (`RuntimeConfig::guarantees`) remembers the identity of what it received — `(producer, scope, sequence)`, the producer being the connection's proved fingerprint unless DATA key `7` names another ([decisions/0008](decisions/0008-session-identity.md) §4.4) — and suppresses a repeat inside the window, counting it in `Runtime::suppressed_duplicates`. A suppressed transfer is read to EOF and discarded, so the sender sees an ordinary receipt: the window saves the application, not the bandwidth. Bounded means bounded twice over — in time by the window and in count by `Limits::max_dedup_entries` — so an identity reused after its window, or evicted at the cap, is **not** suppressed [0001 §7.6]. `Durable` needs a store and belongs to the L2 broker. |
 | Backpressure | `Block`, `Reject`, `Drop` | **The two credit units at L0 are bytes and streams, and there is no application credit.** Bytes: `stream_receive_window` and `connection_receive_window`. Streams: `max_concurrent_uni_streams` and `max_concurrent_bidi_streams`, which *are* weida's message credit — a consumer sizes its prefetch by granting them ([decisions/0003](decisions/0003-credit-unit.md) §4.1, §5). Both are receiver-granted through QUIC transport parameters and both are absolute and idempotent; nothing on the L0 wire grants credit at the application level, and the per-subscription message credit of [0003 §4.2] is L2 work with no v0 representation. `Block`: those two windows, those two budgets and bounded internal channels (`endpoint_queue`, the actor control channel) make senders await capacity; this is what Req/Rep and Push/Pull use. The budget lands on `open`, and a transfer parked in an accept queue still holds its stream, so a deeper queue does not raise it ([PATTERNS.md](PATTERNS.md) §1.4). `Reject`: `IncomingTransfer::read_capped` refuses a payload past its cap with `STOP_SENDING(REJECTED)` and `LimitExceeded` before buffering it, and `Publisher::publish` rejects a payload larger than `subscriber_buffer_bytes` locally. `Drop`: publisher fan-out only — a subscriber past `subscriber_buffer_bytes` loses the message rather than stalling the publisher. `Spill` and `Coalesce` are not implemented. |
 | Producer naming | `Fingerprint` only | The proved fingerprint names the producer and is therefore **not written**: the receiver has it from the handshake ([decisions/0008](decisions/0008-session-identity.md) §4.4). `Stable` needs a supplier that outlives a connection, which is an L2 subscription, so a v0 peer declares it neither offered nor required. |
@@ -433,18 +459,22 @@ Three points deserve emphasis, because each is easy to assume otherwise:
   waits on the reply; an ERROR frame on the reply half is equally conclusive. The receipt
   remains available to callers who drive the halves themselves with `Requester::open`.
 - **Pub/Sub drops are silent to the subscriber under `core`, and visible under
-  `PerProducer(detect)`.** A subscriber whose byte budget at the publisher is exhausted
-  simply does not receive that message; the publisher counts the drop locally
+  `PerProducer` in either mode.** A subscriber whose byte budget at the publisher is
+  exhausted simply does not receive that message; the publisher counts the drop locally
   (`Publisher::dropped`). This is the one place where weida answers overload by discarding,
-  and it is confined to fan-out (master doc §17). Under detect ordering the copy is numbered
-  before fan-out, so the number a dropped copy would have carried is missing from that
-  subscriber's sequence and the next copy it receives carries `IncomingMeta::gap` naming
-  exactly what it lost — the capability [decisions/0001](decisions/0001-sequence-field.md)
-  §7.2 required (`a_dropped_fan_out_copy_shows_up_as_a_gap`).
+  and it is confined to fan-out (master doc §17). The copy is numbered before fan-out, so the
+  number a dropped copy would have carried is missing from that subscriber's sequence. Under
+  **detect** the next copy it receives carries `IncomingMeta::gap` naming exactly what it
+  lost (`a_dropped_fan_out_copy_shows_up_as_a_gap`). Under **reassemble** the copies behind
+  the hole are held — the missing number is never coming — until the hold is full, and the
+  release forced by the bound carries the gap
+  (`a_full_hold_reports_the_pub_sub_drop_it_was_waiting_for`). Either way the loss is
+  observable, which is the capability [decisions/0001](decisions/0001-sequence-field.md)
+  §7.2 required.
 - **Ordering is `None` for the new patterns unless it is configured.** Each message is its
   own stream and QUIC does not order streams relative to each other. A publisher's
   per-subscriber writer enqueues copies in publication order, but that is an implementation
   property of one hop, not a guarantee an application may rely on. `PerProducer(detect)`
   does not change delivery order either: it reports what is missing and holds nothing back.
-  Reordering on the receiving side is the `reassemble` level, which §3 specifies and no
-  code implements.
+  `PerProducer(reassemble)` does change it — that is its entire point — and pays for it with
+  head-of-line blocking bounded by `Limits::max_reorder_hold`.

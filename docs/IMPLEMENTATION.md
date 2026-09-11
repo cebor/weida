@@ -334,6 +334,69 @@ by asserting that the hole after the late arrival is still reported. The suppres
 is also placed ahead of the detector, so a duplicate the receiver never accepted cannot
 shift the receiver's idea of where the producer is.
 
+**Delivered in the eighth increment — reassemble-mode ordering (B-022):**
+
+`OrderingMode::PerProducerReassemble` holds an arrival whose predecessors have not come yet
+and releases the run in sequence order. `Reassembler<T>` in `crates/weida/src/ordering.rs`
+is the whole mechanism: a `BTreeMap` per scope plus the position, generic in what is held so
+that the ordering logic is unit-testable without a connection, and the connection instantiates
+it as `Reassembler<Held>`. The gap detector is now enabled in detect mode *only* — under
+reassemble the reassembler owns the position, and two components tracking it would report the
+same hole twice.
+
+**A held transfer is an unread stream.** `Held` carries the `RecvStream`, the metadata and
+the path; no payload is read, so reassembly stays inside "core transport does not require
+payload materialization" ([INVARIANTS.md](INVARIANTS.md)). What the hold pins is transport
+memory: one stream of the peer's `max_concurrent_uni_streams` budget and up to
+`stream_receive_window` bytes each, the total bounded by `connection_receive_window`. This is
+a **documented deviation from [0002](decisions/0002-control-and-bulk-separation.md) §6.6**,
+which proposed reading eagerly into an application-owned buffer so that transport credit is
+released early: v0 cannot do that without materializing the payload, so the bytes stay in the
+transport, where the receiver's own window already bounds them and the sender feels the hold
+as backpressure. The pubsub test above had to be given a receive window large enough to park
+two copies *and* accept the arrival that evicts them — the deviation is not theoretical.
+
+**The bound is enforced by releasing, never by growing.** `Limits::max_reorder_hold` (256 —
+B-010 measured the peak at N − 1 of the transfers in flight and 84 of 256 with no adversarial
+pattern, so the cap is configuration, not an assumption about arrival order) counts held
+transfers over all scopes. When an arrival does not fit, the oldest held transfer is released
+out of order carrying `IncomingMeta::gap` — exactly what detect mode would have reported —
+and whatever now follows it in order goes out behind it. The victim scope is the one holding
+the most, so one stalled producer cannot spend the whole budget and push every other scope
+into out-of-order release. Seven unit tests cover it: in-order release, gapless runs, the
+forced release and its gap, the hold never exceeding the cap over 500 arrivals, the scope
+table at its own cap, pass-through for unnumbered, untracked-scope and late arrivals, and
+the repeat rule below.
+
+The end-to-end proofs are `crates/weida/tests/reorder.rs` — sequences scrambled on the raw
+wire arrive in sequence order; a hold of two releases out of order with the gap when the
+third arrival does not fit; and the reverse-FIN probe of
+`reverse_order_completion_measures_the_reorder_buffer` rerun at 16 and 256 transfers with
+both `Batched` and `Sequenced` finishing, now asserting that the *runtime* delivers in
+sequence order what the probe's application had to reorder for itself — and
+`a_full_hold_reports_the_pub_sub_drop_it_was_waiting_for` in `crates/weida/tests/pubsub.rs`,
+which is the acceptance criterion that a subscriber in either mode reports a Pub/Sub drop
+through `IncomingMeta`. Note what that test shows about reassemble mode: a hole a publisher
+drop leaves is *never* filled, so the loss becomes visible only when the hold is full. Under
+reassemble, `max_reorder_hold` is the delay a permanent loss costs.
+
+**Two things review caught in the first cut of `admit`.** A repeated number at or above the
+position went through `BTreeMap::insert`, which replaced the held transfer silently while
+`held` was incremented again: the counter drifted upward for good, forced releases began
+firing below the real bound, and the displaced `RecvStream` was dropped — resetting a stream
+its sender still believed was in flight. The slot now belongs to whoever claimed it first
+and the repeat is passed straight through (`a_repeated_number_is_delivered_and_does_not_move_the_hold`
+asserts both the unchanged hold and that every item offered came back exactly once; it fails
+on the old code with `held` at 2). Suppressing a repeat is deduplication's job and stays
+there. Second, the in-order arrival — the common case, and the only one on a network that is
+not reordering — allocated a map node just to take it out again; when the number is the
+expected one and nothing is waiting, it is now released without touching the `BTreeMap`.
+
+**Not bounded in time.** v0 bounds the hold in count only. A hole at the very end of a
+producer's traffic holds its successors until the connection closes, because nothing arrives
+to push the hold over its cap. A time bound on a held transfer is the obvious next knob and
+is deliberately not invented here.
+
 **Deliberately deferred** (recorded now, not discovered later):
 
 - Connecting publishers and binding pushers; v0 fixes Pub/Pull as binders and Sub/Push as

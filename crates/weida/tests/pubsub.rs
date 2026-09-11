@@ -581,3 +581,115 @@ async fn a_dropped_fan_out_copy_shows_up_as_a_gap() {
 
     client.shutdown().await;
 }
+
+/// Reassemble mode over the same drop: the hole is not reported when it
+/// happens — the copies behind it are held, waiting for numbers that will
+/// never arrive — and the bound is what makes it observable. At the cap the
+/// oldest held copy is released out of order and carries the gap.
+#[tokio::test]
+async fn a_full_hold_reports_the_pub_sub_drop_it_was_waiting_for() {
+    const MSG: usize = 32 * 1024;
+    const HOLD: usize = 2;
+
+    let reassemble = GuaranteeSet {
+        ordering: OrderingMode::PerProducerReassemble,
+        ..GuaranteeSet::CORE
+    };
+    let server = Server::start_with_config(RuntimeConfig {
+        limits: Limits {
+            subscriber_buffer_bytes: 64 * 1024,
+            ..Limits::default()
+        },
+        guarantees: reassemble,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+
+    // The receive window must hold the two parked copies *and* still have
+    // room for the arrival that forces them out: a held transfer is an
+    // unread stream, so it pins quinn's buffer until it is released.
+    let client = server.client_runtime_with_config(RuntimeConfig {
+        limits: Limits {
+            connection_receive_window: 512 * 1024,
+            stream_receive_window: 64 * 1024,
+            max_reorder_hold: HOLD,
+            ..Limits::default()
+        },
+        guarantees: reassemble,
+        ..RuntimeConfig::default()
+    });
+    let sub = client.subscriber(server.trust());
+    within(sub.connect(&server.url("/md")))
+        .await
+        .expect("connect");
+    within(sub.subscribe("px.#")).await.expect("subscribe");
+    await_filters(&publisher, 1).await;
+
+    let payload = vec![0u8; MSG];
+    let mut published = 0usize;
+    within(async {
+        while publisher.dropped() == 0 {
+            publisher
+                .publish("px.eur", payload.clone())
+                .expect("publish");
+            published += 1;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let lost = publisher.dropped();
+
+    // Everything published before the hole is in order and arrives
+    // untouched, which also frees the byte budget again.
+    for _ in 0..published - lost as usize {
+        let transfer = within(sub.recv()).await.expect("recv");
+        assert_eq!(transfer.meta().gap, None, "nothing is missing yet");
+        within(transfer.collect(MSG)).await.expect("collect");
+    }
+
+    // Keep publishing. Every copy after the hole is held — the numbers it
+    // waits for were dropped at the publisher and will never arrive — so
+    // nothing reaches the application until the hold is full, and then the
+    // oldest held copy comes out carrying the gap. Publishing in a loop
+    // rather than exactly `HOLD + 1` times keeps the test honest about a
+    // slow writer: a sentinel that is itself dropped only widens the hole.
+    let mut sequences = Vec::new();
+    let gap = within(async {
+        loop {
+            publisher
+                .publish("px.eur", payload.clone())
+                .expect("publish");
+            tokio::task::yield_now().await;
+            let Ok(transfer) = tokio::time::timeout(Duration::from_millis(20), sub.recv()).await
+            else {
+                continue;
+            };
+            let transfer = transfer.expect("recv");
+            let meta = transfer.meta().clone();
+            sequences.push(meta.sequence.expect("fan-out copies are numbered"));
+            transfer.collect(MSG).await.expect("collect");
+            if let Some(gap) = meta.gap {
+                break gap;
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        gap.missed() >= lost,
+        "the gap must cover the copies the publisher dropped: {gap:?}, dropped {}",
+        publisher.dropped()
+    );
+    assert!(
+        gap.missed() <= publisher.dropped(),
+        "the gap must not invent losses: {gap:?}, dropped {}",
+        publisher.dropped()
+    );
+    assert!(
+        sequences.windows(2).all(|pair| pair[0] < pair[1]),
+        "reassemble mode never delivers backwards: {sequences:?}"
+    );
+
+    client.shutdown().await;
+}
