@@ -110,8 +110,9 @@ acceptance: `crates/weida/tests/foreign_executor.rs` gains a Push/Pull and a Pub
 note: the Pub/Sub test needed one thing the tokio suites get for free — waiting for a subscription to land. It retries `publish` until it reaches one subscriber instead of sleeping, because a timer would need the very reactor the test refuses to have, and it subscribes with the empty filter so the test does not move when B-020 changes the matcher. 224 tests pass.
 
 ### B-024 — An example without `#[tokio::main]`
-kind: code | size: 30 | status: ready | needs: [B-016]
+kind: code | size: 30 | status: done 11c31d0 | needs: [B-016]
 acceptance: one existing example (or a new small one) drives a full exchange from a plain `fn main` using `Runtime::owned`, showing what a caller with no async runtime of its own writes; the README's build-and-run section names it; `cargo run -p weida --example <name>` works. Proposed by the B-016 worker, and it is the user-visible half of `Runtime::owned` — the API exists but nothing in the tree demonstrates it.
+note: a new example, `crates/weida/examples/owned_runtime.rs`, rather than a converted one: the existing five all demonstrate a pattern and would have lost that focus. It joins the two halves instead of spawning them, because an executor with no reactor has nothing to spawn onto — which is the lesson the example exists to teach. The README gained a "No reactor of your own" section naming all three constructors. Verified by running it: it prints the pinned URL and `HELLO FROM A PLAIN MAIN`.
 
 ### B-025 — Do not resolve a literal address on every connect
 kind: code | size: 30 | status: done 52ebbbc | needs: []
