@@ -9,7 +9,7 @@ kind: research | size: 45 | status: ready | needs: []
 acceptance: `docs/decisions/0004-durability-levels.md`, Status accepted, defining `Stored(Written|Flushed)` and `Replicated(n, flushed: bool)` from rabbitmq-amqp091 §6d, kafka §6, nats §6, amqp10 §6.5; SYNTHESIS §8.3 marked closed.
 
 ### B-002 — Decision 0005: refusal race closed as documented behaviour
-kind: research | size: 30 | status: ready | needs: []
+kind: research | size: 30 | status: in_progress (delegated) 2026-09-11T02:05Z | needs: []
 acceptance: `docs/decisions/0005-refusal-race.md`, accepted; cites RFC 9000 §3.2 via quic-standards §12 item 8 and PATTERNS §1.6; SYNTHESIS §8.5 closed.
 
 ### B-003 — Decision 0006: guarantee sets and the adapter edge
@@ -17,11 +17,11 @@ kind: research | size: 45 | status: ready | needs: []
 acceptance: `docs/decisions/0006-guarantee-sets.md`, accepted: a default guarantee set plus a configurable superset inside the weida network, validated at configuration time; at an adapter edge the chain ends at the protocol's transfer point (SYNTHESIS §4) and any degradation is named in configuration; SYNTHESIS §8.7 closed.
 
 ### B-004 — Decision 0007: segmented topics, opaque paths
-kind: research | size: 45 | status: ready | needs: []
+kind: research | size: 45 | status: in_progress (delegated) 2026-09-11T02:05Z | needs: []
 acceptance: `docs/decisions/0007-topic-namespace.md`, accepted: endpoint paths stay opaque (INVARIANTS), Pub/Sub filters become segmented patterns with a separator, a one-segment wildcard and a rest wildcard; ZeroMQ byte-prefix subscriptions map to a segment boundary as a named loss; mapping table for MQTT `+`/`#`, NATS `*`/`>`, AMQP `*`/`#`; SYNTHESIS §8.9 closed.
 
 ### B-005 — Decision 0008: session identity by fingerprint
-kind: research | size: 30 | status: ready | needs: []
+kind: research | size: 30 | status: in_progress (delegated) 2026-09-11T02:05Z | needs: []
 acceptance: `docs/decisions/0008-session-identity.md`, accepted: the proved fingerprint is the peer identity across connections (binds 0002's control and bulk connections; is the default producer name of 0001 §7.3); no L0 session state; subscription and sequence resumption is L2 work; the open item from 0001 §8 is closed.
 
 ### B-006 — Spec sync: PROTOCOL.md on the decided state
