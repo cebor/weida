@@ -77,12 +77,13 @@ A local peer is proved by the **kernel** rather than by a key, which is the one 
 identity invariant reads differently: `IncomingMeta::peer` carries a key or a local principal,
 an in-process peer carries neither, and a PID is an observation that MUST NOT be authorized on
 ([ARCHITECTURE.md](ARCHITECTURE.md) §2, [decisions/0010](decisions/0010-local-transport.md)
-§4.4). What does not change is that an identity is proved and never claimed. Of the three,
-only the in-process transport exists today, and it is the case with nothing to prove: its
-`peer` is `None`, which `push_pull_over_inproc` asserts. The local-principal kind arrives
-with `AF_UNIX` (B-038) and named pipes (B-039), and the address form forbids the
-`sha256:…@` userinfo on all three so that no local address can look authenticated
-[0010 §4.8].
+§4.4). What does not change is that an identity is proved and never claimed. Both kinds now
+exist: `IncomingMeta::peer` is `Option<PeerIdentity>`, `None` in process and for an
+anonymous TLS client, `Key` on QUIC, and `Local { uid, gid, pid }` on `AF_UNIX`, taken from
+the kernel at connect time. The `sha256:…@` userinfo is refused on every local scheme so
+that no local address can look authenticated [0010 §4.8], and what binds a local peer's
+several connections together is a group token *plus* those same credentials, never the
+token alone ([decisions/0012](decisions/0012-local-connection-grouping.md) §4.2).
 
 Invariants deferred with their subsystems: brokerless/brokered API parity, broker cluster
 as one logical broker, Raft scope, stream-oriented payload replication, and adapter

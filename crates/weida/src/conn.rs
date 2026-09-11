@@ -320,7 +320,11 @@ pub(crate) async fn write_control(
     kind: FrameKind,
     header: &[u8],
 ) -> Result<(), Error> {
-    let mut stream = conn.open_uni().await?;
+    let mut stream = if kind == FrameKind::Hello {
+        conn.open_control().await?
+    } else {
+        conn.open_uni().await?
+    };
     stream.write_all(&encode_frame(kind, header)).await?;
     stream.finish()?;
     Ok(())

@@ -523,6 +523,55 @@ split locally (there is no shared window to separate), and the `AF_UNIX` and nam
 variants with their platform rules and their local-principal identity, which are B-038 and
 B-039 with the acceptance already written in [0010](decisions/0010-local-transport.md) §4.5.
 
+**Delivered in the eleventh increment — `AF_UNIX` (B-038), and the decision it needed
+(0012):**
+
+Implementing 0010's "the OS connection is the stream" on a socket exposed what that
+sentence does not say: an accepted socket cannot be dialled back, and three things need a
+stream from the accepting side — its own HELLO, Pub/Sub fan-out, and everything the runtime
+holds per connection that is really per peer. Descriptor passing, the shape `ipc.md` §11
+calls strictly better, is closed to us: Windows `AF_UNIX` has no ancillary data and named
+pipes have none either, so B-039 could not inherit it, and `SCM_RIGHTS` is unstable in
+`std` while this crate forbids `unsafe`. [0012](decisions/0012-local-connection-grouping.md)
+decided the alternative and this increment implements §4.1-§4.3 of it.
+
+**Connections become a peer by grouping.** The first connection a client opens is the
+control connection: it carries the HELLO exchange both ways and owns everything per peer
+(`Agreed`, the sequence scopes, the dedup window, the parked drain receipts). Every further
+connection opens with `0x02` and the 16-byte group token the server issued on the control
+connection, and is admitted only if the token names a live peer **and** the kernel
+credentials match that peer's — uid always, pid where the platform reports one. An unbound
+connection is dispatched nowhere, which
+`a_transfer_connection_with_an_unknown_token_is_refused` pins by injecting a raw connection
+with a zero token and observing that only the legitimate transfer arrives.
+
+**Dispatch is by path**, exactly as [PROTOCOL.md](PROTOCOL.md) §2.1 already specified for
+local transports: the accepted connection's frame is read, the path is looked up, and a
+replier answers on that same connection while a puller path never writes back. That is one
+new concept in the boundary — `Link::dispatch_by_path` and a `handle_local` beside
+`handle_bi` — and it is what a transport with no stream kinds needs.
+
+**Identity is now a sum.** `IncomingMeta::peer` is `Option<PeerIdentity>`: a `Key` proved by
+TLS, or a `Local` principal proved by the kernel — `SO_PEERCRED` on Linux through tokio's
+safe `peer_cred()`, `LOCAL_PEERCRED` on macOS with no PID. A PID is reported where it
+exists and is documented as an observation that must not be authorized on [0010 §4.4].
+`a_unix_peer_presents_the_principal_the_kernel_proved` asserts the shape: a principal, no
+key, the uid of the process that owns the socket directory, and a PID on Linux.
+
+**Socket hygiene is the caller's directory plus our two rules.** `bind_unix` removes a
+stale socket node before binding and sets mode `0600` explicitly rather than inheriting
+`umask`, and its doc comment states the obligation the code cannot discharge: unlink-then-bind
+races unless the directory's ownership and permissions prevent substitution
+(`docs/research/ipc.md` §1.2, §7). `a_stale_socket_file_does_not_stop_the_next_bind` leaves
+a node behind, binds over it and checks the mode. The path budget is checked after
+percent-decoding, against 107 bytes on Linux and 104 on macOS.
+
+**What is not here.** Pub/Sub over `AF_UNIX`: a publisher has no stream to a peer that
+dialled it, so the reverse pool of [0012 §4.4] is filed as **B-047** and the transport
+refuses with `Unsupported` in the meantime rather than pretending. No pooling, and no
+control/bulk split, for the same reasons as inproc. The suite is `#[cfg(unix)]`, so Windows
+builds compile the transport out entirely; B-039 adds the pipe variant to the same shape.
+
 **Deliberately deferred** (recorded now, not discovered later):
 
 - Connecting publishers and binding pushers; v0 fixes Pub/Pull as binders and Sub/Push as

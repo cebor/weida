@@ -310,6 +310,30 @@ async fn a_transfer_connection_with_an_unknown_token_is_refused() {
     h.shutdown().await;
 }
 
+/// Claim: a subscription a socket transport could never deliver is refused
+/// at `connect`, not accepted and then starved.
+///
+/// Fan-out needs a stream from the accepting side toward the peer, which an
+/// accepted socket does not have; the reverse connections that would carry
+/// it are [0012 §4.4] and are not built. `Unsupported` at the API is the
+/// honest answer, and it is why the Pub/Sub body above runs over QUIC and
+/// inproc only.
+#[cfg(unix)]
+#[tokio::test]
+async fn pub_sub_over_unix_is_refused_rather_than_starved() {
+    let h = Harness::start(Transport::Unix).await;
+    let _publisher = h.listener.publisher("/md").expect("publisher");
+    let client = h.client();
+    let subscriber = client.subscriber(h.trust());
+    let err = within(subscriber.connect(&h.url("/md")))
+        .await
+        .expect_err("a socket transport cannot fan out");
+    assert!(matches!(err, weida::Error::Unsupported), "{err:?}");
+
+    client.shutdown().await;
+    h.shutdown().await;
+}
+
 #[tokio::test]
 async fn push_pull_over_quic() {
     push_pull_delivery(&Harness::start(Transport::Quic).await).await;

@@ -113,6 +113,31 @@ A local transport is named by its own URL scheme, never by `weida://`
 automatic fallback from one to another, because that would change who may connect and what
 proves them without saying so [0010 §4.6], [0010 §4.8].
 
+**How local connections become a peer.** An accepted socket cannot be dialled
+back, so the connections of one peer are grouped rather than multiplexed
+([decisions/0012](decisions/0012-local-connection-grouping.md)). On a socket
+transport every connection begins with a **local preamble**, which is framing
+of the transport and appears on no QUIC connection:
+
+```text
+0x01                     control connection; the server answers with
+                         16 bytes of group token, then HELLO both ways
+0x02 <16-byte token>     transfer connection; one weida stream
+```
+
+A transfer connection is admitted only if the token names a live control
+connection **and** the kernel credentials of the new connection match that
+control connection's — the uid always, the pid where the platform reports one
+[0012 §4.2]. An unbound connection is dispatched nowhere. The token binds
+connections and resumes nothing: no subscriptions, no sequence position, no
+dedup window, and it is meaningless once the control connection closes, which
+is why it is not the session state §11 excludes [0012 §4.5].
+
+A server has no way to open a stream toward a peer that dialled it, so
+**Pub/Sub over a socket transport is not available** until the parked reverse
+connections of [0012 §4.4] exist; a publisher that has no stream to a local
+subscriber refuses with `UNSUPPORTED` rather than pretending.
+
 ### 2.2 HELLO exchange
 
 Immediately after the QUIC handshake completes, each side MUST open exactly one uni stream

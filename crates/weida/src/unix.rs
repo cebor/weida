@@ -417,14 +417,25 @@ impl UnixLink {
         })
     }
 
-    /// Opens one transfer connection, or hands out the control connection's
-    /// write half the first time.
+    /// Opens one transfer connection, carrying one weida stream.
+    ///
+    /// The control connection's own write half is never handed out here: it
+    /// belongs to `open_control`, so that a fan-out copy can never take the
+    /// stream the HELLO is owed.
     pub(crate) async fn open_uni(&self) -> Result<LocalSend, Error> {
-        if let Some(send) = self.take_control_send() {
-            return Ok(LocalSend::new(send, None));
-        }
         let (send, _recv) = self.open_transfer().await?;
         Ok(send)
+    }
+
+    /// Hands out the control connection's write half, once.
+    ///
+    /// This is the one stream each side has toward the other without dialling
+    /// anything, and both sides spend it on HELLO ([0012 §4.1]).
+    pub(crate) fn open_control(&self) -> Result<LocalSend, Error> {
+        match self.take_control_send() {
+            Some(send) => Ok(LocalSend::new(send, None)),
+            None => Err(Error::Transport("control stream already used".into())),
+        }
     }
 
     pub(crate) async fn open_bi(&self) -> Result<(LocalSend, LocalRecv), Error> {

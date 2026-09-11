@@ -911,6 +911,10 @@ impl Listener {
     // The same endpoints on the in-process transport: no socket, no TLS, no
     // credentials, bus name ≤ 256 B and unique in the process [0010 §4.1, §4.8].
     pub fn bind_inproc(&self, bus: &str) -> Result<LocalBinding, Error>;
+    // AF_UNIX, Unix only: SOCK_STREAM on a path the caller's directory protects,
+    // mode 0600 set explicitly, unlink-then-bind [0010 §4.5, 0012 §4.1].
+    #[cfg(unix)]
+    pub fn bind_unix(&self, path: impl AsRef<Path>) -> Result<UnixBinding, Error>;
     pub fn replier(&self, path: &str) -> Result<Replier, Error>;   // Error::InvalidEndpointPath / AlreadyRegistered
     pub fn puller(&self, path: &str) -> Result<Puller, Error>;     // same path-uniqueness rule
     pub fn publisher(&self, path: &str) -> Result<Publisher, Error>;
@@ -920,6 +924,14 @@ pub struct Binding;
 impl Binding { pub fn local_addr(&self) -> SocketAddr; pub async fn close(&self); }
 pub struct LocalBinding;                                     // unbinds the bus when dropped
 impl LocalBinding { pub fn bus(&self) -> &str; }
+#[cfg(unix)]
+pub struct UnixBinding;                                      // removes the socket file when dropped
+#[cfg(unix)]
+impl UnixBinding { pub fn path(&self) -> &Path; }
+// Who a peer is, once proved: a key from TLS, or a principal from the kernel
+// on a local transport [0010 §4.4]. `None` for an anonymous or in-process peer.
+pub enum PeerIdentity { Key(Fingerprint), Local(LocalPrincipal) }
+pub struct LocalPrincipal { pub uid: u32, pub gid: u32, pub pid: Option<u32> } // a PID is an observation
 
 // ---- L0: the stream core -------------------------------------------------------------
 pub struct Peer;                                             // dialling side; multi-peer, round-robin

@@ -144,6 +144,35 @@ impl Link {
         }
     }
 
+    /// Opens the stream a HELLO is written on.
+    ///
+    /// Only a grouped socket transport distinguishes it: there the two ends
+    /// of the control connection are the one pair of stream halves that exist
+    /// without dialling, and HELLO is what they are for
+    /// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md) §4.1).
+    pub(crate) async fn open_control(&self) -> Result<SendHalf, Error> {
+        match self {
+            #[cfg(unix)]
+            Link::Unix(conn) => conn.open_control().map(SendHalf::Unix),
+            _ => self.open_uni().await,
+        }
+    }
+
+    /// Whether the accepting side of this connection can open a stream back.
+    ///
+    /// QUIC and the in-process pair can; a socket transport cannot, because
+    /// an accepted socket is not dialable and the reverse connections that
+    /// would replace it are
+    /// [0012](../../../docs/decisions/0012-local-connection-grouping.md) §4.4.
+    /// Pub/Sub is the one pattern that needs it.
+    pub(crate) fn carries_reverse_streams(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            Link::Unix(_) => false,
+            _ => true,
+        }
+    }
+
     pub(crate) async fn open_bi(&self) -> Result<(SendHalf, RecvHalf), Error> {
         match self {
             Link::Quic(conn) => conn
