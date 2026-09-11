@@ -593,6 +593,39 @@ context. Measured after the fix: **1.05-1.09 ms**, `change: −11.6 % (p = 0.00)
 pre-B-016 level. Every pinned deployment dials literals, because a pinned address names a key
 rather than a name, so this was the common path and not an edge case.
 
+### Verified results — segment matching in the fan-out path (B-021)
+
+The number [0007](decisions/0007-topic-namespace.md) §6 asked for. The objection the decision
+overrode was that a matching language belongs nowhere near a publisher's hot path
+([0007](decisions/0007-topic-namespace.md) §4.6); this is what it costs.
+
+The `filters` group of `crates/weida/benches/patterns.rs` gives one connection *N* filters that
+the published topic matches **none** of, so `publish` returns 0 and the measurement is *N*
+matcher calls plus the fixed cost of a publish — no enqueue, no copy, no fan-out. Running the
+same shape at `N = 1` and `N = 64` subtracts the fixed cost out: the difference over 63 is what
+one more filter costs.
+
+| Case | Command | Result |
+| --- | --- | --- |
+| Literal mismatch | `cargo bench -p weida --bench patterns -- filters` | 93.3 ns at one filter, **1.020 µs** at 64 → **14.7 ns per filter** |
+| `*` in the middle | same | 97.4 ns at one filter, **999 ns** at 64 → **14.3 ns per filter** |
+| Trailing `#` | same | **1.047 µs** at 64 → **15.1 ns per filter** |
+| The replaced matcher, for scale | same | 64 `topic.starts_with(filter)` comparisons in a tight loop: **29.3 ns**, i.e. **0.46 ns each** |
+| One matched fan-out, for scale | `cargo bench -p weida --bench patterns -- fanout` | `pub_1kib_8_subscribers` **64.5 µs** for publish plus eight receives |
+
+**The shape does not matter.** A walk that fails in the first segment, one that has to cross a
+`*` to reach the third, and one that meets a trailing `#` differ by 5 % — inside the spread of
+this machine. That is the answer to the objection: the per-filter cost is dominated by
+iterating the subscription registry, not by the grammar, and `#` being legal only in the final
+segment is what keeps it that way (no backtracking, so the walk is linear in the filter).
+
+**The scale is what settles it.** Sixty-four non-matching filters cost about **1 µs** of a
+publish, against **64.5 µs** for one matched fan-out to eight subscribers — under 2 % — and a
+publisher hits `max_subscriptions = 256` long before that becomes visible. The byte prefix it
+replaced would have been ~0.5 ns per comparison in isolation, so a hot-path-only argument could
+have preferred it; what it could not do is express a segment boundary at all, which is the
+trade 0007 recorded and these numbers price.
+
 ---
 
 ## 5. Decisions
