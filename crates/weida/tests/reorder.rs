@@ -156,10 +156,7 @@ enum Finish {
 /// exactly once each.
 async fn reverse_finish_case(n: usize, finish: Finish) {
     let server = Server::start_with_config(RuntimeConfig {
-        limits: Limits {
-            endpoint_queue: n + 1,
-            ..config(256).limits
-        },
+        endpoint_queue: n + 1,
         ..config(256)
     })
     .await;

@@ -16,12 +16,51 @@ use weida_protocol::header::GuaranteeSet;
 /// Configuration for one [`crate::Runtime`].
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
-    /// Resource limits applied to every connection this runtime owns.
+    /// Resource limits applied to every connection this runtime owns or
+    /// accepts.
+    ///
+    /// One profile, not yet one per connection tier: the control tier of
+    /// `docs/decisions/0002-control-and-bulk-separation.md` §6.3 does not
+    /// exist in the code yet, and a second profile nothing reads would be
+    /// worse than none.
     pub limits: Limits,
-    /// QUIC keep-alive interval for outgoing connections.
-    pub keep_alive: Duration,
-    /// QUIC idle timeout, applied in both directions.
-    pub idle_timeout: Duration,
+    /// Concurrently accepted connections per binding. Excess connections are
+    /// closed immediately with `LIMIT_EXCEEDED`.
+    ///
+    /// Per binding rather than per connection, which is why it is here and
+    /// not in [`Limits`].
+    pub max_connections: usize,
+    /// Connections one **peer** may hold on one binding at once, counted by
+    /// the fingerprint it proved.
+    ///
+    /// One connection per dialled endpoint path means the dialling side
+    /// chooses how many connections it opens, so `max_connections` alone
+    /// would let a single peer fill a binding: 64 connections to one peer
+    /// measured about 50 MiB of transport state on the pair
+    /// (`docs/IMPLEMENTATION.md` §4, B-011), and the default of 64 is that
+    /// measured number — enough for a control connection plus 63 dialled
+    /// paths, and a sixteenth of the default `max_connections`.
+    ///
+    /// Counted **per proved fingerprint**. Connections that proved no
+    /// identity are each their own peer and are bounded only by
+    /// `max_connections`, because two anonymous connections cannot be shown
+    /// to be one peer ([`PROTOCOL.md`] §2.5,
+    /// `docs/decisions/0008-session-identity.md` §4.2). A binding that wants
+    /// this bound therefore requires a client identity.
+    ///
+    /// [`PROTOCOL.md`]: https://github.com/tuco86/weida/blob/main/docs/PROTOCOL.md
+    pub max_connections_per_peer: usize,
+    /// Depth of an endpoint's accept queue. Senders await a free slot, so QUIC
+    /// flow control carries the backpressure to the peer.
+    pub endpoint_queue: usize,
+    /// Addresses a dialling endpoint will try for one hostname, in the order
+    /// the resolver returned them.
+    ///
+    /// More than one is necessary because the first is not necessarily
+    /// reachable — `localhost` commonly resolves to both `::1` and
+    /// `127.0.0.1` — and a ceiling is necessary because a resolver answer is
+    /// remote input.
+    pub max_resolved_addresses: usize,
     /// Worker threads of the Tokio runtime [`crate::Runtime::owned`] creates.
     ///
     /// Ignored by [`crate::Runtime::new`] and [`crate::Runtime::with_handle`],
@@ -68,8 +107,10 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         RuntimeConfig {
             limits: Limits::default(),
-            keep_alive: Duration::from_secs(10),
-            idle_timeout: Duration::from_secs(30),
+            max_connections_per_peer: 64,
+            max_connections: 1024,
+            endpoint_queue: 256,
+            max_resolved_addresses: 8,
             worker_threads: 1,
             shutdown_timeout: Duration::from_secs(1),
             guarantees: GuaranteeSet::CORE,
@@ -368,9 +409,13 @@ mod tests {
     #[test]
     fn defaults_match_the_protocol_document() {
         let c = RuntimeConfig::default();
-        assert_eq!(c.keep_alive, Duration::from_secs(10));
-        assert_eq!(c.idle_timeout, Duration::from_secs(30));
         assert_eq!(c.limits, Limits::default());
+        assert_eq!(c.limits.keep_alive, Duration::from_secs(10));
+        assert_eq!(c.limits.idle_timeout, Duration::from_secs(30));
+        assert_eq!(c.max_connections, 1024);
+        assert_eq!(c.max_connections_per_peer, 64);
+        assert_eq!(c.endpoint_queue, 256);
+        assert_eq!(c.max_resolved_addresses, 8);
     }
 
     #[test]

@@ -6,20 +6,19 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use quinn::VarInt;
 use tokio::sync::mpsc;
-use weida_core::{Error, Limits, validate_endpoint_path};
+use weida_core::{Error, Fingerprint, validate_endpoint_path};
 use weida_protocol::codes;
-use weida_protocol::header::GuaranteeSet;
 
 use crate::config::ServerTls;
 use crate::conn::ConnCtx;
 use crate::endpoint::{Endpoint, PubState, Publisher, PullState, Puller, RepState, Replier};
 use crate::pubsub::SubRegistry;
-use crate::runtime::{Exec, RuntimeInner};
+use crate::runtime::RuntimeInner;
 use crate::stream::{Acceptor, Incoming};
 use crate::tls;
 use crate::transfer::{IncomingRequest, IncomingTransfer};
@@ -123,6 +122,10 @@ pub struct Listener {
 
 impl Listener {
     pub(crate) fn new(runtime: Arc<RuntimeInner>) -> Listener {
+        // A binding cannot tell the tiers apart — nothing on the wire
+        // distinguishes them (`docs/PROTOCOL.md` §2.5) — so it serves every
+        // accepted connection on the bulk profile, which is the one that must
+        // tolerate payload.
         let limits = runtime.config.limits;
         let ordering = runtime.config.guarantees.ordering;
         Listener {
@@ -153,8 +156,7 @@ impl Listener {
     ) -> Result<Binding, Error> {
         let tls = tls.into();
         let limits = self.inner.runtime.config.limits;
-        let server_config =
-            tls::server_config(&tls, &limits, self.inner.runtime.config.idle_timeout)?;
+        let server_config = tls::server_config(&tls, &limits)?;
         let exec = self.inner.runtime.exec.clone();
 
         // Inside the runtime context: `quinn` registers the socket with the
@@ -168,12 +170,7 @@ impl Listener {
 
         exec.spawn(accept_connections(
             endpoint.clone(),
-            Arc::clone(&self.inner.namespace),
-            Arc::clone(&self.inner.subs),
-            limits,
-            exec.clone(),
-            self.inner.runtime.config.guarantees,
-            self.inner.runtime.duplicates(),
+            Arc::clone(&self.inner),
         ));
 
         tracing::info!(%local_addr, "quic binding listening");
@@ -189,7 +186,7 @@ impl Listener {
     /// registered on this listener.
     pub fn replier(&self, path: &str) -> Result<Replier, Error> {
         validate_endpoint_path(path)?;
-        let (tx, rx) = mpsc::channel(self.inner.runtime.config.limits.endpoint_queue);
+        let (tx, rx) = mpsc::channel(self.inner.runtime.config.endpoint_queue);
         self.inner.namespace.register(path, Route::Request(tx))?;
         Ok(Endpoint::from_state(RepState::new(path, rx)))
     }
@@ -201,7 +198,7 @@ impl Listener {
     /// listener, whatever pattern claimed it.
     pub fn puller(&self, path: &str) -> Result<Puller, Error> {
         validate_endpoint_path(path)?;
-        let (tx, rx) = mpsc::channel(self.inner.runtime.config.limits.endpoint_queue);
+        let (tx, rx) = mpsc::channel(self.inner.runtime.config.endpoint_queue);
         self.inner.namespace.register(path, Route::Transfer(tx))?;
         Ok(Endpoint::from_state(PullState::new(path, rx)))
     }
@@ -230,7 +227,7 @@ impl Listener {
     /// replier's or a puller's.
     pub fn acceptor(&self, path: &str) -> Result<Acceptor, Error> {
         validate_endpoint_path(path)?;
-        let (tx, rx) = mpsc::channel(self.inner.runtime.config.limits.endpoint_queue);
+        let (tx, rx) = mpsc::channel(self.inner.runtime.config.endpoint_queue);
         self.inner.namespace.register(path, Route::Raw(tx))?;
         Ok(Acceptor::new(path, rx))
     }
@@ -266,25 +263,76 @@ fn shutdown_code() -> VarInt {
     VarInt::from_u32(codes::SHUTDOWN as u32)
 }
 
+/// Live connections per proved peer identity, for `max_connections_per_peer`.
+///
+/// Keyed by the fingerprint a peer proved in the handshake, because that is
+/// the only thing that binds two connections into one peer
+/// (`docs/decisions/0008-session-identity.md` §4.2). A connection that proved
+/// nothing is not counted here at all: two anonymous connections cannot be
+/// shown to be one peer, so counting them together would refuse strangers for
+/// each other's traffic. They remain bounded by `max_connections`.
+#[derive(Default)]
+struct PeerCounts(std::sync::Mutex<HashMap<Fingerprint, usize>>);
+
+impl PeerCounts {
+    /// Counts one more connection for `peer` and reports whether it fits.
+    ///
+    /// The count is taken before the connection is served and released when
+    /// it closes, so what is bounded is *live* connections rather than dials
+    /// over time.
+    fn admit(&self, peer: Option<Fingerprint>, max: usize) -> bool {
+        let Some(peer) = peer else {
+            return true;
+        };
+        let mut counts = self.0.lock().expect("peer count poisoned");
+        let count = counts.entry(peer).or_insert(0);
+        if *count >= max {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    fn release(&self, peer: Option<Fingerprint>) {
+        let Some(peer) = peer else {
+            return;
+        };
+        let mut counts = self.0.lock().expect("peer count poisoned");
+        if let Some(count) = counts.get_mut(&peer) {
+            *count -= 1;
+            // The table is keyed by remote input, so an entry that counts
+            // nothing is removed rather than left behind.
+            if *count == 0 {
+                counts.remove(&peer);
+            }
+        }
+    }
+}
+
 /// Accepts connections until the endpoint is closed.
-async fn accept_connections(
-    endpoint: quinn::Endpoint,
-    namespace: Arc<Namespace>,
-    subs: Arc<SubRegistry>,
-    limits: Limits,
-    exec: Exec,
-    guarantees: GuaranteeSet,
-    duplicates: Arc<AtomicU64>,
-) {
+///
+/// Everything it needs is already on the listener it serves: the namespace to
+/// route into, the subscription registry, and the runtime whose configuration
+/// decides the limits and whose executor runs the connections. Holding the
+/// listener for as long as a binding accepts is the honest lifetime — a
+/// binding without its namespace serves nothing.
+async fn accept_connections(endpoint: quinn::Endpoint, listener: Arc<ListenerInner>) {
+    let config = &listener.runtime.config;
+    let limits = config.limits;
+    let max_connections = config.max_connections;
+    let max_connections_per_peer = config.max_connections_per_peer;
+    let guarantees = config.guarantees;
+    let exec = listener.runtime.exec.clone();
+    let duplicates = listener.runtime.duplicates();
+    let namespace = Arc::clone(&listener.namespace);
+    let subs = Arc::clone(&listener.subs);
     let live = Arc::new(AtomicUsize::new(0));
+    let peers = Arc::new(PeerCounts::default());
     while let Some(incoming) = endpoint.accept().await {
-        if live.load(Ordering::Relaxed) >= limits.max_connections {
+        if live.load(Ordering::Relaxed) >= max_connections {
             // Complete the handshake, then say why: a bare refusal leaves the
             // peer unable to distinguish overload from a routing mistake.
-            tracing::warn!(
-                max = limits.max_connections,
-                "connection limit reached; refusing"
-            );
+            tracing::warn!(max = max_connections, "connection limit reached; refusing");
             exec.spawn(async move {
                 if let Ok(conn) = incoming.await {
                     conn.close(
@@ -302,28 +350,50 @@ async fn accept_connections(
         live.fetch_add(1, Ordering::Relaxed);
         let exec_for_conn = exec.clone();
         let duplicates = Arc::clone(&duplicates);
+        let peers = Arc::clone(&peers);
         exec.spawn(async move {
             match incoming.await {
                 Ok(conn) => {
                     let remote = conn.remote_address();
                     let conn_id = conn.stable_id();
-                    tracing::debug!(%remote, "connection accepted");
-                    // The handle must outlive the connection: it owns the
-                    // actor's control channel.
-                    let _ctx = ConnCtx::spawn(
-                        conn.clone(),
-                        limits,
-                        namespace,
-                        Some(Arc::clone(&subs)),
-                        exec_for_conn,
-                        guarantees,
-                        duplicates,
-                    );
-                    let reason = conn.closed().await;
-                    // A peer that goes away takes its subscriptions with it;
-                    // otherwise connection churn would grow the registry.
-                    subs.remove_connection(conn_id);
-                    tracing::debug!(%remote, %reason, "connection closed");
+                    // The per-peer ceiling can only be applied here: the
+                    // identity exists once the handshake is complete, and one
+                    // peer now holds one connection per endpoint path it
+                    // dials, so the path count it chooses would otherwise be
+                    // the only bound
+                    // (`docs/decisions/0002-control-and-bulk-separation.md` §7).
+                    let peer = crate::tls::peer_fingerprint(&conn);
+                    if !peers.admit(peer, max_connections_per_peer) {
+                        tracing::warn!(
+                            %remote,
+                            max = max_connections_per_peer,
+                            "per-peer connection limit reached; refusing"
+                        );
+                        conn.close(
+                            VarInt::from_u32(codes::LIMIT_EXCEEDED as u32),
+                            b"per-peer connection limit reached",
+                        );
+                    } else {
+                        tracing::debug!(%remote, "connection accepted");
+                        // The handle must outlive the connection: it owns the
+                        // actor's control channel.
+                        let _ctx = ConnCtx::spawn(
+                            conn.clone(),
+                            limits,
+                            namespace,
+                            Some(Arc::clone(&subs)),
+                            exec_for_conn,
+                            guarantees,
+                            duplicates,
+                        );
+                        let reason = conn.closed().await;
+                        // A peer that goes away takes its subscriptions with
+                        // it; otherwise connection churn would grow the
+                        // registry.
+                        subs.remove_connection(conn_id);
+                        peers.release(peer);
+                        tracing::debug!(%remote, %reason, "connection closed");
+                    }
                 }
                 Err(e) => tracing::debug!(error = %e, "handshake failed"),
             }

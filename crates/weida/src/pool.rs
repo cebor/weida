@@ -1,17 +1,35 @@
 //! Client connection pool.
 //!
-//! One QUIC endpoint per runtime and one connection per `host:port`. Pooling is
-//! keyed on the authority as written rather than on the resolved address: the
-//! TLS server name comes from the same string, so two spellings of one address
-//! are genuinely different peers as far as authentication is concerned.
+//! One QUIC endpoint per runtime and **one connection per dialled endpoint
+//! path** ([decisions/0002](../../../docs/decisions/0002-control-and-bulk-separation.md)
+//! §6.2). The path is part of the key, so a slow reader on one path cannot
+//! stall a writer on another: they share no connection and therefore no
+//! receive window, which is the only isolation QUIC actually gives
+//! (`docs/PATTERNS.md` §1.3).
+//!
+//! The rest of the key is the authority as written, the trust configuration
+//! and the fingerprint the address named, rather than the resolved address:
+//! the TLS server name comes from the same string, so two spellings of one
+//! address are genuinely different peers as far as authentication is
+//! concerned.
+//!
+//! **The connections of one peer are bound together by the proved
+//! fingerprint, and by nothing else**
+//! ([decisions/0008](../../../docs/decisions/0008-session-identity.md) §4.2).
+//! Dialling a second path is dialling the same peer, so the pool checks that
+//! the peer that answers is the one that answered before and refuses the
+//! connection otherwise — the load-balancer case, where two dials to one
+//! authority reach two different servers.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
+use quinn::VarInt;
 use tokio::sync::Mutex;
-use weida_core::{Error, Fingerprint};
+use weida_core::{EndpointAddr, Error, Fingerprint};
+use weida_protocol::codes;
 
 use crate::config::{ClientTls, RuntimeConfig};
 use crate::conn::{ConnCtx, ConnHandle, conn_error};
@@ -25,16 +43,19 @@ pub(crate) struct ClientPool {
     duplicates: Arc<AtomicU64>,
 }
 
-/// Keyed by authority, trust configuration **and** the fingerprint the
-/// address named. Two endpoints dialling the same `host:port` on different
-/// terms must not share a connection: the peer was authenticated on one set
-/// of terms, not both.
-type PoolKey = (String, u16, Arc<ClientTls>, Option<Fingerprint>);
+/// Which **peer** a connection belongs to: authority, trust configuration and
+/// the fingerprint the address named. Two endpoints dialling the same
+/// `host:port` on different terms are not the same peer — one was
+/// authenticated on one set of terms, not both.
+type PeerKey = (String, u16, Arc<ClientTls>, Option<Fingerprint>);
+
+/// Which **connection**: a peer plus the endpoint path it was dialled for.
+type ConnKey = (PeerKey, String);
 
 #[derive(Default)]
 struct PoolState {
     endpoint: Option<quinn::Endpoint>,
-    connections: HashMap<PoolKey, ConnHandle>,
+    connections: HashMap<ConnKey, ConnHandle>,
 }
 
 impl ClientPool {
@@ -52,22 +73,31 @@ impl ClientPool {
         state.endpoint.take()
     }
 
-    /// Returns a live connection to `host:port` authenticated on `tls`'s
-    /// terms — and, when the address named one, as `expected` — dialling if
-    /// necessary.
+    /// Returns a live connection to `path` on `host:port`, authenticated on
+    /// `tls`'s terms — and, when the address named one, as `expected` —
+    /// dialling if necessary.
     ///
-    /// The returned handle has completed the HELLO exchange, so callers never
-    /// have to think about negotiation.
+    /// One connection per path: two paths on one peer never share a
+    /// connection, so neither can stall the other. The returned handle has
+    /// completed the HELLO exchange, so callers never have to think about
+    /// negotiation, and the peer it proved has been checked against the
+    /// identity this peer proved on its other connections.
     pub(crate) async fn connect(
         &self,
         config: &RuntimeConfig,
         exec: &Exec,
-        host: &str,
-        port: u16,
+        addr: &EndpointAddr,
         tls: &Arc<ClientTls>,
-        expected: Option<Fingerprint>,
     ) -> Result<ConnHandle, Error> {
-        let key: PoolKey = (host.to_owned(), port, Arc::clone(tls), expected);
+        let EndpointAddr {
+            host,
+            port,
+            path,
+            peer: expected,
+        } = addr;
+        let (host, port, expected) = (host.as_str(), *port, *expected);
+        let peer: PeerKey = (host.to_owned(), port, Arc::clone(tls), expected);
+        let key: ConnKey = (peer.clone(), path.clone());
         let mut state = self.state.lock().await;
 
         if let Some(existing) = state.connections.get(&key) {
@@ -86,16 +116,10 @@ impl ClientPool {
             }
         };
 
-        let (client_config, refused) = tls::client_config(
-            tls,
-            expected,
-            &config.limits,
-            config.keep_alive,
-            config.idle_timeout,
-        )?;
+        let (client_config, refused) = tls::client_config(tls, expected, &config.limits)?;
 
         let addrs = exec
-            .resolve(host, port, config.limits.max_resolved_addresses)
+            .resolve(host, port, config.max_resolved_addresses)
             .await?;
         // Every address, in the resolver's order, until one answers. The first
         // is not necessarily reachable: `localhost` commonly resolves to `::1`
@@ -176,6 +200,39 @@ impl ClientPool {
             }
         };
 
+        // The connections of one peer are bound together by the proved
+        // fingerprint and by nothing else (0008 §4.2). Dialling a second path
+        // is dialling the same peer, so a connection that proved a different
+        // identity than this peer's *live* connections is not this peer: it
+        // is a second server behind one authority, and serving a transfer on
+        // it would mean talking to somebody the caller never asked for.
+        //
+        // The comparison is against live connections rather than a remembered
+        // fingerprint, because a peer is this peer only while a connection to
+        // it lives: once the last one is gone, a replacement server with a new
+        // key is a new peer and nothing should still be objecting to it.
+        let presented = crate::tls::peer_fingerprint(&conn);
+        if let Some(known) = state.peer_identity(&peer)
+            && known != presented
+        {
+            conn.close(
+                VarInt::from_u32(codes::SHUTDOWN as u32),
+                b"peer identity differs from this peer's other connections",
+            );
+            // `Untrusted` carries who answered, which is the fingerprint an
+            // operator needs to decide whether to pin it. An anonymous answer
+            // cannot be reported that way, and cannot be bound to anything
+            // either.
+            return Err(match presented {
+                Some(fp) => Error::Untrusted(fp),
+                None => Error::Tls(
+                    "the peer that answered proved no identity, so it cannot be the peer this \
+                     runtime is already connected to"
+                        .into(),
+                ),
+            });
+        }
+
         // A fresh namespace per client connection: a subscriber registers its
         // path here so fanned-out copies have somewhere to go. It is not the
         // listener's namespace — a client serves nothing on its own account.
@@ -195,6 +252,20 @@ impl ClientPool {
 
         state.connections.insert(key, ConnHandle::clone(&handle));
         Ok(handle)
+    }
+}
+
+impl PoolState {
+    /// The identity this peer's live connections proved, if it has any.
+    ///
+    /// `Some(None)` is a peer whose live connections proved nothing at all
+    /// and is a real answer, distinct from `None` — no live connection, so
+    /// nothing to be consistent with.
+    fn peer_identity(&self, peer: &PeerKey) -> Option<Option<Fingerprint>> {
+        self.connections
+            .iter()
+            .find(|((p, _), handle)| p == peer && handle.conn.close_reason().is_none())
+            .map(|(_, handle)| handle.peer)
     }
 }
 

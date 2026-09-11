@@ -200,10 +200,7 @@ impl Peer {
     /// have somewhere to land.
     pub(crate) async fn dial(&self, url: &str) -> Result<(ConnHandle, Arc<str>), Error> {
         let addr = EndpointAddr::parse(url)?;
-        let conn = self
-            .runtime
-            .connect(&addr.host, addr.port, &self.tls, addr.peer)
-            .await?;
+        let conn = self.runtime.connect(&addr, &self.tls).await?;
         self.peers.add(ConnHandle::clone(&conn), &addr.path);
         Ok((conn, Arc::from(addr.path.as_str())))
     }

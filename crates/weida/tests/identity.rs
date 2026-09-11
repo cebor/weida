@@ -343,3 +343,130 @@ async fn connections_are_not_shared_across_different_terms() {
 
     client.shutdown().await;
 }
+
+/// Claim: the connections of one peer are bound together by the proved
+/// fingerprint, and by nothing else
+/// ([0008](../../../docs/decisions/0008-session-identity.md) §4.2). One
+/// connection per dialled path means a second path is a second connection to
+/// the *same* peer, so a second server answering on that authority is refused,
+/// carrying the fingerprint that answered rather than a bare failure.
+///
+/// The setup is the load-balancer case, and it needs a raw server because two
+/// `quinn` endpoints cannot share a port: one socket, whose identity is
+/// swapped between the two handshakes. The client trusts both keys, so nothing
+/// but the binding rule can refuse the second dial.
+#[tokio::test]
+async fn a_second_path_that_answers_with_another_identity_is_refused() {
+    let first = Certs::generate();
+    let second = Certs::generate();
+    let first_fp = first.fingerprint();
+    let second_fp = second.fingerprint();
+
+    let (endpoint, addr) = common::raw::server_endpoint(&first);
+    let swap = common::raw::server_config(&second);
+    tokio::spawn(async move {
+        // First handshake: identity one. The identity is swapped *before* the
+        // HELLO that lets the client's `connect` return, so the second dial
+        // cannot race ahead of the swap.
+        let incoming = endpoint.accept().await.expect("first connection");
+        let held = incoming.await.expect("first handshake");
+        endpoint.set_server_config(Some(swap));
+        common::raw::send_hello(&held).await;
+
+        // Second handshake: identity two. It never needs a HELLO — the pool
+        // refuses it on identity, before negotiation begins.
+        if let Some(incoming) = endpoint.accept().await {
+            let _ = incoming.await;
+        }
+        // Hold the first connection open: the binding rule compares against
+        // this peer's *live* connections.
+        held.closed().await;
+    });
+
+    let client = Runtime::new(RuntimeConfig::default()).expect("client");
+    let pusher = client.pusher(ClientTls::new(Trust::pin(first_fp).and_pin(second_fp)));
+
+    let base = format!("weida://127.0.0.1:{}", addr.port());
+    within(pusher.connect(&format!("{base}/a")))
+        .await
+        .expect("the first path connects");
+
+    let err = within(pusher.connect(&format!("{base}/b")))
+        .await
+        .expect_err("a different peer on the same authority must be refused");
+    match err {
+        Error::Untrusted(fp) => assert_eq!(
+            fp, second_fp,
+            "the refusal names who answered, so an operator can pin it"
+        ),
+        other => panic!("expected Untrusted, got {other:?}"),
+    }
+    // The path that was already connected is untouched by its neighbour's
+    // refusal: one connection per path means one failure per path.
+    assert_eq!(pusher.peer_count(), 1);
+
+    client.shutdown().await;
+}
+
+/// Claim: `max_connections_per_peer` bounds what one peer can hold, counted by
+/// the identity it proved, and one connection per dialled path is exactly why
+/// it is needed — the dialling side chooses the path count
+/// ([0002](../../../docs/decisions/0002-control-and-bulk-separation.md) §7).
+///
+/// The binding requires a client identity, because a bound it cannot attribute
+/// is a bound it cannot enforce: two anonymous connections may not be treated
+/// as one peer.
+#[tokio::test]
+async fn a_peer_cannot_hold_more_connections_than_its_ceiling() {
+    const CEILING: usize = 3;
+
+    let identity = Identity::generate().expect("identity");
+    let fingerprint = identity.fingerprint().expect("fingerprint");
+    let client_identity = Identity::generate().expect("client identity");
+    let client_fp = client_identity.fingerprint().expect("client fingerprint");
+
+    let runtime = Runtime::new(RuntimeConfig {
+        max_connections_per_peer: CEILING,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    let listener = runtime.listener();
+    let binding = listener
+        .bind_quic(
+            "127.0.0.1:0".parse().expect("loopback"),
+            ServerTls::new(identity).require_client(Trust::pin(client_fp)),
+        )
+        .await
+        .expect("bind");
+    let base = format!(
+        "weida://{}@127.0.0.1:{}",
+        fingerprint,
+        binding.local_addr().port()
+    );
+    // Held for the duration: dropping a puller unregisters its path.
+    let _pullers: Vec<_> = (0..=CEILING)
+        .map(|i| listener.puller(&format!("/p{i}")).expect("puller"))
+        .collect();
+
+    let client = Runtime::new(RuntimeConfig::default()).expect("client");
+    let pusher =
+        client.pusher(ClientTls::new(Trust::pin(fingerprint)).with_identity(client_identity));
+
+    // Up to the ceiling: one connection per path, all accepted.
+    for i in 0..CEILING {
+        within(pusher.connect(&format!("{base}/p{i}")))
+            .await
+            .unwrap_or_else(|e| panic!("path {i} must connect: {e:?}"));
+    }
+    assert_eq!(pusher.peer_count(), CEILING);
+
+    // One more path is one more connection, and the binding refuses it by
+    // saying which limit was hit.
+    let err = within(pusher.connect(&format!("{base}/p{CEILING}")))
+        .await
+        .expect_err("the ceiling must bite");
+    assert!(matches!(err, Error::LimitExceeded), "{err:?}");
+
+    client.shutdown().await;
+    runtime.shutdown().await;
+}
