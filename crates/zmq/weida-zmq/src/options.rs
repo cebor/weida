@@ -43,6 +43,18 @@ pub const DEFAULT_BACKLOG: u32 = 100;
 /// commonly resolves to both `::1` and `127.0.0.1`.
 pub const DEFAULT_MAX_RESOLVED_ADDRESSES: usize = 8;
 
+/// Peers one socket admits from accepted connections, by default.
+///
+/// libzmq has no such option, so the number is ours to choose and to state.
+/// 1024 is `ZMQ_MAX_SOCKETS`'s own order of magnitude and one above
+/// `ZMQ_BACKLOG`'s 100, so a listener that fills its accept queue several
+/// times over is still admitted; what it bounds is the product underneath —
+/// at the default high-water marks and message size, 1024 peers is the
+/// ceiling on `1024 × 2 × ZMQ_RCVHWM × ZMQ_MAXMSGSIZE` rather than on
+/// nothing at all. A deployment that expects more peers than this raises it
+/// deliberately, having seen that arithmetic.
+pub const DEFAULT_MAX_PEERS: usize = 1024;
+
 /// The largest `ZMQ_HEARTBEAT_TTL` the wire can carry: the field is
 /// deciseconds in a `u16`, so 6553.5 s (`docs/research/zeromq.md` §11).
 pub const MAX_HEARTBEAT_TTL: Duration = Duration::from_millis(6_553_500);
@@ -129,6 +141,19 @@ pub struct SocketOptions {
     /// 37/ZMTP has no such limit and an unbounded frame count is unbounded
     /// memory. See [`DEFAULT_MAX_MESSAGE_FRAMES`].
     pub max_message_frames: usize,
+    /// Peers this socket will admit from **accepted** connections.
+    ///
+    /// **Not a libzmq option**, and the parity table says so in those terms:
+    /// `ZMQ_MAX_SOCKETS` bounds sockets per context, `ZMQ_BACKLOG` bounds the
+    /// kernel's accept queue, and neither bounds how many established
+    /// connections one socket holds — libzmq has no option that does. Every
+    /// admitted peer carries a queue of `ZMQ_RCVHWM` messages inbound and
+    /// `ZMQ_SNDHWM` outbound, so without this the exposure is that product
+    /// times a number a stranger chooses. See
+    /// [`DEFAULT_MAX_PEERS`] for the default and its arithmetic. Connections
+    /// this socket dialled are not counted: their number is how many times
+    /// the application called `connect`.
+    pub max_peers: usize,
     /// `ZMQ_SNDHWM`/`ZMQ_RCVHWM` and the mute action, per peer.
     pub pipe: PipeConfig,
     /// See [`DEFAULT_MAX_RESOLVED_ADDRESSES`].
@@ -146,6 +171,7 @@ impl Default for SocketOptions {
             backlog: DEFAULT_BACKLOG,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_message_frames: DEFAULT_MAX_MESSAGE_FRAMES,
+            max_peers: DEFAULT_MAX_PEERS,
             heartbeat_ivl: None,
             heartbeat_timeout: None,
             heartbeat_ttl: None,
@@ -175,6 +201,11 @@ impl SocketOptions {
                  request be reported as the reply to the one that superseded it; libzmq \
                  documents that hazard and this library refuses it"
                     .into(),
+            ));
+        }
+        if self.max_peers == 0 {
+            return Err(Error::EINVAL(
+                "max_peers is zero, so this socket could accept no connection at all".into(),
             ));
         }
         if self.max_message_frames == 0 {
