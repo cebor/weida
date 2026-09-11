@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use common::{Certs, Server, raw};
 use weida::{Error, Runtime, RuntimeConfig, TransferMeta, codes};
+use weida_protocol::header::{GuaranteeSet, OrderingMode};
 use weida_protocol::{
     DataHeader, ErrorHeader, FrameKind, Hello, MAGIC, SubscriptionHeader, encode_preamble,
 };
@@ -112,10 +113,7 @@ async fn hello_with_an_unsupported_version_fails_negotiation() {
 
     let hello = Hello {
         versions: vec![99],
-        max_header_bytes: 16 * 1024,
-        max_transfers: 8,
-        capabilities: vec![],
-        required_capabilities: vec![],
+        ..Hello::v0(16 * 1024, 8)
     };
     raw::send_frame(&conn, FrameKind::Hello, &hello.encode()).await;
 
@@ -134,11 +132,9 @@ async fn a_required_capability_we_lack_fails_negotiation() {
         .expect("handshake");
 
     let hello = Hello {
-        versions: vec![0],
-        max_header_bytes: 16 * 1024,
-        max_transfers: 8,
         capabilities: vec![7],
         required_capabilities: vec![7],
+        ..Hello::v0(16 * 1024, 8)
     };
     raw::send_frame(&conn, FrameKind::Hello, &hello.encode()).await;
 
@@ -146,6 +142,65 @@ async fn a_required_capability_we_lack_fails_negotiation() {
         within(raw::closed_code(&conn)).await,
         codes::NEGOTIATION_FAILED
     );
+}
+
+/// A peer that requires a guarantee level this build does not offer gets a
+/// failed handshake, never a quieter success
+/// (`docs/PROTOCOL.md` §2.3 step 6).
+#[tokio::test]
+async fn a_required_guarantee_level_we_do_not_offer_fails_negotiation() {
+    let server = Server::start().await;
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+
+    let wants_ordering = GuaranteeSet {
+        ordering: OrderingMode::PerProducerDetect,
+        ..GuaranteeSet::CORE
+    };
+    let hello = Hello {
+        guarantees_offered: Some(wants_ordering),
+        guarantees_required: Some(wants_ordering),
+        ..Hello::v0(16 * 1024, 8)
+    };
+    raw::send_frame(&conn, FrameKind::Hello, &hello.encode()).await;
+
+    assert_eq!(
+        within(raw::closed_code(&conn)).await,
+        codes::NEGOTIATION_FAILED
+    );
+}
+
+/// A guarantee set the grammar of §6.5 forbids is a framing violation, not a
+/// negotiation failure: the header never becomes a declaration at all.
+#[tokio::test]
+async fn a_malformed_guarantee_set_is_a_framing_violation() {
+    for header in [
+        // An unknown ordering level.
+        raw::hello_with_guarantee_map(&[(4, 99)]),
+        // `durability` without `Stored`/`Replicated`.
+        raw::hello_with_guarantee_map(&[(2, 1)]),
+        // `replicas` of 1, and without `Replicated`.
+        raw::hello_with_guarantee_map(&[(3, 1)]),
+        // `Bounded` deduplication with no window.
+        raw::hello_with_guarantee_map(&[(5, 1)]),
+        // A window with no `Bounded`.
+        raw::hello_with_guarantee_map(&[(6, 1_000)]),
+        // `control_isolated` is a flag, not a number.
+        raw::hello_with_guarantee_map(&[(9, 2)]),
+    ] {
+        let server = Server::start().await;
+        let endpoint = raw::client_endpoint(&server.certs);
+        let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+            .await
+            .expect("handshake");
+        raw::send_frame(&conn, FrameKind::Hello, &header).await;
+        assert_eq!(
+            within(raw::closed_code(&conn)).await,
+            codes::PROTOCOL_VIOLATION
+        );
+    }
 }
 
 #[tokio::test]

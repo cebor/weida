@@ -241,6 +241,49 @@ pub mod raw {
         send_frame(conn, FrameKind::Hello, &Hello::v0(16 * 1024, 1024).encode()).await;
     }
 
+    /// A HELLO header whose `guarantees_offered` map is built byte by byte.
+    ///
+    /// The library's own encoder cannot produce an illegal set — that is the
+    /// point of `GuaranteeSet::validate` — so the hostile suite writes the
+    /// CBOR itself: the five required keys, then key `5` holding exactly the
+    /// `(key, value)` pairs given.
+    pub fn hello_with_guarantee_map(pairs: &[(u64, u64)]) -> Vec<u8> {
+        fn uint(out: &mut Vec<u8>, value: u64) {
+            match value {
+                0..=23 => out.push(value as u8),
+                24..=255 => out.extend_from_slice(&[0x18, value as u8]),
+                256..=65535 => {
+                    out.push(0x19);
+                    out.extend_from_slice(&(value as u16).to_be_bytes());
+                }
+                _ => {
+                    out.push(0x1B);
+                    out.extend_from_slice(&value.to_be_bytes());
+                }
+            }
+        }
+
+        let mut out = vec![0xA6];
+        uint(&mut out, 0);
+        out.extend_from_slice(&[0x81, 0x00]); // versions = [0]
+        uint(&mut out, 1);
+        uint(&mut out, 16 * 1024);
+        uint(&mut out, 2);
+        uint(&mut out, 1024);
+        uint(&mut out, 3);
+        out.push(0x80); // capabilities = []
+        uint(&mut out, 4);
+        out.push(0x80); // required_capabilities = []
+        uint(&mut out, 5);
+        assert!(pairs.len() < 24, "the map header below is one byte");
+        out.push(0xA0 | pairs.len() as u8);
+        for (key, value) in pairs {
+            uint(&mut out, *key);
+            uint(&mut out, *value);
+        }
+        out
+    }
+
     /// Sends one header-only frame on its own stream.
     pub async fn send_frame(conn: &quinn::Connection, kind: FrameKind, header: &[u8]) {
         let mut stream = conn.open_uni().await.expect("open uni");

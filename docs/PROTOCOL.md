@@ -505,12 +505,17 @@ connection and not of a message.
 | `5` | `uint` | `deduplication` | `0` None, `1` Bounded, `2` Durable |
 | `6` | `uint` | `dedup_window_ms` | window length in milliseconds; REQUIRED with `deduplication` `1`, forbidden otherwise |
 | `7` | `uint` | `backpressure` | `0` Block, `1` Reject, `2` Drop, `3` Spill, `4` Coalesce |
+| `8` | `uint` | `producer_naming` | `0` fingerprint, `1` stable; how a sequenced transfer's producer is named ([decisions/0001](decisions/0001-sequence-field.md) §7.3, [decisions/0008](decisions/0008-session-identity.md) §4.3) |
+| `9` | `uint` | `control_isolated` | `0` no, `1` yes: control traffic cannot stall behind bulk ([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.1) |
 
 Rules:
 
 - **An absent key means the `core` level for that dimension**: `delivery` BestEffort,
   `acknowledgement` TransportReceipt, `ordering` None, `deduplication` None, `backpressure`
-  Block [0006 §4.2]. An empty map is therefore exactly `core`, and so is an absent HELLO key.
+  Block, `producer_naming` fingerprint, `control_isolated` no [0006 §4.2]. An empty map is
+  therefore exactly `core`, and so is an absent HELLO key. An encoder MUST NOT write a
+  dimension left at its `core` level, so a `core` declaration is indistinguishable from no
+  declaration on the wire.
 - The map is bounded by `max_header_bytes` like every other header, and every value is a
   `uint`, so a guarantee set introduces no new allocation a peer can influence.
 - A key whose value is outside the list above, or a dimension combination the table forbids
@@ -521,9 +526,16 @@ Rules:
   (§2.3), never a quieter success.
 - The state set is **not a ladder**. Persistence level and replica count are independent axes,
   so `Stored(Flushed)` and `Replicated(3, flushed: false)` are incomparable and comparison is
-  per axis ([decisions/0004](decisions/0004-durability-levels.md) §4.4). `backpressure` is not
-  ordered at all: its values are behaviours, not strengths, so two peers either state the same
-  one or fail to negotiate.
+  per axis ([decisions/0004](decisions/0004-durability-levels.md) §4.4). `backpressure` and
+  `producer_naming` are not ordered at all: their values are behaviours and names, not
+  strengths, so two peers either state the same one or fail to negotiate. Every other
+  dimension *is* a ladder in the order its values are listed above, `control_isolated`
+  included — isolation is strictly stronger than none, so the intersection of §2.3 is the
+  logical AND.
+- When the intersection weakens `acknowledgement` below `Stored`, the `durability` and
+  `replicas` axes it qualified are **dropped** rather than carried: dropping is what "weaker"
+  means here, and keeping them would produce a set this section forbids. The same holds for
+  `dedup_window_ms` when `deduplication` weakens to `None`.
 - An unknown map key MUST be skipped, per §5. That is how a later version adds a dimension
   without breaking this one — and it is also why a peer MUST NOT infer agreement from a key it
   skipped: what binds is the intersection of §2.3, computed over the dimensions both sides
@@ -570,6 +582,9 @@ DATA   {}                                    (reply half)
 
 HELLO  {versions:[0], max_header_bytes:16384, max_transfers:1024, caps:[], req_caps:[]}
        57 00 10  A5 00 81 00 01 19 40 00 02 19 04 00 03 80 04 80
+
+HELLO  {…, guarantees_offered:{ordering:1}, guarantees_required:{ordering:1}}
+       57 00 18  A7 00 81 00 01 19 40 00 02 19 04 00 03 80 04 80 05 A1 04 01 06 A1 04 01
 
 ERROR  {code:5}                              (NO_REPLY, on a reply half)
        57 02 03  A1 00 05
@@ -657,16 +672,24 @@ the pairs are pinned together in `crates/weida/src/pubsub.rs`.
 `topic = "px.*"`. A **`topic` is never a pattern** (§6.2, §6.4): the `*` here is an ordinary
 byte, and the filter `px.*` selects this topic exactly as it selects `px.eur`.
 
-The remaining deferral is a vector for a HELLO carrying a guarantee set, which lands with
-the HELLO fields. The DATA key `6` and `7` vectors above landed with their codec:
-`weida-protocol` encodes and decodes both, while no v0 sender sets either, so those two pin
-an encoding rather than describe traffic.
+Every vector §8 once deferred has now landed with its codec. The DATA key `6` and `7`
+vectors and the extended HELLO below pin encodings rather than describe traffic:
+`weida-protocol` reads and writes all three, while no v0 sender sets the DATA keys and no v0
+peer declares a guarantee set.
 
 **HELLO vector** — magic `0x57`, kind `0x00` (HELLO), `header_len = 0x10` (16 bytes),
 CBOR map of 5 entries: key `0` `versions = [0]`, key `1` `max_header_bytes = 16384`,
 key `2` `max_transfers = 1024`, key `3` `capabilities = []`, key `4`
 `required_capabilities = []`. Keys `5` and `6` are absent, which is the declaration every v0
 peer makes: offering and requiring the default guarantee set `core` (§6.1, §6.5).
+
+**HELLO-with-guarantees vector** — the same five keys plus key `5`
+`guarantees_offered = {4: 1}` and key `6` `guarantees_required = {4: 1}`, each a nested
+one-entry map declaring `ordering = PerProducer detect`; `header_len = 0x18` (24 bytes).
+Two things it pins. A dimension left at `core` is **not** written, so a HELLO whose
+declarations are explicitly `core` is byte-identical to the v0 HELLO above — that is what
+makes the declarations free for a peer that wants none. And the nested map obeys every rule
+of §5 unchanged: uint keys, strictly ascending, no duplicates, unknown keys skipped.
 
 **ERROR vector** — magic `0x57`, kind `0x02` (ERROR), `header_len = 0x03` (3 bytes), CBOR
 map of 1 entry: key `0` `code = 5` (`NO_REPLY`).

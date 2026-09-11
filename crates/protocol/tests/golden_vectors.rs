@@ -12,6 +12,7 @@
 //! what makes the documented frames byte-exact as published.
 
 use weida_core::ErrorCode;
+use weida_protocol::header::{GuaranteeSet, OrderingMode};
 use weida_protocol::{DataHeader, ErrorHeader, FrameKind, Hello, SubscriptionHeader, encode_frame};
 
 /// Asserts one documented frame, and that its header half decodes back.
@@ -244,4 +245,41 @@ fn golden_literal_wildcard_topic_frame() {
         ],
     );
     assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
+}
+
+/// The extended HELLO: the last vector §8 listed as outstanding.
+///
+/// Both declarations are written because both are above `core`; a `core`
+/// declaration is never written, which is what keeps a v0 HELLO byte-exact
+/// (`golden_hello_frame` above pins that).
+#[test]
+fn golden_hello_with_guarantees_frame() {
+    let detect = GuaranteeSet {
+        ordering: OrderingMode::PerProducerDetect,
+        ..GuaranteeSet::CORE
+    };
+    let h = Hello {
+        guarantees_offered: Some(detect),
+        guarantees_required: Some(detect),
+        ..Hello::v0(16384, 1024)
+    };
+    assert_frame(
+        "HELLO with guarantee declarations",
+        FrameKind::Hello,
+        h.encode(),
+        &[
+            0x57, 0x00, 0x18, 0xA7, 0x00, 0x81, 0x00, 0x01, 0x19, 0x40, 0x00, 0x02, 0x19, 0x04,
+            0x00, 0x03, 0x80, 0x04, 0x80, 0x05, 0xA1, 0x04, 0x01, 0x06, 0xA1, 0x04, 0x01,
+        ],
+    );
+    assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
+
+    // A `core` declaration is not written at all: the same HELLO with
+    // explicit `core` sets is byte-identical to the v0 one.
+    let explicit_core = Hello {
+        guarantees_offered: Some(GuaranteeSet::CORE),
+        guarantees_required: Some(GuaranteeSet::CORE),
+        ..Hello::v0(16384, 1024)
+    };
+    assert_eq!(explicit_core.encode(), Hello::v0(16384, 1024).encode());
 }

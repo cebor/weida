@@ -64,6 +64,8 @@ mod hello_key {
     pub const MAX_TRANSFERS: u64 = 2;
     pub const CAPABILITIES: u64 = 3;
     pub const REQUIRED_CAPABILITIES: u64 = 4;
+    pub const GUARANTEES_OFFERED: u64 = 5;
+    pub const GUARANTEES_REQUIRED: u64 = 6;
 }
 
 /// DATA keys.
@@ -138,6 +140,490 @@ pub mod filter {
     }
 }
 
+/// Guarantee set keys (`docs/PROTOCOL.md` §6.5).
+mod guarantee_key {
+    pub const DELIVERY: u64 = 0;
+    pub const ACKNOWLEDGEMENT: u64 = 1;
+    pub const DURABILITY: u64 = 2;
+    pub const REPLICAS: u64 = 3;
+    pub const ORDERING: u64 = 4;
+    pub const DEDUPLICATION: u64 = 5;
+    pub const DEDUP_WINDOW_MS: u64 = 6;
+    pub const BACKPRESSURE: u64 = 7;
+    pub const PRODUCER_NAMING: u64 = 8;
+    pub const CONTROL_ISOLATED: u64 = 9;
+}
+
+/// Declares an enum whose wire form is a small `uint`, with the `core` level
+/// first so that `Default` and "absent means core" agree by construction.
+macro_rules! wire_enum {
+    ($(#[$meta:meta])* $name:ident { $($(#[$vmeta:meta])* $variant:ident = $value:literal),+ $(,)? }) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum $name {
+            $($(#[$vmeta])* $variant,)+
+        }
+
+        impl $name {
+            /// The wire value of `docs/PROTOCOL.md` §6.5.
+            pub fn to_wire(self) -> u64 {
+                match self {
+                    $($name::$variant => $value,)+
+                }
+            }
+
+            /// The level a wire value names, or `None` if the value is not
+            /// one this version defines.
+            pub fn from_wire(value: u64) -> Option<$name> {
+                match value {
+                    $($value => Some($name::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+wire_enum! {
+    /// Delivery dimension ([`GUARANTEES.md`] §3). A ladder: later is stronger.
+    ///
+    /// [`GUARANTEES.md`]: https://github.com/tuco86/weida/blob/main/docs/GUARANTEES.md
+    Delivery {
+        /// v0: no retries, losses reported.
+        #[default]
+        BestEffort = 0,
+        /// Reserved.
+        AtMostOnce = 1,
+        /// Reserved.
+        AtLeastOnce = 2,
+    }
+}
+
+wire_enum! {
+    /// Acknowledgement/completion dimension. A ladder; the durability axes of
+    /// [`Durability`] and `replicas` are *not* part of it.
+    Acknowledgement {
+        /// Nothing is reported.
+        None = 0,
+        /// v0: QUIC's fin-acknowledgement.
+        #[default]
+        TransportReceipt = 1,
+        /// Reserved for the L2 broker.
+        Accepted = 2,
+        /// Reserved for the L2 broker.
+        Stored = 3,
+        /// Reserved for the L2 broker.
+        Replicated = 4,
+        /// Reserved for the L2 broker.
+        Processed = 5,
+    }
+}
+
+wire_enum! {
+    /// Persistence axis of `Stored`/`Replicated`
+    /// ([decisions/0004](../../../docs/decisions/0004-durability-levels.md) §4.1).
+    Durability {
+        /// Survives the broker process.
+        #[default]
+        Written = 0,
+        /// Survives loss of power on that node.
+        Flushed = 1,
+    }
+}
+
+wire_enum! {
+    /// Ordering dimension. A ladder: later is stronger.
+    OrderingMode {
+        /// v0.
+        #[default]
+        None = 0,
+        /// Report gaps, deliver as messages arrive.
+        PerProducerDetect = 1,
+        /// Hold messages back up to a bounded buffer.
+        PerProducerReassemble = 2,
+        /// L2 only.
+        PerKey = 3,
+        /// Reserved.
+        Total = 4,
+    }
+}
+
+wire_enum! {
+    /// Deduplication dimension. A ladder: later is stronger.
+    Deduplication {
+        /// v0.
+        #[default]
+        None = 0,
+        /// Suppressed within a time window.
+        Bounded = 1,
+        /// L2 only.
+        Durable = 2,
+    }
+}
+
+wire_enum! {
+    /// Backpressure dimension. **Not ordered**: these are behaviours, not
+    /// strengths, so two peers state the same one or fail to negotiate.
+    Backpressure {
+        /// v0 for Req/Rep and Push/Pull.
+        #[default]
+        Block = 0,
+        /// Refuse past a cap.
+        Reject = 1,
+        /// v0 for fan-out.
+        Drop = 2,
+        /// Reserved.
+        Spill = 3,
+        /// Reserved.
+        Coalesce = 4,
+    }
+}
+
+wire_enum! {
+    /// How a producer is named for the sequence field of
+    /// [decisions/0001](../../../docs/decisions/0001-sequence-field.md) §7.3.
+    /// **Not ordered**: two peers state the same one or fail.
+    ProducerNaming {
+        /// The proved connection fingerprint; the counter restarts with the
+        /// connection (v0 default,
+        /// [decisions/0008](../../../docs/decisions/0008-session-identity.md) §4.3).
+        #[default]
+        Fingerprint = 0,
+        /// A name supplied above L0, carried in DATA key `7`.
+        Stable = 1,
+    }
+}
+
+/// One level per guarantee dimension, as declared in HELLO keys `5` and `6`
+/// (`docs/PROTOCOL.md` §6.5).
+///
+/// [`GuaranteeSet::CORE`] is the default set and is exactly what v0 does, so
+/// an absent HELLO key, an empty map and `CORE` are the same statement
+/// ([decisions/0006](../../../docs/decisions/0006-guarantee-sets.md) §4.2).
+/// Every field is a small `Copy` value: a set costs no allocation, which is
+/// what lets it ride a header a peer controls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GuaranteeSet {
+    /// Delivery dimension.
+    pub delivery: Delivery,
+    /// Acknowledgement/completion dimension.
+    pub acknowledgement: Acknowledgement,
+    /// Persistence axis; legal only with `Stored` or `Replicated`.
+    pub durability: Option<Durability>,
+    /// Replica count, leader included; legal only with `Replicated`, and ≥ 2.
+    pub replicas: Option<u64>,
+    /// Ordering dimension.
+    pub ordering: OrderingMode,
+    /// Deduplication dimension.
+    pub deduplication: Deduplication,
+    /// Dedup window; required with `Bounded`, forbidden otherwise.
+    pub dedup_window_ms: Option<u64>,
+    /// Backpressure behaviour. Not ordered.
+    pub backpressure: Backpressure,
+    /// How the producer of a sequenced transfer is named. Not ordered.
+    pub producer_naming: ProducerNaming,
+    /// Whether control traffic is isolated from bulk traffic
+    /// ([decisions/0002](../../../docs/decisions/0002-control-and-bulk-separation.md)
+    /// §6.1). Ordered: `true` is strictly stronger.
+    pub control_isolated: bool,
+}
+
+impl GuaranteeSet {
+    /// The default set: what v0 offers and requires.
+    pub const CORE: GuaranteeSet = GuaranteeSet {
+        delivery: Delivery::BestEffort,
+        acknowledgement: Acknowledgement::TransportReceipt,
+        durability: None,
+        replicas: None,
+        ordering: OrderingMode::None,
+        deduplication: Deduplication::None,
+        dedup_window_ms: None,
+        backpressure: Backpressure::Block,
+        producer_naming: ProducerNaming::Fingerprint,
+        control_isolated: false,
+    };
+
+    /// Is this the default set? A `core` declaration is never written: it is
+    /// what an absent key already means.
+    pub fn is_core(&self) -> bool {
+        *self == GuaranteeSet::CORE
+    }
+
+    /// Checks the dimension combinations §6.5 forbids.
+    fn validate(&self) -> Result<(), HeaderError> {
+        let stored_or_replicated = matches!(
+            self.acknowledgement,
+            Acknowledgement::Stored | Acknowledgement::Replicated
+        );
+        if self.durability.is_some() && !stored_or_replicated {
+            return Err(HeaderError::InvalidGuarantees(
+                "durability without Stored or Replicated",
+            ));
+        }
+        match self.replicas {
+            Some(_) if self.acknowledgement != Acknowledgement::Replicated => {
+                return Err(HeaderError::InvalidGuarantees(
+                    "replicas without Replicated",
+                ));
+            }
+            Some(n) if n < 2 => {
+                return Err(HeaderError::InvalidGuarantees(
+                    "a replica count below 2 is not a replication",
+                ));
+            }
+            _ => {}
+        }
+        match (self.deduplication, self.dedup_window_ms) {
+            (Deduplication::Bounded, None) => {
+                return Err(HeaderError::InvalidGuarantees(
+                    "Bounded deduplication without a window",
+                ));
+            }
+            (level, Some(_)) if level != Deduplication::Bounded => {
+                return Err(HeaderError::InvalidGuarantees(
+                    "a dedup window without Bounded deduplication",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Writes the set as a CBOR map, omitting every dimension left at `core`.
+    fn encode_into(
+        &self,
+        e: &mut Encoder<Vec<u8>>,
+    ) -> Result<(), minicbor::encode::Error<Infallible>> {
+        let core = GuaranteeSet::CORE;
+        let count = u64::from(self.delivery != core.delivery)
+            + u64::from(self.acknowledgement != core.acknowledgement)
+            + u64::from(self.durability.is_some())
+            + u64::from(self.replicas.is_some())
+            + u64::from(self.ordering != core.ordering)
+            + u64::from(self.deduplication != core.deduplication)
+            + u64::from(self.dedup_window_ms.is_some())
+            + u64::from(self.backpressure != core.backpressure)
+            + u64::from(self.producer_naming != core.producer_naming)
+            + u64::from(self.control_isolated != core.control_isolated);
+        e.map(count)?;
+        if self.delivery != core.delivery {
+            e.u64(guarantee_key::DELIVERY)?
+                .u64(self.delivery.to_wire())?;
+        }
+        if self.acknowledgement != core.acknowledgement {
+            e.u64(guarantee_key::ACKNOWLEDGEMENT)?
+                .u64(self.acknowledgement.to_wire())?;
+        }
+        if let Some(durability) = self.durability {
+            e.u64(guarantee_key::DURABILITY)?
+                .u64(durability.to_wire())?;
+        }
+        if let Some(replicas) = self.replicas {
+            e.u64(guarantee_key::REPLICAS)?.u64(replicas)?;
+        }
+        if self.ordering != core.ordering {
+            e.u64(guarantee_key::ORDERING)?
+                .u64(self.ordering.to_wire())?;
+        }
+        if self.deduplication != core.deduplication {
+            e.u64(guarantee_key::DEDUPLICATION)?
+                .u64(self.deduplication.to_wire())?;
+        }
+        if let Some(window) = self.dedup_window_ms {
+            e.u64(guarantee_key::DEDUP_WINDOW_MS)?.u64(window)?;
+        }
+        if self.backpressure != core.backpressure {
+            e.u64(guarantee_key::BACKPRESSURE)?
+                .u64(self.backpressure.to_wire())?;
+        }
+        if self.producer_naming != core.producer_naming {
+            e.u64(guarantee_key::PRODUCER_NAMING)?
+                .u64(self.producer_naming.to_wire())?;
+        }
+        if self.control_isolated != core.control_isolated {
+            e.u64(guarantee_key::CONTROL_ISOLATED)?
+                .u64(u64::from(self.control_isolated))?;
+        }
+        Ok(())
+    }
+
+    /// Reads a set from the nested map at the decoder's position.
+    ///
+    /// The nesting is one level deep by specification (§5), and an unknown
+    /// dimension is skipped exactly like an unknown top-level key.
+    fn decode_from(m: &mut MapReader<'_, '_>) -> Result<GuaranteeSet, HeaderError> {
+        let mut set = GuaranteeSet::CORE;
+        let mut inner = MapReader::new(m.d)?;
+        while let Some(key) = inner.next_key()? {
+            match key {
+                guarantee_key::DELIVERY => set.delivery = level(inner.u64()?, "delivery")?,
+                guarantee_key::ACKNOWLEDGEMENT => {
+                    set.acknowledgement = level(inner.u64()?, "acknowledgement")?;
+                }
+                guarantee_key::DURABILITY => {
+                    set.durability = Some(level(inner.u64()?, "durability")?);
+                }
+                guarantee_key::REPLICAS => set.replicas = Some(inner.u64()?),
+                guarantee_key::ORDERING => set.ordering = level(inner.u64()?, "ordering")?,
+                guarantee_key::DEDUPLICATION => {
+                    set.deduplication = level(inner.u64()?, "deduplication")?;
+                }
+                guarantee_key::DEDUP_WINDOW_MS => set.dedup_window_ms = Some(inner.u64()?),
+                guarantee_key::BACKPRESSURE => {
+                    set.backpressure = level(inner.u64()?, "backpressure")?;
+                }
+                guarantee_key::PRODUCER_NAMING => {
+                    set.producer_naming = level(inner.u64()?, "producer naming")?;
+                }
+                guarantee_key::CONTROL_ISOLATED => {
+                    set.control_isolated = match inner.u64()? {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(HeaderError::InvalidGuarantees(
+                                "control_isolated is 0 or 1",
+                            ));
+                        }
+                    };
+                }
+                _ => inner.skip()?,
+            }
+        }
+        set.validate()?;
+        Ok(set)
+    }
+
+    /// The weaker of two offered sets, dimension by dimension
+    /// (`docs/PROTOCOL.md` §2.3 step 5).
+    ///
+    /// Ladders take the minimum. Dimensions that are **not** ordered —
+    /// backpressure, producer naming, and the two independent axes of a
+    /// durability level — have no "weaker", so the two declarations must be
+    /// equal; the name of the dimension comes back as the error so a peer can
+    /// be told which one disagreed.
+    pub fn intersect(&self, other: &GuaranteeSet) -> Result<GuaranteeSet, &'static str> {
+        if self.backpressure != other.backpressure {
+            return Err("backpressure");
+        }
+        if self.producer_naming != other.producer_naming {
+            return Err("producer naming");
+        }
+        if self.durability.is_some()
+            && other.durability.is_some()
+            && self.durability != other.durability
+        {
+            return Err("durability");
+        }
+        if self.replicas.is_some() && other.replicas.is_some() && self.replicas != other.replicas {
+            return Err("replicas");
+        }
+
+        let acknowledgement = self.acknowledgement.min(other.acknowledgement);
+        let keeps_durability = matches!(
+            acknowledgement,
+            Acknowledgement::Stored | Acknowledgement::Replicated
+        );
+        let deduplication = self.deduplication.min(other.deduplication);
+        let mut merged = GuaranteeSet {
+            delivery: self.delivery.min(other.delivery),
+            acknowledgement,
+            // A dimension the weakened acknowledgement can no longer carry is
+            // dropped rather than kept: dropping is what "weaker" means here,
+            // and keeping it would produce a set §6.5 forbids.
+            durability: keeps_durability
+                .then_some(self.durability.or(other.durability))
+                .flatten(),
+            replicas: (acknowledgement == Acknowledgement::Replicated)
+                .then_some(self.replicas.or(other.replicas))
+                .flatten(),
+            ordering: self.ordering.min(other.ordering),
+            deduplication,
+            // A shorter window is the weaker promise.
+            dedup_window_ms: None,
+            backpressure: self.backpressure,
+            producer_naming: self.producer_naming,
+            control_isolated: self.control_isolated && other.control_isolated,
+        };
+        if deduplication == Deduplication::Bounded {
+            merged.dedup_window_ms = match (self.dedup_window_ms, other.dedup_window_ms) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+        }
+        Ok(merged)
+    }
+
+    /// Does this set reach `required` on every dimension?
+    ///
+    /// Ladders compare by level, the durability axes compare per axis, and the
+    /// unordered dimensions must match exactly. A longer dedup window is the
+    /// stronger promise.
+    pub fn reaches(&self, required: &GuaranteeSet) -> bool {
+        if self.delivery < required.delivery
+            || self.acknowledgement < required.acknowledgement
+            || self.ordering < required.ordering
+            || self.deduplication < required.deduplication
+        {
+            return false;
+        }
+        if self.backpressure != required.backpressure
+            || self.producer_naming != required.producer_naming
+        {
+            return false;
+        }
+        if !self.control_isolated && required.control_isolated {
+            return false;
+        }
+        match (self.durability, required.durability) {
+            (_, None) => {}
+            (Some(have), Some(want)) if have >= want => {}
+            _ => return false,
+        }
+        match (self.replicas, required.replicas) {
+            (_, None) => {}
+            (Some(have), Some(want)) if have >= want => {}
+            _ => return false,
+        }
+        match (self.dedup_window_ms, required.dedup_window_ms) {
+            (_, None) => {}
+            (Some(have), Some(want)) if have >= want => {}
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// Maps a wire value to a level, naming the dimension when it is unknown.
+fn level<T: WireLevel>(value: u64, dimension: &'static str) -> Result<T, HeaderError> {
+    T::from_wire_value(value).ok_or(HeaderError::UnknownLevel { dimension, value })
+}
+
+/// Lets [`level`] work for every dimension enum without a macro per call.
+trait WireLevel: Sized {
+    fn from_wire_value(value: u64) -> Option<Self>;
+}
+
+macro_rules! impl_wire_level {
+    ($($name:ident),+ $(,)?) => {
+        $(impl WireLevel for $name {
+            fn from_wire_value(value: u64) -> Option<$name> {
+                $name::from_wire(value)
+            }
+        })+
+    };
+}
+
+impl_wire_level!(
+    Delivery,
+    Acknowledgement,
+    Durability,
+    OrderingMode,
+    Deduplication,
+    Backpressure,
+    ProducerNaming,
+);
+
 /// Why a header was rejected. Every variant is a protocol violation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeaderError {
@@ -175,6 +661,16 @@ pub enum HeaderError {
     DepthExceeded,
     /// Bytes remained after the header map.
     TrailingBytes,
+    /// A guarantee set named a level this version does not define.
+    UnknownLevel {
+        /// Dimension whose value was unknown.
+        dimension: &'static str,
+        /// The value found.
+        value: u64,
+    },
+    /// A guarantee set's dimension combination is one §6.5 forbids, or a
+    /// HELLO requires more than it offers (§6.1).
+    InvalidGuarantees(&'static str),
     /// A topic filter violated the grammar of `docs/PROTOCOL.md` §6.4.
     InvalidFilter(&'static str),
 }
@@ -204,6 +700,10 @@ impl std::fmt::Display for HeaderError {
             }
             HeaderError::DepthExceeded => f.write_str("unknown field nested too deeply"),
             HeaderError::TrailingBytes => f.write_str("trailing bytes after the header"),
+            HeaderError::UnknownLevel { dimension, value } => {
+                write!(f, "unknown {dimension} level {value}")
+            }
+            HeaderError::InvalidGuarantees(why) => write!(f, "invalid guarantee set: {why}"),
             HeaderError::InvalidFilter(why) => write!(f, "invalid topic filter: {why}"),
         }
     }
@@ -492,10 +992,23 @@ pub struct Hello {
     pub capabilities: Vec<u64>,
     /// Capability codes the sender requires the peer to support.
     pub required_capabilities: Vec<u64>,
+    /// Guarantee set the sender can honour (key `5`).
+    ///
+    /// `None` means the default set: an absent key and
+    /// [`GuaranteeSet::CORE`] are the same declaration, which is why a v0
+    /// HELLO is unchanged on the wire.
+    pub guarantees_offered: Option<GuaranteeSet>,
+    /// Guarantee set the sender requires of the peer (key `6`).
+    ///
+    /// MUST be reachable by `guarantees_offered` on every dimension: requiring
+    /// what you cannot honour yourself is a configuration error
+    /// (`docs/PROTOCOL.md` §6.1), and a decoder rejects it.
+    pub guarantees_required: Option<GuaranteeSet>,
 }
 
 impl Hello {
-    /// The HELLO a v0 implementation sends.
+    /// The HELLO a v0 implementation sends: no guarantee declarations, so
+    /// `core` offered and `core` required.
     pub fn v0(max_header_bytes: u64, max_transfers: u64) -> Hello {
         Hello {
             versions: vec![crate::VERSION],
@@ -503,13 +1016,29 @@ impl Hello {
             max_transfers,
             capabilities: Vec::new(),
             required_capabilities: Vec::new(),
+            guarantees_offered: None,
+            guarantees_required: None,
         }
+    }
+
+    /// The set this HELLO offers; an absent declaration means `core`.
+    pub fn offered(&self) -> GuaranteeSet {
+        self.guarantees_offered.unwrap_or(GuaranteeSet::CORE)
+    }
+
+    /// The set this HELLO requires; an absent declaration means `core`.
+    pub fn required(&self) -> GuaranteeSet {
+        self.guarantees_required.unwrap_or(GuaranteeSet::CORE)
     }
 
     /// Encodes the header.
     pub fn encode(&self) -> Vec<u8> {
         encode_with(|e| {
-            e.map(5)?;
+            // A `core` declaration is never written: an absent key already
+            // says it, and a v0 HELLO must stay byte-identical (§6.1).
+            let offered = self.guarantees_offered.filter(|s| !s.is_core());
+            let required = self.guarantees_required.filter(|s| !s.is_core());
+            e.map(5 + u64::from(offered.is_some()) + u64::from(required.is_some()))?;
             e.u64(hello_key::VERSIONS)?
                 .array(self.versions.len() as u64)?;
             for v in &self.versions {
@@ -528,6 +1057,14 @@ impl Hello {
             for c in &self.required_capabilities {
                 e.u64(*c)?;
             }
+            if let Some(set) = offered {
+                e.u64(hello_key::GUARANTEES_OFFERED)?;
+                set.encode_into(e)?;
+            }
+            if let Some(set) = required {
+                e.u64(hello_key::GUARANTEES_REQUIRED)?;
+                set.encode_into(e)?;
+            }
             Ok(())
         })
     }
@@ -540,6 +1077,8 @@ impl Hello {
         let mut max_transfers = 0;
         let mut capabilities = Vec::new();
         let mut required_capabilities = Vec::new();
+        let mut guarantees_offered = None;
+        let mut guarantees_required = None;
         {
             let mut m = MapReader::new(&mut d)?;
             while let Some(key) = m.next_key()? {
@@ -549,6 +1088,12 @@ impl Hello {
                     hello_key::MAX_TRANSFERS => max_transfers = m.u64()?,
                     hello_key::CAPABILITIES => capabilities = m.uint_list(key)?,
                     hello_key::REQUIRED_CAPABILITIES => required_capabilities = m.uint_list(key)?,
+                    hello_key::GUARANTEES_OFFERED => {
+                        guarantees_offered = Some(GuaranteeSet::decode_from(&mut m)?);
+                    }
+                    hello_key::GUARANTEES_REQUIRED => {
+                        guarantees_required = Some(GuaranteeSet::decode_from(&mut m)?);
+                    }
                     _ => m.skip()?,
                 }
             }
@@ -563,13 +1108,23 @@ impl Hello {
             }
         }
         finish(&d)?;
-        Ok(Hello {
+        let hello = Hello {
             versions,
             max_header_bytes,
             max_transfers,
             capabilities,
             required_capabilities,
-        })
+            guarantees_offered,
+            guarantees_required,
+        };
+        // §6.1: requiring more than you offer is a configuration error, and
+        // one a decoder can see in a single header.
+        if !hello.offered().reaches(&hello.required()) {
+            return Err(HeaderError::InvalidGuarantees(
+                "guarantees_required is not covered by guarantees_offered",
+            ));
+        }
+        Ok(hello)
     }
 }
 
