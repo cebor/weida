@@ -267,6 +267,11 @@ impl Harness {
                 // closes the unlink-then-bind race [0010 §4.5].
                 let dir = std::env::temp_dir().join(format!("weida-{}", std::process::id()));
                 std::fs::create_dir_all(&dir).expect("socket directory");
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                        .expect("private socket directory");
+                }
                 let path = dir.join(format!("s{}", SOCKET.fetch_add(1, Ordering::Relaxed)));
                 let binding = listener.bind_unix(&path).expect("bind unix");
                 Harness {

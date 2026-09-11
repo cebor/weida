@@ -195,7 +195,7 @@ async fn a_unix_peer_presents_the_principal_the_kernel_proved() {
     assert!(peer.key().is_none(), "a local peer presents no key");
     assert_eq!(
         principal.uid,
-        unsafe_free_current_uid(),
+        owner_uid(h.socket_path().expect("a unix harness")),
         "the kernel names the process on the other end"
     );
     if cfg!(target_os = "linux") {
@@ -209,14 +209,12 @@ async fn a_unix_peer_presents_the_principal_the_kernel_proved() {
     h.shutdown().await;
 }
 
-/// This process's uid, without touching `libc`: the socket the harness bound
-/// is owned by whoever is running the test.
+/// The uid that owns a path: this process bound the socket, so it is also
+/// the uid the kernel must be reporting for the peer.
 #[cfg(unix)]
-fn unsafe_free_current_uid() -> u32 {
+fn owner_uid(path: &std::path::Path) -> u32 {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(std::env::temp_dir().join(format!("weida-{}", std::process::id())))
-        .expect("the harness created this directory")
-        .uid()
+    std::fs::metadata(path).expect("the bound socket").uid()
 }
 
 /// Claim: a socket file left behind by a crash does not stop the next bind.
