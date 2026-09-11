@@ -154,7 +154,7 @@ acceptance: `Exec::resolve` returns the resolved addresses in order and the dial
 note: the loop alone made it **worse**, and the measurement caught it: an address that answers nothing gives QUIC no refusal to observe, so trying `::1` first cost a full handshake timeout — the regression test took **30 s**. Every attempt but the last is therefore bounded by a new `RuntimeConfig::connect_attempt_timeout`, defaulting to RFC 8305's 250 ms Connection Attempt Delay, which brought the same test to **1.3 s**; the last address keeps the whole budget, so an IP literal and a single-address name behave exactly as before. Sequential rather than RFC 8305's parallel happy-eyeballs, because the failure being fixed is silence and not slowness. `Exec::within` is the one place the crate bounds an await on wall-clock time, beside `sleep`, for the same reason.
 
 ### B-030 — ZMTP codec: sans-I/O, golden vectors, fuzz target
-kind: adapter | size: 90 | status: ready | needs: [B-018]
+kind: adapter | size: 90 | status: in_progress 2026-09-11T10:38Z | needs: [B-018]
 acceptance: `crates/adapters/weida-zmtp`, no I/O and no weida dependency in the codec itself: the 64-octet greeting, version negotiation, the NULL handshake with `READY` metadata, short and long frames with the MORE and COMMAND flags, `SUBSCRIBE`/`CANCEL`, `PING`/`PONG`; the golden vectors of `docs/adapters/zmtp.md` §10 byte-exact in both directions, including the 255/256-octet frame boundary; a fuzz target over the decoder that caps before allocating, since a ZMTP frame may declare up to 2^63-1 octets and `ZMQ_MAXMSGSIZE` is the only defence; no bridge, no sockets, no interop bench yet — those are slices 3 to 5.
 
 ### B-031 — Bound every wait in shutdown
