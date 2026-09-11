@@ -1,16 +1,21 @@
 [workspace]
 resolver = "3"
 members = [
+    # weida itself: the protocol, its runtime and its shared plumbing.
     "crates/core",
     "crates/protocol",
     "crates/runtime",
     "crates/weida",
+    # One directory per foreign protocol family, codec and library and bridge
+    # together, because everything belonging to one protocol belongs together
+    # (0013 §4.1).
+    "crates/zmq/weida-zmtp",
     "crates/zmq/weida-zmq",
-    "crates/adapters/weida-zmtp",
-    "crates/adapters/weida-zmtp-bridge",
-    "crates/adapters/weida-sp",
-    "crates/adapters/weida-sp-bridge",
-    "crates/adapters/cross-tests",
+    "crates/zmq/weida-zmq-bridge",
+    "crates/nng/weida-sp",
+    "crates/nng/weida-nng-bridge",
+    # Belongs to no single family: one protocol in, another out.
+    "crates/interop/cross-tests",
 ]
 
 [workspace.package]
@@ -23,9 +28,9 @@ weida-core = { path = "crates/core", version = "0.1.0" }
 weida-protocol = { path = "crates/protocol", version = "0.1.0" }
 weida-runtime = { path = "crates/runtime", version = "0.1.0" }
 weida = { path = "crates/weida", version = "0.1.0" }
-weida-zmtp = { path = "crates/adapters/weida-zmtp", version = "0.1.0" }
+weida-zmtp = { path = "crates/zmq/weida-zmtp", version = "0.1.0" }
 weida-zmq = { path = "crates/zmq/weida-zmq", version = "0.1.0" }
-weida-sp = { path = "crates/adapters/weida-sp", version = "0.1.0" }
+weida-sp = { path = "crates/nng/weida-sp", version = "0.1.0" }
 
 quinn = "0.11"
 tokio = { version = "1", features = [

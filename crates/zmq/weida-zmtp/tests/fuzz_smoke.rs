@@ -1,7 +1,7 @@
 //! Deterministic hostile-input smoke tests for the ZMTP codec.
 //!
 //! The always-on companion to the `cargo fuzz` targets under
-//! `crates/adapters/weida-zmtp/fuzz`: the same properties, driven by a seeded
+//! `crates/zmq/weida-zmtp/fuzz`: the same properties, driven by a seeded
 //! xorshift generator so they run on stable Rust, in `cargo test`, with no
 //! nightly toolchain and no corpus. The libFuzzer targets explore far deeper;
 //! these make sure the properties are never left unchecked.

@@ -36,14 +36,14 @@ use std::time::Duration;
 use nng::options::Options;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use weida::{ClientTls, GuaranteeSet, Identity, Runtime, ServerTls, Trust};
-use weida_sp::header::EndpointType;
-use weida_sp::{Backtrace, ProtocolHeader, backtrace, message};
-use weida_sp_bridge::{
+use weida_nng_bridge::{
     Dialling as SpDialling, Inbound as SpInbound, InboundConfig as SpInboundConfig,
     Outbound as SpOutbound, OutboundConfig as SpOutboundConfig, Presenting as SpPresenting,
     TopicSplit,
 };
-use weida_zmtp_bridge::{
+use weida_sp::header::EndpointType;
+use weida_sp::{Backtrace, ProtocolHeader, backtrace, message};
+use weida_zmq_bridge::{
     Dialling as ZmqDialling, Inbound as ZmqInbound, InboundConfig as ZmqInboundConfig,
     Outbound as ZmqOutbound, OutboundConfig as ZmqOutboundConfig, Presenting as ZmqPresenting,
     SubscriptionForm,
@@ -63,7 +63,7 @@ async fn within<F: Future>(f: F) -> F::Output {
 
 fn tracing_once() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("weida_zmtp_bridge=debug,weida_sp_bridge=debug")
+        .with_env_filter("weida_zmq_bridge=debug,weida_nng_bridge=debug")
         .try_init();
 }
 

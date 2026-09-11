@@ -388,17 +388,16 @@ crates/
 ```
 
 **This is the layout [decisions/0013](decisions/0013-competitor-libraries.md) §4.1 decided,
-and part of it is ahead of the tree.** `weida-runtime` exists — B-070 created it at
-`crates/runtime`, and `weida` is its first consumer. **`weida-zmq` exists** at
-`crates/zmq/weida-zmq`: its context, endpoints, messages, per-peer pipes, connection engine
-and ZMTP session are built (B-071..B-074), and the socket types, security and the devices are
-the slices after them, so the crate is a library under construction rather than a placeholder.
-`weida-nng` does not exist yet. The two codecs and the two bridges still live under
-`crates/adapters/`, the bridges still named `weida-zmtp-bridge` and `weida-sp-bridge`, and
-`cross-tests` is still `crates/adapters/cross-tests`; B-095 moves and renames them.
-Directories are named for the **protocol family** rather than for the role a crate plays in
-it, so that the directory list answers "does this repository ship a ZeroMQ?" —
-`crates/adapters/` would answer no, because an adapter is a hop at a weida edge
+and it is now the tree.** B-095 moved the crates and renamed the two bridges —
+`weida-zmtp-bridge` became `weida-zmq-bridge` and `weida-sp-bridge` became
+`weida-nng-bridge`, in one commit so that the two could never disagree — and **no other crate
+name changed**, so nothing published or depended upon broke. `weida-zmq` is complete against
+[0013](decisions/0013-competitor-libraries.md) §4.7's six clauses
+([libraries/zmq.md](libraries/zmq.md)); `weida-nng` is the one row above that does not exist
+yet, since the SP codec and its bridge are built and the standalone NNG implementation is
+Phase B2. Directories are named for the **protocol family** rather than for the role a crate
+plays in it, so that the directory list answers "does this repository ship a ZeroMQ?" — the
+old `crates/adapters/` answered no, because an adapter is a hop at a weida edge
 ([0006](decisions/0006-guarantee-sets.md) §4.6) and a library has no edge.
 
 `weida-zmtp` is the first slice of the ZeroMQ adapter
@@ -408,13 +407,15 @@ that can be checked byte-for-byte against a foreign specification must not be ab
 for weida's types, limits or error vocabulary, or the check quietly becomes a check against
 our reading of the specification.
 
-`weida-zmtp-bridge` is the other half and therefore depends on both sides. It is a separate
-crate rather than a feature of the codec for exactly the reason above: a feature would put a
-weida dependency in the codec's manifest, and the codec's dependency-free manifest is the
-thing that keeps it honest.
+`weida-zmq-bridge` is the forwarder and depends on both sides — `weida` and `weida-zmq` — and
+on no protocol of its own: B-094 moved the ZMTP session, the handshake, the heartbeat and the
+subscription counting into the library, so the bridge holds the mapping and nothing else. It
+is a separate crate rather than a feature of the codec for the reason above: a feature would
+put a weida dependency in the codec's manifest, and the codec's dependency-free manifest is
+the thing that keeps it honest.
 
-Planned, not yet present: `weida-zmq` and `weida-nng` — the standalone competitor
-implementations of [0013](decisions/0013-competitor-libraries.md) — `weida-broker` (the L2
+Planned, not yet present: `weida-nng` — the second standalone competitor implementation of
+[0013](decisions/0013-competitor-libraries.md), beside the `weida-zmq` that exists — `weida-broker` (the L2
 semantics of §1 — queues, publisher confirms, consumer acknowledgements with redelivery —
 Phase 6), `weida-web` (the Web binding, Phase 8) and the remaining legacy-protocol adapters
 `weida-mqtt` and `weida-amqp091` (Phase 9). The broker is a separate crate because it is a
@@ -479,8 +480,8 @@ protocol   runtime
  ↑          ↑    ↖
 weida ──────┘     weida-zmq ──→ weida-zmtp   (the codec, which depends on nothing)
 
-weida-zmtp-bridge  →  weida + weida-zmtp     today
-weida-sp-bridge    →  weida + weida-sp       today
+weida-zmq-bridge  →  weida + weida-zmtp     today
+weida-nng-bridge    →  weida + weida-sp       today
 weida-zmq-bridge   →  weida + weida-zmq      B-094, on the library
 ```
 

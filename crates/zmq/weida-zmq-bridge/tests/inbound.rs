@@ -15,8 +15,8 @@ use tokio::net::TcpStream;
 use weida::{
     ClientTls, GuaranteeSet, Identity, Runtime, RuntimeConfig, ServerTls, TransferMeta, Trust,
 };
+use weida_zmq_bridge::{BridgeError, Inbound, InboundConfig, MidSegment, Presenting};
 use weida_zmtp::{Command, FrameKind, Greeting, Mechanism, Metadata, SocketType, frame, greeting};
-use weida_zmtp_bridge::{BridgeError, Inbound, InboundConfig, MidSegment, Presenting};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 const CAP: u64 = 1024 * 1024;
@@ -73,7 +73,7 @@ impl WeidaSide {
 /// reason is in the output rather than inferred from a closed socket.
 async fn bridge(config: InboundConfig) -> (SocketAddr, Runtime) {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("weida_zmtp_bridge=debug")
+        .with_env_filter("weida_zmq_bridge=debug")
         .try_init();
     let inbound = Inbound::bind(config, ClientTls::new(Trust::by_address()))
         .await

@@ -38,7 +38,7 @@ and later remain out of scope; Phase 6 gained the acknowledgement vocabulary tha
 sit in the core.
 
 Phase 9 is open out of order, deliberately and narrowly: the ZMTP codec
-(`crates/adapters/weida-zmtp`, [adapters/zmtp.md](adapters/zmtp.md) §10.1) is a self-contained
+(`crates/zmq/weida-zmtp`, [adapters/zmtp.md](adapters/zmtp.md) §10.1) is a self-contained
 foreign-protocol codec with no weida dependency, so it needs nothing from phases 4-8 and
 building it now is what turns the adapter mapping document from a design into a checked
 claim. The bridge slices, which do need the patterns, wait for their place in the order.
@@ -652,7 +652,7 @@ the pool is not a special case: nothing above the transport knows it is there. 1
 
 **Delivered in the thirteenth increment — the SP codec (B-050):**
 
-`crates/adapters/weida-sp`, the Phase B2 counterpart of `weida-zmtp` and under the same
+`crates/nng/weida-sp`, the Phase B2 counterpart of `weida-zmtp` and under the same
 rule: an **empty `[dependencies]`**, not even `weida-core`, so the codec is checkable
 against a foreign specification instead of against our reading of it
 ([ARCHITECTURE.md](ARCHITECTURE.md) §4). Four modules, one per decode entry point: the
@@ -711,7 +711,7 @@ configuration and belongs to the bridge slice ([adapters/nng.md](adapters/nng.md
 
 **Delivered in the fourteenth increment — the SP inbound bridge (B-052):**
 
-`crates/adapters/weida-sp-bridge`, the mirror of B-041 for SP: one `Inbound` terminates the
+`crates/nng/weida-nng-bridge`, the mirror of B-041 for SP: one `Inbound` terminates the
 SP TCP mapping with `weida-sp` and speaks weida onward. `REP` in front of a weida
 `Replier`, `PULL` in front of a `Puller`, `PUB` fed by a `Subscriber`. Ten integration
 tests against an SP peer built on our own codec — no C library, nothing `#[ignore]`d — plus
@@ -818,9 +818,9 @@ never retransmits.
 
 **Delivered in the sixteenth increment — the cross-adapter test (B-057):**
 
-`crates/adapters/cross-tests` is Phase B slice 6 ([LOOP.md](LOOP.md) §9): a message enters
+`crates/interop/cross-tests` is Phase B slice 6 ([LOOP.md](LOOP.md) §9): a message enters
 through one adapter and leaves through the other. It is its own crate with no library code,
-because `weida-zmtp-bridge` and `weida-sp-bridge` each know one foreign protocol and nothing
+because `weida-zmq-bridge` and `weida-nng-bridge` each know one foreign protocol and nothing
 of the other — the property that keeps either checkable against its own specification
 ([ARCHITECTURE.md](ARCHITECTURE.md) §4) — so a chain belongs to neither.
 
@@ -1308,7 +1308,7 @@ contains is the bridge and the second transport rather than a network.
 | PUSH one-way | 1 KiB | **4.28-4.31 µs** | **5.16-5.28 µs** | 1.2× |
 | PUSH one-way | 1 MiB | **202-224 µs** | **1.43-1.45 ms** | 6.8× |
 
-`cargo bench -p weida-zmtp-bridge --bench interop -- --warm-up-time 1 --measurement-time 3`
+`cargo bench -p weida-zmq-bridge --bench interop -- --warm-up-time 1 --measurement-time 3`
 
 **What the one-way rows do and do not say.** A PUSH that returns is a message accepted by a
 socket, not delivered to anybody: the direct 1 MiB row at 4.6 GiB/s is zmq.rs buffering into
@@ -1505,7 +1505,7 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 
 | Decision | Value | Rationale |
 | --- | --- | --- |
-| Where it lives | its own crate, `crates/adapters/weida-zmtp-bridge` | A feature on the codec crate would put a weida dependency in the codec's manifest, and that manifest being empty is what keeps the codec checkable against 37/ZMTP rather than against our reading of it ([ARCHITECTURE.md](ARCHITECTURE.md) §4). |
+| Where it lives | its own crate, `crates/zmq/weida-zmq-bridge` | A feature on the codec crate would put a weida dependency in the codec's manifest, and that manifest being empty is what keeps the codec checkable against 37/ZMTP rather than against our reading of it ([ARCHITECTURE.md](ARCHITECTURE.md) §4). |
 | The handshake state machine | in the bridge, not the codec | The codec deliberately shipped without one (B-030), so this slice decided its shape: `Session::handshake` sends the full greeting, reads the peer's, exchanges `READY`, and refuses with `ERROR` before closing on two things — a socket type §2's table forbids, and a `READY` naming no socket type at all. The second is a `SHOULD` in the specification and a MUST here: a bridge that does not know which pattern it is translating cannot translate it. |
 | One socket type per listener | `Presenting::{Rep, Pull, Pub}` | The three whose ZeroMQ counterparts bind rather than connect ([ARCHITECTURE.md](ARCHITECTURE.md) §6c.4). It also makes §9.1's refusal — a dropping policy bridged onto a blocking one — unrepresentable rather than checked: the pattern pair follows from the presented type, so there is nothing to misconfigure. |
 | Envelope versus multipart | consume `[empty, body]`, refuse everything else | REQ puts an empty delimiter on the wire and REP strips it, so that frame is envelope and is consumed and mirrored onto the reply; a bare `[body]` is accepted too, because a DEALER peer leaves the envelope to its application. Any other frame count is a genuine multipart message, refused: concatenating it would invent an application protocol weida does not have (loss L1, §9.2). |

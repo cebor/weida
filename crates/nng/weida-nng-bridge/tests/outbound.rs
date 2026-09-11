@@ -21,9 +21,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use weida::{ClientTls, GuaranteeSet, Identity, Runtime, RuntimeConfig, ServerTls, Trust};
+use weida_nng_bridge::{BridgeError, Dialling, Outbound, OutboundConfig, TopicSplit};
 use weida_sp::header::{EndpointType, HEADER_LEN};
 use weida_sp::{ProtocolHeader, backtrace, message};
-use weida_sp_bridge::{BridgeError, Dialling, Outbound, OutboundConfig, TopicSplit};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -143,7 +143,7 @@ impl Peer {
 /// Starts a bridge, serving in the background.
 async fn bridge(config: OutboundConfig) -> (String, Runtime) {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("weida_sp_bridge=debug")
+        .with_env_filter("weida_nng_bridge=debug")
         .try_init();
     let identity = Identity::generate().expect("identity");
     let fingerprint = identity.fingerprint().expect("fingerprint");

@@ -8,8 +8,8 @@ at the commit named below, and those files remain the source of truth. The diagr
 
 **Snapshot:** main `bd40383`, 2026-09-11 ~13:10 UTC. Tree clean, gate green, 505 tests
 (218 at the start of the session). Twelve decision notes (0001–0012), all `accepted`.
-Eight crates: `weida-core`, `weida-protocol`, `weida`, `weida-zmtp`, `weida-zmtp-bridge`,
-`weida-sp`, `weida-sp-bridge` and `cross-tests`.
+Eight crates: `weida-core`, `weida-protocol`, `weida`, `weida-zmtp`, `weida-zmq-bridge`,
+`weida-sp`, `weida-nng-bridge` and `cross-tests`.
 
 ## 1. The roadmap
 
@@ -46,7 +46,8 @@ The **adapters** sit outside the core on purpose. Each codec crate has an empty
 `[dependencies]` section so that it can be checked against its RFC rather than against our
 reading of it; each bridge is its own crate so that the codec never learns what weida is. The
 review pass of B-051 found the only two unbounded remote-influenced allocations of the session
-in a bridge, not in the core — the invariant sweep now covers `crates/adapters` too.
+in a bridge, not in the core — the invariant sweep now covers the foreign-protocol crates
+(`crates/zmq/`, `crates/nng/`) too.
 
 ## 3. The first message across two protocols
 

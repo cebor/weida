@@ -29,7 +29,7 @@ use std::hint::black_box;
 use weida::{
     ClientTls, Identity, Listener, Runtime, RuntimeConfig, ServerTls, TransferMeta, Trust,
 };
-use weida_zmtp_bridge::{Inbound, InboundConfig, Presenting};
+use weida_zmq_bridge::{Inbound, InboundConfig, Presenting};
 use zeromq::{Socket, SocketRecv, SocketSend, ZmqMessage};
 
 /// The payload sizes the sweep uses: one small enough to be pure overhead, one

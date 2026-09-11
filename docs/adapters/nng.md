@@ -1,8 +1,8 @@
 # NNG / SP v1 — adapter mapping
 
-Status: mapping document; slice 1 (the codec) implemented as `crates/adapters/weida-sp` with
+Status: mapping document; slice 1 (the codec) implemented as `crates/nng/weida-sp` with
 an empty `[dependencies]`, and slices 2 and 3 (both bridge directions) as
-`crates/adapters/weida-sp-bridge`. What is left is the interop bench against a real NNG peer
+`crates/nng/weida-nng-bridge`. What is left is the interop bench against a real NNG peer
 ([LOOP.md](../LOOP.md) §9 Phase B, [0006](../decisions/0006-guarantee-sets.md) §4.9).
 Date: 2026-09-11
 Derived from: [docs/research/nanomsg-nng.md](../research/nanomsg-nng.md) (SP v1 RFCs
@@ -37,7 +37,7 @@ it has no application to delegate the omitted state to. `nng_device()` forwardin
 explicitly out of scope for the same reason — it requires raw sockets and only forwards
 [nanomsg-nng §4].
 
-**What the inbound slice built** (`crates/adapters/weida-sp-bridge`): one `Inbound` listens
+**What the inbound slice built** (`crates/nng/weida-nng-bridge`): one `Inbound` listens
 on a TCP address, presents one SP protocol — `REP` for a `REQ` peer, `PULL` for a `PUSH`
 peer, `PUB` for a `SUB` peer — and speaks to one weida endpoint. It exchanges the 8-octet
 protocol headers, checks the peer's endpoint type against §2's table *before any traffic*,
@@ -503,7 +503,7 @@ Consequences, following [LOOP §2] and [LOOP §5]:
 **The bench.**
 
 1. **Golden vectors, no I/O** — slice 1: §10.1 below, asserted byte-exact in both directions in
-   `crates/adapters/weida-sp/tests/golden_vectors.rs`, the shape [PROTOCOL §8] already requires
+   `crates/nng/weida-sp/tests/golden_vectors.rs`, the shape [PROTOCOL §8] already requires
    of weida's own codec.
 2. **Fuzz target** over the SP decoder, cap-before-allocate on the declared 64-bit size — a
    message may declare up to 2^64-1 bytes [rfc-tcp §3] and `RECVMAXSZ` is the only defence
@@ -513,7 +513,7 @@ Consequences, following [LOOP §2] and [LOOP §5]:
    retransmission, observed as a duplicate, L4); NNG PUSH → adapter → `Puller`; NNG SUB ←
    adapter ← weida `Publisher` with the empty subscription of §6. *Slice 2 has all three,
    against a peer built on this repository's own codec*
-   (`crates/adapters/weida-sp-bridge/tests/inbound.rs`). What is left for this item is the
+   (`crates/nng/weida-nng-bridge/tests/inbound.rs`). What is left for this item is the
    only thing that peer cannot be: **independent**. A codec byte-exact against §10.1 is a
    faithful SP peer and still shares every assumption with the code under test, so the
    `nng` run is what turns "we agree with ourselves" into interoperability — and it is the
@@ -523,7 +523,7 @@ Consequences, following [LOOP §2] and [LOOP §5]:
    with concurrent exchanges (SP contexts, one request each [nanomsg-nng §2]); a `Pusher`
    through a foreign PULL; a `Subscriber` fed by a foreign PUB with the topic split of §6.
    *Slice 3 has all three*, against the same non-independent peer
-   (`crates/adapters/weida-sp-bridge/tests/outbound.rs`), plus the two refusals the
+   (`crates/nng/weida-nng-bridge/tests/outbound.rs`), plus the two refusals the
    direction owns: the pending ceiling and a peer whose endpoint type may not talk here.
    The `nng` run is owed here for the same reason as item 3 — and with one extra question
    only a real peer can answer: whether an NNG REP accepts a request from a peer that
@@ -539,7 +539,7 @@ Consequences, following [LOOP §2] and [LOOP §5]:
    the adapter against the same patterns native on both sides, and the message rate at which
    the SP side starts dropping under PUB/SUB — the drop being the protocol's documented answer
    [nanomsg-nng §5], the number being ours.
-7. **Cross-adapter (slice 6).** `crates/adapters/cross-tests` runs a message in through one
+7. **Cross-adapter (slice 6).** `crates/interop/cross-tests` runs a message in through one
    adapter and out through the other against `zeromq` and `nng`: the three pattern chains in
    both directions, the composed losses (a ZMTP multipart refused at hop one, the smaller
    `max_message_bytes` deciding, an SP hop-count ceiling arriving as silence — L11 observed
