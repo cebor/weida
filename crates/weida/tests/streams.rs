@@ -815,3 +815,167 @@ async fn a_replier_that_stops_accepting_stalls_requesters_after_the_queue_fills(
 
     client.shutdown().await;
 }
+
+// --- 9. reordering across streams, and what a reorder buffer costs --------
+
+/// What one arrival order cost an application that wants dispatch order back.
+struct Reorder {
+    /// Payload sequence numbers in the order their transfers completed.
+    arrivals: Vec<u64>,
+    /// Arrivals that did not land at their dispatch position.
+    out_of_order: usize,
+    /// Most transfers an application-side reorder buffer held at once.
+    peak_held: usize,
+    /// Dispatch position at which the arrival order first diverges, if it does.
+    first_divergence: Option<usize>,
+}
+
+/// How the reverse-order FINs are released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Finish {
+    /// All FINs queued back to back, which is what an application does.
+    Batched,
+    /// Each FIN awaited to its transport receipt before the next is queued, so
+    /// the peer provably processes them one at a time, in reverse order.
+    Sequenced,
+}
+
+/// Claim: nothing orders transfers against each other, so an application that
+/// needs dispatch order has to buffer, and the buffer is bounded only by how
+/// many transfers are in flight. `Ordering = None` is therefore a cost the
+/// receiving application pays, not a gap the transport might close.
+///
+/// The setup opens `n` transfers, writes a dispatch sequence into each, and
+/// only then finishes them from the last to the first. A task per accepted
+/// transfer reports the sequence it read, so what is observed is *completion*
+/// order rather than the order a single-threaded reader would impose on
+/// itself.
+///
+/// Asserted is the invariant, never the order: every dispatched transfer
+/// arrives exactly once and the reorder buffer drains empty. The two numbers
+/// — arrivals out of dispatch position, and the peak the buffer held — are
+/// recorded in `docs/IMPLEMENTATION.md`, because QUIC promises no ordering
+/// across streams and a test that pinned one would pin an accident.
+async fn reorder_probe(n: usize, finish: Finish) -> Reorder {
+    let server = Server::start_with(Limits {
+        endpoint_queue: n + 1,
+        ..Limits::default()
+    })
+    .await;
+    let puller = server.listener.puller("/reorder").expect("puller");
+    let client = server.client_runtime();
+    let pusher = client.pusher(server.trust());
+    within(pusher.connect(&server.url("/reorder")))
+        .await
+        .expect("connect");
+
+    // One task per accepted transfer, so a transfer that finishes early is
+    // reported early instead of waiting behind an unfinished sibling.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let reader = tokio::spawn(async move {
+        for _ in 0..n {
+            let transfer = puller.recv().await.expect("recv");
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let body = transfer.collect(64).await.expect("collect");
+                let bytes: [u8; 8] = body[..].try_into().expect("8-byte sequence");
+                let seq = u64::from_le_bytes(bytes);
+                let _ = tx.send(seq);
+            });
+        }
+        puller
+    });
+
+    let mut transfers = Vec::with_capacity(n);
+    for seq in 0..n as u64 {
+        let mut transfer = within(pusher.open(TransferMeta::default()))
+            .await
+            .expect("open");
+        within(transfer.write_all(&seq.to_le_bytes()))
+            .await
+            .expect("write");
+        transfers.push(transfer);
+    }
+    // Reverse order: the transfer dispatched first is the last to be finished,
+    // so its FIN is the last to arrive.
+    for transfer in transfers.into_iter().rev() {
+        let delivery = transfer.finish().expect("finish");
+        if finish == Finish::Sequenced {
+            within(delivery.delivered()).await.expect("delivered");
+        }
+    }
+
+    let mut arrivals = Vec::with_capacity(n);
+    for _ in 0..n {
+        arrivals.push(within(rx.recv()).await.expect("arrival"));
+    }
+    let _puller = within(reader).await.expect("reader task");
+
+    // An application-side reorder buffer keyed on the payload sequence: hold
+    // what cannot be released yet, release as soon as the next one is there.
+    let mut held = std::collections::BTreeSet::new();
+    let mut next_expected = 0u64;
+    let mut peak_held = 0usize;
+    for &seq in &arrivals {
+        held.insert(seq);
+        while held.remove(&next_expected) {
+            next_expected += 1;
+        }
+        peak_held = peak_held.max(held.len());
+    }
+    assert!(
+        held.is_empty() && next_expected == n as u64,
+        "the reorder buffer must drain: {} held, next_expected {next_expected}",
+        held.len()
+    );
+
+    let diverged: Vec<usize> = arrivals
+        .iter()
+        .enumerate()
+        .filter(|(position, seq)| **seq != *position as u64)
+        .map(|(position, _)| position)
+        .collect();
+
+    client.shutdown().await;
+    Reorder {
+        arrivals,
+        out_of_order: diverged.len(),
+        peak_held,
+        first_divergence: diverged.first().copied(),
+    }
+}
+
+#[tokio::test]
+async fn reverse_order_completion_measures_the_reorder_buffer() {
+    // `Sequenced` awaits a transport receipt per transfer, so it is run at the
+    // small size only: at 256 transfers it would spend a quarter of a second
+    // per hundred on QUIC's delayed acknowledgements and measure the same
+    // bound.
+    let cases = [
+        (16usize, Finish::Batched),
+        (256, Finish::Batched),
+        (16, Finish::Sequenced),
+    ];
+
+    for (n, finish) in cases {
+        let probe = within(reorder_probe(n, finish)).await;
+
+        assert_eq!(probe.arrivals.len(), n, "every transfer must arrive");
+        let mut seen = probe.arrivals.clone();
+        seen.sort_unstable();
+        assert!(
+            seen.iter().copied().eq(0..n as u64),
+            "each dispatched transfer must arrive exactly once"
+        );
+        assert!(probe.peak_held < n, "the buffer cannot hold every transfer");
+
+        eprintln!(
+            "reorder n={n} {finish:?}: {} of {n} arrived out of dispatch position, peak reorder \
+             buffer {} transfers, first divergence at position {:?}, first five arrivals {:?}",
+            probe.out_of_order,
+            probe.peak_held,
+            probe.first_divergence,
+            &probe.arrivals[..probe.arrivals.len().min(5)],
+        );
+    }
+}

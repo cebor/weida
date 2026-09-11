@@ -474,6 +474,33 @@ producer key is omitted entirely in the default case and the default pays only t
 32-byte digest, 35 B instead of 74 B, and the hex string stays presentation only. B-013
 implements both cases and their golden vectors.
 
+### Verified results — reassembly buffer under cross-stream reordering (B-010)
+
+What an application-side reorder buffer costs when transfers complete out of dispatch order,
+the second unmeasured cost of [0001](decisions/0001-sequence-field.md) §8. The probe is
+`reverse_order_completion_measures_the_reorder_buffer` in `crates/weida/tests/streams.rs`: it
+opens N transfers, writes a dispatch sequence into each, finishes them from the last to the
+first, and reports each transfer's sequence from its own task, so what is measured is
+completion order rather than the order a single-threaded reader imposes on itself. The buffer
+is then simulated exactly: hold what cannot be released, release as soon as the next sequence
+is present, record the peak. Debug build, loopback, same machine as the runs above; every
+figure below was identical across five runs.
+
+| Case | Command | Result |
+| --- | --- | --- |
+| N = 16, FINs queued back to back | `cargo test -p weida --test streams reverse_order_completion -- --nocapture` | **0 of 16** out of dispatch position, peak reorder buffer **0**. Reversing the FIN order changes nothing the application can see: the FINs are queued in one burst and quinn transmits the pending streams in its own order, so arrival order follows dispatch order |
+| N = 256, FINs queued back to back | same | **90 of 256** out of dispatch position, peak reorder buffer **84** transfers (33 % of the transfers in flight), first divergence at position **29**. The first 29 arrive in order; beyond that, concurrent per-transfer tasks are the reordering source, not the FIN order |
+| N = 16, each FIN awaited to its transport receipt | same | **16 of 16** out of dispatch position, peak reorder buffer **15** = N − 1, arrivals exactly reversed (`[15, 14, 13, …]`). Serializing the FINs is what makes the sender's order reach the receiver, and then the buffer must hold every outstanding transfer but one |
+
+Two results matter for the reassembly mode of 0001 §7.5. First, the bound is N − 1 and it is
+reachable: an eager reassembler must be capped by construction, which is what the INVARIANTS
+follow-up of 0001 §8 asks for — the cap is a configured number of held transfers, not a hope
+about arrival order. Second, at 256 transfers in flight a third of them were already held
+without any adversarial pattern, so the cap has to be chosen against normal concurrency rather
+than against the worst case alone. The probe asserts only the invariants — every transfer
+arrives exactly once, the buffer drains empty, the peak stays below N — because QUIC promises
+no ordering across streams and a test that pinned 84 would pin an accident of this machine.
+
 ---
 
 ## 5. Decisions
