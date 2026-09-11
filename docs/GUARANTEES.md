@@ -210,6 +210,13 @@ it would have been told under detect. A hole that is never filled therefore cost
 of a producer's traffic holds its successors until the connection closes — v0 bounds the hold
 in count only, not in time.
 
+**A repeated number is delivered, not suppressed.** If a number that is already held arrives
+a second time — a producer retransmit, or any repeat on a connection without deduplication —
+the held transfer keeps its place in the run and the repeat is passed to the application
+immediately, out of order. Reassembly never discards a transfer: dropping one would reset a
+stream its sender believes is in flight, and suppressing a repeat is the `Deduplication`
+dimension's job, which is independent of this one [0001 §7.1].
+
 A held transfer is an **unread stream**, not a copy of its payload: reassembly materializes
 nothing ([INVARIANTS.md](INVARIANTS.md)). What it pins is transport memory — one stream of
 the peer's `max_concurrent_uni_streams` budget and up to `stream_receive_window` bytes each,

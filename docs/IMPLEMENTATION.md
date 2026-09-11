@@ -363,9 +363,10 @@ transfers over all scopes. When an arrival does not fit, the oldest held transfe
 out of order carrying `IncomingMeta::gap` — exactly what detect mode would have reported —
 and whatever now follows it in order goes out behind it. The victim scope is the one holding
 the most, so one stalled producer cannot spend the whole budget and push every other scope
-into out-of-order release. Six unit tests cover it: in-order release, gapless runs, the
+into out-of-order release. Seven unit tests cover it: in-order release, gapless runs, the
 forced release and its gap, the hold never exceeding the cap over 500 arrivals, the scope
-table at its own cap, and pass-through for unnumbered, untracked-scope and late arrivals.
+table at its own cap, pass-through for unnumbered, untracked-scope and late arrivals, and
+the repeat rule below.
 
 The end-to-end proofs are `crates/weida/tests/reorder.rs` — sequences scrambled on the raw
 wire arrive in sequence order; a hold of two releases out of order with the gap when the
@@ -378,6 +379,18 @@ which is the acceptance criterion that a subscriber in either mode reports a Pub
 through `IncomingMeta`. Note what that test shows about reassemble mode: a hole a publisher
 drop leaves is *never* filled, so the loss becomes visible only when the hold is full. Under
 reassemble, `max_reorder_hold` is the delay a permanent loss costs.
+
+**Two things review caught in the first cut of `admit`.** A repeated number at or above the
+position went through `BTreeMap::insert`, which replaced the held transfer silently while
+`held` was incremented again: the counter drifted upward for good, forced releases began
+firing below the real bound, and the displaced `RecvStream` was dropped — resetting a stream
+its sender still believed was in flight. The slot now belongs to whoever claimed it first
+and the repeat is passed straight through (`a_repeated_number_is_delivered_and_does_not_move_the_hold`
+asserts both the unchanged hold and that every item offered came back exactly once; it fails
+on the old code with `held` at 2). Suppressing a repeat is deduplication's job and stays
+there. Second, the in-order arrival — the common case, and the only one on a network that is
+not reordering — allocated a map node just to take it out again; when the number is the
+expected one and nothing is waiting, it is now released without touching the `BTreeMap`.
 
 **Not bounded in time.** v0 bounds the hold in count only. A hole at the very end of a
 producer's traffic holds its successors until the connection closes, because nothing arrives

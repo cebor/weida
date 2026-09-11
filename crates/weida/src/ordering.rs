@@ -14,7 +14,7 @@
 //! `docs/INVARIANTS.md`, checked by the unit tests at the bottom of this file
 //! rather than asserted in prose.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, btree_map};
 use std::sync::Mutex;
 
 use weida_protocol::header::OrderingMode;
@@ -247,11 +247,19 @@ impl<T> Reassembler<T> {
     ///
     /// An unnumbered arrival, an arrival on an untracked scope and an arrival
     /// below the position are passed straight through: nothing that is still
-    /// to come can be ordered against them. Everything else is held until the
-    /// numbers before it have arrived — or until the hold is full, which
-    /// releases the oldest held transfer out of order and reports the numbers
-    /// it skipped as a `Gap`, the behaviour `docs/GUARANTEES.md` §3 states.
-    /// Reassembly is never silently weakened: the application is told.
+    /// to come can be ordered against them. So is a **repeat of a number
+    /// already held** — the held transfer keeps its slot, and the repeat is
+    /// delivered immediately rather than displacing it. A repeat is
+    /// delivered, never silently discarded; suppressing one is
+    /// deduplication's job and nothing else's
+    /// ([decision 0001](../../../docs/decisions/0001-sequence-field.md) §7.1
+    /// keeps the two dimensions apart).
+    ///
+    /// Everything else is held until the numbers before it have arrived — or
+    /// until the hold is full, which releases the oldest held transfer out of
+    /// order and reports the numbers it skipped as a `Gap`, the behaviour
+    /// `docs/GUARANTEES.md` §3 states. Reassembly is never silently weakened:
+    /// the application is told.
     pub(crate) fn admit(
         &self,
         scope: &str,
@@ -293,9 +301,19 @@ impl<T> Reassembler<T> {
             // holding it would order it against nothing.
             return vec![(item, None)];
         }
-        let mut out = Vec::new();
-        entry.pending.insert(sequence, item);
+        if sequence == entry.next && entry.pending.is_empty() {
+            // The common case, and the whole hot path of reassemble mode: the
+            // next number arrived and nothing is waiting behind it, so it goes
+            // straight out without a map node.
+            entry.next = sequence.wrapping_add(1);
+            return vec![(item, None)];
+        }
+        match entry.pending.entry(sequence) {
+            btree_map::Entry::Occupied(_) => return vec![(item, None)],
+            btree_map::Entry::Vacant(slot) => slot.insert(item),
+        };
         *held += 1;
+        let mut out = Vec::new();
         *held -= drain_in_order(entry, &mut out);
 
         // Enforce the cap by releasing, never by growing. The victim is the
@@ -527,6 +545,27 @@ mod tests {
             "3 and 4 followed 2 in order"
         );
         assert_eq!(r.held(), 0, "the hold drained behind the forced release");
+    }
+
+    #[test]
+    fn a_repeated_number_is_delivered_and_does_not_move_the_hold() {
+        let r: Reassembler<u64> = Reassembler::new(OrderingMode::PerProducerReassemble, 4, 1024);
+        let mut released = items(r.admit("a", Some(3), 30));
+        assert_eq!(released, [30], "the position starts at the first number");
+
+        // 5 arrives twice while 4 is still missing. The first copy takes the
+        // slot; the second is delivered rather than displacing it, and the
+        // hold counts one transfer, not two.
+        assert!(r.admit("a", Some(5), 50).is_empty());
+        released.extend(items(r.admit("a", Some(5), 51)));
+        assert_eq!(r.held(), 1, "a repeat must not inflate the hold");
+
+        // 4 fills the hole and the run goes out; every item offered came back
+        // exactly once, so no transfer was dropped on the floor.
+        released.extend(items(r.admit("a", Some(4), 40)));
+        released.sort_unstable();
+        assert_eq!(released, [30, 40, 50, 51]);
+        assert_eq!(r.held(), 0, "the hold must drain");
     }
 
     #[test]
