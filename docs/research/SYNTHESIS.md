@@ -1049,17 +1049,16 @@ Where a bridge must refuse or take responsibility itself:
 Questions the evidence leaves open, phrased as decisions to make. Each names what the evidence
 constrains and what it does not.
 
-Seven of the nine are now decided, and each carries a **Closed by** paragraph naming the note:
+Eight of the nine are now decided, and each carries a **Closed by** paragraph naming the note:
 §8.1 by [0003](../decisions/0003-credit-unit.md), §8.2 by
 [0002](../decisions/0002-control-and-bulk-separation.md), §8.3 by
 [0004](../decisions/0004-durability-levels.md), §8.4 by
 [0001](../decisions/0001-sequence-field.md), §8.5 by
-[0005](../decisions/0005-refusal-race.md), §8.7 by
+[0005](../decisions/0005-refusal-race.md), §8.6 by [0009](../decisions/0009-drain.md), §8.7 by
 [0006](../decisions/0006-guarantee-sets.md), §8.9 by
 [0007](../decisions/0007-topic-namespace.md). The question text above each closing paragraph is
 left exactly as it was written, because a decision is only legible against the question it
-answered. **Still open: §8.6** (a bounded drain at shutdown, and whether it belongs to the
-runtime or to L2) and **§8.8** (a local transport, and which one per platform). A ninth
+answered. **Still open: §8.8** — a local transport, and which one per platform. A tenth
 question — a session concept and a stable producer name — was raised in
 [0001](../decisions/0001-sequence-field.md) §8 for this section and never added here; it is
 answered by [0008](../decisions/0008-session-identity.md) in that file instead, and is not
@@ -1156,6 +1155,15 @@ forever [zeromq §12/P17]; RabbitMQ's requeue-on-channel-close [rabbitmq-amqp091
 AMQP 1.0's `drain`/`echo` quiescence point [amqp10 §9]; NATS Lame Duck Mode [nats §12/P17]; and
 D12's finding that none of them is a drain *acknowledgement*. The decision is whether weida
 needs a bounded drain, and whether it belongs to the runtime or to L2.
+
+**Closed by [0009](../decisions/0009-drain.md):** yes, and it is the runtime's. `shutdown`
+stays abortive and is named as such; a separate `drain(Duration)` stops admission, waits for
+transfers already `finish()`ed to reach the peer's *transport* — the only completion signal L0
+has — and then closes. The deadline is mandatory and finite: no infinite variant exists,
+because ZeroMQ's `-1` default is the failure the catalogue unanimously records. The outcome is
+a local count, never an acknowledgement, since D12 says nobody has one; and L2's queue drain is
+a different operation that may not be presented as this one. The unbounded `wait_idle()` in
+today's `shutdown` is named as a defect by the same note.
 
 **8.7 What does a bridge do when it cannot honour the source protocol's guarantee?** The
 invariant is already written — "Protocol adapters may not silently invent guarantees their
