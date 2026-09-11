@@ -695,7 +695,8 @@ a foreign peer's disagreements interpretable rather than mysterious.
 SP has no topic field, only the leading bytes of a body, so the split is adapter
 configuration and belongs to the bridge slice ([adapters/nng.md](adapters/nng.md) §6).
 
-**Delivered in the fourteenth increment — the SP inbound bridge (B-052):**
+**Delivered in the fourteenth increment — the SP inbound bridge (B-0xx, id assigned by the
+backlog):**
 
 `crates/adapters/weida-sp-bridge`, the mirror of B-041 for SP: one `Inbound` terminates the
 SP TCP mapping with `weida-sp` and speaks weida onward. `REP` in front of a weida
