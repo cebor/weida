@@ -1,7 +1,8 @@
 # NNG / SP v1 — adapter mapping
 
 Status: mapping document; slice 1 (the codec) implemented as `crates/adapters/weida-sp` with
-an empty `[dependencies]`. The two bridge directions follow it
+an empty `[dependencies]`, and slice 2 (the inbound bridge) as
+`crates/adapters/weida-sp-bridge`. The outbound direction and the interop bench follow
 ([LOOP.md](../LOOP.md) §9 Phase B, [0006](../decisions/0006-guarantee-sets.md) §4.9).
 Date: 2026-09-11
 Derived from: [docs/research/nanomsg-nng.md](../research/nanomsg-nng.md) (SP v1 RFCs
@@ -35,6 +36,23 @@ a raw peer is a peer of the adapter like any other, but the adapter never *is* a
 it has no application to delegate the omitted state to. `nng_device()` forwarding is
 explicitly out of scope for the same reason — it requires raw sockets and only forwards
 [nanomsg-nng §4].
+
+**What the inbound slice built** (`crates/adapters/weida-sp-bridge`): one `Inbound` listens
+on a TCP address, presents one SP protocol — `REP` for a `REQ` peer, `PULL` for a `PUSH`
+peer, `PUB` for a `SUB` peer — and speaks to one weida endpoint. It exchanges the 8-octet
+protocol headers, checks the peer's endpoint type against §2's table *before any traffic*,
+consumes the REQ/REP tag stack and writes it back onto the reply unchanged (§3), and bounds
+what it holds with `max_message_bytes`, `max_hops`, `max_in_flight` and `max_connections` —
+four factors whose product is the memory a peer can make this process hold, stated in the
+configuration's own documentation. Two things are structurally unlike the ZMTP bridge next
+door. **Requests are served concurrently**, because a cooked REQ holds one outstanding
+request *per context* and a socket may own many [nanomsg-nng §2], so the tag stack rather
+than arrival order is what pairs a reply with its request [rfc-reqrep §5]. And **the
+`PUB` side subscribes to everything**: SP filters at the subscriber, a SUB socket cannot
+send, so the bridge never learns what the peer wants and takes the empty filter of §6 — L1
+made concrete. The tests drive it with an SP peer built on the codec, which is faithful on
+the wire and is *not* an independent implementation — that is what §10's `nng` run is still
+owed for.
 
 Out of scope for the first slices: the UDP and WebSocket/WSS mappings and the experimental
 ZeroTier transport [nanomsg-nng §0, §12/P18]; `inproc`, which is an in-process transport of
@@ -200,6 +218,25 @@ adding them to that table is a follow-up for the decision (§11).
 | Where matching happens | at the subscriber, after the publisher has sent every publication to every subscriber link [nanomsg-nng §4] | at the publisher [ARCHITECTURE §6c.2] | no | L1: bridging inbound moves work and bandwidth *off* the wire, which is fine; bridging outbound to SP subscribers means the adapter must send everything a SUB peer might want and let it filter |
 | Endpoint addressing | URLs per transport, bounded by `NNG_MAXADDRLEN`; legacy IPC paths ≤ 122 bytes [nanomsg-nng §11] | opaque endpoint paths ≤ 512 bytes [INVARIANTS], [PROTOCOL §10] | no | an SP URL is not an endpoint path; the adapter's configuration maps one to the other explicitly and MUST NOT derive a path from a URL |
 
+**What the inbound bridge does with these rows, and why it is only one of them.** The rows
+above are written for an adapter that *knows* a subscription. The inbound bridge does not:
+it presents `PUB` to a `SUB` peer, and a SUB socket has no send operation at all
+[nanomsg-nng §4], so no subscription ever reaches the bridge — the peer's prefixes are
+local to the peer and always were. The bridge therefore takes the **empty subscription**
+row: it subscribes to `""` on the weida side, every publication on that path crosses the
+link, and the peer's own prefix match decides. That is exact as a *mapping* and is the
+worst case as *traffic*, which is L1 stated in one sentence: on this transport a weida
+filter cannot reduce what the link carries, because nothing tells the publisher's side what
+to keep. The rows for a boundary-aligned or mid-segment prefix become live only where a
+subscription is known out of band — an operator configuring the bridge for one known
+consumer — and the mid-segment refusal of 0007 §4.5 applies unchanged there.
+
+The topic split is the other half: SP has no topic field, so the bridge writes the weida
+`topic` immediately followed by the payload and nothing between them. A peer subscribing to
+`px.` therefore matches, and one subscribing to `px.eur` matches a longer prefix of the same
+bytes — the byte-prefix semantics SP already has, with no boundary anywhere. That
+concatenation is the convention, and it is configuration rather than framing.
+
 ## 7. Transfer points and guarantee mapping
 
 **SP has no transfer point.** It defines no application acknowledgement, no broker receipt, no
@@ -325,6 +362,23 @@ experiments.
    declares a 2^64-1 size being disconnected before a single payload byte is read (R4 in
    §10.1). The negative observation that matters: memory does not move when the declaration
    arrives.
+10. **A refusal carries no reason, because SP has no error frame.** ZMTP has an `ERROR`
+    command with a printable reason and MQTT has reason codes; SP has neither, and the only
+    remedy its TCP mapping names is "the connection MUST be closed immediately"
+    [rfc-tcp §2], with "incompatible peers must disconnect" as the pattern-level version
+    [nanomsg-nng §1]. Everything this adapter refuses at the wire — a mismatched endpoint
+    type, a malformed protocol header, an oversized declaration, a too-deep tag stack — is
+    therefore indistinguishable, from the peer's side, from any other close. A REQ peer's
+    only recovery is its own resend timer against a bridge that will refuse the resend the
+    same way [nanomsg-nng §4].
+    *Observed as:* the protocol header arriving (it is written before the peer's is read,
+    as the mapping requires) and then EOF, with nothing between them —
+    `a_wrong_endpoint_type_is_closed_on_after_the_header` and
+    `a_malformed_protocol_header_is_closed_on`. *This document is wrong if* a real NNG peer
+    reports anything more specific than a closed pipe; the manual's failure table only ever
+    says the pipe is removed [nanomsg-nng §8]. The practical consequence for an operator is
+    that the **bridge's own log** is the only place the reason exists, which is why every
+    refusal in the code carries one.
 
 ## 9. Configurations the adapter refuses
 
@@ -389,16 +443,26 @@ Consequences, following [LOOP §2] and [LOOP §5]:
    message may declare up to 2^64-1 bytes [rfc-tcp §3] and `RECVMAXSZ` is the only defence
    [nanomsg-nng §5] — mirroring `max_header_bytes`'s rule [PROTOCOL §3.1]. A stable-Rust smoke
    test runs the same properties under `cargo test`.
-3. **Inbound matrix.** NNG REQ → adapter → weida `Replier` (including a forced retransmission,
-   observed as a duplicate, L4); NNG PUSH → adapter → `Puller`; NNG SUB ← adapter ← weida
-   `Publisher` with a boundary-aligned prefix and a refused mid-segment prefix (§6).
+3. **Inbound matrix.** NNG REQ → adapter → weida `Replier` (including a forced
+   retransmission, observed as a duplicate, L4); NNG PUSH → adapter → `Puller`; NNG SUB ←
+   adapter ← weida `Publisher` with the empty subscription of §6. *Slice 2 has all three,
+   against a peer built on this repository's own codec*
+   (`crates/adapters/weida-sp-bridge/tests/inbound.rs`). What is left for this item is the
+   only thing that peer cannot be: **independent**. A codec byte-exact against §10.1 is a
+   faithful SP peer and still shares every assumption with the code under test, so the
+   `nng` run is what turns "we agree with ourselves" into interoperability — and it is the
+   run that settles §11's PAIR v1 hop-count question and L10's "is a close really all a
+   peer learns".
 4. **Outbound matrix.** The same three reversed: a weida `Requester` through a foreign REP with
    concurrent exchanges (SP contexts, one request each [nanomsg-nng §2]); a `Pusher` through a
    foreign PULL; a `Subscriber` fed by a foreign PUB with the topic split of §6.
-5. **A test per observable named loss.** L1 (filter side: a SUB peer receives publications it
-   did not subscribe to when the adapter is outbound), L2 (an oversized payload refused, not
-   truncated), L4 (a retransmitted request arrives twice), L5 (a survey deadline expires at the
-   adapter), L9 (`RECVMAXSZ = 0` refused at configuration).
+5. **A test per observable named loss.** *Slice 2 has L1, L2, L4 and L10 for the inbound
+   direction* — a SUB peer receiving publications no filter of its could have asked the
+   publisher for, an oversized declaration refused before its body, a retransmitted request
+   reaching the replier twice, and a refusal observable only as a close. Still owed: L5 (a
+   survey deadline expires at the adapter) and L9's configuration half against a real peer
+   (`RECVMAXSZ = 0`), plus L3, L6, L7 and L8, which belong to the outbound slice or to
+   patterns weida does not have.
 6. **Numbers to record.** Round-trip latency and throughput for Req/Rep and Push/Pull through
    the adapter against the same patterns native on both sides, and the message rate at which
    the SP side starts dropping under PUB/SUB — the drop being the protocol's documented answer

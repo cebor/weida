@@ -117,7 +117,7 @@ through this list; the synthesis compares the answers side by side.
 
 | File | Protocol | Status |
 | --- | --- | --- |
-| `zeromq.md` | ZeroMQ: ZMTP 3.1, the zguide patterns, CURVE/ZAP | done |
+| `zeromq.md` | ZeroMQ: ZMTP 3.1, the zguide patterns, CURVE/ZAP | done; §1, §6 and §13 carry what an interop run against `zeromq` 0.6.0 measured [40] |
 | `rabbitmq-amqp091.md` | RabbitMQ and AMQP 0-9-1 with RabbitMQ extensions | done |
 | `amqp10.md` | AMQP 1.0 (ISO/IEC 19464) | done |
 | `mqtt5.md` | MQTT 5.0, with 3.1.1 differences | done |

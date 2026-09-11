@@ -25,6 +25,10 @@ send only the first 11 octets (signature + major) to sniff the peer's version, o
 always uses its own protocol against an equal-or-higher peer, MAY downgrade to a lower one, and MUST close if it cannot [1]. Two documented downgrade strategies exist, one detecting only ZMTP 2.0 and one detecting 1.0 and 2.0
 by abusing the padding field as a ZMTP 1.0 identity-frame length; if the mechanism is anything other than NULL and a ZMTP 1.0/2.0 peer is detected, "it MUST immediately close the connection" [1].
 
+**What a downgrade costs, which no source states.** The rule above is symmetric in words and not in effect: `PING`/`PONG` arrived with 3.1 and the `SUBSCRIBE`/`CANCEL` commands are 3.x, so a 3.1 peer that downgrades to a 3.0
+peer must stop using them for that connection — and it cannot learn this by trying, because a peer that does not recognize a command name is entitled to treat it as an error and close [1]. An implementation announcing 3.0 and
+recognizing only `READY` exists in the wild (§13, `zeromq` 0.6.0 [40]), so the version octets decide which commands may be sent rather than merely which framing applies [inference].
+
 **Mechanism agreement.** "A peer announces precisely one security mechanism, unlike SASL… Security in ZMTP is *assertive* in that all peers on a given socket have the same, required level of security. This prevents downgrade
 attacks and simplifies implementations." [1] A received mechanism that does not exactly match the sent one MUST cause a close. A peer that reads a full greeting including mechanism MUST also send one, to avoid deadlock [1].
 
@@ -257,6 +261,11 @@ Wire form: filtering "SHALL happen at the publisher side (the PUB or XPUB socket
 SHALL match all messages." [1] At the API, XPUB/XSUB expose subscriptions as messages: "byte 1 (for subscriptions) or byte 0 (for unsubscriptions) followed by the subscription body. Messages without a sub/unsub prefix are
 also received, but have no effect on subscription status." [17] Options: `ZMQ_XPUB_VERBOSE`, `ZMQ_XPUB_VERBOSER`, `ZMQ_XPUB_MANUAL`, DRAFT `ZMQ_XPUB_MANUAL_LAST_VALUE`, `ZMQ_XPUB_WELCOME_MSG` (sent on connect and reconnect),
 `ZMQ_XPUB_NODROP` (return `EAGAIN` instead of dropping at SNDHWM, for XPUB and PUB), `ZMQ_INVERT_MATCHING` (send to all except matching subscribers; must be set on both sides for SUB) [18].
+
+**Two subscription wire forms exist, and which one a 3.x peer sends is not settled by the specification.** The commands above are 3.x's; the `%x01`/`%x00`-prefixed one-frame *message* is ZMTP 2.0's wire form and is also what
+`zmq_socket(3)` describes as XPUB/XSUB's API view of a subscription [17]. The two are distinguishable on the wire — a command frame carries the COMMAND flag and a printable name, a message frame does not [1] — so a publisher
+*can* accept both, and a peer that reads only one of them silently has no subscribers from an implementation that sends the other. `zeromq` 0.6.0 announces 3.0 and sends and reads only the 2.0 form [40]; no source states what
+a 3.x peer is required to accept here, and 37/ZMTP does not mention the message form at all [1]. Any implementation that intends to interoperate widely therefore has to accept both on receive [inference].
 
 **Who binds.** "Practical default direction: bind PUB, connect SUB, unless topology prevents it" [31]. The pub-sub proxy binds XSUB and XPUB at well-known endpoints, both publishers and subscribers connect to it, and the
 proxy must forward subscriptions from the XPUB side to the XSUB side [32]. `zmq_proxy()` with XSUB frontend and XPUB backend is the built-in forwarder and "may be used to bridge networks transports, e.g. read on tcp:// and
@@ -779,10 +788,20 @@ implementations: `majordomo` for MDP/0.2 [13], `libcurve` for CurveZMQ [10], `sp
 - `zeromq` (zmq.rs, `zeromq/zmq.rs`, MIT): "A native Rust implementation of ZeroMQ", with "DISCLAIMER: This codebase does not implement all of ZeroMQ's feature set." Status: "Basic ZMTP implementation is working and tested
   against the reference implementation." Transports: TCP and IPC (unix only). Patterns: REQ, REP, DEALER, ROUTER, PUB, SUB, XPUB, XSUB, PUSH, PULL. Runtime selectable between `tokio` (default), `async-std` and
   `async-dispatcher` [38].
+  **Measured against version 0.6.0 [40]**, not stated by its documentation, and each of these is observable in one exchange with it: (a) its greeting announces version **3.0**, not 3.1, so a peer that insists on 3.1 refuses it
+  and a peer that downgrades must then behave as 3.0 for the whole connection; (b) its command decoder recognizes `READY` and nothing else — `PING`, `PONG` and `ERROR` all decode as "Unknown command received", which is an
+  error that ends the connection, so 3.1's heartbeat and the specification's own way of reporting a refusal are both unusable toward it; (c) SUB and XSUB send subscriptions in the **ZMTP 2.0 form** — a one-frame message whose
+  first octet is `%x01` to subscribe or `%x00` to cancel — rather than as the `SUBSCRIBE`/`CANCEL` commands of 3.x, and its PUB and XPUB read only that form. A PUB implementation that accepts only the command form therefore
+  receives no subscriptions from it at all, and one that sends only the command form is not subscribed to by it. (d) Its own client collapses a repeated `subscribe()` for an identical prefix before it reaches the wire, so a
+  peer cannot use it to exercise the additive, non-idempotent counting §11 describes.
 
-**Known incompatibilities** (only those the sources state).
+**Known incompatibilities** (those the sources state, plus one group measured and marked as such).
 - Feature coverage: zmq.rs implements neither PAIR nor the thread-safe draft family, and no transport beyond TCP and IPC [38]; a peer using CLIENT/SERVER, RADIO/DISH, SCATTER/GATHER, PEER/CHANNEL or `ws`/`wss` therefore needs
   libzmq or another complete implementation [inference].
+- **Version and command skew inside 3.x, measured** [40]: an implementation may announce 3.0 and implement neither the 3.1 commands nor the 3.x subscription form, as zmq.rs 0.6.0 does (§13 above). The consequence for any
+  peer that speaks 3.1 is that the version octets are not decoration — `PING`/`PONG` and the `SUBSCRIBE`/`CANCEL` commands must be gated on the version the greeting negotiated, since a 3.0 peer answers an unknown command by
+  closing the connection rather than by ignoring it. The specification permits both halves of this ("a peer MUST accept protocol versions greater or equal to 3.1", "a peer… MAY downgrade to a lower protocol version") but does
+  not say that a downgrade costs the heartbeat, and no source states the subscription-form split for 3.x peers at all [1].
 - Draft status: CLIENT/SERVER, RADIO/DISH, PEER, CHANNEL, `ws`/`wss`, `ZMQ_RECONNECT_STOP`, `ZMQ_ROUTER_NOTIFY`, `ZMQ_XPUB_MANUAL_LAST_VALUE` and `ZMQ_ZERO_COPY_RECV` are all marked "in DRAFT state, not yet available in
   stable releases" or "still in draft phase" [17][18][19].
 - ZMTP version skew: 1.0 and 2.0 peers can only request NULL security, and a peer configured for anything else "MUST immediately close the connection" [1]. ZRE has none at all: "There is no mechanism for backwards
@@ -876,6 +895,9 @@ All sources were read on 2026-09-08, in full or in the cited ranges.
 38. **zmq.rs README.** https://github.com/zeromq/zmq.rs - `zeromq` crate, MIT, read 2026-09-08. The native-implementation disclaimer, supported transport and socket lists, async runtime feature flags.
 39. **rust-zmq README.** https://github.com/erickt/rust-zmq - `zmq` crate, Apache-2.0/MIT, read 2026-09-08. The binding's stated scope and non-idiomatic API, the version-tracking aim, the thread-safety compile-fail tests and
     zguide examples.
+40. **`zeromq` crate 0.6.0, read and exercised 2026-09-11.** https://crates.io/crates/zeromq/0.6.0 - source read (`src/codec/greeting.rs`, `src/codec/command.rs`, `src/sub_backend.rs`) and behaviour observed by running it
+    against an independent ZMTP implementation over loopback TCP. Everything attributed to [40] is **measured against that version**, not a claim about ZeroMQ or about later releases of the crate: the greeting's announced
+    version, the single recognized command name, the subscription wire form in both directions, and the client-side collapsing of a repeated subscription.
 
 Not read, therefore not cited for content: 23/ZMTP (ZMTP 3.0), 13/ZMTP (2.0), 15/ZMTP (1.0), 49/SCATTERGATHER, 51/P2P, 52/CHANNEL, 6/PPP, 7/MDP 0.1, 8/MMI, 20/ZRE-DISC. Their existence and titles come from 37/ZMTP's
 related-specifications list and chapter 4's references [1][34].

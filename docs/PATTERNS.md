@@ -3,12 +3,21 @@
 The reference for what each weida pattern does, in the shape of `zmq_socket(3)`: one table
 per pattern naming its compatible peer, direction, routing strategy and behaviour when it has
 nowhere to send, followed by what happens at every failure. Where ZeroMQ's tables describe
-what its threads and queues do, these describe what QUIC does, because a weida pattern is a
-thin wrapper over QUIC streams and inherits its behaviour from them.
+what its threads and queues do, these describe what the **transport** does, because a weida
+pattern is a thin wrapper over transport streams and inherits its behaviour from them.
+
+Three transports carry those streams today ([decisions/0010](decisions/0010-local-transport.md),
+[0012](decisions/0012-local-connection-grouping.md)): QUIC, an in-process channel pair, and
+`AF_UNIX`, where the OS connection **is** the stream. Every statement below is written for
+QUIC unless it says otherwise, because QUIC is the transport whose flow control the patterns
+were designed against; §1.10 says which of them mean something different locally, and the
+failure tables name the transport where the two diverge.
 
 Every statement below that could be false is defended by a test named in the text. The
 measured numbers are from `crates/weida/tests/streams.rs` on loopback with `quinn 0.11`; the
-statements hold on any link, the numbers do not.
+statements hold on any link, the numbers do not. `crates/weida/tests/transports.rs` runs one
+Req/Rep, Push/Pull and Pub/Sub body over all three transports, which is what makes the
+pattern semantics a fact about weida rather than about QUIC.
 
 Related: [ARCHITECTURE.md](ARCHITECTURE.md) (layer model, primitives P1-P4),
 [GUARANTEES.md](GUARANTEES.md) (the vocabulary), [FAILURE_MODEL.md](FAILURE_MODEL.md)
@@ -18,9 +27,11 @@ Related: [ARCHITECTURE.md](ARCHITECTURE.md) (layer model, primitives P1-P4),
 
 ## 1. Common ground: what a stream is
 
-Every user data flow is one QUIC stream. A Push message, a published copy, the request half of
-an exchange and its reply half are each a stream of their own. What follows is true of all of
-them, whichever pattern opened them.
+Every user data flow is one stream: one QUIC stream over the network, one channel pair in
+process, one `AF_UNIX` connection locally — "the OS connection **is** the stream" [0010 §4.2].
+A Push message, a published copy, the request half of an exchange and its reply half are each
+a stream of their own. What follows is true of all of them, whichever pattern opened them and
+whichever transport carries them, except where §1.10 says a local transport differs.
 
 ### 1.1 `finish()` is a commitment
 
@@ -180,12 +191,58 @@ A peer is named by the SHA-256 fingerprint of its public key (`Fingerprint`, tex
 `sha256:<64 hex>`). The dialling side states whom it accepts with `Trust` — pins, anchors, or
 only what the address names (`weida://sha256:…@host:port/path`) — and a binding may require a
 client identity with `ServerTls::require_client`. Whatever arrives on a stream carries the
-peer's proved fingerprint in `IncomingMeta::peer` (`None` for an anonymous client); it comes
-from the handshake, never from a header, so it can be authorized on but not forged. A peer
-outside the terms fails `connect` with `Error::Untrusted(fingerprint)`, carrying what
+peer's identity in `IncomingMeta::peer`: `PeerIdentity::Key(fingerprint)` over QUIC, `None`
+for an anonymous client, and `PeerIdentity::Local { uid, gid, pid }` over `AF_UNIX`, where
+the **kernel** is the prover instead of TLS and a PID is an observation that must not be
+authorized on [0010 §4.4]. In process there is no identity at all, because there is no
+boundary to prove anything across. Whichever it is, it comes from the transport and never
+from a header, so it can be authorized on but not forged. A peer outside the terms fails
+`connect` with `Error::Untrusted(fingerprint)`, carrying what
 answered so an operator can pin it after checking it out of band.
 
 *`crates/weida/tests/identity.rs`, all ten.*
+
+### 1.10 What a local transport changes
+
+Everything above is written against QUIC. Over the two local transports of
+[0010](decisions/0010-local-transport.md) five of those statements mean something else, and
+the difference is always the same cause: there is no QUIC connection to share, because one
+transfer is one channel pair (inproc) or one OS connection (`AF_UNIX`).
+
+- **§1.2's window arithmetic does not apply.** A receipt still means the peer's transport
+  holds the bytes, but "beyond the window" has no local analogue: inproc hands over a buffer
+  and a socket has the kernel's own buffer, so a receipt is never evidence that the
+  application is reading. The weaker reading — a transport receipt is not an application
+  read — is the one that holds everywhere.
+- **§1.3's two windows collapse into one.** There is no connection window to share, so the
+  head-of-line coupling the per-path connections of
+  [0002](decisions/0002-control-and-bulk-separation.md) exist to remove cannot arise:
+  `a_stalled_path_does_not_stall_another_path` is a statement about QUIC, and locally it is
+  true by construction. What replaces it is a descriptor count — every live transfer is a
+  file descriptor, bounded by `max_local_streams` (255, the number Windows' pipe instance cap
+  fixes) rather than by a stream budget.
+- **§1.4's stream budget becomes that descriptor count.** `open` fails with
+  `Error::LimitExceeded` at the local ceiling instead of parking until a stream frees up, so
+  the backpressure is an error rather than a wait. A caller that wants the QUIC behaviour
+  retries.
+- **§1.8's liveness is the kernel's.** There is no idle timeout and no keep-alive locally: a
+  peer that goes away closes its socket or drops its channel, which arrives as
+  `ConnectionLost(PeerClosed)` on the next operation. That is a *better* signal than a timer,
+  and it is why the two timers are not simulated — an invented local heartbeat would only be
+  able to say what the kernel already said.
+- **§4's fan-out needs a parked connection.** A publisher on a socket transport writes each
+  copy on a reverse connection the subscriber parked in advance
+  ([0012](decisions/0012-local-connection-grouping.md) §4.4), bounded by
+  `Limits::max_parked_reverse` (8). An exhausted pool is a **second drop cause** beside the
+  subscriber byte budget of §4: the copy is dropped, counted in `Publisher::dropped`, and the
+  subscription survives. A subscriber that parks nothing is refused at `connect` rather than
+  silently receiving nothing.
+
+*`crates/weida/tests/transports.rs`: the three pattern bodies over all three transports,
+`a_unix_peer_presents_the_principal_the_kernel_proved`,
+`a_local_peer_that_goes_away_is_reported_as_connection_loss`,
+`an_exhausted_reverse_pool_drops_the_copy_and_counts_it`,
+`a_subscriber_that_parks_nothing_is_refused_at_connect`.*
 
 ---
 
@@ -328,10 +385,12 @@ no selection policy beyond round-robin over peers, no fan-out, no filters.
 
 Two things the patterns cannot express are natural here:
 
-- **A long-lived stream.** Open once, write many messages with a framing of your own, and
-  QUIC orders them for you — the only ordered channel weida has. The stream keeps its window
+- **A long-lived stream.** Open once, write many messages with a framing of your own, and the
+  transport orders them for you — the only ordered channel weida has, and one every transport
+  provides, since a stream is ordered bytes wherever it runs. Over QUIC it keeps its window
   and its place in the budget for as long as it is open, and its reader's pace is its writer's
-  pace (§1.3). A standing feed of frames to one viewer is this shape.
+  pace (§1.3); locally it keeps a descriptor instead (§1.10). A standing feed of frames to one
+  viewer is this shape.
 - **Both stream kinds on one path.** A control exchange and a bulk one-way stream to the same
   endpoint, dispatched by one accept loop.
 
