@@ -371,6 +371,9 @@ L0 carries it as an opaque passthrough, or not at all until then.
 - **Session and stable producer name.** The variant of §7.3 that survives a reconnect needs a
   session concept weida does not have; it is a new open decision to record in
   [SYNTHESIS.md](../research/SYNTHESIS.md) §8, distinct from §8.4 which this note closes.
+  **Closed by [0008](0008-session-identity.md):** there is no L0 session; the proved
+  fingerprint is the peer identity across connections and the default producer name, and a
+  stable producer name is supplied by an L2 subscription.
 - **Measurements before the wire change lands.** The two unmeasured costs of §6 become tasks:
   header cost at high message rates on QUIC [quic-standards §11.9], and reassembly-buffer cost
   under reordering across streams [quic-standards §2.2], [prior-art §8 lesson 2]. Neither has a
