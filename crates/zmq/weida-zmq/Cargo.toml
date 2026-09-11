@@ -35,6 +35,22 @@ crypto_box.workspace = true
 # that promise taken up. Optional, so a caller that does not want the facade
 # does not link it.
 futures = { workspace = true, optional = true }
+# libzmq itself, for B-089's interop tests — the reference implementation this
+# library is measured against, reached through the `zmq` crate's bindings.
+#
+# **Optional and off**, because cargo forbids an optional dev-dependency and
+# linking libzmq must not be a condition of building this crate's tests: a
+# machine without the C library builds and tests everything else. Turn it on
+# with `--features libzmq-interop`; the tests are `#[ignore]`d on top of that,
+# so `--ignored` is the deliberate step that runs them.
+#
+# **0.9 and not 0.10 on purpose.** `zmq-sys` 0.12 (which `zmq` 0.10 requires)
+# always builds libzmq from source, and that build reports
+# `zmq_has("curve") == false`, so CURVE could not be measured against it at
+# all. 0.9's `zmq-sys` 0.11 links the system library through `pkg-config`,
+# which is the library a deployment actually meets — here libzmq 4.3.5 with
+# libsodium, where CURVE exists and the boxes are libsodium's.
+zmq = { version = "0.9", optional = true }
 
 [dev-dependencies]
 # Drives the owned-context doctest and tests from an executor that is not
@@ -57,6 +73,9 @@ bytes.workspace = true
 # and a feature nobody asked for is a reactor nobody asked for
 # (`ContextConfig::worker_threads` threads, owned by the context).
 blocking = ["dep:futures"]
+# The libzmq interop tests. Off by default because the C library is a build
+# condition, not a runtime one: with this on and libzmq absent, nothing links.
+libzmq-interop = ["dep:zmq"]
 
 [[example]]
 # The zguide's Hello World, in the shape its C original has.

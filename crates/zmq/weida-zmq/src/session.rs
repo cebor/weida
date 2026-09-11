@@ -283,20 +283,26 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
     let version = peer
         .accept_downgrading(security.mechanism())
         .map_err(greeting_error)?;
-    if security != Security::Null && peer.as_server == security.as_server() {
-        // 24/ZMTP-PLAIN and 26/CURVEZMQ both give the roles to the
-        // `as-server` octet, so two servers or two clients on one connection
-        // is a configuration mistake that would otherwise deadlock waiting
-        // for a HELLO neither side will send.
+    if security.as_server() && peer.as_server {
+        // Two servers on one connection is a configuration mistake that
+        // would otherwise deadlock, both sides waiting for a `HELLO`
+        // neither will send.
+        //
+        // **Only that half is checkable.** 24/ZMTP-PLAIN and 25/ZMTP-CURVE
+        // say the octet "SHALL be 1 for a server", but libzmq 4.3.5 sends
+        // **0** from a socket with `ZMQ_PLAIN_SERVER` or
+        // `ZMQ_CURVE_SERVER` set — measured in
+        // `tests/interop_libzmq.rs`, both mechanisms, with the octets read
+        // off the wire. It never reads the peer's octet either: the role is
+        // decided locally by the options on each side, so nobody noticed.
+        // A zero therefore proves nothing, and refusing on it refuses the
+        // reference implementation. Two clients are left to
+        // `ZMQ_HANDSHAKE_IVL`, which is what bounds every other handshake
+        // that goes quiet.
         return Err(Error::ENOCOMPATPROTO(
             format!(
-                "both ends of this connection are the {} {}",
-                security.mechanism(),
-                if security.as_server() {
-                    "server"
-                } else {
-                    "client"
-                }
+                "both ends of this connection are the {} server",
+                security.mechanism()
             )
             .into(),
         ));
@@ -454,8 +460,15 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
     };
 
     let identity = match metadata.get("Identity") {
-        Some(bytes) => Some(RoutingId::new(bytes)?),
-        None => None,
+        // An **empty** `Identity` is the absence of one, not a malformed
+        // one: 37/ZMTP's grammar is `identity = 0*255OCTET` and only a
+        // non-empty identity must not begin with a zero octet. libzmq sends
+        // the property with an empty value for every REQ, DEALER and ROUTER
+        // socket that has no `ZMQ_ROUTING_ID` set, so refusing it refuses
+        // the reference implementation — measured against libzmq 4.3.5 in
+        // `tests/interop_libzmq.rs`.
+        Some(bytes) if !bytes.is_empty() => Some(RoutingId::new(bytes)?),
+        _ => None,
     };
 
     let Some(peer_type) = metadata.socket_type() else {
@@ -1116,16 +1129,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     async fn open_next_box(&mut self) -> Result<()> {
         let body = loop {
             match frame::decode(&self.buf, self.limits.max_bytes) {
-                Ok((header, body, used)) => {
+                Ok((_header, body, used)) => {
                     let body = body.to_vec();
                     self.buf.drain(..used);
-                    if header.kind != FrameKind::Command {
-                        return Err(Error::ENOCOMPATPROTO(
-                            "a CURVE connection carries command frames after its READY, and \
-                             this is a message frame in clear text"
-                                .into(),
-                        ));
-                    }
+                    // **The frame kind is not the test; the box is.**
+                    // 26/CURVEZMQ calls `MESSAGE` a command, and libzmq
+                    // 4.3.5 sends it in a **message** frame — flags without
+                    // the COMMAND bit, body `\x07MESSAGE` — measured in
+                    // `tests/interop_libzmq.rs`. So both kinds are read, the
+                    // body decides what arrived, and the outer MORE flag is
+                    // ignored because the real one is inside the box. A
+                    // frame that is neither a `MESSAGE` nor an `ERROR` is
+                    // refused below, and a `MESSAGE` whose box does not open
+                    // is refused after that, which is the check that matters.
                     break body;
                 }
                 Err(e) if !e.is_violation() => self.fill().await?,
@@ -2299,14 +2315,17 @@ mod tests {
         let (public, secret) = crate::curve::keypair();
         let mut transport = curve_handshake_as_client(&mut peer, server_key, public, &secret).await;
 
-        // Outbound: the server's message is a MESSAGE command, and the
-        // plaintext is nowhere in the octets.
+        // Outbound: the message is a `MESSAGE` whose body is a command body
+        // behind a **message** frame header, which is what libzmq sends and
+        // accepts (`tests/interop_libzmq.rs`), and the plaintext is nowhere
+        // in the octets. The outer MORE is always zero: the real one is the
+        // flags octet inside the box.
         pipe.outgoing()
             .send(Multipart::single("the quiet part"))
             .await
             .expect("queued");
         let (kind, body) = peer.read_frame().await;
-        assert_eq!(kind, FrameKind::Command, "even a message is a command now");
+        assert_eq!(kind, FrameKind::Message { more: false });
         assert!(body.starts_with(b"\x07MESSAGE"), "named MESSAGE");
         assert!(
             !body.windows(14).any(|window| window == b"the quiet part"),
@@ -2326,7 +2345,7 @@ mod tests {
             (0, &b"second"[..]),
         ] {
             let (kind, body) = peer.read_frame().await;
-            assert_eq!(kind, FrameKind::Command);
+            assert_eq!(kind, FrameKind::Message { more: false });
             let (flags, payload) = transport.open_message(&body).expect("open");
             assert_eq!(flags, expected_flags);
             assert_eq!(payload, expected_body);
@@ -2342,6 +2361,9 @@ mod tests {
             .expect("a message");
         assert_eq!(arrived.frames()[0].as_slice(), b"the other way");
 
+        // A frame in clear text is refused — not because of its frame kind,
+        // which is the same kind a sealed `MESSAGE` uses, but because its
+        // body is not a `MESSAGE` at all and no box was opened.
         peer.send(&Multipart::single("in the open").encode()).await;
         let outcome = tokio::time::timeout(Duration::from_secs(10), task)
             .await
@@ -2349,7 +2371,7 @@ mod tests {
             .expect("the task");
         let err = outcome.unwrap_err();
         assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
-        assert!(err.cause().contains("clear text"), "{err}");
+        assert!(err.cause().contains("CURVE"), "{err}");
     }
 
     /// Claim: the CURVE credential a ZAP handler is given is the peer's
