@@ -72,6 +72,15 @@ loss L3 exists to preserve and a refused second SUBSCRIBE would make the first c
 by one CANCEL where the peer sent two. The lesson is worth keeping beside the list: a bound
 named for the core is not a bound until the code at the edge has it too.
 
+**And so are the standalone libraries** ([decisions/0013](decisions/0013-competitor-libraries.md)):
+`weida-zmq` and `weida-nng` are inside this invariant exactly as the adapters turned out to
+be, and their bounds carry the foreign protocol's own names, because a libzmq user must
+recognize them — `ZMQ_SNDHWM`, `ZMQ_RCVHWM`, `ZMQ_MAXMSGSIZE`, `ZMQ_MAX_SOCKETS`,
+`ZMQ_BACKLOG`, `ZMQ_HANDSHAKE_IVL`. Two of those defaults therefore differ from libzmq's and
+say so in the parity table: `ZMQ_MAXMSGSIZE` is a real number rather than "no limit", since
+a ZMTP frame may declare 2^63-1 octets, and `ZMQ_LINGER` is finite rather than infinite
+[0013 §4.4].
+
 The hot-path invariant binds all three structures that now exist: a connection that
 negotiated `Ordering = None` and `Deduplication = None` — which is every connection that
 declares nothing, since `core` is the default guarantee set — allocates none of them. That

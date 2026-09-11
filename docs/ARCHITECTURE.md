@@ -371,15 +371,30 @@ one that plainly is not [0010 §4.8].
 
 ```text
 crates/
-    core/                         →  weida-core         I/O-free model
-    protocol/                     →  weida-protocol     wire codec, no I/O
-    weida/                        →  weida              runtime + QUIC and local transports
-                                                        + stream core + patterns
-    adapters/weida-zmtp/          →  weida-zmtp         ZMTP 3.1 codec, no I/O and no
-                                                        weida dependency
-    adapters/weida-zmtp-bridge/   →  weida-zmtp-bridge  foreign ZeroMQ peers onto weida
-                                                        endpoints
+    core/                      →  weida-core        I/O-free model
+    protocol/                  →  weida-protocol    wire codec, no I/O
+    runtime/                   →  weida-runtime     reactor, resolver, OS hygiene
+    weida/                     →  weida             runtime + QUIC and local transports
+                                                    + stream core + patterns
+    zmq/weida-zmtp/            →  weida-zmtp        ZMTP 3.1 codec, no I/O and no
+                                                    weida dependency
+    zmq/weida-zmq/             →  weida-zmq         the ZeroMQ implementation
+    zmq/weida-zmq-bridge/      →  weida-zmq-bridge  weida endpoints ↔ ZeroMQ sockets
+    nng/weida-sp/              →  weida-sp          SP codec, no I/O and no weida
+                                                    dependency
+    nng/weida-nng/             →  weida-nng         the NNG implementation
+    nng/weida-nng-bridge/      →  weida-nng-bridge  weida endpoints ↔ SP sockets
+    interop/cross-tests/       →  cross-tests       one protocol in, another out
 ```
+
+**This is the layout [decisions/0013](decisions/0013-competitor-libraries.md) §4.1 decided,
+and part of it is ahead of the tree.** `weida-runtime`, `weida-zmq` and `weida-nng` do not
+exist yet; the codecs and bridges live under `crates/adapters/` and the two bridges are still
+named `weida-zmtp-bridge` and `weida-sp-bridge`. B-070 creates the shared crate and B-095
+performs the move and the renames. Directories are named for the **protocol family** rather
+than for the role a crate plays in it, so that the directory list answers "does this
+repository ship a ZeroMQ?" — `crates/adapters/` would answer no, because an adapter is a hop
+at a weida edge ([0006](decisions/0006-guarantee-sets.md) §4.6) and a library has no edge.
 
 `weida-zmtp` is the first slice of the ZeroMQ adapter
 ([adapters/zmtp.md](adapters/zmtp.md)) and depends on **nothing at all** — not even
@@ -393,16 +408,19 @@ crate rather than a feature of the codec for exactly the reason above: a feature
 weida dependency in the codec's manifest, and the codec's dependency-free manifest is the
 thing that keeps it honest.
 
-Planned, not yet present: `weida-broker` (the L2 semantics of §1 — queues, publisher
-confirms, consumer acknowledgements with redelivery — Phase 6), `weida-web` (the Web
-binding, Phase 8) and the remaining legacy-protocol adapters `weida-mqtt` and
-`weida-amqp091` (Phase 9). The broker is a separate crate because it is a separate layer:
-it depends on the patterns, nothing in the core may depend on it, and a brokerless
-deployment must not link it. The adapters are separate crates because they are separately
-useful: each is a native Rust implementation of a foreign protocol, hosted by this runtime
-or an extension of it, and each must be usable on its own — the ZMTP codec without a weida
-deployment at all, and later repackaged for other languages. They may depend on
-`weida-core` and `weida-protocol`; the core never depends on them.
+Planned, not yet present: `weida-runtime` (B-070), `weida-zmq` and `weida-nng` — the
+standalone competitor implementations of
+[0013](decisions/0013-competitor-libraries.md) — `weida-broker` (the L2 semantics of §1 —
+queues, publisher confirms, consumer acknowledgements with redelivery — Phase 6),
+`weida-web` (the Web binding, Phase 8) and the remaining legacy-protocol adapters
+`weida-mqtt` and `weida-amqp091` (Phase 9). The broker is a separate crate because it is a
+separate layer: it depends on the patterns, nothing in the core may depend on it, and a
+brokerless deployment must not link it. The foreign-protocol crates are separate because they
+are separately useful: each is a native Rust implementation of a foreign protocol, hosted by
+this runtime or an extension of it, and each must be usable on its own — the ZMTP codec
+without a weida deployment at all today, and a whole ZeroMQ without one once 0013 §4.4 lands.
+They may depend on `weida-core`, `weida-protocol` and `weida-runtime`; the core never depends
+on them, and a library never depends on `weida`.
 
 ### `weida-core`
 
@@ -434,15 +452,20 @@ both layers share. The QUIC-specific code lives in module `transport`.
 
 ```text
 core
- ↑
-protocol
- ↑
-weida
+ ↑        ↖
+protocol   runtime
+ ↑          ↑    ↖
+weida ──────┘     weida-zmq / weida-nng
+
+weida-zmq-bridge  →  weida + weida-zmq
 ```
 
 `weida-core` MUST NOT depend on `weida-protocol` or `weida`. `weida-protocol` MUST NOT
-depend on `weida`. Circular architectural dependencies are prohibited (master doc §74). The
-core must not depend on transport, runtime or, later, broker implementation details.
+depend on `weida`. `weida-runtime` MUST NOT depend on `weida-protocol` or `weida`, and a
+competitor library MUST NOT depend on `weida` or `weida-protocol`
+([0013](decisions/0013-competitor-libraries.md) §4.2): only a bridge names both sides.
+Circular architectural dependencies are prohibited (master doc §74). The core must not depend
+on transport, runtime or, later, broker implementation details.
 
 ### Why runtime and transport are one crate
 
@@ -453,14 +476,26 @@ into `crates/weida` for this increment, on the authority of §73's own rule:
 > Start with strong module boundaries and split crates where the dependency/ownership
 > boundary is real.
 
-The boundary is not real yet. Exactly one transport exists, so a `runtime` crate would have
-exactly one consumer and a `transport-quic` crate exactly one dependent; the split would
-buy no isolation and no independent versioning while adding a public API surface between two
-halves of one design. The QUIC code is confined to module `transport` inside `crates/weida`,
-so extracting it later is a mechanical move: the module boundary that a crate split needs
-already exists and is already enforced by the module system. The split becomes worthwhile
-when a second transport or adapter binding appears — that is, at Phase 8 (Web adapter) at
-the earliest.
+The boundary was not real when that was written. Exactly one transport existed, so a
+`runtime` crate would have had exactly one consumer and a `transport-quic` crate exactly one
+dependent; the split would have bought no isolation and no independent versioning while
+adding a public API surface between two halves of one design. The QUIC code is confined to
+module `transport` inside `crates/weida`, so extracting it later is a mechanical move: the
+module boundary that a crate split needs already exists and is already enforced by the
+module system. The split becomes worthwhile when a second consumer of the runtime appears.
+
+**The trigger has fired, and the cut is not the one §73 named.** The second consumer arrived
+as the standalone competitor libraries of
+[0013](decisions/0013-competitor-libraries.md), so `weida-runtime` is extracted (B-070). What
+it takes is the **reactor and the OS**: `Exec` with `spawn`, `sleep`, `within`, `enter` and
+the capped resolver, the three reactor-ownership constructors with their background-shutdown
+discipline, the `AF_UNIX` bind hygiene and peer credentials of
+[0010](decisions/0010-local-transport.md) §4.5, a generic named-endpoint registry and the
+bounded close budget. What it deliberately leaves behind is QUIC: §73's `transport-quic`
+still has exactly one dependent, because a ZeroMQ implementation has no use for it, so
+`Link`, the connection pool, the actor and every line of
+[0012](decisions/0012-local-connection-grouping.md) stay here with the protocol they serve.
+No public item of `weida` changes [0013 §4.2].
 
 ---
 

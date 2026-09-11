@@ -1,6 +1,6 @@
 # 0013: Standalone competitor libraries beside weida, not backends inside it
 
-Status: provisional
+Status: accepted
 Date: 2026-09-11
 Relates to: [0006](0006-guarantee-sets.md) §4.6-§4.9; [0008](0008-session-identity.md) §4.2,
 §5; [0010](0010-local-transport.md) §4.4, §4.5, §4.8;
@@ -396,7 +396,7 @@ Six clauses; all six, or the parity table says which is missing.
 
 ### 5.1 Proposed replacement for [LOOP.md](../LOOP.md) §9 Phase B
 
-Not applied by this note; it is a proposal until the user accepts it.
+Applied to LOOP.md §9 on acceptance.
 
 > **Phase B — the competitor implementations, and the helpers that marry them to weida.**
 > Each foreign protocol family is its own directory under `crates/<family>/` and produces two
