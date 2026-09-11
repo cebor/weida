@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="300" viewBox="0 0 960 300" font-family="Helvetica, Arial, sans-serif" font-size="12">
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="470" viewBox="0 0 960 470" font-family="Helvetica, Arial, sans-serif" font-size="12">
   <defs>
     <style>
       .inproc { fill:#81c784; }
@@ -10,28 +10,45 @@
       .axis   { stroke:#90a4ae; }
     </style>
   </defs>
-  <text x="20" y="28" class="title">Req/Rep round trip by transport (B-059, loopback, release; Push rows pending a decision)</text>
+  <text x="20" y="28" class="title">Latency by transport (B-059, loopback for QUIC, release, both ends in one process)</text>
 
-  <!-- group 1: 1 KiB, scale 4 px per µs -->
-  <text x="20" y="66" class="lbl">1 KiB payload</text>
+  <!-- group 1: Req/Rep 1 KiB, scale 10 px per µs -->
+  <text x="20" y="66" class="lbl">Req/Rep, 1 KiB</text>
   <g transform="translate(140,50)">
-    <rect x="0" y="0"  width="58"  height="16" class="inproc"/><text x="64"  y="12" class="sub">inproc 14.4 µs</text>
-    <rect x="0" y="22" width="224" height="16" class="unix"/>  <text x="230" y="34" class="sub">AF_UNIX 55.9 µs</text>
-    <rect x="0" y="44" width="268" height="16" class="quic"/>  <text x="274" y="56" class="sub">QUIC 67.1 µs</text>
+    <rect x="0" y="0"  width="133" height="16" class="inproc"/><text x="139" y="12" class="sub">inproc 13.3 µs</text>
+    <rect x="0" y="22" width="507" height="16" class="unix"/>  <text x="513" y="34" class="sub">AF_UNIX 50.7 µs</text>
+    <rect x="0" y="44" width="585" height="16" class="quic"/>  <text x="591" y="56" class="sub">QUIC 58.5 µs</text>
   </g>
 
-  <!-- group 2: 1 MiB, scale 0.28 px per µs -->
-  <text x="20" y="150" class="lbl">1 MiB payload</text>
+  <!-- group 2: Req/Rep 1 MiB, scale 0.26 px per µs -->
+  <text x="20" y="150" class="lbl">Req/Rep, 1 MiB</text>
   <g transform="translate(140,134)">
-    <rect x="0" y="0"  width="45"  height="16" class="inproc"/><text x="51"  y="12" class="sub">inproc 162 µs</text>
-    <rect x="0" y="22" width="97"  height="16" class="unix"/>  <text x="103" y="34" class="sub">AF_UNIX 348 µs</text>
-    <rect x="0" y="44" width="756" height="16" class="quic"/>  <text x="762" y="56" class="sub">QUIC 2.70 ms</text>
+    <rect x="0" y="0"  width="38"  height="16" class="inproc"/><text x="44"  y="12" class="sub">inproc 145 µs</text>
+    <rect x="0" y="22" width="75"  height="16" class="unix"/>  <text x="81"  y="34" class="sub">AF_UNIX 266–312 µs</text>
+    <rect x="0" y="44" width="702" height="16" class="quic"/>  <text x="708" y="56" class="sub">QUIC 2.70 ms</text>
   </g>
-  <line x1="140" y1="45" x2="140" y2="200" class="axis"/>
-  <text x="140" y="214" class="sub">bars are scaled per group; read the numbers, not the ratios across groups</text>
 
-  <rect x="20" y="228" width="920" height="58" rx="6" fill="#fff3cd" stroke="#b28704"/>
-  <text x="30" y="246" class="lbl">Open decision found by this measurement (docs/NIGHTLOG.md, bottom)</text>
-  <text x="30" y="262" class="sub">Locally a queued inbound transfer holds an OS descriptor, so a fire-and-forget Push fills max_local_streams (255) and the 384th message is refused with LimitExceeded.</text>
-  <text x="30" y="277" class="sub">Either local open waits for a free slot (Block, same as QUIC) or the refusal stands and PATTERNS §1.10 documents Push/Pull as Reject locally. A patch was tried and measured inconclusive.</text>
+  <!-- group 3: Push one-way 1 KiB, scale 24 px per µs -->
+  <text x="20" y="234" class="lbl">Push one-way, 1 KiB</text>
+  <g transform="translate(140,218)">
+    <rect x="0" y="0"  width="49"  height="16" class="inproc"/><text x="55"  y="12" class="sub">inproc 2.05 µs</text>
+    <rect x="0" y="22" width="576" height="16" class="unix"/>  <text x="582" y="34" class="sub">AF_UNIX 24.0 µs</text>
+    <rect x="0" y="44" width="192" height="16" class="quic"/>  <text x="198" y="56" class="sub">QUIC 8.0 µs</text>
+  </g>
+
+  <!-- group 4: Push one-way 1 MiB, scale 0.5 px per µs -->
+  <text x="20" y="318" class="lbl">Push one-way, 1 MiB</text>
+  <g transform="translate(140,302)">
+    <rect x="0" y="0"  width="35"  height="16" class="inproc"/><text x="41"  y="12" class="sub">inproc 58–80 µs</text>
+    <rect x="0" y="22" width="70"  height="16" class="unix"/>  <text x="76"  y="34" class="sub">AF_UNIX 130–147 µs</text>
+    <rect x="0" y="44" width="680" height="16" class="quic"/>  <text x="686" y="56" class="sub">QUIC 1.36 ms</text>
+  </g>
+
+  <line x1="140" y1="45" x2="140" y2="365" class="axis"/>
+  <text x="140" y="380" class="sub">bars are scaled per group; read the numbers, not the ratios across groups. A one-way row measures enqueue, not delivery — the round trip is the honest comparison.</text>
+
+  <rect x="20" y="394" width="920" height="62" rx="6" fill="#e3f2fd" stroke="#1565c0"/>
+  <text x="30" y="412" class="lbl">What the 1 KiB Push row costs: one connection per transfer is free at 1 MiB and is the whole message at 1 KiB</text>
+  <text x="30" y="428" class="sub">A 1 KiB Push over AF_UNIX is 24.0 µs against 8.0 µs over loopback QUIC — 3× slower, because QUIC opens a stream inside a connection it already has while AF_UNIX opens a connection.</text>
+  <text x="30" y="444" class="sub">That fixed ~22 µs is the price of not reimplementing a stream layer (0010 §4.2). Memory goes the other way: 0–1761 B per live local connection against 995 KiB for a QUIC one.</text>
 </svg>

@@ -12,7 +12,7 @@
       .phase   { fill:#263238; font-size:14px; font-weight:bold; }
     </style>
   </defs>
-  <text x="20" y="28" class="phase">Roadmap (LOOP.md §9) — state at main e357a4e, 494 tests</text>
+  <text x="20" y="28" class="phase">Roadmap (LOOP.md §9) — state at main bd40383, 505 tests</text>
 
   <!-- legend -->
   <g transform="translate(560,14)">
@@ -43,8 +43,8 @@
   <g transform="translate(20,170)">
     <rect x="0"   y="0" width="220" height="58" rx="4" class="done"/>
     <text x="8" y="18" class="lbl">B1 ZMTP 3.1</text><text x="8" y="34" class="sub">6/6 slices; interop vs zeromq crate</text><text x="8" y="48" class="sub">3 of 4 findings were our own bugs</text>
-    <rect x="228" y="0" width="220" height="58" rx="4" class="partial"/>
-    <text x="236" y="18" class="lbl">B2 NNG / SP</text><text x="236" y="34" class="sub">5/6 merged; cross-adapter test green</text><text x="236" y="48" class="sub">on branch b057-cross-adapter</text>
+    <rect x="228" y="0" width="220" height="58" rx="4" class="done"/>
+    <text x="236" y="18" class="lbl">B2 NNG / SP</text><text x="236" y="34" class="sub">6/6 slices; cross-adapter vs zeromq+nng</text><text x="236" y="48" class="sub">no transfer point at all: chain is BestEffort</text>
     <rect x="456" y="0" width="220" height="58" rx="4" class="ready"/>
     <text x="464" y="18" class="lbl">B3 MQTT 5</text><text x="464" y="34" class="sub">mapping document is B-062 (ready)</text><text x="464" y="48" class="sub">sessions vs no-session is the hard part</text>
     <rect x="684" y="0" width="220" height="58" rx="4" class="todo"/>
@@ -54,7 +54,7 @@
   <!-- Phase C -->
   <text x="20" y="266" class="phase">Phase C — bindings (after A8)</text>
   <g transform="translate(20,276)">
-    <rect x="0"   y="0" width="220" height="46" rx="4" class="ready"/><text x="8" y="18" class="lbl">Python (PyO3)</text><text x="8" y="34" class="sub">B-058 sync client, ready</text>
+    <rect x="0"   y="0" width="220" height="46" rx="4" class="parked"/><text x="8" y="18" class="lbl">Python (PyO3)</text><text x="8" y="34" class="sub">B-058 parked until B3</text>
     <rect x="228" y="0" width="220" height="46" rx="4" class="todo"/> <text x="236" y="18" class="lbl">Java</text><text x="236" y="34" class="sub">after Python</text>
     <rect x="456" y="0" width="220" height="46" rx="4" class="todo"/> <text x="464" y="18" class="lbl">Node</text><text x="464" y="34" class="sub">after Java</text>
   </g>

@@ -6,23 +6,24 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `e357a4e`, 2026-09-11 ~20:00 UTC. Tree clean, gate green, 494 tests
+**Snapshot:** main `bd40383`, 2026-09-11 ~13:10 UTC. Tree clean, gate green, 505 tests
 (218 at the start of the session). Twelve decision notes (0001–0012), all `accepted`.
-Seven crates: `weida-core`, `weida-protocol`, `weida`, `weida-zmtp`, `weida-zmtp-bridge`,
-`weida-sp`, `weida-sp-bridge` (plus `cross-tests` on a branch).
+Eight crates: `weida-core`, `weida-protocol`, `weida`, `weida-zmtp`, `weida-zmtp-bridge`,
+`weida-sp`, `weida-sp-bridge` and `cross-tests`.
 
 ## 1. The roadmap
 
 ![Roadmap](status/roadmap.svg)
 
-Reading it: **Phase A is done** except two deliberate gaps — the control-connection tier
+Reading it: **Phase A is complete** except two deliberate gaps — the control-connection tier
 (A5) is parked because after decision 0011 no frame needs it, and named pipes (A9) are
-blocked on a Windows runner rather than on a design. **Phase B has one protocol complete**
-(ZMTP, all six slices, interop against the real `zeromq` crate) and one at five of six (SP:
-codec, document, both bridges merged; the cross-adapter test is green on
-`b057-cross-adapter` and waiting for its merge). MQTT is next and starts with a document,
-because it is the first protocol with a session and weida deliberately has none. Phase C's
-prerequisite (`Runtime::owned`) exists and the Python slice is a `ready` item.
+blocked on a Windows runner rather than on a design. The last open question in it, what a
+local `open` does at its ceiling, is answered: it **waits for a slot**, so `Block` means the
+same thing on every transport (B-059). **Phase B has two protocols complete** — ZMTP and SP,
+all six slices each, both interoperating with the real upstream (`zeromq`, and the `nng` C
+library), and the sixth slice is one test crate they share. MQTT is next and starts with a
+document, because it is the first protocol with a session and weida deliberately has none.
+Phase C's prerequisite (`Runtime::owned`) exists; its first slice is parked until MQTT.
 
 ## 2. What exists, layer by layer
 
@@ -72,26 +73,24 @@ other end.
 | Segment matcher in the fan-out path | 14 ns per filter, shape-independent (B-021) | the grammar is not the cost; registry iteration is |
 | Parking a drain receipt on drop | first cut −3 %, per-connection inside noise (B-032) | per-connection parking; "dropping a Delivery is free" rewritten |
 | Dedup key allocation | ~10 ns; the fix measures the same (B-040) | key left alone, with the number beside it |
+| Local transports against QUIC | Req/Rep 1 KiB 13 µs inproc, 51 µs unix, 58 µs QUIC; Push 1 KiB 24 µs unix against 8 µs QUIC (B-059) | a local `open` waits for a slot, and 0010 §4.2's "the connection is the stream" is priced: free at 1 MiB, the whole cost at 1 KiB |
 
 ![Transport latency](status/transport-latency.svg)
 
 ## 6. What needs a human
 
-In the order [NIGHTLOG.md](NIGHTLOG.md) lists them:
+One thing, and it is the same one [NIGHTLOG.md](NIGHTLOG.md) leads with:
 
-1. **B-059, the local Push/Pull bound.** A queued local transfer holds a descriptor, so a
-   fire-and-forget sender hits `max_local_streams` at the 384th message. Block on every
-   transport, or document Reject locally. The measurement that found it is otherwise done.
-2. **B-039, named pipes.** Blocked on a Windows runner by the loop's judgement: code the gate
-   cannot compile is code nobody verified. Decision 0012 already covers its shape.
-3. **Process:** two backlog ids were assigned in two places at once during the session
-   (B-051/B-052, B-057/B-063). Ids now come from the backlog owner only.
+1. **B-039, named pipes.** Blocked on a Windows runner by the loop's judgement: code the gate
+   cannot compile is code nobody verified. Decision 0012 already covers its shape. A Windows
+   route is being prepared outside this tree; `wine` here is a possible later smoke-test path
+   and not a substitute for a runner.
 
-## 7. Where the loop stopped
+## 7. Where the loop stands
 
-- `loop-owner` stopped inside B-059 with the green part committed (`81d70e7`) and a note in
-  the backlog; `decisions-helper` stopped with B-057 committed and mergeable on
-  `b057-cross-adapter` (`14c27fd`, main already merged in).
-- Resuming is one instruction to the loop: merge `b057-cross-adapter`, write the two
-  "cross-adapter" lines the mapping documents owe (text in the worker's last report), then
-  B-059 with the decision above.
+- **Paused, not stopped, and nothing is in flight.** Both branches of the session are merged
+  (`525db84` the cross-adapter test, `6ca89ad` the local `Block` fix), the gate is green at
+  505 tests and the tree is clean. No worktree holds unmerged work.
+- Resuming is one instruction: take the first `ready` item of [BACKLOG.md](BACKLOG.md). That
+  is B-060, the `weida` CLI; B-062, the MQTT mapping document, is the one that moves the
+  roadmap.
