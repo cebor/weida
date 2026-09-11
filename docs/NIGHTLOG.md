@@ -5,20 +5,14 @@ first, then the numbers, then the chronology.
 
 ## Review needed
 
-**One thing is waiting on disk:** `b057-cross-adapter` (head `14c27fd`) carries B-057, the
-cross-adapter test, gated green on the branch with main merged in — it is not on main because
-the session stopped first. Merge `--no-ff`, gate, close the item, and write the one
-"cross-adapter" line zmtp.md §10 item 7 and nng.md §10 each owe.
+**Nothing is waiting on disk.** `b057-cross-adapter` is merged (`525db84`, gate green at 503
+tests), B-059's open choice is decided — a local `open` blocks on a free slot — and is in
+progress on `b059-local-block` in the parallel worktree.
 
 **Then read these three, in this order.**
 
-1. **B-059's open choice** (bottom of the chronology). Benchmarking the local transports found
-   two bugs; one is fixed with a regression test, and the second needs a decision rather than a
-   repair: locally a queued inbound transfer holds a **descriptor**, so a fire-and-forget
-   sender refuses its 384th message. Either a local `open` waits for a free slot — which is
-   what `Block` means in GUARANTEES §6, and would make Push/Pull behave the same on every
-   transport — or the refusal stands and PATTERNS §1.10 says plainly that Push/Pull degrades
-   to `Reject` locally. I stopped rather than choose.
+1. **B-058, the Python binding, is `parked`** at your decision: Phase C does not start before
+   B3 (MQTT). Nothing depends on it and the prerequisite (`Runtime::owned`) is not going away.
 2. **B-039, named pipes**, blocked on a Windows runner by my judgement — the paragraph below
    says why, and it is the one place I have overruled an acceptance line on grounds of
    verifiability rather than design.
@@ -47,10 +41,14 @@ the session stopped first. Merge `--no-ff`, gate, close the item, and write the 
   leaves that tier with no frame to carry. 0002 and 0003 carry amendment markers; neither was
   rewritten.
 - **No stashes.** Blocked: B-039 only, on the runner above. Parked: B-045, the control
-  connection, with a written revival condition. Delegated and running: B-063, the SP outbound
-  bridge. Eight items are `ready`: B-053 and B-054 are closed, and of the rest the two worth
-  reading are B-057 (the cross-adapter test, the first place two adapters meet) and B-058
-  (the first Python binding slice, which A8's runtime ownership exists to make possible).
+  connection, with a written revival condition, and B-058, the Python binding, at your
+  decision that Phase C waits for B3. Delegated and running: B-059, the local `Block` fix, on
+  `b059-local-block` in the parallel worktree. Eight items are `ready`: B-060 (the CLI),
+  B-061 (CI), B-062 (the MQTT mapping document, which is what Phase B does next) and the five
+  filed from the zeughaus requirements note now at
+  [requirements/zeughaus-video.md](requirements/zeughaus-video.md) — B-064 streaming fan-out,
+  B-065 conflation, B-066 peer authorization, B-067 per-topic drop counters, B-068 a pinnable
+  release.
 - **One process mistake of mine, for the record.** `docs/adapters/nng.md` reached main through
   my own `git add docs` rather than through the worker's branch: a directory-wide stage swept
   an item that was still being written. Nothing was lost and the document was complete, but
@@ -202,3 +200,4 @@ Recorded in IMPLEMENTATION.md §4.
 2026-09-11T19:40Z | B-063 | done 4b46bd6 a429a1c | the **SP outbound bridge**, merged `--no-ff` and gated here: **494 tests**. I had asked the worker one question — what a weida requester learns when an SP peer will not answer, given loss L10's "a refusal carries no reason" — and got a better answer than the one I suggested. B-042's per-exchange deadline is kept, with its reasoning restated because the *cause* differs (a ROUTER dropped the request there; an SP peer may simply be silent and has no way to decline), **and a peer close now ends every pending exchange at once** rather than letting each wait out its deadline. That is exactly right for the reason L10 names: a close is the only statement SP can make, so waiting past it would be inventing patience the protocol never offered. Proved with an exchange parked behind a 600 s deadline, the peer dropped, and `NoReply` expected immediately. Two more decisions, both refusals to invent. **No resend timer, asserted as an absence** — one request on the wire and nothing after — because retransmitting would manufacture at-least-once for a requester that asked for one attempt, which is the same principle that made a retransmitted *inbound* REQ a second exchange in B-052 rather than a deduplication problem. And the topic split is named configuration (`TopicSplit::{Delimiter, Fixed, Constant}`, with a matching `topic_delimiter` inbound) because SP has no topic field at all: guessing where a topic ends in a body is precisely the kind of invention an adapter must not make. New loss **L11**, a weida filter does not become an SP subscription, so prefixes are applied locally; and a new §11 question that only a real `nng` peer can settle — whether a REP minds a requester that never retransmits. B-057, the cross-adapter test both mapping documents have been promising, is delegated now that both halves exist. | next B-059 finished — the local-transport numbers, and the bug they found
 2026-09-11T20:00Z | B-059 | stopped | **paused at your request, tree clean, gate green at 494 tests.** The local-transport fix that is finished is committed (`81d70e7`): a receipt parked for the drain holds its send half, which on a local transport is an OS descriptor rather than a slot in a QUIC budget, and the parked set was sized by QUIC's stream budgets — so the 128th sequential local exchange failed with `LimitExceeded` with nothing in flight and nothing wrong. The cap is now half the local ceiling with a reap under pressure, and a 1000-exchange regression test runs over inproc and `AF_UNIX`; it fails at exchange 254 under the mutation that restores the QUIC-sized cap. The Req/Rep numbers the item exists for are measured but **not yet recorded in IMPLEMENTATION.md**: at 1 KiB, inproc **14.4 µs** and unix **55.9 µs** against QUIC's **67.1 µs**; at 1 MiB, inproc **162 µs** and unix **348 µs** against **2.70 ms**. The Push rows do not complete locally, and that is a second finding rather than a bench defect: a queued inbound transfer holds its stream, so a fire-and-forget sender fills `endpoint_queue` (1024) with the 255 descriptors `max_local_streams` allows and the 384th send is refused. What remains is a **choice**, which is why I stopped rather than picked: either a local `open` waits for a free slot — which is what `Block` means and would make Push/Pull behave identically on every transport — or the error stands and the documents say Push/Pull degrades to `Reject` locally. The cheap third option (never park an already-settled receipt) is measured and inconclusive: the header bench reported +28 % with it and +19 % *without* it, because a second `cargo` was running in another worktree. Re-measure on a quiet machine before choosing. | next: B-059's choice, on a quiet machine
 2026-09-11T20:10Z | B-057 | delivered, not merged | the cross-adapter test both mapping documents had been promising exists on `b057-cross-adapter` (head `14c27fd`, main `e357a4e` merged in, gate green there) and is **not on main**, because the session stopped first — merging it is the first thing to do tomorrow, followed by the one "cross-adapter" line zmtp.md §10 item 7 and nng.md §10 each owe. Nine tests in a new `crates/adapters/cross-tests` crate, both foreign ends the real `zeromq` and `nng`: a message enters through the ZMTP bridge and leaves through the SP one in both directions, each protocol's envelope restored on its own side, and the claim the chain can actually make asserted rather than described — **`BestEffort` end to end**, shown by a ZeroMQ send that succeeds while the far end is closed and a fresh puller that proves nothing arrived. The composed losses are tests too: a ZMTP multipart refused at the first hop with nothing reaching the second, the smaller of the two caps deciding, and an SP hop-count ceiling that reaches the first peer only as silence. One honest exception, stated in the test: that last peer is raw TCP on `weida-sp`, because no single REP produces a multi-hop tag stack without an `nng_device` topology. **One finding worth carrying into any future `nng` work:** `nng_dial` is synchronous and returns only once the SP handshake is answered, so it must not run on the thread a bridge's accept loop needs — two tests timed out until the dial moved to a blocking thread. | next: merge it, then B-059's open choice
+2026-09-11T12:17Z | B-057 | done 525db84 | the **cross-adapter test is on main**: `b057-cross-adapter` merged `--no-ff` and the gate run here — fmt, clippy in both configurations, **503 tests** with one ignored, rustdoc — no conflicts, main had moved only by backlog commits since the branch took `e357a4e`. (The clock: the timestamps above this line were ahead of the machine's UTC; this one is the real time.) The two "cross-adapter" lines the mapping documents owed are written — zmtp.md §10 item 7 and nng.md §10 item 7, each naming the three pattern chains in both directions, the composed losses and `BestEffort` asserted rather than described — and IMPLEMENTATION.md §1 gained the sixteenth increment with the reasoning from the test file's own module documentation. One thing the merge settles that the acceptance line did not ask for: the `nng` C library builds on this machine, so the SP end of the chain is the **real implementation and not `#[ignore]`d**, which makes this the independent run nng.md §10 items 3 and 4 were owed and answers §11's first question (a real `Rep0` replies to a raw requester that never retransmits). PAIR is in no chain, so the v1 hop-count disagreement is still open on the wire | next B-069, the SP research item that mirrors B-055
