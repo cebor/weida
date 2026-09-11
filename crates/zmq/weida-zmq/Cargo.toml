@@ -43,6 +43,13 @@ futures.workspace = true
 # The compile-fail harness for libzmq's thread rule: a socket is `Send` and
 # **not** `Sync`, and the second half only a compiler can assert.
 trybuild.workspace = true
+# The independent ZeroMQ the interop tests measure against: a pure-Rust
+# implementation that shares no code and no assumptions with ours, so a
+# disagreement is an interoperability bug rather than a tautology. Tests
+# only, and no supervised process - `cargo test` is the whole apparatus.
+zeromq.workspace = true
+# Frames for the peer's own message type, which takes `Bytes`.
+bytes.workspace = true
 
 [features]
 # The synchronous facade, off by default: `weida_zmq::blocking`. Not default
