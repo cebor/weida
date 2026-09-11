@@ -13,7 +13,7 @@ kind: research | size: 30 | status: in_progress (delegated) 2026-09-11T02:05Z | 
 acceptance: `docs/decisions/0005-refusal-race.md`, accepted; cites RFC 9000 §3.2 via quic-standards §12 item 8 and PATTERNS §1.6; SYNTHESIS §8.5 closed.
 
 ### B-003 — Decision 0006: guarantee sets and the adapter edge
-kind: research | size: 45 | status: ready | needs: []
+kind: research | size: 45 | status: in_progress 2026-09-11T02:20Z | needs: []
 acceptance: `docs/decisions/0006-guarantee-sets.md`, accepted: a default guarantee set plus a configurable superset inside the weida network, validated at configuration time; at an adapter edge the chain ends at the protocol's transfer point (SYNTHESIS §4) and any degradation is named in configuration; SYNTHESIS §8.7 closed.
 
 ### B-004 — Decision 0007: segmented topics, opaque paths
