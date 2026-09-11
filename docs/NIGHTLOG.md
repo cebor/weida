@@ -5,7 +5,16 @@ first, then the numbers, then the chronology.
 
 ## Review needed
 
-(nothing yet)
+- **A stray document at the repository root.** `weida-sample-transport.md` was left untracked
+  by a previous session and committed as-is (81d1df7, `chore: recover uncommitted work`). It
+  is a *zeughaus*-side design note about carrying video frames over weida, with links pointing
+  outside this repository. It is useful input (it names five things weida would need, led by
+  streaming fan-out) but it does not belong at the root of this tree. Decide: move it under
+  `docs/` as an external-requirements note, or drop it and take its five requests into the
+  backlog.
+- **No provisional decisions.** 0004-0008 are all `accepted`; nothing was decided on a
+  reversible flag that a human still has to confirm.
+- **Nothing parked, nothing blocked, no stashes.**
 
 ## Numbers
 
@@ -38,3 +47,4 @@ a configured number. Recorded in IMPLEMENTATION.md §4.
 2026-09-11T03:23Z | B-004 | done c06c072 | decision 0007 (parallel worker), verified: paths stay opaque, topic filters `.`-segmented with `*` and trailing `#` (zero-or-more), full foreign mapping table; SYNTHESIS §8.9 closed | next B-005
 2026-09-11T03:24Z | B-005 | done 7d3d31b | decision 0008 (parallel worker), verified: fingerprint is the peer across connections and binds control to bulk, no L0 session, resumption is L2, producer key absent by default else 32-byte `bstr` from B-009's numbers; 0001 §8 item closed | next B-010, B-007 and B-018 delegated
 2026-09-11T03:40Z | B-010 | done a236cbb | reorder probe in `tests/streams.rs` with two FIN modes, full gate green (218 tests), numbers above and in IMPLEMENTATION.md §4 | next review pass (§8), then B-011
+2026-09-11T03:50Z | review | 4e0c899 | 4 findings, all filed: B-019 FAILURE_MODEL per 0005, B-020 segment matcher in code, B-021 its cost in the fan-out path, B-022 capped reassembly + drop detection; B-017's acceptance extended with 0008 §4.2's fingerprint binding. Gate green on the tree; no public API changed since the anchor (bench and test only); no stale identifier in the normative docs — the four that no longer exist in code (`transfer_id`, `role`, `correlation_id`, `ack_mode`, plus `max_pending`) are PROTOCOL's own "these are gone" statements; no new remote-influenced allocation | next B-011

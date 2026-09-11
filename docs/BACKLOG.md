@@ -37,6 +37,10 @@ acceptance: §3 ordering `PerProducer(detect|reassemble)`, dedup `Bounded(window
 kind: spec | size: 45 | status: ready | needs: [B-006, B-007]
 acceptance: PATTERNS §1.3 narrowed to "bulk writers on the same path's connection", §1.4 states the stream budget is the L0 message credit, §1.6 cites 0005, §4 gains subscriber-side drop detection and segmented filters; INVARIANTS permits a control connection while forbidding a multiplexed control stream, adds the reassembly cap and per-peer connection count to the named bounds; ARCHITECTURE §5 describes the two pool tiers and two Limits profiles; SYNTHESIS §8 entries carry their decision numbers.
 
+### B-019 — Spec sync: FAILURE_MODEL.md per 0005
+kind: spec | size: 30 | status: ready | needs: []
+acceptance: §4 keeps "a refusal can lose the race with the transport" and gains 0005 §4.4's consequence — no sender outcome exists for a refusal observed after the receipt resolved, and none is added — plus 0005 §4.3's two deterministic constructions (payload beyond the peer's stream receive window, or an exchange) with the note number; the three 2 MiB tests named in 0005 §2 get a doc-comment sentence saying their payload size is what makes the refusal deterministic; `grep` shows no document still calling the race an open question.
+
 ### B-009 — Measure: DATA header cost at high message rate
 kind: measure | size: 60 | status: done 178a95c | needs: []
 acceptance: a criterion bench in `crates/weida/benches/patterns.rs` pushing 64-byte payloads with a minimal header versus a header carrying two extra uint keys (simulated via `content_len` and `topic` today), messages per second and bytes per message on loopback; numbers in IMPLEMENTATION.md verified results.
@@ -73,8 +77,20 @@ acceptance: `Runtime::owned(config)` (multi-thread, `worker_threads` configurabl
 
 ### B-017 — Control connection per peer, bulk per path
 kind: code | size: 90 | status: ready | needs: [B-014, B-011, B-012]
-acceptance: pool tiers per 0002 §7; HELLO on the control connection; bulk connections keyed by path and bound by fingerprint; `Limits` profiles `control` and `bulk` in `RuntimeConfig` with defaults chosen from B-011/B-012 numbers; stream probes updated; `a_stalled_stream_does_not_block_its_siblings` extended to show a control frame crossing while bulk is stalled.
+acceptance: pool tiers per 0002 §7; HELLO on the control connection; bulk connections keyed by path and bound by fingerprint per 0008 §4.2, with a fingerprint mismatch refused and a test for that refusal in `crates/weida/tests/identity.rs`, and anonymous clients (no proved fingerprint) never treated as one peer; `Limits` profiles `control` and `bulk` in `RuntimeConfig` with defaults chosen from B-011/B-012 numbers; stream probes updated; `a_stalled_stream_does_not_block_its_siblings` extended to show a control frame crossing while bulk is stalled.
 
 ### B-018 — Research: ZMTP adapter mapping document
 kind: research | size: 60 | status: in_progress (delegated) 2026-09-11T03:20Z | needs: [B-004]
 acceptance: `docs/adapters/zmtp.md` derived from `docs/research/zeromq.md`: socket type to weida pattern table, stream mapping, HWM to credit, NULL/CURVE to Identity/Trust, transfer points, named losses (byte-prefix subscriptions, multipart), and the interop bench plan against the pure-Rust `zeromq` crate.
+
+### B-020 — Segmented topic filter matching in code
+kind: code | size: 90 | status: ready | needs: [B-006]
+acceptance: `matches_filter` in `crates/weida/src/pubsub.rs` becomes the allocation-free, backtracking-free segment walker of 0007 §4.3, and its doc-comment objection is rewritten rather than deleted; filter grammar validation lands in `weida-protocol` beside the other header rules so an invalid filter (`*` not alone in its segment, `#` not final) is rejected at the codec boundary; `Subscriber::subscribe`'s documentation states the grammar; golden vectors for a literal filter, a middle-segment `*`, a trailing `#`, the empty filter and a topic containing a literal `*`; `subscribe_prefix_filters_topics` is renamed and extended, including the boundary case a byte prefix over-matched (`sensors.temp` must not select `sensors.temperature`).
+
+### B-021 — Measure: segment matching in the fan-out path
+kind: measure | size: 45 | status: ready | needs: [B-020]
+acceptance: a criterion bench comparing byte-prefix `starts_with` against the segment walker at a realistic subscriber and filter count (the objection recorded in `crates/weida/src/pubsub.rs` asserts a cost without a number); publish-to-all-drained time per subscriber count for both matchers; numbers in IMPLEMENTATION.md verified results, which is what 0007 §6 asks for.
+
+### B-022 — Reassembly mode, capped, and subscriber-side drop detection
+kind: code | size: 90 | status: ready | needs: [B-015]
+acceptance: `PerProducer(reassemble)` holds out-of-order transfers and releases them in sequence order, with the hold bounded by a named `Limits` field and the bound enforced by refusing or releasing out of order rather than by growing — B-010 measured the peak at N − 1 of the transfers in flight, and 84 of 256 with no adversarial pattern, so the cap is a configured number and not an assumption about arrival order; the cap appears in INVARIANTS' named bounds; a subscriber in detect or reassemble mode reports a Pub/Sub drop through `IncomingMeta`; a test drives reordering with the two FIN modes of `reverse_order_completion_measures_the_reorder_buffer`.
