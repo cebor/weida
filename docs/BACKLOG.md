@@ -381,9 +381,10 @@ note: on branch `b070-weida-runtime` in `../weida-b016` by the parallel worker.
 note: merged `--no-ff` as ff9131a and gated here: **522 tests**, one ignored (the 1 GiB memory test). `crates/runtime` → `weida-runtime`, dependencies **`weida-core` and `tokio` only** (dev: `futures`), so the shared crate can never reach a weida frame: `Exec` with `spawn`/`sleep`/`within`/`enter`/`resolve` and the three reactor-ownership constructors, `OwnedReactor` with the background shutdown, `CloseBudget`, `NameRegistry<T>` and `BoundUnixSocket` with `peer_credentials`. **The acceptance line's hard half — "no `pub` item in `weida` changes" — was proved rather than asserted**: a signature diff taken from `cargo doc`, 113 pages and 1458 signatures identical before and after, which is the check the item needed and the one a passing test suite cannot give. The extraction also bought tests the code never had: the `AF_UNIX` bind hygiene of [0010](decisions/0010-local-transport.md) §4.5 was exercised only through a live connection before and now has its own, and the resolver tests moved with the code. Three commits on `b070-weida-runtime` (6de5178 crate, 5652988 the weida refactor, 07e8b87 docs); QUIC stayed behind, as [0013](decisions/0013-competitor-libraries.md) §4.2 requires.
 
 ### B-071 — weida-zmq: context, endpoints, error vocabulary
-kind: code | size: 90 | status: ready | needs: [B-070]
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T16:25Z | needs: [B-070]
 acceptance: `crates/zmq/weida-zmq` with a `Context` created three ways on `weida-runtime`'s `Exec`, `ZMQ_MAX_SOCKETS` honoured, `tcp://`/`ipc://`/`inproc://` parsed under libzmq's own length rules (113 B ipc on Linux, 256 inproc), and an error enum carrying libzmq's errno names; no dependency on `weida` or `weida-protocol`.
 note: from 0013 §5.3.
+note: on branch `b071-zmq-context` by the parallel worker, straight off ff9131a. The directory is `crates/zmq/weida-zmq` from the first commit even though the move of `weida-zmtp` and the bridges is B-095's: a new crate is placed where [0013](decisions/0013-competitor-libraries.md) §4.1 puts it rather than moved twice.
 
 ### B-072 — Message, per-peer queue and the high-water marks
 kind: code | size: 90 | status: ready | needs: [B-071]
