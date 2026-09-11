@@ -1,16 +1,20 @@
-//! Per-producer sequencing and gap detection: `PerProducer(detect)`.
+//! Per-producer sequencing, gap detection and reassembly.
 //!
-//! Detect mode is the default of [decision 0001](../../../docs/decisions/0001-sequence-field.md)
-//! §7.5: the sender numbers its transfers, the receiver reports the gap and
-//! **delivers messages as they arrive**. Nothing is held back, so there is no
-//! reassembly buffer and no head-of-line blocking above QUIC.
+//! One sender-side counter and two receiver-side modes, the two of
+//! [decision 0001](../../../docs/decisions/0001-sequence-field.md) §7.5.
+//! *Detect*, the default: report the gap and **deliver messages as they
+//! arrive**, holding nothing back. *Reassemble*, opt-in: hold an arrival
+//! whose predecessors are missing and release the run in sequence order,
+//! accepting head-of-line blocking above QUIC in exchange, with the hold
+//! bounded by `Limits::max_reorder_hold`.
 //!
-//! Both halves are inert when the negotiated ordering is `None`: no map is
-//! ever touched, so an endpoint that negotiated nothing allocates nothing —
-//! the hot-path rule of `docs/INVARIANTS.md`, checked by the unit tests at the
-//! bottom of this file rather than asserted in prose.
+//! All three parts are inert when the negotiated ordering is `None`, and the
+//! reassembler is inert under `detect` as well: no map is ever touched, so an
+//! endpoint that negotiated nothing allocates nothing — the hot-path rule of
+//! `docs/INVARIANTS.md`, checked by the unit tests at the bottom of this file
+//! rather than asserted in prose.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use weida_protocol::header::OrderingMode;
@@ -111,7 +115,10 @@ pub(crate) struct GapDetector {
 impl GapDetector {
     pub(crate) fn new(ordering: OrderingMode, max_scopes: usize) -> GapDetector {
         GapDetector {
-            enabled: ordering != OrderingMode::None,
+            // Detect mode only: under `reassemble` the reassembler owns the
+            // position and reports what it had to skip, and two components
+            // tracking the same counter would report the same hole twice.
+            enabled: ordering == OrderingMode::PerProducerDetect,
             max_scopes,
             expected: Mutex::new(HashMap::new()),
         }
@@ -166,6 +173,191 @@ impl GapDetector {
             .capacity()
             > 0
     }
+}
+
+/// Holds out-of-order arrivals back and releases them in sequence order:
+/// `PerProducer(reassemble)` of
+/// [decision 0001](../../../docs/decisions/0001-sequence-field.md) §7.5.
+///
+/// Generic in what is held so that the ordering logic can be exercised
+/// without a connection; the connection holds `Reassembler<Held>`, where a
+/// `Held` is one *unread* transfer — the stream handle, its metadata and its
+/// path. **No payload is materialized**, which "core transport does not
+/// require payload materialization" ([`docs/INVARIANTS.md`]) forbids. What a
+/// held transfer really pins is transport memory: one entry of the peer's
+/// `max_concurrent_uni_streams` budget and up to `stream_receive_window`
+/// bytes of quinn's receive buffer for that stream, the whole hold being
+/// bounded in turn by `connection_receive_window`. That is the accountability
+/// [0002](../../../docs/decisions/0002-control-and-bulk-separation.md) §6.6
+/// asks for, reached from the other side: 0002 proposed reading eagerly into
+/// an application-owned buffer so that transport credit is released early,
+/// which v0 cannot do without materializing the payload, so the hold keeps
+/// the bytes in the transport where the peer's own window already bounds them
+/// and pays for them with head-of-line blocking instead.
+pub(crate) struct Reassembler<T> {
+    enabled: bool,
+    /// Transfers held at once, summed over scopes: the `max_reorder_hold`
+    /// bound of `docs/INVARIANTS.md`. B-010 measured the peak at N − 1 of the
+    /// transfers in flight, and 84 of 256 with no adversarial pattern, so
+    /// this is a configured number and never an assumption about arrival
+    /// order.
+    max_hold: usize,
+    /// Scopes tracked at once, shared bound with the gap detector.
+    max_scopes: usize,
+    state: Mutex<Reorder<T>>,
+}
+
+struct Reorder<T> {
+    scopes: HashMap<Box<str>, Scope<T>>,
+    /// Held entries over all scopes, kept here so the cap is one comparison.
+    held: usize,
+}
+
+struct Scope<T> {
+    /// The number that must arrive before anything after it is released.
+    next: u64,
+    pending: BTreeMap<u64, T>,
+}
+
+impl<T> Reassembler<T> {
+    pub(crate) fn new(
+        ordering: OrderingMode,
+        max_hold: usize,
+        max_scopes: usize,
+    ) -> Reassembler<T> {
+        Reassembler {
+            enabled: ordering == OrderingMode::PerProducerReassemble,
+            max_hold,
+            max_scopes,
+            state: Mutex::new(Reorder {
+                scopes: HashMap::new(),
+                held: 0,
+            }),
+        }
+    }
+
+    /// Whether anything is reassembled at all. The caller checks this before
+    /// building the argument list, so a connection that negotiated `None` or
+    /// `detect` never touches this structure and never allocates the `Vec`.
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Offers one arrival and returns what may now be delivered, in order.
+    ///
+    /// An unnumbered arrival, an arrival on an untracked scope and an arrival
+    /// below the position are passed straight through: nothing that is still
+    /// to come can be ordered against them. Everything else is held until the
+    /// numbers before it have arrived — or until the hold is full, which
+    /// releases the oldest held transfer out of order and reports the numbers
+    /// it skipped as a `Gap`, the behaviour `docs/GUARANTEES.md` §3 states.
+    /// Reassembly is never silently weakened: the application is told.
+    pub(crate) fn admit(
+        &self,
+        scope: &str,
+        sequence: Option<u64>,
+        item: T,
+    ) -> Vec<(T, Option<Gap>)> {
+        // Defensive: callers gate on `enabled()` so that an off connection
+        // never even builds the argument list, but an off reassembler must
+        // hold nothing if it is called anyway.
+        if !self.enabled {
+            return vec![(item, None)];
+        }
+        let Some(sequence) = sequence else {
+            return vec![(item, None)];
+        };
+        let mut state = self.state.lock().expect("reassembler poisoned");
+        let Reorder { scopes, held } = &mut *state;
+        if !scopes.contains_key(scope) {
+            if scopes.len() >= self.max_scopes {
+                // At the scope cap nothing is tracked and nothing is held: a
+                // peer that invents scopes must not be able to size this
+                // table.
+                return vec![(item, None)];
+            }
+            // The first number seen establishes the position: the peer's
+            // counter is older than this connection's view of it.
+            scopes.insert(
+                scope.into(),
+                Scope {
+                    next: sequence,
+                    pending: BTreeMap::new(),
+                },
+            );
+        }
+
+        let entry = scopes.get_mut(scope).expect("present");
+        if sequence < entry.next {
+            // Late: its successors have already gone to the application, so
+            // holding it would order it against nothing.
+            return vec![(item, None)];
+        }
+        let mut out = Vec::new();
+        entry.pending.insert(sequence, item);
+        *held += 1;
+        *held -= drain_in_order(entry, &mut out);
+
+        // Enforce the cap by releasing, never by growing. The victim is the
+        // scope holding the most, so one stalled producer cannot spend the
+        // whole budget and push every other scope into out-of-order release.
+        while *held > self.max_hold {
+            let Some(victim) = widest_scope(scopes) else {
+                break;
+            };
+            let Some((seq, item)) = victim.pending.pop_first() else {
+                break;
+            };
+            let gap = Gap {
+                expected: victim.next,
+                seen: seq,
+            };
+            victim.next = seq.wrapping_add(1);
+            out.push((item, Some(gap)));
+            *held -= 1;
+            *held -= drain_in_order(victim, &mut out);
+        }
+        out
+    }
+
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.state.lock().expect("reassembler poisoned").held
+    }
+
+    #[cfg(test)]
+    fn allocated(&self) -> bool {
+        self.state
+            .lock()
+            .expect("reassembler poisoned")
+            .scopes
+            .capacity()
+            > 0
+    }
+}
+
+/// Moves the consecutive run starting at `scope.next` out of the hold and
+/// returns how many entries that was.
+fn drain_in_order<T>(scope: &mut Scope<T>, out: &mut Vec<(T, Option<Gap>)>) -> usize {
+    let mut released = 0;
+    while let Some(entry) = scope.pending.first_entry() {
+        if *entry.key() != scope.next {
+            break;
+        }
+        out.push((entry.remove(), None));
+        scope.next = scope.next.wrapping_add(1);
+        released += 1;
+    }
+    released
+}
+
+/// The scope holding the most transfers: the one to take a slot from when the
+/// hold is full.
+fn widest_scope<T>(scopes: &mut HashMap<Box<str>, Scope<T>>) -> Option<&mut Scope<T>> {
+    scopes
+        .values_mut()
+        .max_by_key(|scope| scope.pending.len())
+        .filter(|scope| !scope.pending.is_empty())
 }
 
 #[cfg(test)]
@@ -259,5 +451,139 @@ mod tests {
             4,
             "a peer must not be able to size this table"
         );
+    }
+
+    /// Shorthand: the items released by one arrival, without their gaps.
+    fn items(released: Vec<(u64, Option<Gap>)>) -> Vec<u64> {
+        released.into_iter().map(|(item, _)| item).collect()
+    }
+
+    #[test]
+    fn a_disabled_reassembler_holds_nothing_and_allocates_nothing() {
+        for mode in [OrderingMode::None, OrderingMode::PerProducerDetect] {
+            let reassembler: Reassembler<u64> = Reassembler::new(mode, 256, 1024);
+            assert!(!reassembler.enabled());
+            for seq in 0..1000 {
+                // Out of order on purpose: an off reassembler still passes
+                // everything through untouched.
+                assert_eq!(items(reassembler.admit("/md", Some(999 - seq), seq)), [seq]);
+            }
+            assert_eq!(reassembler.held(), 0);
+            assert!(
+                !reassembler.allocated(),
+                "an off reassembler must not allocate a table"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_order_arrivals_are_released_in_sequence_order() {
+        let r: Reassembler<u64> = Reassembler::new(OrderingMode::PerProducerReassemble, 256, 1024);
+        assert_eq!(items(r.admit("a", Some(0), 0)), [0]);
+        // 1 is missing, so 2 and 3 wait for it.
+        assert!(items(r.admit("a", Some(2), 2)).is_empty());
+        assert!(items(r.admit("a", Some(3), 3)).is_empty());
+        assert_eq!(r.held(), 2);
+        // 1 arrives and the whole run goes out at once, in order.
+        assert_eq!(items(r.admit("a", Some(1), 1)), [1, 2, 3]);
+        assert_eq!(r.held(), 0, "the hold must drain");
+    }
+
+    #[test]
+    fn a_run_released_in_order_carries_no_gap() {
+        let r: Reassembler<u64> = Reassembler::new(OrderingMode::PerProducerReassemble, 256, 1024);
+        r.admit("a", Some(0), 0);
+        r.admit("a", Some(2), 2);
+        let released = r.admit("a", Some(1), 1);
+        assert!(
+            released.iter().all(|(_, gap)| gap.is_none()),
+            "nothing was missed: the hole was filled"
+        );
+    }
+
+    #[test]
+    fn the_hold_releases_out_of_order_at_its_cap_and_reports_the_gap() {
+        let r: Reassembler<u64> = Reassembler::new(OrderingMode::PerProducerReassemble, 2, 1024);
+        assert_eq!(items(r.admit("a", Some(0), 0)), [0]);
+        // 1 never arrives; 2 and 3 fill the hold.
+        assert!(r.admit("a", Some(2), 2).is_empty());
+        assert!(r.admit("a", Some(3), 3).is_empty());
+        // 4 does not fit: the oldest held transfer is released out of order
+        // and says what it skipped, which is exactly what detect mode would
+        // have reported. 3 and 4 follow it in order behind the forced
+        // release, so the hole at 1 costs one out-of-order delivery and not
+        // the whole run.
+        let released = r.admit("a", Some(4), 4);
+        assert_eq!(items(released.clone()), [2, 3, 4]);
+        assert_eq!(
+            released[0].1.expect("a gap"),
+            Gap {
+                expected: 1,
+                seen: 2
+            }
+        );
+        assert!(
+            released[1..].iter().all(|(_, gap)| gap.is_none()),
+            "3 and 4 followed 2 in order"
+        );
+        assert_eq!(r.held(), 0, "the hold drained behind the forced release");
+    }
+
+    #[test]
+    fn the_hold_never_exceeds_its_cap() {
+        let r: Reassembler<u64> = Reassembler::new(OrderingMode::PerProducerReassemble, 8, 1024);
+        r.admit("a", Some(0), 0);
+        // A producer whose 1 never arrives: every later number is held until
+        // the cap forces a release, and the cap is never exceeded.
+        for seq in 2..500u64 {
+            r.admit("a", Some(seq), seq);
+            assert!(r.held() <= 8, "the hold must be bounded by its cap");
+        }
+    }
+
+    #[test]
+    fn one_stalled_scope_does_not_spend_another_scope_s_budget() {
+        let r: Reassembler<u64> = Reassembler::new(OrderingMode::PerProducerReassemble, 4, 1024);
+        r.admit("stalled", Some(0), 0);
+        r.admit("busy", Some(0), 100);
+        // The stalled scope parks two transfers behind a hole.
+        r.admit("stalled", Some(2), 2);
+        r.admit("stalled", Some(3), 3);
+        // The busy scope parks two more, filling the hold, and then one more.
+        r.admit("busy", Some(102), 102);
+        r.admit("busy", Some(103), 103);
+        let released = r.admit("busy", Some(104), 104);
+        // The widest holder pays: both scopes hold two, so the eviction comes
+        // from one of them and the hold stays inside its cap either way.
+        assert!(!released.is_empty(), "the cap must release something");
+        assert!(r.held() <= 4);
+    }
+
+    #[test]
+    fn an_unnumbered_or_late_arrival_passes_straight_through() {
+        let r: Reassembler<u64> = Reassembler::new(OrderingMode::PerProducerReassemble, 256, 1024);
+        // Nothing names it, so nothing can be ordered against it.
+        assert_eq!(items(r.admit("a", None, 7)), [7]);
+        assert_eq!(items(r.admit("a", Some(5), 5)), [5]);
+        // Below the position: its successors already went to the application.
+        assert_eq!(items(r.admit("a", Some(4), 4)), [4]);
+        assert_eq!(r.held(), 0);
+    }
+
+    #[test]
+    fn the_reassembler_scope_table_stops_growing_at_its_cap() {
+        let r: Reassembler<u64> = Reassembler::new(OrderingMode::PerProducerReassemble, 256, 4);
+        for i in 0..100u64 {
+            // Each scope's second number is a hole, so an untracked scope
+            // would be visible as a hold that should not exist.
+            r.admit(&format!("scope-{i}"), Some(0), i);
+            r.admit(&format!("scope-{i}"), Some(2), i);
+        }
+        assert_eq!(
+            r.state.lock().expect("poisoned").scopes.len(),
+            4,
+            "a peer must not be able to size this table"
+        );
+        assert_eq!(r.held(), 4, "only the tracked scopes hold anything");
     }
 }
