@@ -1127,6 +1127,14 @@ is which of the three is the default, and where the refusal surfaces: at configu
 which is what the guarantee-validation rule requires ("Invalid combinations MUST be rejected…
 at configuration time, not silently at runtime" [GUARANTEES §4]), or per message.
 
+**Closed by [0006](../decisions/0006-guarantee-sets.md):** guarantees become a set over the
+dimensions of [GUARANTEES §3], with `core` as the default and configured sets only ever
+supersets of it, declared in HELLO and intersected per dimension with failure instead of
+downgrade. Refusal at configuration time is the default at an adapter edge, where the chain ends
+at the foreign protocol's transfer point (§4) — at the adapter's own queue where the protocol has
+none; degradation is available only as a named configuration entry, and store-before-forwarding
+is refused until the L2 durable hop of 0004 exists.
+
 **8.8 Local transport: does weida get one, and which?** No weida document read here states any
 local, IPC or in-process transport [ARCHITECTURE §2]. `ipc.md` §11 lists the candidates with
 their trade-offs and makes no choice, and the decisions it leaves open are:
