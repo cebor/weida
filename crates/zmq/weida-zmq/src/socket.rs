@@ -248,7 +248,7 @@ impl SocketCore {
                     });
                 }
                 MuteAction::Fail => return Err(mute_error(peers.is_empty())),
-                MuteAction::Block => self.wait_for_room(&peers).await,
+                MuteAction::Block => wait_for_room(&self.engine, &peers).await,
             }
         }
     }
@@ -271,7 +271,7 @@ impl SocketCore {
     /// Reports `EHOSTUNREACH` when that peer is gone, which is what a socket
     /// type with `ZMQ_ROUTER_MANDATORY` surfaces and what one without turns
     /// into a drop.
-    pub async fn send_to(&self, peer: PeerId, message: Multipart) -> Result<Sent> {
+    pub async fn send_to(&mut self, peer: PeerId, message: Multipart) -> Result<Sent> {
         let Some(pipe) = self.pipe_of(peer) else {
             return Err(Error::EHOSTUNREACH(
                 format!("{peer} is gone; its queue was destroyed with it").into(),
@@ -295,7 +295,8 @@ impl SocketCore {
             if let Some(taken) = self.take_fair() {
                 return Ok(taken);
             }
-            self.wait_for_message(&self.engine.peers()).await;
+            let peers = self.engine.peers();
+            wait_for_message(&self.engine, &peers).await;
         }
     }
 
@@ -336,26 +337,7 @@ impl SocketCore {
             if let Ok(message) = pipe.incoming().try_recv() {
                 return Ok(message);
             }
-            self.wait_for_message(&peers).await;
-        }
-    }
-
-    /// Runs `future` under a wall-clock bound — `ZMQ_SNDTIMEO` and
-    /// `ZMQ_RCVTIMEO` — reporting `EAGAIN` when it expires, which is the
-    /// errno libzmq uses for both.
-    pub async fn within<T>(
-        &self,
-        limit: Option<Duration>,
-        future: impl Future<Output = Result<T>>,
-    ) -> Result<T> {
-        match limit {
-            None => future.await,
-            Some(limit) => match self.exec.within(limit, future).await {
-                Some(result) => result,
-                None => Err(Error::EAGAIN(
-                    format!("the operation did not complete within {limit:?}").into(),
-                )),
-            },
+            wait_for_message(&self.engine, &peers).await;
         }
     }
 
@@ -386,23 +368,48 @@ impl SocketCore {
         }
         None
     }
+}
 
-    /// Waits for room on any of `peers`, or for the peer set to change.
-    async fn wait_for_room(&self, peers: &[Peer]) {
-        let queues: Vec<Arc<Queue>> = peers.iter().map(|peer| peer.pipe.outgoing()).collect();
-        let waits: Vec<_> = queues.iter().map(|queue| queue.wait_for_room()).collect();
-        first_of(waits, self.engine.wait_for_peer_change()).await;
-    }
+/// Waits for room on any of `peers`, or for the peer set to change.
+///
+/// A free function taking `&Engine` rather than a method taking `&self`, and
+/// that is load-bearing: a socket is `!Sync`, so a future holding
+/// `&SocketCore` is not `Send` and could not be moved into a task. Holding
+/// `&Engine` — which *is* `Sync` — keeps every socket future `Send`, so
+/// libzmq's rule comes out exactly right: a socket may be moved to another
+/// thread and used there, and may not be shared between two.
+async fn wait_for_room(engine: &Engine, peers: &[Peer]) {
+    let queues: Vec<Arc<Queue>> = peers.iter().map(|peer| peer.pipe.outgoing()).collect();
+    let waits: Vec<_> = queues.iter().map(|queue| queue.wait_for_room()).collect();
+    first_of(waits, engine.wait_for_peer_change()).await;
+}
 
-    /// Waits for a message from any of `peers`, or for the peer set to
-    /// change.
-    async fn wait_for_message(&self, peers: &[Peer]) {
-        let queues: Vec<Arc<Queue>> = peers.iter().map(|peer| peer.pipe.incoming()).collect();
-        let waits: Vec<_> = queues
-            .iter()
-            .map(|queue| queue.wait_for_message())
-            .collect();
-        first_of(waits, self.engine.wait_for_peer_change()).await;
+/// Waits for a message from any of `peers`, or for the peer set to change.
+async fn wait_for_message(engine: &Engine, peers: &[Peer]) {
+    let queues: Vec<Arc<Queue>> = peers.iter().map(|peer| peer.pipe.incoming()).collect();
+    let waits: Vec<_> = queues
+        .iter()
+        .map(|queue| queue.wait_for_message())
+        .collect();
+    first_of(waits, engine.wait_for_peer_change()).await;
+}
+
+/// Runs `future` under a wall-clock bound — `ZMQ_SNDTIMEO` and
+/// `ZMQ_RCVTIMEO` — reporting `EAGAIN` when it expires, which is the errno
+/// libzmq uses for both.
+pub async fn within<T>(
+    exec: &Exec,
+    limit: Option<Duration>,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match limit {
+        None => future.await,
+        Some(limit) => match exec.within(limit, future).await {
+            Some(result) => result,
+            None => Err(Error::EAGAIN(
+                format!("the operation did not complete within {limit:?}").into(),
+            )),
+        },
     }
 }
 
@@ -497,17 +504,17 @@ mod tests {
     async fn an_expired_timeout_is_eagain() {
         let ctx = Context::new(ContextConfig::default()).expect("context");
         let core = SocketCore::new(&ctx, SocketType::Rep, SocketOptions::default()).expect("core");
-        let err = core
-            .within(
-                Some(Duration::from_millis(5)),
-                std::future::pending::<Result<()>>(),
-            )
-            .await
-            .unwrap_err();
+        let err = within(
+            core.exec(),
+            Some(Duration::from_millis(5)),
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.errno(), "EAGAIN", "{err}");
 
         // And a bound that does not expire is transparent.
-        core.within(Some(Duration::from_secs(30)), async { Ok(()) })
+        within(core.exec(), Some(Duration::from_secs(30)), async { Ok(()) })
             .await
             .expect("inside the bound");
     }
