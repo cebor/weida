@@ -30,7 +30,7 @@ kind: spec | size: 45 | status: ready | needs: [B-001, B-004, B-005]
 acceptance: reserved DATA keys 6 (sequence) and 7 (producer identity, encoding per 0008) in §6.2 with "optional, skipped by v0"; HELLO §2.3/§6.1 gains guarantee declarations and the intersection rule; §2 states the control connection and per-path bulk connections of 0002; §9 topic filter grammar per 0007; §10 split into control and bulk limits; §11 reserves the L2 credit frame kind (0003) and lists what is deferred; wire version stays 0 with the changes marked "spec ahead of code".
 
 ### B-007 — Spec sync: GUARANTEES.md
-kind: spec | size: 45 | status: in_progress (delegated) 2026-09-11T03:20Z | needs: [B-001, B-003]
+kind: spec | size: 45 | status: done 30b8942 | needs: [B-001, B-003]
 acceptance: §3 ordering `PerProducer(detect|reassemble)`, dedup `Bounded(window)`, `PerKey` L2-only; `Stored`/`Replicated` with durability levels; §6 rows for backpressure name the two L0 credit units and the absence of application credit; a new subsection on guarantee sets per 0006; §3 receipt paragraph cites RFC 9000 §3.2 per 0005.
 
 ### B-008 — Spec sync: PATTERNS.md, INVARIANTS.md, ARCHITECTURE.md
@@ -72,16 +72,18 @@ kind: code | size: 90 | status: ready | needs: [B-014]
 acceptance: a sending endpoint configured `PerProducer(detect)` numbers its transfers per (connection, path/topic); the receiver reports gaps through `IncomingMeta` (gap count, expected vs seen) without holding anything back; dedup with a time window drops repeats and counts them; both allocate nothing when negotiated off (INVARIANTS); tests for gap detection through a Pub/Sub drop.
 
 ### B-016 — Runtime ownership and centralized spawn/timer/DNS
-kind: code | size: 90 | status: ready | needs: []
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T04:05Z | needs: []
 acceptance: `Runtime::owned(config)` (multi-thread, `worker_threads` configurable, default 1) and `Runtime::with_handle`; all `tokio::spawn`, `tokio::time::sleep` and `lookup_host` calls go through `runtime.rs`; a test drives a full Req/Rep round trip under `futures::executor::block_on` with no `#[tokio::test]`; `futures-io` `AsyncRead`/`AsyncWrite` implemented beside the tokio traits.
+note: built by the parallel worker on branch `b016-runtime` in the worktree `../weida-b016` with its own `CARGO_TARGET_DIR`, so this tree's build lock is untouched. On delivery it is merged here (`--no-ff`), gated in this tree, and finished per LOOP §1.5; a red gate goes back to the worker rather than to a revert.
 
 ### B-017 — Control connection per peer, bulk per path
 kind: code | size: 90 | status: ready | needs: [B-014, B-011, B-012]
 acceptance: pool tiers per 0002 §7; HELLO on the control connection; bulk connections keyed by path and bound by fingerprint per 0008 §4.2, with a fingerprint mismatch refused and a test for that refusal in `crates/weida/tests/identity.rs`, and anonymous clients (no proved fingerprint) never treated as one peer; `Limits` profiles `control` and `bulk` in `RuntimeConfig` with defaults chosen from B-011/B-012 numbers; stream probes updated; `a_stalled_stream_does_not_block_its_siblings` extended to show a control frame crossing while bulk is stalled.
 
 ### B-018 — Research: ZMTP adapter mapping document
-kind: research | size: 60 | status: in_progress (delegated) 2026-09-11T03:20Z | needs: [B-004]
+kind: research | size: 60 | status: done fecd996 | needs: [B-004]
 acceptance: `docs/adapters/zmtp.md` derived from `docs/research/zeromq.md`: socket type to weida pattern table, stream mapping, HWM to credit, NULL/CURVE to Identity/Trust, transfer points, named losses (byte-prefix subscriptions, multipart), and the interop bench plan against the pure-Rust `zeromq` crate.
+note: delivered with `docs/adapters/README.md` as well — the mapping-document template and its own table, so no row was needed in `docs/decisions/README.md`. Exceeds the acceptance line with ten named losses, six refused configurations and a per-loss test in the bench plan.
 
 ### B-020 — Segmented topic filter matching in code
 kind: code | size: 90 | status: ready | needs: [B-006]
