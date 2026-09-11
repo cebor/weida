@@ -563,12 +563,15 @@ paths pays 278 ms of handshakes where it pays 1.5 ms today, so the bulk tier wan
 per-path connections — a path dialled is not a path used — while the control connection stays
 eager per B-011.
 
-**One regression found, not caused by this item.** `connect/cold_handshake` moved from
-1.02-1.10 ms to **1.18-1.24 ms** (+12 %, p = 0.00) against criterion's stored baseline, and the
-baseline was recorded before B-016 landed. The cause is visible in the code rather than
-inferred: `Exec::resolve` allocates the host string, spawns a task and awaits its join handle
-on **every** `connect`, including for a literal `127.0.0.1` that needs no lookup at all
-(`crates/weida/src/runtime.rs`, `crates/weida/src/pool.rs`). Filed as B-025.
+**One regression found and fixed (B-025).** `connect/cold_handshake` had moved from
+1.02-1.10 ms to **1.18-1.24 ms** (+12 %, p = 0.00) against criterion's stored baseline, which
+predated B-016. The cause was in the code rather than inferred: `Exec::resolve` allocated the
+host string, spawned a task and awaited its join handle on **every** `connect`, including for a
+literal `127.0.0.1` that needs no lookup at all. `Exec::resolve` now parses an IP literal in
+place and keeps the task only for real hostnames, which `lookup_host` needs for its Tokio
+context. Measured after the fix: **1.05-1.09 ms**, `change: −11.6 % (p = 0.00)` — back to the
+pre-B-016 level. Every pinned deployment dials literals, because a pinned address names a key
+rather than a name, so this was the common path and not an edge case.
 
 ---
 

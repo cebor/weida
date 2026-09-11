@@ -7,7 +7,7 @@
 //! here does, so the reactor is an implementation detail the runtime owns
 //! rather than an ambient requirement on every caller.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -72,9 +72,21 @@ impl Exec {
         tokio::time::sleep(duration)
     }
 
-    /// Resolves `host:port`. The lookup runs as a task on the runtime because
-    /// `lookup_host` needs a Tokio context; awaiting the join handle does not.
+    /// Resolves `host:port`.
+    ///
+    /// An address that is already an IP literal is not resolved at all: it is
+    /// parsed in place, with no allocation, no task and no join handle. Every
+    /// pinned deployment dials literals — the address carries the peer's
+    /// fingerprint, not a name — and the round trip through the runtime cost
+    /// 12 % of a cold handshake when it applied to them too
+    /// (`docs/IMPLEMENTATION.md` §4, B-012, B-025).
+    ///
+    /// A real hostname keeps the task: `lookup_host` needs a Tokio context,
+    /// and awaiting the join handle does not.
     pub(crate) async fn resolve(&self, host: &str, port: u16) -> Result<SocketAddr, Error> {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(SocketAddr::new(ip, port));
+        }
         let query = (host.to_owned(), port);
         let looked_up = self
             .spawn(async move {
