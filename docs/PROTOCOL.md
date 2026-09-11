@@ -1015,12 +1015,23 @@ versions.
   Push and Sub connect. The reverse directions have no v0 representation.
 - **Streaming fan-out.** A publisher sends whole messages (§9.5). Tee-ing one long stream
   to many subscribers needs its own drop and ordering design and is not specified.
-- **Per-producer ordering as a behaviour.** The sequence key of §6.2 is coded and its vectors
-  are pinned (§8), but nothing numbers a transfer and nothing detects a gap: the `PerProducer`
-  levels are decided ([decisions/0001](decisions/0001-sequence-field.md) §7.1, §7.5) and
-  unnegotiated (§6.5), so no v0 sender writes the key and no v0 receiver acts on it. `PerKey`
-  ordering has no wire representation at all and is L2 work [0001 §7.4]; `Total` is
-  unspecified.
+- **Ordering and deduplication beyond what is negotiated.** The sequence and producer keys
+  of §6.2 are coded, pinned (§8) and now acted on: a peer that negotiated `PerProducer`
+  numbers its one-way transfers and, in `detect`, reports gaps, or, in `reassemble`, holds
+  arrivals back up to `max_reorder_hold` ([decisions/0001](decisions/0001-sequence-field.md)
+  §7.5, [GUARANTEES.md](GUARANTEES.md) §3). What stays unspecified: `PerKey` ordering has no
+  wire representation at all and is L2 work [0001 §7.4], `Total` is unspecified, and
+  `Durable` deduplication needs a store and belongs to the broker [0001 §7.6]. None of these
+  adds a frame: the guarantee set of §6.5 is the whole wire surface for them.
+- **A quiescence signal.** `Runtime::drain(deadline)` is a **local** operation and has no
+  wire representation: it stops admitting work, waits on transport receipts the connection
+  already produces and then closes with `SHUTDOWN` like any other close. A peer observes
+  exactly what it observes today — refused streams and a close — and nothing announces the
+  drain. The alternative, a frame the peer answers when it has taken everything, is an
+  application acknowledgement and is closed by
+  [decisions/0005](decisions/0005-refusal-race.md); no protocol in the catalogue offers one
+  either ([decisions/0009](decisions/0009-drain.md) §4.8, §3 option E). Implementations MUST
+  NOT invent a quiescence frame for it.
 - **Session state.** No session identifier, no subscription resumption and no sequence
   resumption. The peer's proved fingerprint identifies it across connections and carries no
   retained state; resumption is L2 work

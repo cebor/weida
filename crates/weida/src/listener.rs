@@ -323,12 +323,19 @@ async fn accept_connections(endpoint: quinn::Endpoint, listener: Arc<ListenerInn
     let max_connections_per_peer = config.max_connections_per_peer;
     let guarantees = config.guarantees;
     let exec = listener.runtime.exec.clone();
-    let duplicates = listener.runtime.duplicates();
+    let shared = listener.runtime.shared();
     let namespace = Arc::clone(&listener.namespace);
     let subs = Arc::clone(&listener.subs);
     let live = Arc::new(AtomicUsize::new(0));
     let peers = Arc::new(PeerCounts::default());
     while let Some(incoming) = endpoint.accept().await {
+        // A draining runtime admits nothing new: the handshake is refused
+        // outright rather than accepted and then closed
+        // (`docs/decisions/0009-drain.md` §4.5).
+        if shared.drain.is_draining() {
+            incoming.refuse();
+            continue;
+        }
         if live.load(Ordering::Relaxed) >= max_connections {
             // Complete the handshake, then say why: a bare refusal leaves the
             // peer unable to distinguish overload from a routing mistake.
@@ -349,7 +356,7 @@ async fn accept_connections(endpoint: quinn::Endpoint, listener: Arc<ListenerInn
         let live = Arc::clone(&live);
         live.fetch_add(1, Ordering::Relaxed);
         let exec_for_conn = exec.clone();
-        let duplicates = Arc::clone(&duplicates);
+        let shared = Arc::clone(&shared);
         let peers = Arc::clone(&peers);
         exec.spawn(async move {
             match incoming.await {
@@ -384,7 +391,7 @@ async fn accept_connections(endpoint: quinn::Endpoint, listener: Arc<ListenerInn
                             Some(Arc::clone(&subs)),
                             exec_for_conn,
                             guarantees,
-                            duplicates,
+                            shared,
                         );
                         let reason = conn.closed().await;
                         // A peer that goes away takes its subscriptions with

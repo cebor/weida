@@ -159,6 +159,16 @@ to QUIC's max ack delay; the same 1 KiB push without the receipt costs ~7.9 µs.
 while callers who want the receipt use `Pusher::open` plus `finish()` and `delivered()`
 themselves. Dropping a `Delivery` is free and observes no outcome at all.
 
+**`Runtime::drain` waits on exactly this signal**, and therefore inherits exactly this
+meaning ([decisions/0009](decisions/0009-drain.md) §4.2). A drain counts a transfer as
+delivered when the peer's transport acknowledged it — not when a peer application read it,
+and not when one acted on it. A drained transfer may still be discarded by the peer's
+application after the fact: the refusal race is documented behaviour and no receipt closes
+it ([decisions/0005](decisions/0005-refusal-race.md) §4.2). What a drain adds is a bound
+and a count; what it cannot add is a stronger signal, because L0 has none. Dropping a
+`Delivery` remains free for the caller — the runtime parks the receipt so the drain has
+something to wait on, and a receipt the caller awaits itself is never parked.
+
 What the receipt implies about the peer's application depends on the payload size, and the
 dependency is worth stating precisely. Inside the peer's stream receive window the receipt
 resolves before the application has called `recv`, and even while the transfer is still

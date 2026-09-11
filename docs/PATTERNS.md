@@ -27,9 +27,16 @@ them, whichever pattern opened them.
 Once `OutgoingTransfer::finish` has queued the FIN, the payload arrives without any local
 handle. The transfer is consumed, the `Delivery` may be dropped, the endpoint may go out of
 scope; only the connection has to live, and the runtime's pool holds it.
-`Runtime::shutdown` is the one thing that cuts a finished transfer short.
+`Runtime::shutdown` is the one thing that cuts a finished transfer short. Its counterpart is
+`Runtime::drain(deadline)`: it stops admitting work, gives the transfers that were already
+finished until the deadline to reach the peer's **transport**, and only then performs the
+same close ([decisions/0009](decisions/0009-drain.md) §4.1-§4.6). What comes back is a pair
+of counts, `Drained { delivered, outstanding }`, not a promise — and an expired drain with
+something still outstanding is not an error. The deadline is mandatory and finite: there is
+no infinite variant to set by accident [0009 §4.3].
 
-*`a_finished_transfer_needs_no_local_handle_to_arrive`.*
+*`a_finished_transfer_needs_no_local_handle_to_arrive`,
+`a_finished_transfer_that_shutdown_cuts_short_arrives_under_drain`.*
 
 ### 1.2 The receipt, inside and beyond the window
 

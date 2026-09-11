@@ -871,8 +871,14 @@ impl Runtime {
     pub fn requester(&self, tls: impl Into<ClientTls>) -> Requester;
     pub fn pusher(&self, tls: impl Into<ClientTls>) -> Pusher;          // Push connects, Pull binds
     pub fn subscriber(&self, tls: impl Into<ClientTls>) -> Subscriber;  // Sub connects, Pub binds
-    pub async fn shutdown(self);                             // close all conns/bindings code SHUTDOWN, wait_idle
+    pub fn suppressed_duplicates(&self) -> u64;              // receiving-side counterpart of Publisher::dropped
+    pub async fn shutdown(self);                             // abortive: close all conns/bindings code SHUTDOWN, bounded wait_idle
+    // The bounded counterpart of 0009: stop admitting, let finished transfers
+    // reach the peer's transport, then the same close. The deadline is
+    // mandatory and finite; an expired drain is a count, not an error.
+    pub async fn drain(self, deadline: Duration) -> Drained;
 }
+pub struct Drained { pub delivered: u64, pub outstanding: u64 } // Copy; local counts, never a claim about the peer
 pub struct Listener;                                         // owns Namespace shared by all bindings
 impl Listener {
     // Server identity is per binding: transports differ in what they need, and two

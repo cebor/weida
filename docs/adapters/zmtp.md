@@ -382,8 +382,11 @@ one-octet body `x`.
   (§5, L6). CURVE is documented "when using TCP transport" only [zeromq §10].
 - **XPUB semantics** (L7): whether weida should expose subscription events at all is a weida
   question, not an adapter one, and belongs in a decision note if an adapter needs it.
-- **Shutdown** (L9) depends on SYNTHESIS §8.6, which is still open: whether weida gets a
-  bounded drain, and whether it belongs to the runtime or to L2.
+- **Shutdown** (L9) is no longer open: SYNTHESIS §8.6 was closed by
+  [0009](../decisions/0009-drain.md), and the drain it decided exists as
+  `Runtime::drain(Duration)`. What is left for this adapter is the mapping, which §8 L9
+  already states: a finite `ZMQ_LINGER` on the ZeroMQ sockets, the adapter's own shutdown
+  onto `drain(timeout)`, and neither side's shutdown presented as a drain acknowledgement.
 
 ## 12. Sources
 

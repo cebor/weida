@@ -361,6 +361,12 @@ async fn write_one(ctx: &ConnHandle, path: &str, msg: &PubMsg) -> Result<(), Err
     stream
         .finish()
         .map_err(|_| Error::Transport("fan-out stream closed early".into()))?;
+    // A published copy is a finished transfer like any other, and nobody
+    // holds a receipt for it: park it on this connection so a drain waits
+    // for it (`docs/decisions/0009-drain.md` §4.2).
+    if ctx.parked.park(Box::pin(stream.stopped())) {
+        ctx.shared.drain.evict();
+    }
     Ok(())
 }
 

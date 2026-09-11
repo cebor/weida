@@ -1,9 +1,14 @@
 //! Transfer handles.
 //!
 //! These own their `quinn` streams outright: payload bytes go straight to the
-//! socket without passing through the connection actor, so a transfer costs no
-//! task hop and takes no lock (master doc §49). The actor is involved only for
-//! the two control frames a destructor may still need to emit.
+//! socket without passing through the connection actor, so writing and reading
+//! a transfer costs no task hop and takes no lock (master doc §49). The actor
+//! is involved only for the two control frames a destructor may still need to
+//! emit — and `finish()` costs one more thing, paid once at the end of a
+//! transfer rather than per write: an unawaited `Delivery` hands its receipt
+//! to the connection's parked set on drop, which is one uncontended lock and
+//! a push, so that a drain can wait for it
+//! (`docs/decisions/0009-drain.md` §4.2).
 //!
 //! Nothing here materializes a payload. `AsyncRead`/`AsyncWrite` are the
 //! primitive API; `collect(max_bytes)` is an opt-in convenience with an
@@ -20,6 +25,7 @@ use weida_core::{Error, ErrorCode, Fingerprint, TraceContext};
 use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes, encode_preamble};
 
 use crate::conn::{ConnHandle, Ctl, read_error, read_frame, write_error, write_error_frame};
+use crate::drain::Receipt;
 use crate::ordering::Gap;
 
 /// Per-transfer metadata supplied by the application.
@@ -168,14 +174,23 @@ pub struct OutgoingTransfer {
     stream: quinn::SendStream,
     trace: TraceContext,
     settled: bool,
+    /// The connection this stream belongs to: where an unawaited receipt is
+    /// parked so a drain can wait on it
+    /// (`docs/decisions/0009-drain.md` §4.2).
+    conn: ConnHandle,
 }
 
 impl OutgoingTransfer {
-    pub(crate) fn new(stream: quinn::SendStream, trace: TraceContext) -> OutgoingTransfer {
+    pub(crate) fn new(
+        stream: quinn::SendStream,
+        trace: TraceContext,
+        conn: ConnHandle,
+    ) -> OutgoingTransfer {
         OutgoingTransfer {
             stream,
             trace,
             settled: false,
+            conn,
         }
     }
 
@@ -209,7 +224,8 @@ impl OutgoingTransfer {
         // `stopped()` yields a `'static` future, so the receipt outlives the
         // handle it came from.
         Ok(Delivery {
-            stopped: Box::pin(self.stream.stopped()),
+            stopped: Some(Box::pin(self.stream.stopped())),
+            conn: Arc::clone(&self.conn),
         })
     }
 
@@ -286,10 +302,15 @@ impl std::fmt::Debug for OutgoingTransfer {
 /// processed them. Guarantees of that shape belong to a broker hop and are
 /// deliberately absent from the v0 core (`docs/GUARANTEES.md`).
 ///
-/// Dropping a `Delivery` is free: that is the fire-and-forget path.
+/// Dropping a `Delivery` observes no outcome and waits for nothing, which is
+/// the fire-and-forget path. It is not quite free: the receipt is handed to
+/// the connection's parked set — one uncontended lock and a push — so that
+/// [`crate::Runtime::drain`] has something to wait on
+/// (`docs/decisions/0009-drain.md` §4.2). A receipt the caller *does* await
+/// is never parked; whoever holds it is doing the waiting.
 pub struct Delivery {
-    stopped:
-        Pin<Box<dyn Future<Output = Result<Option<VarInt>, quinn::StoppedError>> + Send + Sync>>,
+    stopped: Option<Receipt>,
+    conn: ConnHandle,
 }
 
 impl Delivery {
@@ -299,14 +320,28 @@ impl Delivery {
     /// (`STOP_SENDING`) surfaces as the matching error; a connection lost after
     /// the FIN yields [`Error::Indeterminate`], because the payload may or may
     /// not have arrived (`docs/FAILURE_MODEL.md`).
-    pub async fn delivered(self) -> Result<(), Error> {
-        match self.stopped.await {
+    pub async fn delivered(mut self) -> Result<(), Error> {
+        let stopped = self.stopped.take().expect("receipt taken only here");
+        match stopped.await {
             Ok(None) => Ok(()),
             Ok(Some(code)) => Err(codes::stop_reason(code.into_inner()).into()),
             Err(quinn::StoppedError::ConnectionLost(_)) => Err(Error::Indeterminate),
             Err(quinn::StoppedError::ZeroRttRejected) => {
                 Err(Error::Transport("0-RTT data rejected by the peer".into()))
             }
+        }
+    }
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        if let Some(receipt) = self.stopped.take()
+            && self.conn.parked.park(receipt)
+        {
+            // The connection's parked set was full of receipts that had not
+            // settled, so the oldest was dropped unobserved: the next drain
+            // reports it as outstanding rather than assuming it landed.
+            self.conn.shared.drain.evict();
         }
     }
 }
@@ -588,7 +623,11 @@ impl IncomingRequest {
         // addresses nothing.
         let (header, trace) = data_header(None, &meta, self.meta.tracestate.clone());
         write_data_preamble(&mut send, &header).await?;
-        Ok(OutgoingTransfer::new(send, trace))
+        Ok(OutgoingTransfer::new(
+            send,
+            trace,
+            Arc::clone(&self.reply.conn),
+        ))
     }
 
     /// Refuses the exchange: a typed ERROR on the reply half, `STOP_SENDING` on
