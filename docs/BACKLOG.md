@@ -146,7 +146,7 @@ kind: code | size: 45 | status: ready | needs: []
 acceptance: `PeerSet::pick` stops flattening every closed peer into `Error::ConnectionLost`: the `quinn::ConnectionError` of the peer it rejected is mapped through the existing `conn_error` so an idle timeout, a peer-initiated close and a transport error are distinguishable through the pattern APIs; a test drives the idle-timeout case and asserts the specific error rather than `ConnectionLost`; the debt entry in IMPLEMENTATION.md §6 is removed rather than annotated. Found by the review pass in the debt list: an application deciding whether to redial cannot currently tell why it lost the peer.
 
 ### B-029 — Try more than the first resolved address
-kind: code | size: 45 | status: ready | needs: [B-025]
+kind: code | size: 45 | status: in_progress 2026-09-11T09:33Z | needs: [B-025]
 acceptance: `Exec::resolve` returns the resolved addresses in order and the dialling path tries them until one connection succeeds, so `weida://localhost:7443/x` reaches a server bound to `127.0.0.1` on a host where `localhost` also resolves to `::1`; the number tried is bounded (a hostile resolver is remote input) and the bound is named in INVARIANTS; the last error is reported when all fail; the IP-literal short-circuit of B-025 is untouched; the debt entry in IMPLEMENTATION.md §6 is removed rather than annotated.
 
 ### B-030 — ZMTP codec: sans-I/O, golden vectors, fuzz target
