@@ -389,9 +389,13 @@ crates/
 
 **This is the layout [decisions/0013](decisions/0013-competitor-libraries.md) §4.1 decided,
 and part of it is ahead of the tree.** `weida-runtime` exists — B-070 created it at
-`crates/runtime`, and `weida` is its first consumer. `weida-zmq` and `weida-nng` do not
-exist yet; the codecs and bridges still live under `crates/adapters/` and the two bridges
-are still named `weida-zmtp-bridge` and `weida-sp-bridge`, which B-095 moves and renames.
+`crates/runtime`, and `weida` is its first consumer. **`weida-zmq` exists** at
+`crates/zmq/weida-zmq`: its context, endpoints, messages, per-peer pipes, connection engine
+and ZMTP session are built (B-071..B-074), and the socket types, security and the devices are
+the slices after them, so the crate is a library under construction rather than a placeholder.
+`weida-nng` does not exist yet. The two codecs and the two bridges still live under
+`crates/adapters/`, the bridges still named `weida-zmtp-bridge` and `weida-sp-bridge`, and
+`cross-tests` is still `crates/adapters/cross-tests`; B-095 moves and renames them.
 Directories are named for the **protocol family** rather than for the role a crate plays in
 it, so that the directory list answers "does this repository ship a ZeroMQ?" —
 `crates/adapters/` would answer no, because an adapter is a hop at a weida edge
@@ -473,9 +477,11 @@ core
  ↑        ↖
 protocol   runtime
  ↑          ↑    ↖
-weida ──────┘     weida-zmq / weida-nng
+weida ──────┘     weida-zmq ──→ weida-zmtp   (the codec, which depends on nothing)
 
-weida-zmq-bridge  →  weida + weida-zmq
+weida-zmtp-bridge  →  weida + weida-zmtp     today
+weida-sp-bridge    →  weida + weida-sp       today
+weida-zmq-bridge   →  weida + weida-zmq      B-094, on the library
 ```
 
 `weida-core` MUST NOT depend on `weida-protocol` or `weida`. `weida-protocol` MUST NOT
