@@ -30,7 +30,7 @@ use weida::{
     ErrorCode, GuaranteeSet, IncomingRequest, Listener, Runtime, RuntimeConfig, ServerTls,
     TransferMeta,
 };
-use weida_zmtp::{Command, SocketType};
+use weida_zmtp::{Command, SocketType, Version, greeting};
 
 use crate::error::BridgeError;
 use crate::wire::{Incoming, Session, answer_command};
@@ -57,6 +57,28 @@ impl Dialling {
             Dialling::Sub => SocketType::Sub,
         }
     }
+}
+
+/// How a subscription is put on the wire toward a foreign publisher.
+///
+/// Two forms exist because the implementations disagree, and neither this
+/// bridge nor its user should have to find that out from a dead connection.
+/// 3.x has the `SUBSCRIBE`/`CANCEL` **commands** [zeromq §6] and that is the
+/// default; ZMTP 2.0's form is a one-frame **message** whose first octet is
+/// `1` or `0`, which is also how libzmq presents subscriptions to an XPUB
+/// application. The pure-Rust `zeromq` crate announces ZMTP 3.0 and reads only
+/// the legacy form — it answers any command but `READY` with "Unknown command
+/// received" and closes — so an interop run against it needs
+/// [`SubscriptionForm::LegacyMessage`], and saying so in configuration is
+/// better than guessing per peer or sending both and hoping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SubscriptionForm {
+    /// `SUBSCRIBE`/`CANCEL` commands: what 3.x specifies and libzmq speaks.
+    #[default]
+    Command,
+    /// A one-frame message, `1`/`0` then the prefix: ZMTP 2.0's form, which
+    /// some 3.x implementations send and read instead.
+    LegacyMessage,
 }
 
 /// How to bridge one weida endpoint onto one foreign ZeroMQ peer.
@@ -90,6 +112,8 @@ pub struct OutboundConfig {
     /// no weida counterpart (loss L7). So the bridge subscribes to what it was
     /// told to.
     pub subscribe: Vec<Vec<u8>>,
+    /// Which wire form those prefixes take: see [`SubscriptionForm`].
+    pub subscription_form: SubscriptionForm,
     /// `PING` interval toward the foreign peer, or `None` for no heartbeat.
     ///
     /// On by default here, unlike libzmq, and deliberately: TCP's own timeout
@@ -122,6 +146,7 @@ impl OutboundConfig {
             max_message_bytes: 8 * 1024 * 1024,
             reply_deadline: Duration::from_secs(10),
             subscribe: Vec::new(),
+            subscription_form: SubscriptionForm::default(),
             heartbeat: Some(Duration::from_secs(5)),
             liveness_multiple: 3,
             runtime: RuntimeConfig::default(),
@@ -210,17 +235,18 @@ impl Outbound {
         socket.set_nodelay(true)?;
         let mut session = Session::new(socket, self.config.max_message_bytes);
         let ours = self.config.dialling.socket_type();
-        let theirs = session.handshake(ours).await?;
+        let (theirs, version) = session.handshake(ours).await?;
         tracing::debug!(
             presenting = ours.as_str(),
             peer = theirs.as_str(),
+            version = %version,
             "ZMTP handshake complete"
         );
 
         match self.config.dialling {
-            Dialling::Dealer => serve_dealer(session, &self.listener, &self.config).await,
-            Dialling::Push => serve_push(session, &self.listener, &self.config).await,
-            Dialling::Sub => serve_sub(session, &self.listener, &self.config).await,
+            Dialling::Dealer => serve_dealer(session, &self.listener, &self.config, version).await,
+            Dialling::Push => serve_push(session, &self.listener, &self.config, version).await,
+            Dialling::Sub => serve_sub(session, &self.listener, &self.config, version).await,
         }
     }
 }
@@ -236,18 +262,37 @@ async fn serve_dealer(
     mut session: Session<TcpStream>,
     listener: &Listener,
     config: &OutboundConfig,
+    version: Version,
 ) -> Result<(), BridgeError> {
     let replier = listener.replier(&config.weida_path)?;
     let cap = usize::try_from(config.max_message_bytes).unwrap_or(usize::MAX);
     let mut pending: HashMap<u64, Pending> = HashMap::new();
     let mut next_id: u64 = 0;
-    let mut liveness = Liveness::new(config);
+    let mut liveness = Liveness::new(config, version);
 
     loop {
         tokio::select! {
             accepted = replier.accept() => {
                 let mut request = accepted?;
-                let body = request.body().read_capped(cap).await?;
+                // Same rule as the push loop: over the cap the payload is
+                // already refused with `STOP_SENDING(REJECTED)` and none of it
+                // buffered, and a refusal is per-stream. Here the requester
+                // gets the ERROR frame as well, because an exchange that will
+                // never be answered must say so rather than wait for the
+                // deadline.
+                let body = match request.body().read_capped(cap).await {
+                    Ok(body) => body,
+                    Err(weida::Error::LimitExceeded) => {
+                        tracing::warn!(
+                            cap,
+                            "refused a weida request past max_message_bytes; the ZeroMQ peer \
+                             cannot be handed a message it must receive atomically"
+                        );
+                        request.refuse(ErrorCode::Rejected).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 next_id += 1;
                 let id = next_id;
                 // The envelope 28/REQREP defines: every frame up to the
@@ -336,16 +381,35 @@ async fn serve_push(
     mut session: Session<TcpStream>,
     listener: &Listener,
     config: &OutboundConfig,
+    version: Version,
 ) -> Result<(), BridgeError> {
     let puller = listener.puller(&config.weida_path)?;
     let cap = usize::try_from(config.max_message_bytes).unwrap_or(usize::MAX);
-    let mut liveness = Liveness::new(config);
+    let mut liveness = Liveness::new(config, version);
 
     loop {
         tokio::select! {
             arrived = puller.recv() => {
                 let transfer = arrived?;
-                let body = transfer.collect(cap).await?;
+                // Over the cap, `collect` has already refused the rest of the
+                // payload with `STOP_SENDING(REJECTED)` and buffered none of
+                // it. That is a refusal of **this transfer**, and weida keeps
+                // refusals per stream — "a refusal is per-stream, a violation
+                // ends the connection" (`docs/PROTOCOL.md` §3) — so the loop
+                // continues rather than taking the ZeroMQ peer down for one
+                // oversized message it never saw.
+                let body = match transfer.collect(cap) .await {
+                    Ok(body) => body,
+                    Err(weida::Error::LimitExceeded) => {
+                        tracing::warn!(
+                            cap,
+                            "refused a weida payload past max_message_bytes; the ZeroMQ peer \
+                             cannot be handed a message it must receive atomically"
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 // Writing blocks when the peer's window is full, which stops
                 // this loop reading, which is weida's `Block` backpressure
                 // reaching a ZeroMQ high-water mark. Both sides block rather
@@ -379,12 +443,23 @@ async fn serve_sub(
     mut session: Session<TcpStream>,
     listener: &Listener,
     config: &OutboundConfig,
+    version: Version,
 ) -> Result<(), BridgeError> {
     let publisher = listener.publisher(&config.weida_path)?;
-    let mut liveness = Liveness::new(config);
+    let mut liveness = Liveness::new(config, version);
 
     for prefix in &config.subscribe {
-        session.write_command(&Command::Subscribe(prefix)).await?;
+        match config.subscription_form {
+            SubscriptionForm::Command => {
+                session.write_command(&Command::Subscribe(prefix)).await?;
+            }
+            SubscriptionForm::LegacyMessage => {
+                let mut frame = Vec::with_capacity(prefix.len() + 1);
+                frame.push(1);
+                frame.extend_from_slice(prefix);
+                session.write_message(&[&frame]).await?;
+            }
+        }
     }
 
     loop {
@@ -434,6 +509,16 @@ fn split_published(parts: Vec<Vec<u8>>) -> Result<(String, Vec<u8>), BridgeError
 
 /// The heartbeat of `docs/adapters/zmtp.md` §3: `PING` on a timer, and silence
 /// declared fatal after a multiple of it.
+///
+/// **`PING`/`PONG` are 3.1 commands**, so a peer that negotiated 3.0 gets no
+/// heartbeat at all, whatever the configuration says. That is not caution:
+/// sending a command a 3.0 peer does not know is a protocol violation, and the
+/// interop tests show what it costs — the pure-Rust `zeromq` crate answers any
+/// command but `READY` with "Unknown command received" and drops the
+/// connection. The configuration therefore asks for a heartbeat and the
+/// version decides whether it can be honoured; a run with it suppressed says
+/// so once, rather than leaving a silently different behaviour to be guessed
+/// from a packet capture.
 struct Liveness {
     interval: Option<Duration>,
     multiple: u32,
@@ -441,9 +526,21 @@ struct Liveness {
 }
 
 impl Liveness {
-    fn new(config: &OutboundConfig) -> Liveness {
+    fn new(config: &OutboundConfig, version: Version) -> Liveness {
+        let interval = match config.heartbeat {
+            Some(interval) if version >= greeting::VERSION => Some(interval),
+            Some(_) => {
+                tracing::info!(
+                    %version,
+                    "peer speaks ZMTP 3.0, which has no PING: the heartbeat is off for this \
+                     connection and liveness is the transport's business"
+                );
+                None
+            }
+            None => None,
+        };
         Liveness {
-            interval: config.heartbeat,
+            interval,
             multiple: config.liveness_multiple,
             last: Instant::now(),
         }

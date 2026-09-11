@@ -22,6 +22,14 @@ tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 # So a failing test can show why a bridged connection ended: the bridge logs
 # that through `tracing` and a test with `--nocapture` prints it.
 tracing-subscriber.workspace = true
+# The independent ZeroMQ implementation the interop tests and the bench run
+# against: `docs/adapters/zmtp.md` §10 item 3 is explicit that a peer built on
+# our own codec is faithful and *not* independent, so this is what settles it.
+zeromq.workspace = true
+criterion.workspace = true
+# `ZmqMessage` frames are `bytes::Bytes`, so a multipart message in a test has
+# to be built from them.
+bytes.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

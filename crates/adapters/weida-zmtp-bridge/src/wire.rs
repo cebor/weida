@@ -9,7 +9,9 @@
 use std::collections::VecDeque;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use weida_zmtp::{Command, FrameKind, Greeting, Mechanism, Metadata, SocketType, frame, greeting};
+use weida_zmtp::{
+    Command, FrameKind, Greeting, Mechanism, Metadata, SocketType, Version, frame, greeting,
+};
 
 use crate::error::BridgeError;
 
@@ -70,26 +72,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     }
 
     /// Drives the greeting and the NULL handshake, and returns the peer's
-    /// socket type.
+    /// socket type together with the **version to speak**.
     ///
     /// The order is the specification's: send the full greeting, read the
     /// peer's, then `READY` both ways. A peer that read a full greeting must
     /// send a full one, so nothing here waits for a partial one
     /// ([37/ZMTP](https://rfc.zeromq.org/spec/37/), "Version Negotiation").
     ///
+    /// **A 3.0 peer is accepted by downgrading**, which the specification
+    /// permits ("a peer MAY downgrade to a lower protocol version") and a
+    /// bridge needs: refusing 3.0 would refuse every implementation that has
+    /// not adopted 3.1, which is not a theoretical set — the pure-Rust
+    /// `zeromq` crate announces 3.0 and decodes `READY` and nothing else, so
+    /// a `PING` to it is "Unknown command received" and ends the connection.
+    /// The returned version is what the caller gates 3.1-only traffic on; it
+    /// is not advice.
+    ///
     /// Two refusals happen here, both with `ERROR` before the close, which is
     /// what the specification asks for: a socket type that may not talk to
     /// `ours`, and a `READY` that names no socket type at all. The second is a
     /// `SHOULD` in the specification and a MUST for a bridge — it has to know
     /// which pattern it is translating before it forwards anything.
-    pub(crate) async fn handshake(&mut self, ours: SocketType) -> Result<SocketType, BridgeError> {
+    pub(crate) async fn handshake(
+        &mut self,
+        ours: SocketType,
+    ) -> Result<(SocketType, Version), BridgeError> {
         self.io.write_all(&Greeting::null().encode()).await?;
         self.io.flush().await?;
 
         let mut theirs = [0u8; greeting::GREETING_LEN];
         self.read_exactly(&mut theirs).await?;
         let peer = Greeting::decode(&theirs)?;
-        peer.accept(Mechanism::NULL)?;
+        let version = peer.accept_downgrading(Mechanism::NULL)?;
 
         let ready = Command::Ready(Metadata::new().with_socket_type(ours));
         self.io.write_all(&ready.encode()?).await?;
@@ -136,7 +150,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             .await;
             return Err(BridgeError::SocketType { ours, theirs });
         }
-        Ok(theirs)
+        Ok((theirs, version))
     }
 
     /// Writes an `ERROR` command and gives up on the connection.

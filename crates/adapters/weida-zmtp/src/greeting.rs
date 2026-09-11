@@ -47,13 +47,37 @@ pub struct Version {
 }
 
 impl Version {
-    /// True if this codec can talk to a peer announcing this version.
+    /// True if this codec can talk to a peer announcing this version without
+    /// downgrading.
     ///
     /// "A peer MUST accept protocol versions greater or equal to 3.1", and a
-    /// peer that cannot downgrade to a lower one "MUST close the connection".
-    /// This codec implements no downgrade, so 3.1 is the floor.
+    /// peer "SHALL always use its own protocol… when talking to an equal or
+    /// higher protocol peer". 3.1 is therefore the floor for
+    /// [`Greeting::accept`]; [`Greeting::accept_downgrading`] is the other
+    /// branch of the same rule.
     pub const fn is_supported(self) -> bool {
         self.major > 3 || (self.major == 3 && self.minor >= 1)
+    }
+
+    /// True if this codec can talk to this peer by **downgrading** to it.
+    ///
+    /// "A peer MAY downgrade to a lower protocol version" — but only within
+    /// major version 3, because 2.0 and 1.0 have a different framing and a
+    /// different subscription form, and the specification's own downgrade
+    /// strategies detect them by abusing the padding field rather than by
+    /// reading the version at all.
+    pub const fn is_downgradable(self) -> bool {
+        self.major == 3
+    }
+
+    /// The version to speak with a peer that announced `self`: the lower of
+    /// the two, which is what a downgrade means on the wire.
+    pub const fn min(self, other: Version) -> Version {
+        if self.major < other.major || (self.major == other.major && self.minor < other.minor) {
+            self
+        } else {
+            other
+        }
     }
 }
 
@@ -244,6 +268,32 @@ impl Greeting {
             });
         }
         Ok(VERSION)
+    }
+
+    /// Checks a peer's greeting and returns the version to speak, **accepting
+    /// a lower 3.x peer by downgrading to it**.
+    ///
+    /// The other branch of the same sentence [`Self::accept`] quotes: a peer
+    /// "MAY downgrade to a lower protocol version". Between 3.0 and 3.1 the
+    /// difference a codec can see is `PING`/`PONG` and the `Resource` metadata
+    /// key, so the downgrade is a promise not to send them — which is what the
+    /// returned version is for, and why it is returned rather than assumed. A
+    /// caller that would rather refuse calls [`Self::accept`]; nothing here
+    /// decides that for it.
+    ///
+    /// Below major 3 there is no downgrade: 2.0 and 1.0 have different framing
+    /// and a different subscription form, and the specification detects them
+    /// by abusing the padding field rather than by the version octets.
+    pub fn accept_downgrading(&self, ours: Mechanism) -> Result<Version, GreetingError> {
+        if !self.version.is_supported() && !self.version.is_downgradable() {
+            return Err(GreetingError::UnsupportedVersion(self.version));
+        }
+        if self.mechanism != ours {
+            return Err(GreetingError::MechanismMismatch {
+                theirs: self.mechanism,
+            });
+        }
+        Ok(self.version.min(VERSION))
     }
 }
 

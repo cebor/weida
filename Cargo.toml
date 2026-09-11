@@ -43,3 +43,8 @@ ring = "0.17"
 rcgen = "0.14"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
+# The foreign peer for the ZMTP interop bench and tests: a pure-Rust ZeroMQ that
+# shares no code and no assumptions with our codec, which is the only thing that
+# turns "we agree with ourselves" into interoperability
+# (`docs/adapters/zmtp.md` §10 item 3). Tests and benches only.
+zeromq = "0.6"

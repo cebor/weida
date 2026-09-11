@@ -79,5 +79,5 @@ mod wire;
 
 pub use error::BridgeError;
 pub use inbound::{Inbound, InboundConfig, Presenting};
-pub use outbound::{Dialling, Outbound, OutboundConfig};
+pub use outbound::{Dialling, Outbound, OutboundConfig, SubscriptionForm};
 pub use subscriptions::MidSegment;

@@ -193,10 +193,11 @@ async fn serve_one(
     socket.set_nodelay(true)?;
     let mut session = Session::new(socket, config.max_message_bytes);
     let ours = config.presenting.socket_type();
-    let theirs = session.handshake(ours).await?;
+    let (theirs, version) = session.handshake(ours).await?;
     tracing::debug!(
         presenting = ours.as_str(),
         peer = theirs.as_str(),
+        version = %version,
         "ZMTP handshake complete"
     );
 
@@ -328,16 +329,28 @@ async fn serve_pub(
                             return Err(e);
                         }
                         // A refused subscription costs the peer that
-                        // subscription and nothing else: it is told with
-                        // ERROR and the connection stays up.
+                        // subscription; whether it costs the connection is the
+                        // peer's choice, since an incoming ERROR is fatal by
+                        // specification. This side keeps serving either way.
                         tracing::info!(error = %e, "subscription refused");
                     }
                 }
-                Incoming::Message(_) => {
-                    return Err(BridgeError::Protocol(
-                        "a SUB peer sent a message, which its socket type cannot do".into(),
-                    ));
-                }
+                Incoming::Message(message) => match legacy_subscription(&message.0) {
+                    Some((subscribe, prefix)) => {
+                        if let Err(e) = apply_change(&mut session, &mut subs, &subscriber, subscribe, prefix, config).await {
+                            if e.is_fatal() {
+                                return Err(e);
+                            }
+                            tracing::info!(error = %e, "subscription refused");
+                        }
+                    }
+                    None => {
+                        return Err(BridgeError::Protocol(
+                            "a SUB peer sent a message that is not a subscription, which its \
+                             socket type cannot do".into(),
+                        ));
+                    }
+                },
             },
             published = subscriber.recv() => match published {
                 Ok(transfer) => {
@@ -427,22 +440,65 @@ async fn apply_subscription(
     body: &[u8],
     config: &InboundConfig,
 ) -> Result<(), BridgeError> {
-    let command = Command::decode(body)?;
-    let change = match command {
-        Command::Subscribe(prefix) => match subs.subscribe(prefix, config.mid_segment) {
+    match Command::decode(body)? {
+        Command::Subscribe(prefix) => {
+            apply_change(session, subs, subscriber, true, prefix, config).await
+        }
+        Command::Cancel(prefix) => {
+            apply_change(session, subs, subscriber, false, prefix, config).await
+        }
+        other => answer(session, other).await,
+    }
+}
+
+/// The **legacy** subscription form: a one-frame message whose first octet is
+/// `1` to subscribe or `0` to cancel, the rest being the prefix.
+///
+/// This is ZMTP 2.0's wire form, and it is also how libzmq presents
+/// subscriptions to an XPUB application — "byte 1 (for subscriptions) or byte
+/// 0 (for unsubscriptions) followed by the subscription body" [zeromq §6].
+/// 3.x has the `SUBSCRIBE`/`CANCEL` commands instead, and this bridge sends
+/// those; it **accepts** both, because the pure-Rust `zeromq` crate announces
+/// 3.0 and sends the legacy form, and refusing it would mean refusing every
+/// real subscriber that crate has. The decode is unambiguous: a SUB or XSUB
+/// peer may not send application messages at all, so a message from one is a
+/// subscription or an error.
+fn legacy_subscription(parts: &[Vec<u8>]) -> Option<(bool, &[u8])> {
+    let [frame] = parts else { return None };
+    match frame.split_first() {
+        Some((1, prefix)) => Some((true, prefix)),
+        Some((0, prefix)) => Some((false, prefix)),
+        _ => None,
+    }
+}
+
+/// Subscribes or cancels one prefix, whichever form it arrived in.
+async fn apply_change(
+    session: &mut Session<TcpStream>,
+    subs: &mut Subscriptions,
+    subscriber: &weida::Subscriber,
+    subscribe: bool,
+    prefix: &[u8],
+    config: &InboundConfig,
+) -> Result<(), BridgeError> {
+    let change = if subscribe {
+        match subs.subscribe(prefix, config.mid_segment) {
             Ok(change) => change,
             Err(e) => {
                 // The peer is told, because a silently ignored subscription is
                 // a subscriber that waits forever for messages nobody will
-                // send.
+                // send. It may well treat the ERROR as fatal and close —
+                // "the peer SHALL treat an incoming ERROR command as fatal" —
+                // which is the protocol's own price for having no per-
+                // subscription error channel (`docs/adapters/zmtp.md` §9.3).
                 session
                     .write_command(&Command::Error(&sanitize(&e.to_string())))
                     .await?;
                 return Err(e);
             }
-        },
-        Command::Cancel(prefix) => subs.cancel(prefix, config.mid_segment),
-        other => return answer(session, other).await,
+        }
+    } else {
+        subs.cancel(prefix, config.mid_segment)
     };
     match change {
         Change::Subscribe(filter) => subscriber.subscribe(&filter).await?,
