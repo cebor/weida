@@ -31,16 +31,23 @@
 //!   specifies, bounded by `ZMQ_SNDHWM`/`ZMQ_RCVHWM` in messages, with
 //!   [`MuteAction`] carrying `zmq_socket(3)`'s "Action in mute state" column
 //!   so that no socket type re-decides it.
+//! - [`Engine`] and [`SocketOptions`] — one socket's binds, connects and
+//!   reconnects, with `ZMQ_RECONNECT_IVL`/`_IVL_MAX` backoff,
+//!   `ZMQ_HANDSHAKE_IVL`, `ZMQ_CONNECT_TIMEOUT`, `ZMQ_IMMEDIATE`,
+//!   `ZMQ_BACKLOG` and `ZMQ_LAST_ENDPOINT`, handing each established
+//!   connection to a [`Session`].
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
 //!
 //! The socket types — `ReqSocket`, `RepSocket`, `DealerSocket`,
 //! `RouterSocket`, `PubSocket`, `SubSocket`, `XPubSocket`, `XSubSocket`,
 //! `PushSocket`, `PullSocket`, `PairSocket` — are the following slices, as
-//! are the connection engine with its reconnect, security and authorization,
-//! and the option surface [0013 §5.3]. They are named here so that a reader
-//! knows what this crate is for and what it does not do yet; nothing stands
-//! in for them.
+//! are the ZMTP session that fills [`Session`], security and authorization,
+//! and the rest of the option surface [0013 §5.3]. They are named here so
+//! that a reader knows what this crate is for and what it does not do yet;
+//! nothing stands in for them, and in particular there is no default
+//! `Session`: a socket that handed its peers to a no-op would be a ZeroMQ
+//! implementation that speaks nothing.
 //!
 //! # Rules this crate keeps
 //!
@@ -74,17 +81,28 @@
 
 pub mod context;
 pub mod endpoint;
+pub mod engine;
 pub mod error;
 pub mod message;
+pub mod options;
 pub mod pipe;
+pub mod transport;
 
 pub use context::{
     Context, ContextConfig, DEFAULT_CLOSE_BUDGET, DEFAULT_MAX_SOCKETS, InprocDial, SocketId,
     SocketSlot, Terminated,
 };
 pub use endpoint::{Endpoint, MAX_INPROC_NAME_BYTES, MAX_IPC_ENDPOINT_BYTES, TcpHost};
+pub use engine::{
+    Connection, Discarded, Engine, HandshakeGate, Peer, PeerId, Role, Session, SessionFuture,
+};
 pub use error::{Cause, Error, Result};
 pub use message::{DEFAULT_MAX_MESSAGE_SIZE, Decoded, Message, Multipart};
+pub use options::{
+    DEFAULT_BACKLOG, DEFAULT_HANDSHAKE_IVL, DEFAULT_MAX_RESOLVED_ADDRESSES, DEFAULT_RECONNECT_IVL,
+    SocketOptions,
+};
 pub use pipe::{
     DEFAULT_RCVHWM, DEFAULT_SNDHWM, MuteAction, Pipe, PipeConfig, Queue, QueueConfig, Sent,
 };
+pub use transport::Stream;
