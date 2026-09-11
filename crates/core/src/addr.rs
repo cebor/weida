@@ -173,18 +173,24 @@ pub enum Address {
     Quic(EndpointAddr),
     /// `weida+inproc://bus/path` — in process, no socket and no identity.
     Inproc(InprocAddr),
+    /// `weida+unix://<percent-encoded>/path` — `AF_UNIX`, the kernel proves
+    /// the peer.
+    Unix(UnixAddr),
 }
 
 impl Address {
-    /// Parses an address of either transport, by scheme.
+    /// Parses an address of any transport, by scheme.
     pub fn parse(input: &str) -> Result<Address, Error> {
-        match input
+        if let Some(rest) = input
             .strip_prefix(SCHEME_INPROC)
             .and_then(|r| r.strip_prefix("://"))
         {
-            Some(rest) => parse_inproc(input, rest).map(Address::Inproc),
-            None => EndpointAddr::parse(input).map(Address::Quic),
+            return parse_inproc(input, rest).map(Address::Inproc);
         }
+        if input.starts_with(SCHEME_UNIX) {
+            return UnixAddr::parse(input).map(Address::Unix);
+        }
+        EndpointAddr::parse(input).map(Address::Quic)
     }
 
     /// The endpoint path, whatever the transport.
@@ -192,6 +198,7 @@ impl Address {
         match self {
             Address::Quic(a) => &a.path,
             Address::Inproc(a) => &a.path,
+            Address::Unix(a) => &a.path,
         }
     }
 }
@@ -221,6 +228,116 @@ fn parse_inproc(input: &str, rest: &str) -> Result<InprocAddr, Error> {
         bus: bus.to_owned(),
         path: path.to_owned(),
     })
+}
+
+/// URL scheme of the `AF_UNIX` transport.
+pub const SCHEME_UNIX: &str = "weida+unix";
+
+/// Longest socket path this platform accepts, in bytes, after decoding.
+///
+/// `sun_path` is `char[108]` on Linux including its NUL — 107 usable — and
+/// exactly 104 characters on macOS, where an App Group container path plus a
+/// team-ID-prefixed group name consumes most of it, so the budget is checked
+/// against the *expanded* path
+/// ([decisions/0010](../../../docs/decisions/0010-local-transport.md) §4.5,
+/// `docs/research/ipc.md` §1.1, §2.1, §6.1).
+pub const MAX_SOCKET_PATH_BYTES: usize = if cfg!(target_os = "macos") { 104 } else { 107 };
+
+/// A parsed `weida+unix://<percent-encoded-socket-path>/<path>` address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnixAddr {
+    /// Filesystem path of the socket, **decoded**.
+    pub socket: String,
+    /// Opaque endpoint identifier, starting with `/`.
+    pub path: String,
+}
+
+impl UnixAddr {
+    /// Parses `weida+unix://<percent-encoded-socket-path>/<path>`.
+    ///
+    /// The socket path is percent-encoded because it contains the same
+    /// separator the endpoint path uses, and it is validated against this
+    /// platform's `sun_path` budget **after** decoding [0010 §4.8]. The
+    /// `sha256:…@` userinfo form is refused: there is no key to pin on a
+    /// local transport, and an address that looks like it authenticates but
+    /// does not is worse than one that plainly does not.
+    pub fn parse(input: &str) -> Result<UnixAddr, Error> {
+        let invalid = |m: &str| Error::InvalidAddress(format!("{m}: {input:?}"));
+        let rest = input
+            .strip_prefix(SCHEME_UNIX)
+            .and_then(|r| r.strip_prefix("://"))
+            .ok_or_else(|| invalid("expected scheme weida+unix://"))?;
+
+        let (authority, path) = match rest.find('/') {
+            Some(i) => rest.split_at(i),
+            None => return Err(invalid("missing endpoint path")),
+        };
+        if authority.contains('@') {
+            return Err(invalid("a local address carries no fingerprint"));
+        }
+        let socket = percent_decode(authority).ok_or_else(|| invalid("invalid percent escape"))?;
+        if socket.is_empty() {
+            return Err(invalid("empty socket path"));
+        }
+        if socket.len() > MAX_SOCKET_PATH_BYTES {
+            return Err(invalid(&format!(
+                "socket path exceeds this platform's {MAX_SOCKET_PATH_BYTES}-byte sun_path budget after decoding"
+            )));
+        }
+        // A NUL would truncate `sun_path` where the kernel reads it, and the
+        // abstract namespace — a leading NUL — is deliberately not this
+        // transport's [0010 §4.5].
+        if socket.bytes().any(|b| b == 0) {
+            return Err(invalid("a socket path contains no NUL"));
+        }
+        validate_endpoint_path(path).map_err(|_| invalid("invalid endpoint path"))?;
+
+        Ok(UnixAddr {
+            socket,
+            path: path.to_owned(),
+        })
+    }
+}
+
+impl fmt::Display for UnixAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{SCHEME_UNIX}://")?;
+        for byte in self.socket.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    f.write_str(std::str::from_utf8(&[byte]).expect("ascii"))?;
+                }
+                other => write!(f, "%{other:02X}")?,
+            }
+        }
+        f.write_str(&self.path)
+    }
+}
+
+/// Decodes percent escapes, returning `None` on a malformed one.
+///
+/// Deliberately small: what has to round-trip here is a filesystem path, and
+/// the encoding exists only so that the socket path's separators cannot be
+/// mistaken for the endpoint path's [0010 §4.8].
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hex = bytes.get(i + 1..i + 3)?;
+                let hex = std::str::from_utf8(hex).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 #[cfg(test)]
@@ -327,6 +444,48 @@ mod tests {
         ] {
             let a = EndpointAddr::parse(s).unwrap();
             assert_eq!(EndpointAddr::parse(&a.to_string()).unwrap(), a);
+        }
+    }
+
+    #[test]
+    fn a_unix_socket_path_round_trips_through_percent_encoding() {
+        let a = UnixAddr::parse("weida+unix://%2Frun%2Fweida.sock/jobs").expect("parse");
+        assert_eq!(a.socket, "/run/weida.sock");
+        assert_eq!(a.path, "/jobs");
+        // The encoding exists so that the socket path's separators cannot be
+        // read as the endpoint path's, so it must survive a round trip.
+        assert_eq!(UnixAddr::parse(&a.to_string()).expect("reparse"), a);
+    }
+
+    #[test]
+    fn a_unix_address_is_validated_after_decoding() {
+        // One byte past this platform's `sun_path` budget, written encoded:
+        // the check has to happen on the decoded form or it would pass.
+        let long: String = std::iter::repeat_n("%61", MAX_SOCKET_PATH_BYTES + 1).collect();
+        let err = UnixAddr::parse(&format!("weida+unix://{long}/jobs")).unwrap_err();
+        assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
+
+        let ok: String = std::iter::repeat_n("%61", MAX_SOCKET_PATH_BYTES).collect();
+        assert!(UnixAddr::parse(&format!("weida+unix://{ok}/jobs")).is_ok());
+    }
+
+    #[test]
+    fn a_unix_address_refuses_what_would_look_authenticated() {
+        for case in [
+            // No key can be pinned on a local transport [0010 §4.8].
+            "weida+unix://sha256:0000000000000000000000000000000000000000000000000000000000000000@%2Ftmp%2Fs/jobs",
+            // A NUL would truncate `sun_path`, and the abstract namespace is
+            // deliberately not this transport.
+            "weida+unix://%00abstract/jobs",
+            // Malformed escape, empty socket path, missing endpoint path.
+            "weida+unix://%2/jobs",
+            "weida+unix:///jobs",
+            "weida+unix://%2Ftmp%2Fs",
+        ] {
+            assert!(
+                UnixAddr::parse(case).is_err(),
+                "expected rejection of {case:?}"
+            );
         }
     }
 }

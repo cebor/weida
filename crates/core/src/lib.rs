@@ -17,10 +17,10 @@ pub mod limits;
 pub mod trace;
 
 pub use addr::{
-    Address, EndpointAddr, InprocAddr, MAX_BUS_BYTES, MAX_PATH_BYTES, SCHEME, SCHEME_INPROC,
-    validate_endpoint_path,
+    Address, EndpointAddr, InprocAddr, MAX_BUS_BYTES, MAX_PATH_BYTES, MAX_SOCKET_PATH_BYTES,
+    SCHEME, SCHEME_INPROC, SCHEME_UNIX, UnixAddr, validate_endpoint_path,
 };
 pub use error::{Error, ErrorCode, LossCause, Result, StopReason};
-pub use identity::Fingerprint;
+pub use identity::{Fingerprint, LocalPrincipal, PeerIdentity};
 pub use limits::Limits;
 pub use trace::{TraceContext, TraceError};

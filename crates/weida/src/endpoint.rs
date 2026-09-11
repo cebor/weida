@@ -403,8 +403,18 @@ impl Subscriber {
     /// connection and claiming the same path therefore collide with
     /// [`Error::AlreadyRegistered`]; fanning one subscription out to several
     /// in-process consumers is the application's business, not the transport's.
+    ///
+    /// A transport that gives the accepting side no way to open a stream back
+    /// refuses here with [`Error::Unsupported`], rather than accepting a
+    /// subscription that could never deliver: on `AF_UNIX` the reverse
+    /// connections that would carry fan-out are
+    /// [0012](../../../docs/decisions/0012-local-connection-grouping.md) §4.4
+    /// and do not exist yet.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
         let (conn, path) = self.state.peer.dial(url).await?;
+        if !conn.conn.carries_reverse_streams() {
+            return Err(Error::Unsupported);
+        }
         conn.namespace
             .register(&path, Route::Transfer(self.state.queue_tx.clone()))?;
 

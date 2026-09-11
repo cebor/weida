@@ -190,6 +190,10 @@ pub enum Transport {
     /// In process: `weida+inproc://<bus>/<path>`, no socket, no TLS
     /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)).
     Inproc,
+    /// `AF_UNIX`: `weida+unix://<percent-encoded>/<path>`, no TLS, the peer
+    /// proved by the kernel [0010 §4.4, §4.5].
+    #[cfg(unix)]
+    Unix,
 }
 
 /// A server reachable over either transport, so that one test body can be
@@ -205,6 +209,8 @@ pub struct Harness {
     pub listener: Listener,
     quic: Option<(Binding, Certs)>,
     local: Option<weida::LocalBinding>,
+    #[cfg(unix)]
+    unix: Option<(weida::UnixBinding, std::path::PathBuf)>,
 }
 
 impl Harness {
@@ -231,6 +237,8 @@ impl Harness {
                     listener,
                     quic: Some((binding, certs)),
                     local: None,
+                    #[cfg(unix)]
+                    unix: None,
                 }
             }
             Transport::Inproc => {
@@ -247,6 +255,32 @@ impl Harness {
                     listener,
                     quic: None,
                     local: Some(binding),
+                    #[cfg(unix)]
+                    unix: None,
+                }
+            }
+            #[cfg(unix)]
+            Transport::Unix => {
+                static SOCKET: AtomicU32 = AtomicU32::new(0);
+                // A short path in a private directory: `sun_path` is 107
+                // bytes on Linux and 104 on macOS, and the directory is what
+                // closes the unlink-then-bind race [0010 §4.5].
+                let dir = std::env::temp_dir().join(format!("weida-{}", std::process::id()));
+                std::fs::create_dir_all(&dir).expect("socket directory");
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                        .expect("private socket directory");
+                }
+                let path = dir.join(format!("s{}", SOCKET.fetch_add(1, Ordering::Relaxed)));
+                let binding = listener.bind_unix(&path).expect("bind unix");
+                Harness {
+                    transport,
+                    runtime,
+                    listener,
+                    quic: None,
+                    local: None,
+                    unix: Some((binding, path)),
                 }
             }
         }
@@ -254,6 +288,21 @@ impl Harness {
 
     /// An address for `path` on this server, in the scheme of its transport.
     pub fn url(&self, path: &str) -> String {
+        #[cfg(unix)]
+        if let Some((_, socket)) = &self.unix {
+            let encoded: String = socket
+                .to_str()
+                .expect("utf-8 socket path")
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                        (b as char).to_string()
+                    }
+                    other => format!("%{other:02X}"),
+                })
+                .collect();
+            return format!("weida+unix://{encoded}{path}");
+        }
         match (&self.quic, &self.local) {
             (Some((binding, _)), _) => {
                 format!("weida://127.0.0.1:{}{}", binding.local_addr().port(), path)
@@ -261,6 +310,12 @@ impl Harness {
             (_, Some(binding)) => format!("weida+inproc://{}{}", binding.bus(), path),
             _ => unreachable!("a harness always has one binding"),
         }
+    }
+
+    /// The socket path, on the `AF_UNIX` harness.
+    #[cfg(unix)]
+    pub fn socket_path(&self) -> Option<&std::path::Path> {
+        self.unix.as_ref().map(|(_, path)| path.as_path())
     }
 
     /// Trust for a dialling endpoint. On a local address there is no key to

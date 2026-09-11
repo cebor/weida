@@ -81,9 +81,17 @@ async fn push_pull_delivery(h: &Harness) {
     let delivery = transfer.finish().expect("finish");
 
     let received = within(puller.recv()).await.expect("recv");
-    // Nobody is proved in process, and an anonymous QUIC client presents no
-    // key either, so both transports report the same thing here [0010 §4.4].
-    assert_eq!(received.meta().peer, None);
+    // What a peer presents is the transport's business and nothing else's:
+    // an anonymous QUIC client and an in-process peer prove nothing, while
+    // the kernel proves a principal on a socket [0010 §4.4].
+    match h.transport {
+        #[cfg(unix)]
+        Transport::Unix => {
+            let peer = received.meta().peer.expect("the kernel proved one");
+            assert!(peer.local().is_some() && peer.key().is_none());
+        }
+        _ => assert_eq!(received.meta().peer, None),
+    }
     let body = within(received.collect(64 * 1024)).await.expect("collect");
     assert_eq!(body, b"work item".to_vec());
     within(delivery.delivered()).await.expect("delivered");
@@ -144,6 +152,184 @@ async fn req_rep_over_quic() {
 #[tokio::test]
 async fn req_rep_over_inproc() {
     req_rep_echo(&Harness::start(Transport::Inproc).await).await;
+}
+
+/// `AF_UNIX` runs the same Req/Rep body. Ignored, with the reason, where the
+/// suite cannot create a socket at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn req_rep_over_unix() {
+    req_rep_echo(&Harness::start(Transport::Unix).await).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn push_pull_over_unix() {
+    push_pull_delivery(&Harness::start(Transport::Unix).await).await;
+}
+
+/// Claim: the peer a local connection presents is the one the **kernel**
+/// attributed to it, and it is a principal rather than a key
+/// ([decisions/0010](../../docs/decisions/0010-local-transport.md) §4.4).
+///
+/// The uid is this process's own, because both ends are this test. What the
+/// assertion is really for is the *shape*: `IncomingMeta::peer` carries a
+/// local principal on a socket transport, a key on QUIC and nothing in
+/// process, and a PID is reported where the platform has one and never
+/// authorized on.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_unix_peer_presents_the_principal_the_kernel_proved() {
+    let h = Harness::start(Transport::Unix).await;
+    let puller = h.listener.puller("/jobs").expect("puller");
+    let client = h.client();
+    let pusher = client.pusher(h.trust());
+    within(pusher.connect(&h.url("/jobs")))
+        .await
+        .expect("connect");
+    within(pusher.send(b"work item")).await.expect("send");
+
+    let transfer = within(puller.recv()).await.expect("recv");
+    let peer = transfer.meta().peer.expect("a local peer is proved");
+    let principal = peer.local().expect("a principal, not a key");
+    assert!(peer.key().is_none(), "a local peer presents no key");
+    assert_eq!(
+        principal.uid,
+        owner_uid(h.socket_path().expect("a unix harness")),
+        "the kernel names the process on the other end"
+    );
+    if cfg!(target_os = "linux") {
+        assert!(
+            principal.pid.is_some(),
+            "Linux reports a PID; it is an observation, never authorized on"
+        );
+    }
+    within(transfer.collect(64)).await.expect("collect");
+    client.shutdown().await;
+    h.shutdown().await;
+}
+
+/// The uid that owns a path: this process bound the socket, so it is also
+/// the uid the kernel must be reporting for the peer.
+#[cfg(unix)]
+fn owner_uid(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).expect("the bound socket").uid()
+}
+
+/// Claim: a socket file left behind by a crash does not stop the next bind.
+///
+/// Unlink-then-bind is the only answer `AF_UNIX` has — closing a socket does
+/// not remove its node — and the race it opens is closed by the directory's
+/// ownership and permissions, which is why the doc comment on `bind_unix`
+/// makes that the caller's obligation
+/// (`docs/research/ipc.md` §1.2, [0010 §4.5]).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stale_socket_file_does_not_stop_the_next_bind() {
+    let h = Harness::start(Transport::Unix).await;
+    let path = h.socket_path().expect("a unix harness").to_path_buf();
+    assert!(path.exists(), "the socket file is there while bound");
+
+    // A crash leaves the node behind: drop the *binding* without removing it,
+    // by leaking the harness's runtime and recreating the file.
+    let runtime = weida::Runtime::new(weida::RuntimeConfig::default()).expect("runtime");
+    let listener = runtime.listener();
+    h.shutdown().await;
+    std::os::unix::net::UnixListener::bind(&path).expect("leave a stale node");
+    assert!(path.exists(), "a stale socket file is what a crash leaves");
+
+    let second = listener.bind_unix(&path).expect("bind over the stale node");
+    assert_eq!(second.path(), path);
+
+    // And the mode is the one set explicitly, not whatever umask allowed.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&path)
+        .expect("bound socket")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "the socket mode is set, not inherited");
+    runtime.shutdown().await;
+}
+
+/// Claim: a transfer connection that does not name a live peer is dispatched
+/// nowhere.
+///
+/// The group token is what binds a peer's connections together
+/// ([decisions/0012](../../docs/decisions/0012-local-connection-grouping.md)
+/// §4.2); a connection carrying an unknown one is refused before any frame
+/// on it is read, which is what stops a second process on the same machine
+/// from injecting transfers into somebody else's peer.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_transfer_connection_with_an_unknown_token_is_refused() {
+    use tokio::io::AsyncWriteExt;
+
+    let h = Harness::start(Transport::Unix).await;
+    let puller = h.listener.puller("/jobs").expect("puller");
+    let socket = h.socket_path().expect("a unix harness").to_path_buf();
+
+    // A transfer connection whose token names no peer: kind byte plus 16
+    // zero bytes, then a DATA frame for a path that exists.
+    let mut raw = tokio::net::UnixStream::connect(&socket)
+        .await
+        .expect("connect");
+    let mut preamble = vec![0x02u8];
+    preamble.extend_from_slice(&[0u8; 16]);
+    raw.write_all(&preamble).await.expect("write preamble");
+    let header = weida_protocol::DataHeader::addressed("/jobs").encode();
+    raw.write_all(&weida_protocol::encode_frame(
+        weida_protocol::FrameKind::Data,
+        &header,
+    ))
+    .await
+    .expect("write frame");
+    raw.write_all(b"injected").await.expect("write payload");
+    drop(raw);
+
+    // Nothing reaches the endpoint. A real transfer does, which is what
+    // makes the negative observable rather than a race with the test's own
+    // impatience.
+    let client = h.client();
+    let pusher = client.pusher(h.trust());
+    within(pusher.connect(&h.url("/jobs")))
+        .await
+        .expect("connect");
+    within(pusher.send(b"legitimate")).await.expect("send");
+
+    let transfer = within(puller.recv()).await.expect("recv");
+    assert_eq!(
+        within(transfer.collect(64)).await.expect("collect"),
+        b"legitimate".to_vec(),
+        "the refused connection must not have been dispatched"
+    );
+    client.shutdown().await;
+    h.shutdown().await;
+}
+
+/// Claim: a subscription a socket transport could never deliver is refused
+/// at `connect`, not accepted and then starved.
+///
+/// Fan-out needs a stream from the accepting side toward the peer, which an
+/// accepted socket does not have; the reverse connections that would carry
+/// it are [0012 §4.4] and are not built. `Unsupported` at the API is the
+/// honest answer, and it is why the Pub/Sub body above runs over QUIC and
+/// inproc only.
+#[cfg(unix)]
+#[tokio::test]
+async fn pub_sub_over_unix_is_refused_rather_than_starved() {
+    let h = Harness::start(Transport::Unix).await;
+    let _publisher = h.listener.publisher("/md").expect("publisher");
+    let client = h.client();
+    let subscriber = client.subscriber(h.trust());
+    let err = within(subscriber.connect(&h.url("/md")))
+        .await
+        .expect_err("a socket transport cannot fan out");
+    assert!(matches!(err, weida::Error::Unsupported), "{err:?}");
+
+    client.shutdown().await;
+    h.shutdown().await;
 }
 
 #[tokio::test]

@@ -217,6 +217,11 @@ impl Peer {
                 let conn = self.runtime.connect_local(&addr.bus).await?;
                 (conn, addr.path)
             }
+            #[cfg(unix)]
+            Address::Unix(addr) => {
+                let conn = self.runtime.connect_unix(&addr.socket).await?;
+                (conn, addr.path)
+            }
         };
         self.peers.add(ConnHandle::clone(&conn), &path);
         Ok((conn, Arc::from(path.as_str())))
