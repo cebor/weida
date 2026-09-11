@@ -52,7 +52,7 @@ acceptance: a probe in `crates/weida/tests/streams.rs` opening N transfers, fini
 note: queueing the reverse FINs back to back does not reverse the arrival order — quinn transmits pending streams in its own order — so the probe carries a second mode that awaits each FIN's transport receipt, which does reverse it and reaches the N − 1 bound. Run at N = 16 for that mode; N = 16 and 256 for the batched one.
 
 ### B-011 — Measure: second handshake per peer
-kind: measure | size: 45 | status: ready | needs: []
+kind: measure | size: 45 | status: in_progress 2026-09-11T03:52Z | needs: []
 acceptance: a bench measuring `connect` latency and the runtime's RSS delta for 1 versus 2 versus 64 pooled connections to one server on loopback (mTLS off, pinned trust); numbers recorded.
 
 ### B-012 — Measure: connections per dialled path
