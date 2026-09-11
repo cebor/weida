@@ -41,6 +41,7 @@
 
 mod config;
 mod conn;
+mod dedup;
 mod endpoint;
 mod listener;
 mod ordering;

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use quinn::VarInt;
@@ -173,6 +173,7 @@ impl Listener {
             limits,
             exec.clone(),
             self.inner.runtime.config.guarantees,
+            self.inner.runtime.duplicates(),
         ));
 
         tracing::info!(%local_addr, "quic binding listening");
@@ -273,6 +274,7 @@ async fn accept_connections(
     limits: Limits,
     exec: Exec,
     guarantees: GuaranteeSet,
+    duplicates: Arc<AtomicU64>,
 ) {
     let live = Arc::new(AtomicUsize::new(0));
     while let Some(incoming) = endpoint.accept().await {
@@ -299,6 +301,7 @@ async fn accept_connections(
         let live = Arc::clone(&live);
         live.fetch_add(1, Ordering::Relaxed);
         let exec_for_conn = exec.clone();
+        let duplicates = Arc::clone(&duplicates);
         exec.spawn(async move {
             match incoming.await {
                 Ok(conn) => {
@@ -314,6 +317,7 @@ async fn accept_connections(
                         Some(Arc::clone(&subs)),
                         exec_for_conn,
                         guarantees,
+                        duplicates,
                     );
                     let reason = conn.closed().await;
                     // A peer that goes away takes its subscriptions with it;

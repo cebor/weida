@@ -134,7 +134,12 @@ impl GapDetector {
                     expected: *next,
                     seen: sequence,
                 });
-                *next = (*next).max(sequence).wrapping_add(1);
+                // A number below the expected one carries no information
+                // about what is still to come: advancing on it would consume
+                // a number that has not arrived and silence its gap.
+                if sequence >= *next {
+                    *next = sequence.wrapping_add(1);
+                }
                 gap
             }
             None => {
@@ -238,6 +243,9 @@ mod tests {
         // 1 arrives late: detect mode delivers it and reports no new gap,
         // because nothing further is missing.
         assert_eq!(detector.observe("a", 1), None);
+        // And it did not consume 3: a late arrival moves the position
+        // nowhere, so a later hole is still reported.
+        assert_eq!(detector.observe("a", 4).expect("gap").missed(), 1);
     }
 
     #[test]

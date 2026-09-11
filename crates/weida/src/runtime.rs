@@ -10,6 +10,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use quinn::VarInt;
@@ -160,6 +161,8 @@ pub(crate) struct RuntimeInner {
     _owned: Option<OwnedRuntime>,
     /// Every QUIC endpoint this runtime owns, for shutdown.
     endpoints: Mutex<Vec<quinn::Endpoint>>,
+    /// Duplicates suppressed by any connection this runtime owns.
+    pub(crate) duplicates: Arc<AtomicU64>,
 }
 
 impl RuntimeInner {
@@ -182,6 +185,11 @@ impl RuntimeInner {
         self.pool
             .connect(&self.config, &self.exec, host, port, tls, expected)
             .await
+    }
+
+    /// The shared suppression counter, handed to every connection.
+    pub(crate) fn duplicates(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.duplicates)
     }
 }
 
@@ -249,15 +257,30 @@ impl Runtime {
     }
 
     fn from_parts(config: RuntimeConfig, exec: Exec, owned: Option<OwnedRuntime>) -> Runtime {
+        // One counter per runtime: the pool hands it to the connections it
+        // dials, the listener to the connections it accepts.
+        let duplicates = Arc::new(AtomicU64::new(0));
         Runtime {
             inner: Arc::new(RuntimeInner {
                 config,
-                pool: ClientPool::new(),
+                pool: ClientPool::new(Arc::clone(&duplicates)),
                 exec,
                 _owned: owned,
                 endpoints: Mutex::new(Vec::new()),
+                duplicates,
             }),
         }
+    }
+
+    /// Duplicates suppressed by every connection this runtime owns.
+    ///
+    /// The counterpart of `Publisher::dropped` on the receiving side: a
+    /// message the peer sent twice inside the negotiated
+    /// `Deduplication::Bounded` window was read, thrown away and counted
+    /// here, and the application never saw it. Zero unless deduplication is
+    /// negotiated, because nothing is suppressed without it.
+    pub fn suppressed_duplicates(&self) -> u64 {
+        self.inner.duplicates.load(Ordering::Relaxed)
     }
 
     /// Creates an empty messaging namespace.

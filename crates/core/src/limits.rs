@@ -50,6 +50,12 @@ pub struct Limits {
     /// both `::1` and `127.0.0.1` — and a ceiling is necessary because a
     /// resolver answer is remote input.
     pub max_resolved_addresses: usize,
+    /// Identities a receiver remembers per connection for `Bounded`
+    /// deduplication. The window bounds how long an identity is kept, not
+    /// how many arrive within it, so the count needs its own ceiling; at the
+    /// cap the oldest entry is evicted, which costs suppression rather than
+    /// memory.
+    pub max_dedup_entries: usize,
 }
 
 impl Limits {
@@ -78,6 +84,7 @@ impl Default for Limits {
             subscriber_buffer_bytes: 8 * 1024 * 1024,
             max_sequence_scopes: 1024,
             max_resolved_addresses: 8,
+            max_dedup_entries: 4096,
         }
     }
 }
@@ -101,6 +108,7 @@ mod tests {
         assert_eq!(l.subscriber_buffer_bytes, 8 << 20);
         assert_eq!(l.max_sequence_scopes, 1024);
         assert_eq!(l.max_resolved_addresses, 8);
+        assert_eq!(l.max_dedup_entries, 4096);
     }
 
     #[test]

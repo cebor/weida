@@ -10,6 +10,7 @@
 //! takes no lock (master doc §49).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use quinn::VarInt;
@@ -21,6 +22,7 @@ use weida_protocol::{
     SubscriptionHeader, codes, encode_frame, negotiate, parse_preamble,
 };
 
+use crate::dedup::DedupWindow;
 use crate::listener::{Namespace, Route};
 use crate::ordering::{GapDetector, Sequencer};
 use crate::pubsub::SubRegistry;
@@ -70,6 +72,11 @@ pub(crate) struct ConnCtx {
     pub sequencer: Sequencer,
     /// Reports gaps in inbound sequences; inert unless ordering is on.
     pub gaps: GapDetector,
+    /// Suppresses repeated identities; inert unless deduplication is on.
+    pub dedup: DedupWindow,
+    /// Duplicates this runtime suppressed, shared with every connection it
+    /// owns and surfaced by `Runtime::suppressed_duplicates`.
+    pub duplicates: Arc<AtomicU64>,
     agreed: watch::Receiver<Option<Agreed>>,
 }
 
@@ -84,6 +91,7 @@ impl ConnCtx {
         subs: Option<Arc<SubRegistry>>,
         exec: Exec,
         guarantees: GuaranteeSet,
+        duplicates: Arc<AtomicU64>,
     ) -> ConnHandle {
         let (ctl_tx, ctl_rx) = mpsc::channel(CTL_QUEUE);
         let (agreed_tx, agreed_rx) = watch::channel(None);
@@ -100,6 +108,12 @@ impl ConnCtx {
             guarantees,
             sequencer: Sequencer::new(guarantees.ordering),
             gaps: GapDetector::new(guarantees.ordering, limits.max_sequence_scopes),
+            dedup: DedupWindow::new(
+                guarantees.deduplication,
+                guarantees.dedup_window_ms,
+                limits.max_dedup_entries,
+            ),
+            duplicates,
             agreed: agreed_rx,
         });
 
@@ -587,11 +601,28 @@ async fn handle_data(
         return violation(ctx, "DATA on a unidirectional stream must name an endpoint");
     };
 
-    // Detect mode: report what is missing and deliver what arrived. The scope
-    // is the topic for a published copy and the path otherwise, which is the
-    // `(producer, endpoint or topic)` scope of decision 0001 §7.1.
+    // The scope is the topic for a published copy and the path otherwise,
+    // which is the `(producer, endpoint or topic)` scope of decision 0001
+    // §7.1. Both the dedup window and the gap detector key on it.
     let scope = header.topic.as_deref().unwrap_or(path.as_str());
+
+    // Deduplication sits between the wire and everything else: a repeat is
+    // read to EOF and thrown away, so the sender sees an ordinary receipt and
+    // neither the application nor the gap detector ever sees the message
+    // twice. A dedup window saves the application, not the bandwidth — the
+    // bytes crossed the wire before anything could know they were a repeat.
+    if ctx
+        .dedup
+        .is_duplicate(header.producer, scope, header.sequence)
+    {
+        ctx.duplicates.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(path, sequence = ?header.sequence, "duplicate suppressed");
+        return drain(stream).await;
+    }
+
+    // Detect mode: report what is missing and deliver what arrived.
     let gap = header.sequence.and_then(|seq| ctx.gaps.observe(scope, seq));
+
     let transfer = IncomingTransfer::new(
         stream,
         Arc::new(IncomingMeta::from_header(&header, ctx.peer).with_gap(gap)),
@@ -625,6 +656,23 @@ async fn handle_data(
             transfer.refuse(codes::UNKNOWN_ENDPOINT);
         }
     }
+    Ok(())
+}
+
+/// Reads a stream to EOF and discards it.
+///
+/// Used for a suppressed duplicate: dropping the stream instead would reset
+/// it, and the sender would read that as a refusal
+/// ([FAILURE_MODEL.md](../../../docs/FAILURE_MODEL.md) §4) — which a
+/// successfully deduplicated message is not.
+async fn drain(mut stream: quinn::RecvStream) -> Result<(), Error> {
+    let mut scratch = [0u8; 8 * 1024];
+    while stream
+        .read(&mut scratch)
+        .await
+        .map_err(read_error)?
+        .is_some()
+    {}
     Ok(())
 }
 
