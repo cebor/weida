@@ -11,7 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quinn::VarInt;
 use tokio::runtime::Handle;
@@ -21,6 +21,7 @@ use weida_protocol::codes;
 
 use crate::config::{ClientTls, RuntimeConfig};
 use crate::conn::ConnHandle;
+use crate::drain::{self, DrainState, Drained};
 use crate::endpoint::{Endpoint, PushState, Pusher, ReqState, Requester, SubState, Subscriber};
 use crate::listener::Listener;
 use crate::pool::ClientPool;
@@ -152,6 +153,15 @@ impl Drop for OwnedRuntime {
     }
 }
 
+/// What every connection of one runtime shares: the counters and flags that
+/// outlive any single connection.
+pub(crate) struct Shared {
+    /// Duplicates suppressed by any connection this runtime owns.
+    pub(crate) duplicates: AtomicU64,
+    /// Admission flag and parked receipts of [`Runtime::drain`].
+    pub(crate) drain: DrainState,
+}
+
 pub(crate) struct RuntimeInner {
     pub(crate) config: RuntimeConfig,
     pub(crate) pool: ClientPool,
@@ -161,8 +171,7 @@ pub(crate) struct RuntimeInner {
     _owned: Option<OwnedRuntime>,
     /// Every QUIC endpoint this runtime owns, for shutdown.
     endpoints: Mutex<Vec<quinn::Endpoint>>,
-    /// Duplicates suppressed by any connection this runtime owns.
-    pub(crate) duplicates: Arc<AtomicU64>,
+    pub(crate) shared: Arc<Shared>,
 }
 
 impl RuntimeInner {
@@ -187,9 +196,9 @@ impl RuntimeInner {
             .await
     }
 
-    /// The shared suppression counter, handed to every connection.
-    pub(crate) fn duplicates(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.duplicates)
+    /// The state handed to every connection this runtime owns.
+    pub(crate) fn shared(&self) -> Arc<Shared> {
+        Arc::clone(&self.shared)
     }
 }
 
@@ -257,17 +266,20 @@ impl Runtime {
     }
 
     fn from_parts(config: RuntimeConfig, exec: Exec, owned: Option<OwnedRuntime>) -> Runtime {
-        // One counter per runtime: the pool hands it to the connections it
-        // dials, the listener to the connections it accepts.
-        let duplicates = Arc::new(AtomicU64::new(0));
+        // One set of counters and flags per runtime: the pool hands it to the
+        // connections it dials, the listener to the connections it accepts.
+        let shared = Arc::new(Shared {
+            duplicates: AtomicU64::new(0),
+            drain: DrainState::new(&config.limits),
+        });
         Runtime {
             inner: Arc::new(RuntimeInner {
+                pool: ClientPool::new(Arc::clone(&shared)),
                 config,
-                pool: ClientPool::new(Arc::clone(&duplicates)),
                 exec,
                 _owned: owned,
                 endpoints: Mutex::new(Vec::new()),
-                duplicates,
+                shared,
             }),
         }
     }
@@ -280,7 +292,7 @@ impl Runtime {
     /// here, and the application never saw it. Zero unless deduplication is
     /// negotiated, because nothing is suppressed without it.
     pub fn suppressed_duplicates(&self) -> u64 {
-        self.inner.duplicates.load(Ordering::Relaxed)
+        self.inner.shared.duplicates.load(Ordering::Relaxed)
     }
 
     /// Creates an empty messaging namespace.
@@ -352,6 +364,54 @@ impl Runtime {
     /// loss — so a process that must exit within a budget of its own could not
     /// use it [0009 §4.4].
     pub async fn shutdown(self) {
+        let budget = self.inner.config.shutdown_timeout;
+        self.close(budget).await;
+    }
+
+    /// Stops admitting work, gives the transfers that were already
+    /// [`crate::OutgoingTransfer::finish`]ed until `deadline` to reach the
+    /// peer's transport, and then performs the same close as
+    /// [`Runtime::shutdown`].
+    ///
+    /// This is the counterpart of that abortive close
+    /// (`docs/decisions/0009-drain.md` §4.1). In order:
+    ///
+    /// 1. Admission stops. Bindings accept no new connection, and a new
+    ///    inbound stream on an existing connection is refused with
+    ///    `SHUTDOWN` [0009 §4.5]. Nothing is sent to announce it: a peer that
+    ///    had to be told would have to answer, and that would be an
+    ///    application acknowledgement [0009 §4.8].
+    /// 2. Finished transfers are awaited to their **transport** receipt —
+    ///    the condition [`crate::Delivery::delivered`] reports, and no more. A
+    ///    drained transfer may still be discarded by the peer's application
+    ///    (`docs/decisions/0005-refusal-race.md` §4.2); there is no
+    ///    `Processed` at L0 [0009 §4.2]. A transfer that was never finished
+    ///    is not part of the drain: the application still owns it.
+    /// 3. The close runs, bounded by whatever is left of `deadline`.
+    ///
+    /// The deadline is mandatory and finite on purpose: an infinite drain is
+    /// a hang with a rationale, which is the one thing every protocol in the
+    /// catalogue warns about [0009 §4.3].
+    ///
+    /// Returns what this drain achieved, as counts. An expired drain with a
+    /// non-zero [`Drained::outstanding`] is **not an error** — it is a number
+    /// to log, retry against or ignore [0009 §4.6].
+    pub async fn drain(self, deadline: Duration) -> Drained {
+        let started = Instant::now();
+        self.inner.shared.drain.begin();
+
+        let (receipts, evicted) = self.inner.shared.drain.take();
+        let drained = drain::wait_for(receipts, evicted, self.inner.exec.sleep(deadline)).await;
+
+        // The close gets what is left of the same deadline: nothing about
+        // process exit may depend on a peer's behaviour [0009 §4.4].
+        self.close(deadline.saturating_sub(started.elapsed())).await;
+        drained
+    }
+
+    /// Closes every binding and pooled connection and waits, for at most
+    /// `budget`, for the sockets to go idle.
+    async fn close(self, budget: Duration) {
         let endpoints: Vec<quinn::Endpoint> = self
             .inner
             .endpoints
@@ -368,19 +428,19 @@ impl Runtime {
             );
         }
 
-        // One budget for the whole shutdown, not one per endpoint: what a
-        // caller cares about is when `shutdown` returns.
+        // One budget for the whole close, not one per endpoint: what a
+        // caller cares about is when the call returns.
         let idle = async {
             for endpoint in endpoints.iter().chain(client.iter()) {
                 endpoint.wait_idle().await;
             }
         };
-        let deadline = self.inner.exec.sleep(self.inner.config.shutdown_timeout);
+        let deadline = self.inner.exec.sleep(budget);
         tokio::select! {
             () = idle => {}
             () = deadline => tracing::debug!(
-                timeout_ms = self.inner.config.shutdown_timeout.as_millis(),
-                "shutdown timeout reached before the sockets went idle"
+                timeout_ms = budget.as_millis(),
+                "timeout reached before the sockets went idle"
             ),
         }
     }

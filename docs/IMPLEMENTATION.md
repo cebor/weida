@@ -397,6 +397,48 @@ producer's traffic holds its successors until the connection closes, because not
 to push the hold over its cap. A time bound on a held transfer is the obvious next knob and
 is deliberately not invented here.
 
+**Delivered in the ninth increment — the bounded drain (B-032):**
+
+`Runtime::drain(Duration) -> Drained` is the counterpart of the abortive `shutdown`
+([decisions/0009](decisions/0009-drain.md) §4.1). In order: admission stops, the finished
+transfers are awaited to their transport receipt, and then the same close runs, bounded by
+whatever is left of the same deadline (§4.4). The deadline is a plain `Duration` — no
+`Option`, no configuration default that could grow into ZeroMQ's infinite linger (§4.3) —
+and `Drained { delivered, outstanding }` is a pair of local counts. An expired drain is not
+an error and returns no error (§4.6). Nothing was added to the wire (§4.8).
+
+**Admission** is one flag in the per-runtime `Shared` state that every connection already
+needs: a binding refuses an incoming handshake outright, and an inbound stream on an
+existing connection is answered with `STOP_SENDING(SHUTDOWN)` — a bidirectional one also
+has its reply half reset with the same code (§4.5). No frame announces it: a peer that had
+to be told would have to answer, which is the application acknowledgement
+[0005](decisions/0005-refusal-race.md) closed.
+
+**What the drain waits on, and why it had to be parked.** The only completion signal L0 has
+is `SendStream::stopped()`, and a fire-and-forget sender drops the `Delivery` that holds
+it, taking the last handle to the acknowledgement with it. `Delivery::drop` now hands that
+receipt to `crates/weida/src/drain.rs` instead of dropping it; a receipt the application
+awaits itself is never parked. Published fan-out copies, which never had a `Delivery` at
+all, are parked at `finish()` in `pubsub::write_one`. The parked set is bounded twice: by
+reaping settled receipts on the way in — one poll with `Waker::noop()`, no task and no
+registration — and by the stream budgets already in `Limits`, which is why
+[INVARIANTS.md](INVARIANTS.md) needs no new number for it. A receipt evicted at that cap
+is counted as outstanding by the next drain rather than assumed delivered.
+
+**What a slow reader cannot show, and the test that says so.** QUIC acknowledges bytes into
+the receive window whether or not the application reads them, so a slow *reader* never
+leaves a finished transfer outstanding — what does is an acknowledgement that never comes.
+The proof pair in `crates/weida/tests/drain.rs` is therefore built around a window smaller
+than the payload: a 512 KiB transfer whose receiver starts reading late arrives whole under
+`drain` and is cut short by `shutdown`, asserted in both directions so the pair cannot
+drift. The expiry test gives the peer its own single-threaded reactor and blocks that
+thread outright — socket open, connection up, nothing read or acknowledged — and a
+200 ms drain returns at its deadline with `outstanding = 1`, `delivered = 0` and no error.
+
+Not covered by a test: the admission refusals. Both are three lines in the accept loops and
+neither has an observable that does not need a second frozen peer to hold a drain open long
+enough to race a connect against it.
+
 **Deliberately deferred** (recorded now, not discovered later):
 
 - Connecting publishers and binding pushers; v0 fixes Pub/Pull as binders and Sub/Push as

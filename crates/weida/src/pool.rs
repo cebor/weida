@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use tokio::sync::Mutex;
 use weida_core::{Error, Fingerprint};
@@ -16,13 +15,13 @@ use weida_core::{Error, Fingerprint};
 use crate::config::{ClientTls, RuntimeConfig};
 use crate::conn::{ConnCtx, ConnHandle, conn_error};
 use crate::listener::Namespace;
-use crate::runtime::Exec;
+use crate::runtime::{Exec, Shared};
 use crate::tls;
 
 pub(crate) struct ClientPool {
     state: Mutex<PoolState>,
     /// Handed to every connection this pool dials; owned by the runtime.
-    duplicates: Arc<AtomicU64>,
+    shared: Arc<Shared>,
 }
 
 /// Keyed by authority, trust configuration **and** the fingerprint the
@@ -38,10 +37,10 @@ struct PoolState {
 }
 
 impl ClientPool {
-    pub(crate) fn new(duplicates: Arc<AtomicU64>) -> ClientPool {
+    pub(crate) fn new(shared: Arc<Shared>) -> ClientPool {
         ClientPool {
             state: Mutex::new(PoolState::default()),
-            duplicates,
+            shared,
         }
     }
 
@@ -186,7 +185,7 @@ impl ClientPool {
             None,
             exec.clone(),
             config.guarantees,
-            Arc::clone(&self.duplicates),
+            Arc::clone(&self.shared),
         );
         // Negotiation must complete before the caller can send anything: a
         // DATA frame ahead of our own HELLO would be parked by the peer, and a

@@ -42,6 +42,7 @@
 mod config;
 mod conn;
 mod dedup;
+mod drain;
 mod endpoint;
 mod listener;
 mod ordering;
@@ -59,6 +60,7 @@ pub use weida_core::{
 pub use weida_protocol::{ALPN, VERSION, codes};
 
 pub use config::{ClientTls, Identity, Pem, RuntimeConfig, ServerTls, Trust};
+pub use drain::Drained;
 pub use endpoint::{
     Endpoint, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher, Rep, Replier, Req, Requester,
     Sub, Subscriber,

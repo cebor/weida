@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use quinn::VarInt;
@@ -19,7 +19,7 @@ use crate::config::ServerTls;
 use crate::conn::ConnCtx;
 use crate::endpoint::{Endpoint, PubState, Publisher, PullState, Puller, RepState, Replier};
 use crate::pubsub::SubRegistry;
-use crate::runtime::{Exec, RuntimeInner};
+use crate::runtime::{Exec, RuntimeInner, Shared};
 use crate::stream::{Acceptor, Incoming};
 use crate::tls;
 use crate::transfer::{IncomingRequest, IncomingTransfer};
@@ -173,7 +173,7 @@ impl Listener {
             limits,
             exec.clone(),
             self.inner.runtime.config.guarantees,
-            self.inner.runtime.duplicates(),
+            self.inner.runtime.shared(),
         ));
 
         tracing::info!(%local_addr, "quic binding listening");
@@ -274,10 +274,17 @@ async fn accept_connections(
     limits: Limits,
     exec: Exec,
     guarantees: GuaranteeSet,
-    duplicates: Arc<AtomicU64>,
+    shared: Arc<Shared>,
 ) {
     let live = Arc::new(AtomicUsize::new(0));
     while let Some(incoming) = endpoint.accept().await {
+        // A draining runtime admits nothing new: the handshake is refused
+        // outright rather than accepted and then closed
+        // (`docs/decisions/0009-drain.md` §4.5).
+        if shared.drain.is_draining() {
+            incoming.refuse();
+            continue;
+        }
         if live.load(Ordering::Relaxed) >= limits.max_connections {
             // Complete the handshake, then say why: a bare refusal leaves the
             // peer unable to distinguish overload from a routing mistake.
@@ -301,7 +308,7 @@ async fn accept_connections(
         let live = Arc::clone(&live);
         live.fetch_add(1, Ordering::Relaxed);
         let exec_for_conn = exec.clone();
-        let duplicates = Arc::clone(&duplicates);
+        let shared = Arc::clone(&shared);
         exec.spawn(async move {
             match incoming.await {
                 Ok(conn) => {
@@ -317,7 +324,7 @@ async fn accept_connections(
                         Some(Arc::clone(&subs)),
                         exec_for_conn,
                         guarantees,
-                        duplicates,
+                        shared,
                     );
                     let reason = conn.closed().await;
                     // A peer that goes away takes its subscriptions with it;

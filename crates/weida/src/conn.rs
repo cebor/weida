@@ -10,7 +10,7 @@
 //! takes no lock (master doc §49).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use quinn::VarInt;
@@ -26,7 +26,7 @@ use crate::dedup::DedupWindow;
 use crate::listener::{Namespace, Route};
 use crate::ordering::{GapDetector, Reassembler, Sequencer};
 use crate::pubsub::SubRegistry;
-use crate::runtime::Exec;
+use crate::runtime::{Exec, Shared};
 use crate::stream::Incoming;
 use crate::transfer::{IncomingMeta, IncomingRequest, IncomingTransfer};
 
@@ -76,9 +76,10 @@ pub(crate) struct ConnCtx {
     pub reorder: Reassembler<Held>,
     /// Suppresses repeated identities; inert unless deduplication is on.
     pub dedup: DedupWindow,
-    /// Duplicates this runtime suppressed, shared with every connection it
-    /// owns and surfaced by `Runtime::suppressed_duplicates`.
-    pub duplicates: Arc<AtomicU64>,
+    /// Counters and flags shared with every other connection of this
+    /// runtime: the duplicate count and the drain's admission flag and
+    /// parked receipts.
+    pub shared: Arc<Shared>,
     agreed: watch::Receiver<Option<Agreed>>,
 }
 
@@ -93,7 +94,7 @@ impl ConnCtx {
         subs: Option<Arc<SubRegistry>>,
         exec: Exec,
         guarantees: GuaranteeSet,
-        duplicates: Arc<AtomicU64>,
+        shared: Arc<Shared>,
     ) -> ConnHandle {
         let (ctl_tx, ctl_rx) = mpsc::channel(CTL_QUEUE);
         let (agreed_tx, agreed_rx) = watch::channel(None);
@@ -120,7 +121,7 @@ impl ConnCtx {
                 guarantees.dedup_window_ms,
                 limits.max_dedup_entries,
             ),
-            duplicates,
+            shared,
             agreed: agreed_rx,
         });
 
@@ -381,6 +382,12 @@ async fn accept_uni_loop(ctx: ConnHandle, agreed_tx: Arc<watch::Sender<Option<Ag
     loop {
         match ctx.conn.accept_uni().await {
             Ok(stream) => {
+                // Admission stopped: the drain refuses new work rather than
+                // taking on more of it (`docs/decisions/0009-drain.md` §4.5).
+                if ctx.shared.drain.is_draining() {
+                    refuse_uni(stream);
+                    continue;
+                }
                 let ctx = Arc::clone(&ctx);
                 let agreed_tx = Arc::clone(&agreed_tx);
                 ctx.exec.clone().spawn(async move {
@@ -403,7 +410,12 @@ async fn accept_uni_loop(ctx: ConnHandle, agreed_tx: Arc<watch::Sender<Option<Ag
 async fn accept_bi_loop(ctx: ConnHandle) {
     loop {
         match ctx.conn.accept_bi().await {
-            Ok((send, recv)) => {
+            Ok((mut send, recv)) => {
+                if ctx.shared.drain.is_draining() {
+                    refuse_uni(recv);
+                    let _ = send.reset(shutdown_code());
+                    continue;
+                }
                 let ctx = Arc::clone(&ctx);
                 ctx.exec.clone().spawn(async move {
                     if let Err(e) = handle_bi(&ctx, send, recv).await {
@@ -417,6 +429,17 @@ async fn accept_bi_loop(ctx: ConnHandle) {
             }
         }
     }
+}
+
+/// The application code a draining runtime answers a new stream with.
+fn shutdown_code() -> VarInt {
+    VarInt::from_u32(codes::SHUTDOWN as u32)
+}
+
+/// Refuses an inbound stream without reading it: the drain's answer to work
+/// that arrived too late.
+fn refuse_uni(mut stream: quinn::RecvStream) {
+    let _ = stream.stop(shutdown_code());
 }
 
 fn close(conn: &quinn::Connection, code: u64, reason: &str) {
@@ -630,7 +653,7 @@ async fn handle_data(
         .dedup
         .is_duplicate(header.producer, scope, header.sequence)
     {
-        ctx.duplicates.fetch_add(1, Ordering::Relaxed);
+        ctx.shared.duplicates.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(path, sequence = ?header.sequence, "duplicate suppressed");
         return drain(stream).await;
     }
