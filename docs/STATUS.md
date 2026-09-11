@@ -84,10 +84,7 @@ In the order [NIGHTLOG.md](NIGHTLOG.md) lists them:
    transport, or document Reject locally. The measurement that found it is otherwise done.
 2. **B-039, named pipes.** Blocked on a Windows runner by the loop's judgement: code the gate
    cannot compile is code nobody verified. Decision 0012 already covers its shape.
-3. **A deviation from 0002 §6.6:** reassembly holds transfers as unread streams (pinning the
-   QUIC window) instead of reading eagerly into an application buffer, because the core forbids
-   materializing payloads. Documented in GUARANTEES §3; a decision could still overrule it.
-4. **Process:** two backlog ids were assigned in two places at once during the session
+3. **Process:** two backlog ids were assigned in two places at once during the session
    (B-051/B-052, B-057/B-063). Ids now come from the backlog owner only.
 
 ## 7. Where the loop stopped

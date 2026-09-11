@@ -355,6 +355,14 @@ combined with Option E, plus three properties no single option carried.
   sentence "one slow reader stalls every writer on the connection" is narrowed to "every bulk
   writer on the same path's connection"; control traffic and other paths are isolated by
   construction. The new overload condition of decision 5 joins the failure tables.
+- **§6.6 is deviated from, and the deviation is accepted.** Reassembly as built (B-022) holds
+  an out-of-order transfer as an **unread stream** instead of reading it eagerly into an
+  application-owned buffer: the eager read §6.6 asks for would materialize the payload, which
+  the core forbids ([INVARIANTS.md](../INVARIANTS.md)), so the bytes stay in the transport and
+  the hold is paid as backpressure. The bound is stated in
+  [GUARANTEES.md](../GUARANTEES.md) §3 — `Limits::max_reorder_hold` transfers, each up to
+  `stream_receive_window` bytes, the whole hold inside `connection_receive_window`, which is
+  also the "another way to hold the peer accountable" that §6.6's own caveat demands.
 - **[INVARIANTS.md](../INVARIANTS.md).** Restate the control-stream invariant to permit a
   control connection; add the reassembly buffer cap and the per-peer connection count (control
   plus one per dialled path, against `max_connections`) to the named bounds.
