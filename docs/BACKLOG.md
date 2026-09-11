@@ -59,7 +59,7 @@ acceptance: a bench measuring `connect` latency and the runtime's RSS delta for 
 note: "pooled connections to one server" cannot be dialled from one runtime today — the pool keys on `(host, port, ClientTls, address fingerprint)` — so the memory figures use one client runtime per connection and separate the per-runtime delta (0-4 KiB) from the per-connection one, both ends in one process. New bench target `crates/weida/benches/connections.rs`, which B-012 extends.
 
 ### B-012 — Measure: connections per dialled path
-kind: measure | size: 45 | status: ready | needs: [B-011]
+kind: measure | size: 45 | status: in_progress 2026-09-11T05:18Z | needs: [B-011]
 acceptance: the same bench with one connection per path for 16 and 256 paths, against `max_connections`; handshake time, RSS, and the point where the server refuses with `LIMIT_EXCEEDED`; numbers recorded.
 
 ### B-013 — Wire: DATA keys 6 and 7 in weida-protocol
