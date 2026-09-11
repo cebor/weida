@@ -5,7 +5,7 @@ Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
 ### B-001 — Decision 0004: durability levels for Stored and Replicated
-kind: research | size: 45 | status: ready | needs: []
+kind: research | size: 45 | status: in_progress 2026-09-11T02:06Z | needs: []
 acceptance: `docs/decisions/0004-durability-levels.md`, Status accepted, defining `Stored(Written|Flushed)` and `Replicated(n, flushed: bool)` from rabbitmq-amqp091 §6d, kafka §6, nats §6, amqp10 §6.5; SYNTHESIS §8.3 marked closed.
 
 ### B-002 — Decision 0005: refusal race closed as documented behaviour
