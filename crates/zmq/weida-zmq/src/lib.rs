@@ -83,13 +83,23 @@
 //!   connection that is a pair of memory buffers rather than a socket, and a
 //!   connect that **parks** until the bind arrives, which is what libzmq 4.0
 //!   changed.
+//! - [`Security`] — PLAIN, as either end: `ZMQ_PLAIN_SERVER`,
+//!   `ZMQ_PLAIN_USERNAME` and `ZMQ_PLAIN_PASSWORD` selecting the mechanism,
+//!   and 24/ZMTP-PLAIN's `HELLO`/`WELCOME`/`INITIATE`/`READY` over the
+//!   codec's octets.
+//! - [`ZapRequest`], [`ZapReply`] and [`ZapUserId`] — 27/ZAP over
+//!   `inproc://zeromq.zap.01`: status 200/300/400/500, the user id of a 200
+//!   held per connection and convertible to no weida identity,
+//!   `ZMQ_ZAP_DOMAIN` as the switch that turns authorization on and
+//!   `ZMQ_ZAP_ENFORCE_DOMAIN` as the refusal to send an empty one, one
+//!   handler per context because the namespace says so, and a refusal that
+//!   lands before any message flows.
 //!
-//! What remains is security and authorization, and the rest of the option
-//! surface [0013 §5.3]. They are named here so that a reader knows
-//! what this crate is for and what it does not do yet; nothing stands in for
-//! them, and in particular there is no default [`Session`] beyond
-//! [`ZmtpSession`]: a socket that handed its peers to a no-op would be a
-//! ZeroMQ implementation that speaks nothing.
+//! What remains is CURVE and the rest of the option surface [0013 §5.3].
+//! They are named here so that a reader knows what this crate is for and what
+//! it does not do yet; nothing stands in for them, and in particular there is
+//! no default [`Session`] beyond [`ZmtpSession`]: a socket that handed its
+//! peers to a no-op would be a ZeroMQ implementation that speaks nothing.
 //!
 //! # Rules this crate keeps
 //!
@@ -142,6 +152,7 @@ pub mod socket;
 pub mod subscriptions;
 pub mod transport;
 pub mod xpubxsub;
+pub mod zap;
 
 pub use context::{
     Context, ContextConfig, DEFAULT_CLOSE_BUDGET, DEFAULT_MAX_SOCKETS, SocketId, SocketSlot,
@@ -164,7 +175,7 @@ pub use message::{
 };
 pub use options::{
     DEFAULT_BACKLOG, DEFAULT_HANDSHAKE_IVL, DEFAULT_MAX_RESOLVED_ADDRESSES, DEFAULT_RECONNECT_IVL,
-    SocketOptions,
+    MAX_ZAP_DOMAIN_BYTES, Security, SocketOptions,
 };
 pub use pair::PairSocket;
 pub use pipe::{
@@ -180,3 +191,6 @@ pub use subscriptions::{
 };
 pub use transport::Stream;
 pub use xpubxsub::{XPubSocket, XSubSocket};
+pub use zap::{
+    AuthenticatedUser, ZAP_ENDPOINT, ZAP_NAME, ZapReply, ZapRequest, ZapStatus, ZapUserId,
+};

@@ -134,6 +134,60 @@ fn golden_ping_and_pong() {
 }
 
 #[test]
+fn golden_plain_handshake() {
+    // 24/ZMTP-PLAIN: `hello = command-size %d5 "HELLO" username password`,
+    // each field a length octet followed by its value. 0x04 is the COMMAND
+    // flag; 0x12 is the body length (1 + 5 + 1 + 5 + 1 + 6).
+    assert_command(
+        Command::Hello {
+            username: b"admin",
+            password: b"secret",
+        },
+        b"\x04\x13\x05HELLO\x05admin\x06secret",
+    );
+
+    // An empty username and password are legal: `*-value = *OCTET`, and the
+    // two length octets are still there.
+    assert_command(
+        Command::Hello {
+            username: b"",
+            password: b"",
+        },
+        b"\x04\x08\x05HELLO\x00\x00",
+    );
+
+    // `welcome = command-size %d7 "WELCOME"` — no data at all.
+    assert_command(Command::Welcome, b"\x04\x08\x07WELCOME");
+
+    // `initiate = command-size %d8 "INITIATE" metadata`, carrying the
+    // client's metadata where NULL would have put it in READY.
+    assert_command(
+        Command::Initiate(Metadata::new().with_socket_type(SocketType::Dealer)),
+        b"\x04\x1F\x08INITIATE\x0BSocket-Type\x00\x00\x00\x06DEALER",
+    );
+}
+
+#[test]
+fn golden_plain_hello_from_a_foreign_peer() {
+    // The direction that matters for interop: the octets libzmq puts on the
+    // wire for ZMQ_PLAIN_USERNAME="user", ZMQ_PLAIN_PASSWORD="pass", read
+    // back field by field.
+    let bytes: &[u8] = b"\x04\x10\x05HELLO\x04user\x04pass";
+    let (header, body, used) = frame::decode(bytes, CAP).expect("decode");
+    assert_eq!(header.kind, FrameKind::Command);
+    assert_eq!(used, bytes.len());
+    let Command::Hello { username, password } = Command::decode(body).expect("decode body") else {
+        panic!("expected HELLO");
+    };
+    assert_eq!(username, b"user");
+    assert_eq!(password, b"pass");
+
+    // A truncated field is a violation rather than a request for more
+    // octets: a command body is complete when it is decoded.
+    let short: &[u8] = b"\x05HELLO\x09user";
+    assert!(Command::decode(short).is_err());
+}
+#[test]
 fn golden_message_frame_at_the_short_long_boundary() {
     // 255 octets: the largest short frame. Header 0x00 0xFF.
     let body = vec![0xAB; 255];

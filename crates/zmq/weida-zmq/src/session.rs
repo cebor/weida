@@ -30,22 +30,24 @@
 //! it on this crate; nothing here touches it.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use weida_runtime::Exec;
 use weida_zmtp::{
-    Command, CommandError, Greeting, GreetingError, Mechanism, Metadata, SocketType, Version,
-    greeting,
+    Command, CommandError, Greeting, GreetingError, Metadata, SocketType, Version, greeting,
 };
 
-use crate::engine::{Connection, Session, SessionFuture};
+use crate::context::Context;
+use crate::engine::{Connection, Role, Session, SessionFuture};
 use crate::error::{Error, Result};
 use crate::identity::RoutingId;
 use crate::message::{Decoded, Message, MessageLimits, Multipart};
-use crate::options::SocketOptions;
+use crate::options::{Security, SocketOptions};
 use crate::pipe::{Queue, Sent};
 use crate::subscriptions::{self, SubscriptionForm, Subscriptions};
+use crate::zap::{self, ZapRequest, ZapUserId};
 
 /// Read buffer growth step. A frame header is at most nine octets and a
 /// command body a few hundred, so the interesting case is a payload, which is
@@ -118,6 +120,13 @@ pub struct Negotiated {
     /// see [`RoutingId`] — and what a ROUTER keys its queue by, which is that
     /// socket type's slice rather than this one.
     pub identity: Option<RoutingId>,
+    /// The user id a ZAP handler returned with its 200, where this side
+    /// authorized the connection.
+    ///
+    /// A per-connection fact and not an identity: see [`ZapUserId`]. `None`
+    /// when nothing was authorized, and `None` for a handler that allowed the
+    /// connection without naming a user.
+    pub user_id: Option<ZapUserId>,
 }
 
 async fn drive(
@@ -135,11 +144,24 @@ async fn drive(
         mut handshake,
         identity,
         subscriptions,
-        role: _,
+        role,
+        context,
+        peer_address,
+        credentials,
+        user,
     } = connection;
 
     let mut wire = Wire::new(stream, options.message_limits());
-    let negotiated = handshake_on(&mut wire, ours, &options).await?;
+    let facts = PeerFacts {
+        role,
+        address: peer_address,
+        credentials,
+        context,
+    };
+    let negotiated = handshake_on(&mut wire, ours, &options, &facts).await?;
+    // What the handler said about this connection, where the socket can read
+    // it: a per-connection fact held by the server.
+    user.set(negotiated.user_id.clone());
     // The engine's ZMQ_HANDSHAKE_IVL stops counting here.
     handshake.complete();
     // A ROUTER addresses this peer by what it just announced — and needs to
@@ -194,50 +216,140 @@ async fn drive(
     .await
 }
 
-/// Drives the greeting and the NULL handshake.
+/// What the handshake knows about the connection besides its bytes.
+///
+/// Gathered rather than passed as five arguments, and each field is here
+/// because the security handshake needs it: the role decides who is the
+/// server under NULL, the address and the kernel credentials are what a ZAP
+/// handler is told about the peer, and the context is where the handler
+/// lives.
+#[derive(Clone, Debug)]
+pub struct PeerFacts {
+    /// Which side dialled. Under NULL "the peer that binds SHALL be the
+    /// server"; under PLAIN the `as-server` octet decides instead.
+    pub role: Role,
+    /// The peer's address for a ZAP request: an IP for `tcp://`, empty for
+    /// every local transport, which is what 27/ZAP's `address` frame can
+    /// carry.
+    pub address: String,
+    /// The kernel's statement about a local peer, offered to the handler as
+    /// the extension frame [`crate::zap`] documents.
+    pub credentials: Option<weida_core::LocalPrincipal>,
+    /// The context whose `inproc://` namespace holds the ZAP handler.
+    pub context: Context,
+}
+
+/// Drives the greeting and the security handshake, whichever mechanism the
+/// options select.
 ///
 /// The order is the specification's: send the full greeting, read the peer's,
-/// then `READY` both ways. Two refusals happen here, both with an `ERROR`
-/// before the close, which is what 37/ZMTP asks for: a socket type that may
-/// not talk to `ours`, and a `READY` that names no socket type at all — the
-/// second is a `SHOULD` in the specification and a MUST for an
-/// implementation, which cannot check compatibility against a peer that will
-/// not say what it is.
+/// then the mechanism's own exchange — `READY` both ways for NULL,
+/// `HELLO`/`WELCOME`/`INITIATE`/`READY` for PLAIN (24/ZMTP-PLAIN). Two
+/// refusals are shared by both, and both send an `ERROR` before the close,
+/// which is what 37/ZMTP asks for: a socket type that may not talk to `ours`,
+/// and a handshake that names no socket type at all — the second is a
+/// `SHOULD` in the specification and a MUST for an implementation, which
+/// cannot check compatibility against a peer that will not say what it is.
+///
+/// **Authorization happens here, before this returns**, so no message can
+/// flow under a refused connection: a ZAP status other than 200 ends the
+/// handshake with an `ERROR` carrying the handler's text.
 pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
     ours: SocketType,
     options: &SocketOptions,
+    facts: &PeerFacts,
 ) -> Result<Negotiated> {
-    wire.write_all(&Greeting::null().encode()).await?;
+    let security = options.security();
+    let greeting = Greeting {
+        mechanism: security.mechanism(),
+        as_server: security.as_server(),
+        ..Greeting::null()
+    };
+    wire.write_all(&greeting.encode()).await?;
 
     let mut theirs = [0u8; greeting::GREETING_LEN];
     wire.read_exactly(&mut theirs).await?;
     let peer = Greeting::decode(&theirs).map_err(greeting_error)?;
     let version = peer
-        .accept_downgrading(Mechanism::NULL)
+        .accept_downgrading(security.mechanism())
         .map_err(greeting_error)?;
-
-    let mut metadata = Metadata::new().with_socket_type(ours);
-    if let Some(routing_id) = &options.routing_id {
-        // libzmq deprecates the name `ZMQ_IDENTITY` for `ZMQ_ROUTING_ID`, but
-        // the wire property is still `Identity` and a peer that reads the
-        // other name would not find it.
-        metadata = metadata.with("Identity", routing_id.as_bytes());
+    if security != Security::Null && peer.as_server == security.as_server() {
+        // 24/ZMTP-PLAIN gives the roles to the `as-server` octet, so two
+        // servers or two clients on one connection is a configuration
+        // mistake that would otherwise deadlock waiting for HELLO.
+        return Err(Error::ENOCOMPATPROTO(
+            format!(
+                "both ends of this connection are the PLAIN {}",
+                if security.as_server() {
+                    "server"
+                } else {
+                    "client"
+                }
+            )
+            .into(),
+        ));
     }
-    wire.write_command(&Command::Ready(metadata)).await?;
 
-    let body = match wire.read_next().await? {
-        Incoming::Command(body) => body,
-        // Nothing may precede the peer's READY; a message here is a protocol
-        // violation rather than early data.
-        Incoming::Message(_) => {
-            return Err(Error::ENOCOMPATPROTO(
-                "the peer sent a message before its READY".into(),
-            ));
+    let ours_metadata = handshake_metadata(ours, options);
+    let mut user_id = None;
+    let peer_metadata_bytes = match security {
+        Security::Null => {
+            wire.write_command(&Command::Ready(ours_metadata)).await?;
+            expect_command(wire, "READY").await?
+        }
+        Security::PlainClient => {
+            // `C:HELLO(user,pass) -> S:WELCOME|S:ERROR`, then
+            // `C:INITIATE(metadata) -> S:READY|S:ERROR`.
+            wire.write_command(&Command::Hello {
+                username: options.plain_username.as_deref().unwrap_or("").as_bytes(),
+                password: options.plain_password.as_deref().unwrap_or("").as_bytes(),
+            })
+            .await?;
+            let body = expect_command(wire, "WELCOME").await?;
+            match Command::decode(&body).map_err(command_error)? {
+                Command::Welcome => {}
+                other => {
+                    return Err(Error::ENOCOMPATPROTO(
+                        format!("expected WELCOME, got {}", other.name()).into(),
+                    ));
+                }
+            }
+            wire.write_command(&Command::Initiate(ours_metadata))
+                .await?;
+            expect_command(wire, "READY").await?
+        }
+        Security::PlainServer => {
+            let body = expect_command(wire, "HELLO").await?;
+            let (username, password) = match Command::decode(&body).map_err(command_error)? {
+                Command::Hello { username, password } => (username.to_vec(), password.to_vec()),
+                other => {
+                    return Err(Error::ENOCOMPATPROTO(
+                        format!("expected HELLO, got {}", other.name()).into(),
+                    ));
+                }
+            };
+            // The credentials are checked by the handler, not here: a
+            // username this library judged itself would be a policy nobody
+            // configured.
+            user_id = authorize(
+                wire,
+                options,
+                facts,
+                "PLAIN",
+                vec![username, password],
+                Vec::new(),
+            )
+            .await?;
+            wire.write_command(&Command::Welcome).await?;
+            let peer_metadata = expect_command(wire, "INITIATE").await?;
+            wire.write_command(&Command::Ready(ours_metadata)).await?;
+            peer_metadata
         }
     };
-    let metadata = match Command::decode(&body).map_err(command_error)? {
-        Command::Ready(metadata) => metadata,
+
+    let metadata = match Command::decode(&peer_metadata_bytes).map_err(command_error)? {
+        Command::Ready(metadata) | Command::Initiate(metadata) => metadata,
         // "The peer SHALL treat an incoming ERROR command as fatal."
         Command::Error(reason) => {
             return Err(Error::ENOCOMPATPROTO(
@@ -246,7 +358,7 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
         }
         other => {
             return Err(Error::ENOCOMPATPROTO(
-                format!("expected READY, got {}", other.name()).into(),
+                format!("expected the peer's metadata, got {}", other.name()).into(),
             ));
         }
     };
@@ -279,11 +391,120 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
         ));
     }
 
+    if security == Security::Null && facts.role == Role::Binder && options.authorizes() {
+        // NULL "provides no security credentials but allows a server to
+        // filter bogus clients on the basis of IP address", and the identity
+        // the peer just announced is the other thing 27/ZAP hands over. Run
+        // after the metadata so that both are known, and before this returns,
+        // which is before any message may flow.
+        user_id = authorize(
+            wire,
+            options,
+            facts,
+            "NULL",
+            Vec::new(),
+            identity
+                .as_ref()
+                .map(|id| id.as_bytes().to_vec())
+                .unwrap_or_default(),
+        )
+        .await?;
+    }
+
     Ok(Negotiated {
         peer_type,
         version,
         identity,
+        user_id,
     })
+}
+
+/// This socket's own metadata: the socket type it announces and, where it has
+/// one, the routing id a ROUTER peer should address it by.
+fn handshake_metadata(ours: SocketType, options: &SocketOptions) -> Metadata<'_> {
+    let mut metadata = Metadata::new().with_socket_type(ours);
+    if let Some(routing_id) = &options.routing_id {
+        // libzmq deprecates the name `ZMQ_IDENTITY` for `ZMQ_ROUTING_ID`, but
+        // the wire property is still `Identity` and a peer that reads the
+        // other name would not find it.
+        metadata = metadata.with("Identity", routing_id.as_bytes());
+    }
+    metadata
+}
+
+/// Reads the next command body, refusing a message: nothing may precede a
+/// handshake command, so early data is a protocol violation.
+async fn expect_command<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    what: &str,
+) -> Result<Vec<u8>> {
+    match wire.read_next().await? {
+        Incoming::Command(body) => Ok(body),
+        Incoming::Message(_) => Err(Error::ENOCOMPATPROTO(
+            format!("the peer sent a message before its {what}").into(),
+        )),
+    }
+}
+
+/// Asks the ZAP handler about this connection, and refuses the connection
+/// with an `ERROR` when the answer is not 200.
+///
+/// Returns the user id of a 200, which is a per-connection fact and never an
+/// identity ([`crate::ZapUserId`]).
+async fn authorize<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    options: &SocketOptions,
+    facts: &PeerFacts,
+    mechanism: &str,
+    credentials: Vec<Vec<u8>>,
+    identity: Vec<u8>,
+) -> Result<Option<ZapUserId>> {
+    let request = ZapRequest {
+        request_id: next_request_id(),
+        domain: options.zap_domain.clone(),
+        address: facts.address.clone(),
+        identity,
+        mechanism: mechanism.to_owned(),
+        credentials,
+        local_principal: facts.credentials,
+    };
+    let outcome = zap::authorize(&facts.context, &request).await;
+    let reply = match outcome {
+        Ok(reply) => reply,
+        Err(e) => {
+            // No handler, or a handler that malfunctioned: the connection is
+            // refused, because a server that cannot ask must not admit.
+            wire.refuse("authorization is unavailable").await;
+            return Err(e);
+        }
+    };
+    if !reply.status.is_allowed() {
+        wire.refuse(&format!("{} {}", reply.status, reply.text))
+            .await;
+        return Err(Error::EACCES(
+            format!(
+                "the ZAP handler answered {} for this {mechanism} connection: {}",
+                reply.status,
+                if reply.text.is_empty() {
+                    "no reason given"
+                } else {
+                    &reply.text
+                }
+            )
+            .into(),
+        ));
+    }
+    Ok(reply.user_id)
+}
+
+/// A request id unique within this process, which is all 27/ZAP needs: the
+/// reply is read on the socket that asked, and the id only has to catch a
+/// handler answering the wrong question.
+fn next_request_id() -> Vec<u8> {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+        .to_string()
+        .into_bytes()
 }
 
 /// Moves messages both ways until the connection or the pipe ends.
@@ -795,6 +1016,7 @@ mod tests {
     use crate::message::Message;
     use crate::pipe::Pipe;
     use crate::transport::Stream;
+    use crate::zap::{AuthenticatedUser, ZapReply, ZapStatus};
     use std::sync::Arc;
     use tokio::net::{TcpListener, TcpStream};
     use weida_zmtp::{FrameKind, frame};
@@ -870,21 +1092,59 @@ mod tests {
                 .expect("READY");
             self.send(&ready).await;
         }
+
+        /// Greets with a mechanism and an `as-server` octet, which is what
+        /// PLAIN needs and NULL forbids.
+        async fn greet_as(&mut self, mechanism: weida_zmtp::Mechanism, as_server: bool) {
+            let greeting = Greeting {
+                mechanism,
+                as_server,
+                ..Greeting::null()
+            };
+            self.send(&greeting.encode()).await;
+        }
+
+        async fn command(&mut self, command: Command<'_>) {
+            let bytes = command.encode().expect("encode");
+            self.send(&bytes).await;
+        }
+
+        /// The next command, decoded by name, for a handshake assertion.
+        async fn read_command_name(&mut self) -> (String, Vec<u8>) {
+            let (kind, body) = self.read_frame().await;
+            assert_eq!(kind, FrameKind::Command);
+            let name = Command::decode(&body)
+                .map(|command| command.name().to_owned())
+                .unwrap_or_else(|e| panic!("the session sent a bad command: {e}"));
+            (name, body)
+        }
     }
 
     /// Runs a session over one end of a connected pair, with no engine, and
     /// hands back the pipe so a test can see both directions.
+    ///
+    /// `role` is the one fact the engine would otherwise supply that the
+    /// security handshake reads: under NULL it decides which side
+    /// authorizes, so a test of a server's ZAP dialog binds rather than
+    /// dials.
+    fn context() -> Context {
+        Context::new(ContextConfig::default()).expect("context")
+    }
+
     fn drive_session(
         stream: TcpStream,
         ours: SocketType,
         options: SocketOptions,
-    ) -> (Pipe, tokio::task::JoinHandle<Result<()>>) {
+        role: Role,
+        context: &Context,
+    ) -> (Pipe, AuthenticatedUser, tokio::task::JoinHandle<Result<()>>) {
         let pipe = Pipe::new(options.pipe);
+        let user = AuthenticatedUser::default();
         let connection = Connection {
             stream: Stream::tcp(stream),
             pipe: pipe.clone(),
             peer: PeerId::detached(),
-            role: Role::Connecter,
+            role,
             endpoint: Endpoint::parse("tcp://127.0.0.1:1").expect("endpoint"),
             options,
             exec: Exec::current().expect("ambient reactor"),
@@ -894,10 +1154,14 @@ mod tests {
                 crate::subscriptions::DEFAULT_MAX_SUBSCRIPTIONS,
                 crate::subscriptions::DEFAULT_MAX_SUBSCRIPTION_BYTES,
             )),
+            context: context.clone(),
+            peer_address: "127.0.0.1".to_owned(),
+            credentials: None,
+            user: user.clone(),
         };
         let session = ZmtpSession::new(ours);
         let task = tokio::spawn(async move { session.run(connection).await });
-        (pipe, task)
+        (pipe, user, task)
     }
 
     async fn pair() -> (TcpStream, TcpStream) {
@@ -913,6 +1177,369 @@ mod tests {
         SocketOptions::default()
     }
 
+    /// A ZAP handler in this context that answers every request with
+    /// `decide`, and reports what it was asked.
+    ///
+    /// A real handler on a real REP socket over `inproc://`, because a ZAP
+    /// dialog that skipped the transport would prove nothing about the
+    /// transport it is specified to run over.
+    async fn zap_handler(
+        context: &Context,
+        decide: impl Fn(crate::zap::ZapRequest) -> ZapReply + Send + 'static,
+    ) -> (
+        Arc<std::sync::Mutex<Vec<crate::zap::ZapRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        let mut handler = crate::RepSocket::new(context).expect("rep");
+        // Bound **before** the task is spawned, which is 27/ZAP's "the
+        // handler SHALL start before any server starts" made structural, and
+        // which also keeps the spawned future `Send`: a socket may be moved
+        // into a task but not shared with one, so the borrow `bind` takes
+        // must not cross the spawn.
+        handler
+            .bind(crate::zap::ZAP_ENDPOINT)
+            .await
+            .expect("bind the ZAP endpoint");
+        let task = tokio::spawn(async move {
+            while let Ok(message) = handler.recv().await {
+                let request = crate::zap::ZapRequest::decode(&message).expect("a ZAP request");
+                seen.lock().expect("seen").push(request.clone());
+                let reply = decide(request);
+                if handler.send(reply.encode()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (asked, task)
+    }
+
+    /// Claim: a PLAIN client's handshake is 24/ZMTP-PLAIN's — a greeting
+    /// naming PLAIN with `as-server` clear, `HELLO` carrying the username
+    /// and password, `INITIATE` carrying the metadata `READY` would have
+    /// carried under NULL, and nothing sent before the server's `WELCOME`.
+    #[tokio::test]
+    async fn a_plain_client_sends_hello_then_initiate() {
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (_pipe, _user, task) = drive_session(
+            ours,
+            SocketType::Req,
+            SocketOptions {
+                plain_username: Some("admin".to_owned()),
+                plain_password: Some("secret".to_owned()),
+                ..options()
+            },
+            Role::Connecter,
+            &context(),
+        );
+
+        let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
+        assert_eq!(greeting.mechanism, weida_zmtp::Mechanism::PLAIN);
+        assert!(!greeting.as_server, "a client's as-server octet is zero");
+        peer.greet_as(weida_zmtp::Mechanism::PLAIN, true).await;
+
+        let (name, body) = peer.read_command_name().await;
+        assert_eq!(name, "HELLO");
+        assert_eq!(
+            Command::decode(&body).expect("HELLO"),
+            Command::Hello {
+                username: b"admin",
+                password: b"secret",
+            }
+        );
+
+        peer.command(Command::Welcome).await;
+        let (name, body) = peer.read_command_name().await;
+        assert_eq!(name, "INITIATE", "the metadata travels in INITIATE");
+        let Command::Initiate(metadata) = Command::decode(&body).expect("INITIATE") else {
+            panic!("expected INITIATE");
+        };
+        assert_eq!(metadata.socket_type(), Some(SocketType::Req));
+
+        peer.ready(SocketType::Rep).await;
+        drop(peer);
+        let _ = task.await;
+    }
+
+    /// Claim: a PLAIN server asks the ZAP handler about the credentials it
+    /// was given, sends `WELCOME` on a 200, and records the user id the
+    /// handler named — a per-connection fact, not an identity.
+    #[tokio::test]
+    async fn a_plain_server_asks_the_handler_and_keeps_its_answer() {
+        let context = context();
+        let (_asked, handler) = zap_handler(&context, |request| {
+            assert_eq!(request.mechanism, "PLAIN");
+            assert_eq!(request.domain, "test");
+            assert_eq!(request.address, "127.0.0.1");
+            let (username, password) = request.plain_credentials().expect("PLAIN credentials");
+            assert_eq!(username, b"admin");
+            assert_eq!(password, b"secret");
+            ZapReply::allowed(request.request_id, "operator")
+        })
+        .await;
+
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (_pipe, user, task) = drive_session(
+            ours,
+            SocketType::Rep,
+            SocketOptions {
+                plain_server: true,
+                zap_domain: "test".to_owned(),
+                ..options()
+            },
+            Role::Binder,
+            &context,
+        );
+
+        let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
+        assert_eq!(greeting.mechanism, weida_zmtp::Mechanism::PLAIN);
+        assert!(greeting.as_server, "a server's as-server octet is one");
+        peer.greet_as(weida_zmtp::Mechanism::PLAIN, false).await;
+
+        peer.command(Command::Hello {
+            username: b"admin",
+            password: b"secret",
+        })
+        .await;
+        let (name, _) = peer.read_command_name().await;
+        assert_eq!(name, "WELCOME", "a 200 is a WELCOME");
+
+        peer.command(Command::Initiate(
+            Metadata::new().with_socket_type(SocketType::Req),
+        ))
+        .await;
+        let (name, _) = peer.read_command_name().await;
+        assert_eq!(name, "READY");
+
+        let recorded = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(id) = user.get() {
+                    return id;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the user id was recorded");
+        assert_eq!(recorded.as_str(), "operator");
+
+        drop(peer);
+        let _ = task.await;
+        handler.abort();
+    }
+
+    /// Claim: a 400 refuses the connection **before any message flows** —
+    /// the server answers `ERROR` with the handler's text instead of
+    /// `WELCOME`, and the session ends with `EACCES`.
+    #[tokio::test]
+    async fn a_four_hundred_refuses_before_any_message() {
+        let context = context();
+        let (_asked, handler) = zap_handler(&context, |request| {
+            ZapReply::refused(
+                request.request_id,
+                ZapStatus::AuthenticationFailure,
+                "unknown user",
+            )
+        })
+        .await;
+
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (_pipe, user, task) = drive_session(
+            ours,
+            SocketType::Rep,
+            SocketOptions {
+                plain_server: true,
+                zap_domain: "test".to_owned(),
+                ..options()
+            },
+            Role::Binder,
+            &context,
+        );
+
+        peer.read_greeting().await;
+        peer.greet_as(weida_zmtp::Mechanism::PLAIN, false).await;
+        peer.command(Command::Hello {
+            username: b"nobody",
+            password: b"guess",
+        })
+        .await;
+
+        let (name, body) = peer.read_command_name().await;
+        assert_eq!(name, "ERROR", "a refusal is an ERROR, not a WELCOME");
+        let Command::Error(reason) = Command::decode(&body).expect("ERROR") else {
+            panic!("expected ERROR");
+        };
+        assert!(reason.contains("400"), "{reason}");
+
+        let outcome = task.await.expect("the session task");
+        let err = outcome.unwrap_err();
+        assert_eq!(err.errno(), "EACCES", "{err}");
+        assert!(
+            err.cause().contains("unknown user"),
+            "the handler's reason must survive: {err}"
+        );
+        assert_eq!(user.get(), None, "nothing was authorized");
+        handler.abort();
+    }
+
+    /// Claim: a server that must authorize and finds no handler refuses the
+    /// connection instead of admitting one nobody checked — 27/ZAP's "the
+    /// handler SHALL start before any server starts", enforced where it can
+    /// be.
+    #[tokio::test]
+    async fn a_server_without_a_handler_admits_nobody() {
+        let context = context();
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (_pipe, _user, task) = drive_session(
+            ours,
+            SocketType::Rep,
+            SocketOptions {
+                plain_server: true,
+                zap_domain: "test".to_owned(),
+                ..options()
+            },
+            Role::Binder,
+            &context,
+        );
+
+        peer.read_greeting().await;
+        peer.greet_as(weida_zmtp::Mechanism::PLAIN, false).await;
+        peer.command(Command::Hello {
+            username: b"admin",
+            password: b"secret",
+        })
+        .await;
+
+        let (name, _) = peer.read_command_name().await;
+        assert_eq!(name, "ERROR");
+        let err = task.await.expect("the session task").unwrap_err();
+        assert_eq!(err.errno(), "ENOTSOCK", "{err}");
+        assert!(err.cause().contains("zeromq.zap.01"), "{err}");
+    }
+
+    /// Claim: NULL authorizes too when a domain is configured — "NULL
+    /// provides no security credentials but allows a server to filter bogus
+    /// clients on the basis of IP address" — and the handler is told the
+    /// address and the identity the peer announced, with no credential
+    /// frames.
+    #[tokio::test]
+    async fn null_with_a_domain_asks_the_handler_about_the_address() {
+        let context = context();
+        let (asked, handler) = zap_handler(&context, |request| {
+            ZapReply::allowed(request.request_id, "by-address")
+        })
+        .await;
+
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (_pipe, user, task) = drive_session(
+            ours,
+            SocketType::Rep,
+            SocketOptions {
+                zap_domain: "global".to_owned(),
+                ..options()
+            },
+            Role::Binder,
+            &context,
+        );
+
+        let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
+        assert_eq!(
+            greeting.mechanism,
+            weida_zmtp::Mechanism::NULL,
+            "a domain does not change the mechanism"
+        );
+        peer.greet(greeting::VERSION).await;
+        peer.read_command_name().await;
+        let ready = Command::Ready(
+            Metadata::new()
+                .with_socket_type(SocketType::Req)
+                .with("Identity", b"client-9"),
+        )
+        .encode()
+        .expect("READY");
+        peer.send(&ready).await;
+
+        let recorded = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(id) = user.get() {
+                    return id;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the user id was recorded");
+        assert_eq!(recorded.as_str(), "by-address");
+
+        let request = asked
+            .lock()
+            .expect("asked")
+            .first()
+            .cloned()
+            .expect("one request");
+        assert_eq!(request.mechanism, "NULL");
+        assert!(
+            request.credentials.is_empty(),
+            "NULL has no credentials to send"
+        );
+        assert_eq!(request.address, "127.0.0.1");
+        assert_eq!(request.identity, b"client-9".to_vec());
+        assert_eq!(request.domain, "global");
+
+        drop(peer);
+        let _ = task.await;
+        handler.abort();
+    }
+
+    /// Claim: without a domain, NULL does not authorize at all — libzmq's
+    /// "when the ZAP domain is empty, which is the default, ZAP
+    /// authentication is disabled" — so a handler that would refuse
+    /// everything is never asked.
+    #[tokio::test]
+    async fn null_without_a_domain_does_not_authorize() {
+        let context = context();
+        let (asked, handler) = zap_handler(&context, |request| {
+            ZapReply::refused(
+                request.request_id,
+                ZapStatus::AuthenticationFailure,
+                "would refuse",
+            )
+        })
+        .await;
+
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (pipe, user, task) =
+            drive_session(ours, SocketType::Pull, options(), Role::Binder, &context);
+
+        peer.read_greeting().await;
+        peer.greet(greeting::VERSION).await;
+        peer.read_command_name().await;
+        peer.ready(SocketType::Push).await;
+
+        // The handshake completed and a message flows, which it could not
+        // have done if the refusing handler had been consulted.
+        let message = Multipart::single(Message::from("work")).encode();
+        peer.send(&message).await;
+        let arrived = tokio::time::timeout(Duration::from_secs(10), pipe.incoming().recv())
+            .await
+            .expect("the message arrived")
+            .expect("a message");
+        assert_eq!(arrived.frames()[0].as_slice(), b"work");
+        assert_eq!(user.get(), None, "nothing was authorized");
+        assert!(asked.lock().expect("asked").is_empty(), "nobody was asked");
+
+        drop(peer);
+        let _ = task.await;
+        handler.abort();
+    }
+
     /// Claim: the greeting we send is the specification's 64 octets, exactly
     /// as the codec encodes them, and our `READY` carries `Socket-Type` and —
     /// when `ZMQ_ROUTING_ID` is set — `Identity`.
@@ -920,13 +1547,15 @@ mod tests {
     async fn the_handshake_sends_the_greeting_and_a_ready() {
         let (ours, theirs) = pair().await;
         let mut peer = CodecPeer::new(theirs);
-        let (_pipe, task) = drive_session(
+        let (_pipe, _user, task) = drive_session(
             ours,
             SocketType::Req,
             SocketOptions {
                 routing_id: Some(RoutingId::new(b"client-7").expect("id")),
                 ..options()
             },
+            Role::Connecter,
+            &context(),
         );
 
         // Byte-for-byte: what the codec says a NULL 3.1 greeting is.
@@ -955,7 +1584,13 @@ mod tests {
     async fn messages_cross_in_both_directions() {
         let (ours, theirs) = pair().await;
         let mut peer = CodecPeer::new(theirs);
-        let (pipe, task) = drive_session(ours, SocketType::Dealer, options());
+        let (pipe, _user, task) = drive_session(
+            ours,
+            SocketType::Dealer,
+            options(),
+            Role::Connecter,
+            &context(),
+        );
 
         peer.read_greeting().await;
         peer.greet(greeting::VERSION).await;
@@ -995,13 +1630,15 @@ mod tests {
     async fn a_three_zero_peer_is_accepted_and_never_pinged() {
         let (ours, theirs) = pair().await;
         let mut peer = CodecPeer::new(theirs);
-        let (pipe, task) = drive_session(
+        let (pipe, _user, task) = drive_session(
             ours,
             SocketType::Push,
             SocketOptions {
                 heartbeat_ivl: Some(Duration::from_millis(10)),
                 ..options()
             },
+            Role::Connecter,
+            &context(),
         );
 
         peer.read_greeting().await;
@@ -1043,7 +1680,7 @@ mod tests {
     async fn a_three_one_peer_is_pinged_on_the_interval() {
         let (ours, theirs) = pair().await;
         let mut peer = CodecPeer::new(theirs);
-        let (_pipe, task) = drive_session(
+        let (_pipe, _user, task) = drive_session(
             ours,
             SocketType::Push,
             SocketOptions {
@@ -1052,6 +1689,8 @@ mod tests {
                 heartbeat_ttl: Some(Duration::from_secs(3)),
                 ..options()
             },
+            Role::Connecter,
+            &context(),
         );
 
         peer.read_greeting().await;
@@ -1079,7 +1718,13 @@ mod tests {
     async fn a_ping_is_answered_with_a_pong_that_echoes() {
         let (ours, theirs) = pair().await;
         let mut peer = CodecPeer::new(theirs);
-        let (_pipe, task) = drive_session(ours, SocketType::Rep, options());
+        let (_pipe, _user, task) = drive_session(
+            ours,
+            SocketType::Rep,
+            options(),
+            Role::Connecter,
+            &context(),
+        );
 
         peer.read_greeting().await;
         peer.greet(greeting::VERSION).await;
@@ -1112,7 +1757,13 @@ mod tests {
     async fn an_incompatible_socket_type_gets_an_error_then_a_close() {
         let (ours, theirs) = pair().await;
         let mut peer = CodecPeer::new(theirs);
-        let (_pipe, task) = drive_session(ours, SocketType::Req, options());
+        let (_pipe, _user, task) = drive_session(
+            ours,
+            SocketType::Req,
+            options(),
+            Role::Connecter,
+            &context(),
+        );
 
         peer.read_greeting().await;
         peer.greet(greeting::VERSION).await;
@@ -1141,7 +1792,13 @@ mod tests {
     async fn a_ready_without_a_socket_type_is_refused() {
         let (ours, theirs) = pair().await;
         let mut peer = CodecPeer::new(theirs);
-        let (_pipe, task) = drive_session(ours, SocketType::Pull, options());
+        let (_pipe, _user, task) = drive_session(
+            ours,
+            SocketType::Pull,
+            options(),
+            Role::Connecter,
+            &context(),
+        );
 
         peer.read_greeting().await;
         peer.greet(greeting::VERSION).await;
@@ -1165,7 +1822,13 @@ mod tests {
         for during_handshake in [true, false] {
             let (ours, theirs) = pair().await;
             let mut peer = CodecPeer::new(theirs);
-            let (_pipe, task) = drive_session(ours, SocketType::Pull, options());
+            let (_pipe, _user, task) = drive_session(
+                ours,
+                SocketType::Pull,
+                options(),
+                Role::Connecter,
+                &context(),
+            );
 
             peer.read_greeting().await;
             peer.greet(greeting::VERSION).await;
@@ -1188,13 +1851,15 @@ mod tests {
     async fn an_oversized_declaration_ends_the_connection() {
         let (ours, theirs) = pair().await;
         let mut peer = CodecPeer::new(theirs);
-        let (_pipe, task) = drive_session(
+        let (_pipe, _user, task) = drive_session(
             ours,
             SocketType::Pull,
             SocketOptions {
                 max_message_size: 1024,
                 ..options()
             },
+            Role::Connecter,
+            &context(),
         );
 
         peer.read_greeting().await;

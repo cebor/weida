@@ -172,6 +172,9 @@ pub enum CommandError {
     ReasonTooLong(usize),
     /// An `ERROR` reason contains a non-printable octet.
     ReasonNotPrintable,
+    /// A PLAIN `HELLO` username or password exceeds 255 octets, which its
+    /// own one-octet length field cannot describe.
+    FieldTooLong(usize),
 }
 
 impl CommandError {
@@ -198,6 +201,9 @@ impl fmt::Display for CommandError {
             CommandError::ReasonTooLong(n) => write!(f, "error reason of {n} octets exceeds 255"),
             CommandError::ReasonNotPrintable => {
                 f.write_str("error reason contains a non-printable octet")
+            }
+            CommandError::FieldTooLong(n) => {
+                write!(f, "PLAIN field of {n} octets exceeds 255")
             }
         }
     }

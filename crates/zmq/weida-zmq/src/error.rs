@@ -73,6 +73,16 @@ pub enum Error {
     /// with — an incompatible ZMTP version, or a socket type that is not a
     /// legal peer of ours (`docs/research/zeromq.md` §4.1).
     ENOCOMPATPROTO(Cause),
+    /// `EACCES`: a ZAP handler refused this connection.
+    ///
+    /// **Not one of libzmq's socket errnos**: libzmq reports a failed
+    /// authorization only through `zmq_socket_monitor`'s
+    /// `HANDSHAKE_FAILED_AUTH` event and closes the connection, so there is no
+    /// name to borrow. `EACCES` is POSIX's word for the thing that happened
+    /// and is used here rather than folding authorization into a protocol
+    /// error, which would say the peer was malformed when it was merely not
+    /// allowed (`docs/research/zeromq.md` §10).
+    EACCES(Cause),
     /// `EADDRINUSE`: the endpoint is already bound.
     EADDRINUSE(Cause),
     /// `EADDRNOTAVAIL`: the address cannot be bound on this host.
@@ -117,6 +127,7 @@ impl Error {
             Error::EINVAL(_) => "EINVAL",
             Error::EPROTONOSUPPORT(_) => "EPROTONOSUPPORT",
             Error::ENOCOMPATPROTO(_) => "ENOCOMPATPROTO",
+            Error::EACCES(_) => "EACCES",
             Error::EADDRINUSE(_) => "EADDRINUSE",
             Error::EADDRNOTAVAIL(_) => "EADDRNOTAVAIL",
             Error::ENOTSOCK(_) => "ENOTSOCK",
@@ -141,6 +152,7 @@ impl Error {
             | Error::EINVAL(cause)
             | Error::EPROTONOSUPPORT(cause)
             | Error::ENOCOMPATPROTO(cause)
+            | Error::EACCES(cause)
             | Error::EADDRINUSE(cause)
             | Error::EADDRNOTAVAIL(cause)
             | Error::ENOTSOCK(cause)
@@ -231,6 +243,7 @@ mod tests {
             Error::EINVAL("".into()),
             Error::EPROTONOSUPPORT("".into()),
             Error::ENOCOMPATPROTO("".into()),
+            Error::EACCES("".into()),
             Error::EADDRINUSE("".into()),
             Error::EADDRNOTAVAIL("".into()),
             Error::ENOTSOCK("".into()),

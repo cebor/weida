@@ -51,11 +51,12 @@ use crate::context::{Context, SocketId, SocketSlot};
 use crate::endpoint::{Endpoint, TcpHost};
 use crate::error::{Error, Result};
 use crate::identity::RoutingId;
-use crate::inproc::{Inproc, InprocBinding};
+use crate::inproc::InprocBinding;
 use crate::options::SocketOptions;
 use crate::pipe::Pipe;
 use crate::subscriptions::Subscriptions;
 use crate::transport::Stream;
+use crate::zap::{AuthenticatedUser, ZapUserId};
 
 /// What a [`Session`] returns: a future that ends when the connection does.
 pub type SessionFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
@@ -154,6 +155,18 @@ pub struct Connection {
     /// This peer's subscription table, which a PUB or XPUB session fills
     /// from the peer's `SUBSCRIBE`/`CANCEL` in either wire form.
     pub subscriptions: Arc<Subscriptions>,
+    /// The context this connection belongs to, for the `inproc://` namespace
+    /// its ZAP handler lives in.
+    pub context: Context,
+    /// The peer's address for a ZAP request: an IP for `tcp://`, and empty
+    /// for a local transport, which has no address to report.
+    pub peer_address: String,
+    /// The kernel's statement about a local peer, where the transport has
+    /// one, offered to a ZAP handler as the fact it is.
+    pub credentials: Option<weida_core::LocalPrincipal>,
+    /// Where to record what a ZAP handler said about this connection; see
+    /// [`AuthenticatedUser`].
+    pub user: AuthenticatedUser,
 }
 
 /// What drives one connection once its bytes flow: in this library, ZMTP.
@@ -172,6 +185,14 @@ pub trait Session: Send + Sync + 'static {
 /// A snapshot of one peer.
 #[derive(Clone, Debug)]
 pub struct Peer {
+    /// The user id a ZAP handler returned for this connection, where this
+    /// socket authorized it.
+    ///
+    /// A per-connection fact held by the server and never a per-message
+    /// label: 27/ZAP's user id is a string a handler chose, with no bridge to
+    /// weida's proved identities and none to the routing id either
+    /// ([`ZapUserId`]).
+    pub user_id: Option<ZapUserId>,
     /// The credentials the kernel attributes to this peer, for a local
     /// transport that has them.
     ///
@@ -219,6 +240,8 @@ struct PeerEntry {
     /// The kernel's statement about this peer, for an `ipc://` connection:
     /// captured when the connection was made and never re-read.
     credentials: Option<weida_core::LocalPrincipal>,
+    /// What a ZAP handler said about this connection, where one was asked.
+    user: AuthenticatedUser,
     pipe: Pipe,
     identity: AnnouncedIdentity,
     /// What this peer has subscribed to, as a publisher keeps it. Empty and
@@ -314,9 +337,11 @@ enum Admitted {
 }
 
 struct EngineInner {
-    /// The context's `inproc://` namespace, so that a bind can take a name
-    /// and a dial can find one.
-    inproc: Arc<Inproc>,
+    /// The context this socket belongs to: its `inproc://` namespace, so
+    /// that a bind can take a name and a dial can find one, and its ZAP
+    /// handler, which a session asks about every connection it must
+    /// authorize.
+    context: Context,
     exec: Exec,
     session: Arc<dyn Session>,
     options: SocketOptions,
@@ -359,7 +384,7 @@ pub struct Engine {
 /// What a task needs to run a connection without keeping the engine alive.
 #[derive(Clone)]
 struct TaskCtx {
-    inproc: Arc<Inproc>,
+    context: Context,
     socket: SocketId,
     engine: Weak<EngineInner>,
     exec: Exec,
@@ -382,7 +407,7 @@ impl Engine {
         let slot = context.open_socket()?;
         Ok(Engine {
             inner: Arc::new(EngineInner {
-                inproc: context.inproc_shared(),
+                context: context.clone(),
                 exec: context.exec().clone(),
                 session,
                 options,
@@ -432,7 +457,7 @@ impl Engine {
         check_transport(endpoint)?;
         let (bound, task) = match endpoint {
             Endpoint::Inproc(name) => {
-                let binding = self.inner.inproc.bind(name)?;
+                let binding = self.inner.context.inproc().bind(name)?;
                 let ctx = self.task_ctx();
                 let accepting = endpoint.clone();
                 // The binding moves into the task, so aborting the task —
@@ -523,6 +548,7 @@ impl Engine {
                 peer,
                 PeerEntry {
                     credentials: None,
+                    user: AuthenticatedUser::default(),
                     pipe,
                     identity: AnnouncedIdentity::default(),
                     subscriptions: Arc::new(Subscriptions::new(
@@ -754,7 +780,7 @@ impl Engine {
 
     fn task_ctx(&self) -> TaskCtx {
         TaskCtx {
-            inproc: Arc::clone(&self.inner.inproc),
+            context: self.inner.context.clone(),
             socket: self.inner.slot.id(),
             engine: Arc::downgrade(&self.inner),
             exec: self.inner.exec.clone(),
@@ -783,6 +809,7 @@ impl std::fmt::Debug for Engine {
 fn snapshot(id: PeerId, entry: &PeerEntry) -> Peer {
     Peer {
         id,
+        user_id: entry.user.get(),
         credentials: entry.credentials,
         endpoint: entry.endpoint.clone(),
         connected: entry.connected,
@@ -839,6 +866,7 @@ impl EngineInner {
             peer,
             PeerEntry {
                 credentials: None,
+                user: AuthenticatedUser::default(),
                 pipe,
                 identity: AnnouncedIdentity::default(),
                 subscriptions: Arc::new(Subscriptions::new(
@@ -923,6 +951,15 @@ impl EngineInner {
             .map(|entry| Arc::clone(&entry.subscriptions))
     }
 
+    fn user_slot(&self, peer: PeerId) -> Option<AuthenticatedUser> {
+        self.state
+            .lock()
+            .expect("engine state poisoned")
+            .peers
+            .get(&peer)
+            .map(|entry| entry.user.clone())
+    }
+
     fn identity_slot(&self, peer: PeerId) -> Option<AnnouncedIdentity> {
         self.state
             .lock()
@@ -946,9 +983,13 @@ impl EngineInner {
 /// automatically" — there is no `zmq_accept()` (§2).
 async fn accept_loop(ctx: TaskCtx, listener: TcpListener, endpoint: Endpoint) {
     loop {
-        let Ok((stream, _from)) = listener.accept().await else {
+        let Ok((stream, from)) = listener.accept().await else {
             return;
         };
+        // 27/ZAP wants "the client IP address as an IPv4 dotted or IPv6
+        // canonical string", so the address and not the port: authorization
+        // is about who connected, and the source port is noise.
+        let address = from.ip().to_string();
         // Upgraded per connection, never held across one: a task holding the
         // engine alive would make closing a socket impossible.
         let Some(engine) = ctx.engine.upgrade() else {
@@ -972,6 +1013,7 @@ async fn accept_loop(ctx: TaskCtx, listener: TcpListener, endpoint: Endpoint) {
             Admitted::SocketClosed => return,
         };
         let identity = engine.identity_slot(peer).unwrap_or_default();
+        let user = engine.user_slot(peer).unwrap_or_default();
         let subscriptions = engine.subscriptions_of(peer).unwrap_or_else(|| {
             Arc::new(Subscriptions::new(
                 ctx.options.max_subscriptions,
@@ -996,6 +1038,9 @@ async fn accept_loop(ctx: TaskCtx, listener: TcpListener, endpoint: Endpoint) {
                     role: Role::Binder,
                     identity,
                     subscriptions,
+                    address,
+                    credentials: None,
+                    user,
                 },
             )
             .await;
@@ -1042,6 +1087,7 @@ async fn inproc_accept_loop(ctx: TaskCtx, mut binding: InprocBinding, endpoint: 
             Admitted::SocketClosed => return,
         };
         let identity = engine.identity_slot(peer).unwrap_or_default();
+        let user = engine.user_slot(peer).unwrap_or_default();
         let subscriptions = engine.subscriptions_of(peer).unwrap_or_else(|| {
             Arc::new(Subscriptions::new(
                 ctx.options.max_subscriptions,
@@ -1064,6 +1110,11 @@ async fn inproc_accept_loop(ctx: TaskCtx, mut binding: InprocBinding, endpoint: 
                     role: Role::Binder,
                     identity,
                     subscriptions,
+                    // No address and no kernel: an in-process peer is this
+                    // process, and 27/ZAP's address frame stays empty.
+                    address: String::new(),
+                    credentials: None,
+                    user,
                 },
             )
             .await;
@@ -1110,8 +1161,10 @@ async fn ipc_accept_loop(ctx: TaskCtx, binding: crate::ipc::IpcBinding, endpoint
             }
             Admitted::SocketClosed => return,
         };
-        engine.set_credentials(peer, stream.peer_credentials());
+        let credentials = stream.peer_credentials();
+        engine.set_credentials(peer, credentials);
         let identity = engine.identity_slot(peer).unwrap_or_default();
+        let user = engine.user_slot(peer).unwrap_or_default();
         let subscriptions = engine.subscriptions_of(peer).unwrap_or_else(|| {
             Arc::new(Subscriptions::new(
                 ctx.options.max_subscriptions,
@@ -1134,6 +1187,13 @@ async fn ipc_accept_loop(ctx: TaskCtx, binding: crate::ipc::IpcBinding, endpoint
                     role: Role::Binder,
                     identity,
                     subscriptions,
+                    // A filesystem endpoint has no IP to report, and the
+                    // kernel's answer takes its place: 27/ZAP has no field
+                    // for it, so it travels as the extension frame
+                    // `crate::zap` documents.
+                    address: String::new(),
+                    credentials,
+                    user,
                 },
             )
             .await;
@@ -1164,6 +1224,7 @@ async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
             return;
         };
         let identity = engine.identity_slot(peer).unwrap_or_default();
+        let user = engine.user_slot(peer).unwrap_or_default();
         let subscriptions = engine.subscriptions_of(peer).unwrap_or_else(|| {
             Arc::new(Subscriptions::new(
                 ctx.options.max_subscriptions,
@@ -1174,8 +1235,9 @@ async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
 
         match dial(&ctx, &endpoint).await {
             Ok(stream) => {
+                let credentials = stream.peer_credentials();
                 if let Some(engine) = ctx.engine.upgrade() {
-                    engine.set_credentials(peer, stream.peer_credentials());
+                    engine.set_credentials(peer, credentials);
                     engine.set_connected(peer, true);
                 } else {
                     return;
@@ -1190,6 +1252,11 @@ async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
                         role: Role::Connecter,
                         identity: identity.clone(),
                         subscriptions: Arc::clone(&subscriptions),
+                        // The address of a dialled peer is the one we
+                        // dialled, which is the only one there is to report.
+                        address: dialled_address(&endpoint),
+                        credentials,
+                        user: user.clone(),
                     },
                 )
                 .await;
@@ -1232,10 +1299,10 @@ async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
 async fn dial(ctx: &TaskCtx, endpoint: &Endpoint) -> Result<Stream> {
     if let Endpoint::Inproc(name) = endpoint {
         loop {
-            if let Some(stream) = ctx.inproc.dial(name, ctx.socket) {
+            if let Some(stream) = ctx.context.inproc().dial(name, ctx.socket) {
                 return Ok(stream);
             }
-            ctx.inproc.wait_until_bound(name).await;
+            ctx.context.inproc().wait_until_bound(name).await;
         }
     }
     #[cfg(unix)]
@@ -1297,6 +1364,23 @@ async fn dial(ctx: &TaskCtx, endpoint: &Endpoint) -> Result<Stream> {
     Err(last)
 }
 
+/// The address to report to a ZAP handler for an endpoint this socket
+/// dialled.
+///
+/// A dialled `tcp://` endpoint's host, because that is the peer: 27/ZAP wants
+/// an IP, and a name that was resolved is still the address the application
+/// named. Empty for every local transport, which has no address at all.
+fn dialled_address(endpoint: &Endpoint) -> String {
+    match endpoint {
+        Endpoint::Tcp { host, .. } => match host {
+            TcpHost::Ip(ip) => ip.to_string(),
+            TcpHost::Name(name) => name.clone(),
+            TcpHost::Any => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
 /// Everything one peer contributes to a connection: what the engine holds
 /// for it, gathered so that starting a session is one argument rather than
 /// six that must be kept in the same order at two call sites.
@@ -1307,6 +1391,13 @@ struct PeerSession {
     role: Role,
     identity: AnnouncedIdentity,
     subscriptions: Arc<Subscriptions>,
+    /// The peer's address, for a ZAP request: an IP where the transport has
+    /// one, and empty otherwise.
+    address: String,
+    /// The kernel's statement about a local peer.
+    credentials: Option<weida_core::LocalPrincipal>,
+    /// Where the session records what a ZAP handler said.
+    user: AuthenticatedUser,
 }
 
 /// Hands a connection to the session, enforcing `ZMQ_HANDSHAKE_IVL`.
@@ -1323,6 +1414,10 @@ async fn run_session(ctx: &TaskCtx, stream: Stream, peer: PeerSession) -> Result
         handshake: HandshakeGate { done: Some(done) },
         identity: peer.identity,
         subscriptions: peer.subscriptions,
+        context: ctx.context.clone(),
+        peer_address: peer.address,
+        credentials: peer.credentials,
+        user: peer.user,
     };
     let mut session = ctx.session.run(connection);
 
