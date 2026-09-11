@@ -1049,17 +1049,17 @@ Where a bridge must refuse or take responsibility itself:
 Questions the evidence leaves open, phrased as decisions to make. Each names what the evidence
 constrains and what it does not.
 
-Eight of the nine are now decided, and each carries a **Closed by** paragraph naming the note:
-§8.1 by [0003](../decisions/0003-credit-unit.md), §8.2 by
+**Every question in this section is now decided**, and each carries a **Closed by** paragraph
+naming the note: §8.1 by [0003](../decisions/0003-credit-unit.md), §8.2 by
 [0002](../decisions/0002-control-and-bulk-separation.md), §8.3 by
 [0004](../decisions/0004-durability-levels.md), §8.4 by
 [0001](../decisions/0001-sequence-field.md), §8.5 by
 [0005](../decisions/0005-refusal-race.md), §8.6 by [0009](../decisions/0009-drain.md), §8.7 by
-[0006](../decisions/0006-guarantee-sets.md), §8.9 by
+[0006](../decisions/0006-guarantee-sets.md), §8.8 by
+[0010](../decisions/0010-local-transport.md), §8.9 by
 [0007](../decisions/0007-topic-namespace.md). The question text above each closing paragraph is
 left exactly as it was written, because a decision is only legible against the question it
-answered. **Still open: §8.8** — a local transport, and which one per platform. A tenth
-question — a session concept and a stable producer name — was raised in
+answered. A tenth question — a session concept and a stable producer name — was raised in
 [0001](../decisions/0001-sequence-field.md) §8 for this section and never added here; it is
 answered by [0008](../decisions/0008-session-identity.md) in that file instead, and is not
 created retroactively merely to strike it out.
@@ -1209,6 +1209,18 @@ their trade-offs and makes no choice, and the decisions it leaves open are:
   better than a named one" for a spawned-child topology, and records that there is no kernel
   zero-copy path for `AF_UNIX`, so passing a memfd, Mach memory entry or file-mapping handle is
   "the only route to zero-copy" [ipc §11]. Each of these is a decision weida has not made.
+
+**Closed by [0010](../decisions/0010-local-transport.md):** yes — inproc first, then `AF_UNIX`
+`SOCK_STREAM` on a permission-protected filesystem path (Linux and macOS, path budget checked
+after decoding), then named pipes in message mode with an explicit DACL and
+`PIPE_REJECT_REMOTE_CLIENTS`. `SOCK_SEQPACKET`, the abstract namespace, XPC as a transport and
+Windows `AF_UNIX` are each rejected with their reason. The shape that makes it cheap: **the OS
+connection is the stream**, one per transfer, so no framing or multiplexing layer is invented —
+at the price of a named `max_local_streams` bound. No TLS locally, so the kernel is the prover
+and `IncomingMeta::peer` becomes a sum of key and local principal, which amends 0008 §4.1
+without touching its rule. No automatic fallback to loopback TCP, because that would change
+who can connect silently; and bulk zero-copy by memfd, Mach entry or file-mapping handle is
+named as the only route and deferred to its own decision.
 
 **8.9 Does the endpoint-path namespace stay opaque?** "Endpoint paths are opaque identifiers"
 is an invariant, and the topic prefix match is deliberately confined to Pub/Sub topics
