@@ -15,9 +15,11 @@ its guarantee vocabulary is deliberately kept out of the socket layer until it d
 **Status:** alpha. Wire protocol version `0` (experimental, breaking changes permitted
 within `0.x`). Phases 0-2 implemented: docs, core model, native QUIC transport with Req/Rep.
 Phase 3 in progress: Push/Pull, Pub/Sub, the raw L0 stream API, peer identity by public-key
-fingerprint, and opt-in per-producer ordering and bounded deduplication have landed. The
-first slice of the ZeroMQ adapter — a standalone ZMTP 3.1 codec — is in
-`crates/adapters/weida-zmtp`.
+fingerprint, opt-in per-producer ordering and bounded deduplication, one connection per
+dialled endpoint path, a bounded `drain`, and an in-process transport beside QUIC have
+landed. The ZeroMQ adapter has its first two slices: a standalone ZMTP 3.1 codec
+(`crates/adapters/weida-zmtp`) and an inbound bridge that puts foreign ZeroMQ peers onto
+weida endpoints (`crates/adapters/weida-zmtp-bridge`).
 
 ## Documentation
 
@@ -38,8 +40,9 @@ first slice of the ZeroMQ adapter — a standalone ZMTP 3.1 codec — is in
 | --- | --- | --- |
 | `crates/core` | `weida-core` | I/O-free model: errors, endpoint addresses, limits, trace context |
 | `crates/protocol` | `weida-protocol` | wire codec, no I/O: varints, framing, CBOR headers, negotiation, error codes |
-| `crates/weida` | `weida` | runtime, native QUIC transport, the raw stream core, and the Req/Rep, Push/Pull and Pub/Sub patterns |
+| `crates/weida` | `weida` | runtime, the QUIC and in-process transports, the raw stream core, and the Req/Rep, Push/Pull and Pub/Sub patterns |
 | `crates/adapters/weida-zmtp` | `weida-zmtp` | ZMTP 3.1 codec — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |
+| `crates/adapters/weida-zmtp-bridge` | `weida-zmtp-bridge` | bridges foreign ZeroMQ peers onto weida endpoints, terminating both protocols |
 
 ## Identity in one line
 
@@ -101,9 +104,11 @@ cargo run -p weida --example owned_runtime   # a full exchange from a plain `fn 
 ```
 cargo test --workspace
 cargo test -p weida --test streams               # QUIC stream mechanics, measured
+cargo test -p weida --test transports            # one pattern suite over QUIC and inproc
 cargo test -p weida --test identity              # pins, anchors, addresses, client identity
 cargo test -p weida --test large -- --ignored     # 1 GiB echo, asserts bounded peak RSS
 cargo test -p weida-zmtp                         # ZMTP golden vectors and hostile input
+cargo test -p weida-zmtp-bridge                  # ZeroMQ peers against the bridge
 cargo bench                                      # codec and loopback QUIC throughput
 ```
 

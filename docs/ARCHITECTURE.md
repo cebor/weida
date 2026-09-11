@@ -371,10 +371,14 @@ one that plainly is not [0010 §4.8].
 
 ```text
 crates/
-    core/                  →  weida-core       I/O-free model
-    protocol/              →  weida-protocol   wire codec, no I/O
-    weida/                 →  weida            runtime + QUIC transport + stream core + patterns
-    adapters/weida-zmtp/   →  weida-zmtp       ZMTP 3.1 codec, no I/O and no weida dependency
+    core/                         →  weida-core         I/O-free model
+    protocol/                     →  weida-protocol     wire codec, no I/O
+    weida/                        →  weida              runtime + QUIC and local transports
+                                                        + stream core + patterns
+    adapters/weida-zmtp/          →  weida-zmtp         ZMTP 3.1 codec, no I/O and no
+                                                        weida dependency
+    adapters/weida-zmtp-bridge/   →  weida-zmtp-bridge  foreign ZeroMQ peers onto weida
+                                                        endpoints
 ```
 
 `weida-zmtp` is the first slice of the ZeroMQ adapter
@@ -382,7 +386,12 @@ crates/
 `weida-core`. That is deliberate and stronger than the rule below: the half of an adapter
 that can be checked byte-for-byte against a foreign specification must not be able to reach
 for weida's types, limits or error vocabulary, or the check quietly becomes a check against
-our reading of the specification. The bridge slices depend on both sides.
+our reading of the specification.
+
+`weida-zmtp-bridge` is the other half and therefore depends on both sides. It is a separate
+crate rather than a feature of the codec for exactly the reason above: a feature would put a
+weida dependency in the codec's manifest, and the codec's dependency-free manifest is the
+thing that keeps it honest.
 
 Planned, not yet present: `weida-broker` (the L2 semantics of §1 — queues, publisher
 confirms, consumer acknowledgements with redelivery — Phase 6), `weida-web` (the Web

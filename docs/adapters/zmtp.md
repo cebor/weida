@@ -1,9 +1,10 @@
 # ZMTP 3.1 — adapter mapping
 
-Status: mapping document; slice 1 (the codec) implemented as `crates/adapters/weida-zmtp`.
-The rest is the design the bridge slices must implement, and the contract the adapter's
+Status: mapping document; slice 1 (the codec) implemented as `crates/adapters/weida-zmtp` and
+slice 2 (the inbound bridge) as `crates/adapters/weida-zmtp-bridge`. What is left is the
+outbound direction (slice 3) and the interop bench (slice 5), and the contract the adapter's
 documentation owes its user
-([LOOP.md](../LOOP.md) §9 Phase B slice 2, [0006](../decisions/0006-guarantee-sets.md) §4.9).
+([LOOP.md](../LOOP.md) §9 Phase B, [0006](../decisions/0006-guarantee-sets.md) §4.9).
 Date: 2026-09-11
 Derived from: [docs/research/zeromq.md](../research/zeromq.md) (ZMTP 3.1, libzmq 4.3.x, the
 zguide, CURVE/ZAP). Every ZeroMQ claim below carries that sheet's section; every weida claim
@@ -23,6 +24,17 @@ subscriptions — and it terminates weida; nothing is forwarded opaquely. That i
 "all guarantees are defined against the immediate next hop"
 ([INVARIANTS.md](../INVARIANTS.md)) checkable at this edge, and it is why §7 can name exactly
 where the chain ends.
+
+**What the inbound slice built** (`crates/adapters/weida-zmtp-bridge`): one `Inbound` listens
+on a TCP address, presents one ZeroMQ socket type, and speaks to one weida endpoint —
+`REP` for a `REQ`/`DEALER` peer, `PULL` for a `PUSH` peer, `PUB` for a `SUB`/`XSUB` peer. It
+drives the greeting and the NULL handshake, checks the peer's socket type against §2's table
+and answers a mismatch with `ERROR` before the close, consumes the envelope frames a pattern
+defines and refuses the multipart messages it does not (L1), translates subscriptions per §6
+with the refusals of §9.3 and ZeroMQ's reference counting (L3), and bounds what it buffers
+with its own `max_message_bytes` (§3). The tests drive it with a ZMTP peer built on the
+codec, which is faithful on the wire and is *not* an independent implementation — that is
+what slice 5's bench against the pure-Rust `zeromq` crate is still owed for (§10 items 3-6).
 
 Out of scope for the first slices: the draft thread-safe socket family, `pgm`/`epgm`, `udp`,
 `vmci`, `tipc`, `vsock` and `ws`/`wss` [zeromq §12/P18]; `ZMQ_STREAM` (a raw-TCP shim, not a
@@ -320,7 +332,12 @@ the process supervisor with a `ready` condition and is stopped in the same item 
    `cargo test`, including a long header with an arbitrary 64-bit length and no body.
 3. **Inbound matrix.** zmq.rs REQ → adapter → weida `Replier`; zmq.rs PUSH → adapter →
    `Puller`; zmq.rs SUB ← adapter ← weida `Publisher`, including a boundary-aligned prefix and
-   a rejected mid-segment prefix (L2).
+   a rejected mid-segment prefix (L2). *Slice 2 has all three, and the losses, against a peer
+   built on this repository's own codec* (`crates/adapters/weida-zmtp-bridge/tests/inbound.rs`).
+   What is left for this item is the only thing that peer cannot be: **independent**. A codec
+   that is byte-exact against the golden vectors is a faithful ZMTP peer and still shares every
+   assumption with the code under test, so the zmq.rs run is what turns "we agree with
+   ourselves" into interoperability.
 4. **Outbound matrix.** The same four with the directions reversed, plus DEALER/ROUTER against
    weida's concurrent exchanges [ARCHITECTURE §6b].
 5. **Loss assertions, not just happy paths.** Each named loss of §8 that is observable gets a
