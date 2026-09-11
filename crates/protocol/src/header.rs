@@ -38,6 +38,12 @@ pub mod limits {
     pub const MAX_TRACESTATE_BYTES: usize = 512;
     /// Cap for the DATA `topic` field.
     pub const MAX_TOPIC_BYTES: usize = 256;
+    /// Length of the DATA `producer` field: a raw 32-byte digest.
+    ///
+    /// Both a cap and an exact length. `docs/PROTOCOL.md` §6.2 defines the
+    /// value as "the raw 32-byte digest", so a longer one is a framing
+    /// violation and a shorter one names nothing this specification defines.
+    pub const PRODUCER_BYTES: usize = 32;
     /// Cap for the SUBSCRIBE/UNSUBSCRIBE `filter` field.
     pub const MAX_FILTER_BYTES: usize = 256;
     /// Cap for the ERROR `message` field.
@@ -68,6 +74,8 @@ mod data_key {
     pub const TRACEPARENT: u64 = 3;
     pub const TRACESTATE: u64 = 4;
     pub const TOPIC: u64 = 5;
+    pub const SEQUENCE: u64 = 6;
+    pub const PRODUCER: u64 = 7;
 }
 
 /// ERROR keys.
@@ -362,6 +370,29 @@ impl<'a, 'b> MapReader<'a, 'b> {
         Ok(s.to_owned())
     }
 
+    /// Reads a byte string of exactly `N` bytes.
+    ///
+    /// The cap is checked before the length is trusted for anything, and a
+    /// shorter value is rejected rather than padded: `docs/PROTOCOL.md` §6.2
+    /// defines the one field that uses this as a raw 32-byte digest, and half
+    /// a digest identifies nobody.
+    fn byte_array<const N: usize>(&mut self, key: u64) -> Result<[u8; N], HeaderError> {
+        let bytes = self
+            .d
+            .bytes()
+            .map_err(|_| HeaderError::Malformed("expected a byte string"))?;
+        if bytes.len() > N {
+            return Err(HeaderError::StringTooLong {
+                key,
+                len: bytes.len(),
+                max: N,
+            });
+        }
+        bytes
+            .try_into()
+            .map_err(|_| HeaderError::Malformed("byte string has the wrong length"))
+    }
+
     fn uint_list(&mut self, key: u64) -> Result<Vec<u64>, HeaderError> {
         let len = self
             .d
@@ -509,9 +540,28 @@ pub struct DataHeader {
     pub traceparent: Option<String>,
     /// W3C `tracestate`, opaque passthrough.
     pub tracestate: Option<String>,
-    /// Pub/Sub topic; opaque bytes matched by byte prefix. Only meaningful on
-    /// transfers fanned out by a publisher.
+    /// Pub/Sub topic; opaque bytes, selected by the filter grammar of
+    /// `docs/PROTOCOL.md` §6.4. Only meaningful on transfers fanned out by a
+    /// publisher.
     pub topic: Option<String>,
+    /// Per-producer sequence number, for ordering and gap detection
+    /// (`docs/PROTOCOL.md` §6.2, key `6`).
+    ///
+    /// **Specified ahead of code**: the codec carries it, and no v0 sender
+    /// sets it. It is not a transfer identifier and correlates nothing — an
+    /// exchange is correlated by its stream.
+    pub sequence: Option<u64>,
+    /// Producer identity: the raw 32-byte digest (`docs/PROTOCOL.md` §6.2,
+    /// key `7`).
+    ///
+    /// **Specified ahead of code**, and absent in the default case by design:
+    /// the receiver already knows the sending peer's proved fingerprint from
+    /// the handshake, so this names a producer only where it is *not* the
+    /// connection peer — a relay, or a name an L2 subscription supplies
+    /// ([decisions/0008](../../../docs/decisions/0008-session-identity.md)
+    /// §4.4). The `sha256:<64 hex>` spelling is presentation only and never
+    /// goes on the wire.
+    pub producer: Option<[u8; limits::PRODUCER_BYTES]>,
 }
 
 impl DataHeader {
@@ -538,7 +588,9 @@ impl DataHeader {
             + u64::from(self.content_type.is_some())
             + u64::from(self.traceparent.is_some())
             + u64::from(self.tracestate.is_some())
-            + u64::from(self.topic.is_some());
+            + u64::from(self.topic.is_some())
+            + u64::from(self.sequence.is_some())
+            + u64::from(self.producer.is_some());
         encode_with(|e| {
             e.map(count)?;
             if let Some(endpoint) = &self.endpoint {
@@ -558,6 +610,14 @@ impl DataHeader {
             }
             if let Some(topic) = &self.topic {
                 e.u64(data_key::TOPIC)?.str(topic)?;
+            }
+            // Keys 6 and 7 are written only when set, which for every v0
+            // sender means never: nothing in `weida` populates them yet.
+            if let Some(sequence) = self.sequence {
+                e.u64(data_key::SEQUENCE)?.u64(sequence)?;
+            }
+            if let Some(producer) = &self.producer {
+                e.u64(data_key::PRODUCER)?.bytes(producer)?;
             }
             Ok(())
         })
@@ -585,6 +645,8 @@ impl DataHeader {
                         header.tracestate = Some(m.text(key, limits::MAX_TRACESTATE_BYTES)?)
                     }
                     data_key::TOPIC => header.topic = Some(m.text(key, limits::MAX_TOPIC_BYTES)?),
+                    data_key::SEQUENCE => header.sequence = Some(m.u64()?),
+                    data_key::PRODUCER => header.producer = Some(m.byte_array(key)?),
                     _ => m.skip()?,
                 }
             }
@@ -783,6 +845,106 @@ mod tests {
         assert_eq!(DataHeader::decode(&bytes).unwrap(), h);
     }
 
+    /// The digest of the §8 vectors: SHA-256 of `"test"`, the value the
+    /// address examples in `docs/PROTOCOL.md` already use.
+    const VECTOR_PRODUCER: [u8; limits::PRODUCER_BYTES] = [
+        0x9F, 0x86, 0xD0, 0x81, 0x88, 0x4C, 0x7D, 0x65, 0x9A, 0x2F, 0xEA, 0xA0, 0xC5, 0x5A, 0xD0,
+        0x15, 0xA3, 0xBF, 0x4F, 0x1B, 0x2B, 0x0B, 0x82, 0x2C, 0xD1, 0x5D, 0x6C, 0x15, 0xB0, 0xF0,
+        0x0A, 0x08,
+    ];
+
+    #[test]
+    fn golden_sequenced_data_header() {
+        let mut h = DataHeader::addressed("/t");
+        h.sequence = Some(1);
+        let bytes = h.encode();
+        assert_eq!(bytes, vec![0xA2, 0x00, 0x62, 0x2F, 0x74, 0x06, 0x01]);
+        assert_eq!(bytes.len(), 0x07);
+        assert_eq!(DataHeader::decode(&bytes).unwrap(), h);
+    }
+
+    #[test]
+    fn golden_relayed_data_header() {
+        let mut h = DataHeader::addressed("/t");
+        h.sequence = Some(1);
+        h.producer = Some(VECTOR_PRODUCER);
+        let bytes = h.encode();
+        let mut expected = vec![0xA3, 0x00, 0x62, 0x2F, 0x74, 0x06, 0x01, 0x07, 0x58, 0x20];
+        expected.extend_from_slice(&VECTOR_PRODUCER);
+        assert_eq!(bytes, expected);
+        assert_eq!(bytes.len(), 0x2A);
+        assert_eq!(DataHeader::decode(&bytes).unwrap(), h);
+    }
+
+    #[test]
+    fn a_producer_longer_than_the_cap_is_rejected() {
+        let bytes = encode_with(|e| {
+            e.map(1)?;
+            e.u64(data_key::PRODUCER)?
+                .bytes(&[0u8; limits::PRODUCER_BYTES + 1])?;
+            Ok(())
+        });
+        assert_eq!(
+            DataHeader::decode(&bytes),
+            Err(HeaderError::StringTooLong {
+                key: data_key::PRODUCER,
+                len: limits::PRODUCER_BYTES + 1,
+                max: limits::PRODUCER_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn a_producer_shorter_than_a_digest_is_rejected() {
+        // Half a digest identifies nobody, so it is a framing violation
+        // rather than a value to carry (`docs/PROTOCOL.md` §6.2).
+        let bytes = encode_with(|e| {
+            e.map(1)?;
+            e.u64(data_key::PRODUCER)?.bytes(&[0u8; 16])?;
+            Ok(())
+        });
+        assert!(matches!(
+            DataHeader::decode(&bytes),
+            Err(HeaderError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn the_new_keys_reject_the_wrong_cbor_type() {
+        let sequence_as_text = encode_with(|e| {
+            e.map(1)?;
+            e.u64(data_key::SEQUENCE)?.str("7")?;
+            Ok(())
+        });
+        assert!(DataHeader::decode(&sequence_as_text).is_err());
+
+        let producer_as_text = encode_with(|e| {
+            e.map(1)?;
+            e.u64(data_key::PRODUCER)?.str("sha256:…")?;
+            Ok(())
+        });
+        assert!(DataHeader::decode(&producer_as_text).is_err());
+    }
+
+    #[test]
+    fn a_v0_header_carries_neither_new_key() {
+        // What the runtime actually writes: keys 6 and 7 are specified ahead
+        // of code, and no v0 sender sets them.
+        let mut h = DataHeader::addressed("/t");
+        h.traceparent = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into());
+        let bytes = h.encode();
+        let mut d = Decoder::new(&bytes);
+        let pairs = d.map().unwrap().unwrap();
+        let keys: Vec<u64> = (0..pairs)
+            .map(|_| {
+                let key = d.u64().unwrap();
+                d.skip().unwrap();
+                key
+            })
+            .collect();
+        assert_eq!(keys, vec![data_key::ENDPOINT, data_key::TRACEPARENT]);
+    }
+
     #[test]
     fn golden_subscription_headers() {
         let h = SubscriptionHeader::new("/md", "px.");
@@ -810,6 +972,8 @@ mod tests {
             traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
             tracestate: Some("vendor=value".into()),
             topic: Some("px.eur".into()),
+            sequence: Some(u64::MAX),
+            producer: Some([0x5A; limits::PRODUCER_BYTES]),
         };
         assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
     }
@@ -836,6 +1000,8 @@ mod tests {
             traceparent: Some("p".into()),
             tracestate: Some("s".into()),
             topic: Some("k".into()),
+            sequence: Some(9),
+            producer: Some([0u8; limits::PRODUCER_BYTES]),
         };
         let bytes = h.encode();
         let mut d = Decoder::new(&bytes);

@@ -22,6 +22,11 @@ struct ArbHeader {
     traceparent: Option<String>,
     tracestate: Option<String>,
     topic: Option<String>,
+    sequence: Option<u64>,
+    /// The wire form is a fixed-length digest, so the input is an array
+    /// rather than a `Vec`: a shorter value is not representable on the wire
+    /// and is the `data_header` target's job.
+    producer: Option<[u8; limits::PRODUCER_BYTES]>,
 }
 
 /// Truncates on a char boundary so the result stays valid UTF-8.
@@ -48,6 +53,8 @@ fuzz_target!(|input: ArbHeader| {
         traceparent: cap(input.traceparent, limits::MAX_TRACEPARENT_BYTES),
         tracestate: cap(input.tracestate, limits::MAX_TRACESTATE_BYTES),
         topic: cap(input.topic, limits::MAX_TOPIC_BYTES),
+        sequence: input.sequence,
+        producer: input.producer,
     };
 
     let bytes = header.encode();

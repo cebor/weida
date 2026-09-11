@@ -284,6 +284,11 @@ fn wire_bytes(endpoint: &str, meta: &TransferMeta, payload: usize) -> usize {
         traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_owned()),
         tracestate: None,
         topic: None,
+        // B-009 simulated keys 6 and 7 with the existing fields whose wire
+        // shape matched; the runtime still writes neither, so the frame this
+        // function measures is unchanged.
+        sequence: None,
+        producer: None,
     };
     encode_frame(FrameKind::Data, &header.encode()).len() + payload
 }

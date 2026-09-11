@@ -396,7 +396,8 @@ It is **absent** in the default case, because the receiver already knows the sen
 proved fingerprint from the handshake and a claimed name could not be trusted anyway
 ([decisions/0008](decisions/0008-session-identity.md) §4.4). Where present it is the raw
 32-byte digest as a `bstr`; the `sha256:<64 hex>` spelling is presentation only and MUST NOT
-appear on the wire. The cap is 32 B, so a longer value is a framing violation (§3.2), and the
+appear on the wire. The length is exact rather than merely capped — a `bstr` of any other
+length is a framing violation (§3.2), because a truncated digest names nobody — and the
 absent default is also what keeps a connection that negotiated no ordering from paying for
 one: the measured cost of writing the text form was +80 B and −9 % of the message rate at a
 64-byte payload ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-009).
@@ -571,6 +572,14 @@ ERROR  {code:5}                              (NO_REPLY, on a reply half)
 DATA   {endpoint:"/md", topic:"px.eur"}      (publisher fan-out copy)
        57 01 0E  A2 00 63 2F 6D 64 05 66 70 78 2E 65 75 72
 
+DATA   {endpoint:"/t", sequence:1}           (key 6; no v0 sender writes it)
+       57 01 07  A2 00 62 2F 74 06 01
+
+DATA   {endpoint:"/t", sequence:1, producer:<32-byte digest>}   (keys 6 and 7)
+       57 01 2A  A3 00 62 2F 74 06 01 07 58 20
+                 9F 86 D0 81 88 4C 7D 65 9A 2F EA A0 C5 5A D0 15
+                 A3 BF 4F 1B 2B 0B 82 2C D1 5D 6C 15 B0 F0 0A 08
+
 SUB    {endpoint:"/md", filter:"px."}
        57 03 0B  A2 00 63 2F 6D 64 01 63 70 78 2E
 
@@ -593,6 +602,19 @@ CBOR map of 2 entries: key `0` `endpoint = "/md"`, key `5` `topic = "px.eur"`. T
 shape of a copy a publisher writes to one subscriber. A real fan-out copy additionally
 carries `content_len` and `traceparent`; they are omitted here to keep the vector minimal.
 
+**Sequenced DATA vector** — magic `0x57`, kind `0x01` (DATA), `header_len = 0x07` (7 bytes),
+CBOR map of 2 entries: key `0` `endpoint = "/t"`, key `6` `sequence = 1`. The sequence is a
+plain minimal `uint`, so the whole field costs two bytes here and six at `u64::MAX`. The
+vector fixes the encoding; no v0 sender writes the key (§6.2).
+
+**Relayed DATA vector** — magic `0x57`, kind `0x01` (DATA), `header_len = 0x2A` (42 bytes),
+CBOR map of 3 entries: key `0` `endpoint = "/t"`, key `6` `sequence = 1`, key `7` `producer`
+= the 32 bytes `9f86…0a08`, which is SHA-256 of `"test"` — the digest the address examples
+of §4 already use. The `bstr` header is `58 20`: major type 2, one-byte length `0x20` = 32.
+This is the shape a relay or an L2 hop writes when the producer is **not** the connection
+peer; the `sha256:<64 hex>` spelling never appears on the wire, and a value of any other
+length is a framing violation (§6.2).
+
 **SUBSCRIBE and UNSUBSCRIBE vectors** — magic `0x57`, kind `0x03` / `0x04`,
 `header_len = 0x0B` (11 bytes), CBOR map of 2 entries: key `0` `endpoint = "/md"`, key `1`
 `filter = "px."`. The two frames differ in exactly one byte, the kind.
@@ -603,9 +625,10 @@ string `px.` is a two-segment filter `["px", ""]`, so it does **not** select the
 and its bytes are still exactly what an encoder must produce for that filter string. Vectors
 for the grammar itself — a literal filter, a middle-segment `*`, a trailing `#`, the empty
 filter, and a topic containing a literal `*` — land with the matcher
-([decisions/0007](decisions/0007-topic-namespace.md) §6), as do vectors for DATA keys `6` and
-`7` and for a HELLO carrying a guarantee set. §8 deliberately carries no vector for anything
-no implementation writes yet.
+([decisions/0007](decisions/0007-topic-namespace.md) §6), and a vector for a HELLO carrying a
+guarantee set lands with the HELLO fields. The DATA key `6` and `7` vectors above landed with
+their codec: `weida-protocol` encodes and decodes both, while no v0 sender sets either, so
+the vectors pin an encoding rather than describe traffic.
 
 **HELLO vector** — magic `0x57`, kind `0x00` (HELLO), `header_len = 0x10` (16 bytes),
 CBOR map of 5 entries: key `0` `versions = [0]`, key `1` `max_header_bytes = 16384`,

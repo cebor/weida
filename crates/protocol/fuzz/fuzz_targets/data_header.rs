@@ -35,6 +35,11 @@ fuzz_target!(|data: &[u8]| {
     if let Some(topic) = &header.topic {
         assert!(topic.len() <= limits::MAX_TOPIC_BYTES);
     }
+    // Key 7 is length-exact, not merely capped: an accepted header carries a
+    // whole digest or none at all.
+    if let Some(producer) = &header.producer {
+        assert_eq!(producer.len(), limits::PRODUCER_BYTES);
+    }
 
     let reencoded = header.encode();
     assert_eq!(DataHeader::decode(&reencoded).as_ref(), Ok(&header));

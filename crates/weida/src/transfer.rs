@@ -130,6 +130,10 @@ pub(crate) fn data_header(
         traceparent: Some(trace.to_traceparent()),
         tracestate,
         topic: None,
+        // Keys 6 and 7 are specified ahead of code: the codec carries them,
+        // the v0 runtime writes neither (`docs/PROTOCOL.md` §6.2).
+        sequence: None,
+        producer: None,
     };
     (header, trace)
 }
