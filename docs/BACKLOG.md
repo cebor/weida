@@ -43,8 +43,9 @@ acceptance: a criterion bench in `crates/weida/benches/patterns.rs` pushing 64-b
 note: `topic` is settable only by a publisher, so the second key is simulated by a `sha256:<64 hex>` `content_type` — the wire shape of the producer identity of 0008 — rather than by `topic`. The measured +80 B is therefore the worst case for DATA keys 6 and 7, and it is what 0008 §4.4 used to fix the encoding.
 
 ### B-010 — Measure: reassembly buffer under cross-stream reordering
-kind: measure | size: 60 | status: in_progress 2026-09-11T03:00Z | needs: []
+kind: measure | size: 60 | status: done a236cbb | needs: []
 acceptance: a probe in `crates/weida/tests/streams.rs` opening N transfers, finishing them in reverse order, and measuring at the puller how many arrive out of dispatch order and the peak count held back by an application-side reorder buffer keyed on a payload sequence; N = 16, 256; numbers recorded.
+note: queueing the reverse FINs back to back does not reverse the arrival order — quinn transmits pending streams in its own order — so the probe carries a second mode that awaits each FIN's transport receipt, which does reverse it and reaches the N − 1 bound. Run at N = 16 for that mode; N = 16 and 256 for the batched one.
 
 ### B-011 — Measure: second handshake per peer
 kind: measure | size: 45 | status: ready | needs: []
