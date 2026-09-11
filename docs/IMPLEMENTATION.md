@@ -537,6 +537,39 @@ RSS is read from `/proc/self/status` `VmRSS` and the allocator does not return e
 between measurements, so each row's baseline is the previous row's residue; the per-connection
 deltas are the trustworthy part and the absolute totals are not.
 
+### Verified results — connections per dialled path (B-012)
+
+The same bench, extended with the per-path fan of
+[0002](decisions/0002-control-and-bulk-separation.md) and the point at which a server refuses.
+Two shapes are measured because they are two different systems: today the pool keys on
+`(host, port, ClientTls, address fingerprint)` and **not** on the path, so every path a runtime
+dials shares one connection; 0002's bulk tier makes it one connection per path.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| 16 paths, pooled (today) | `cargo bench -p weida --bench connections` | **1.13-1.15 ms** for all 16 dials: one handshake and fifteen pool hits, 16 `(connection, path)` peer entries over **one** QUIC connection |
+| 256 paths, pooled (today) | same | **1.47 ms** for all 256 dials, 256 peer entries over **one** connection. The fan does not exist yet: dialling more paths costs microseconds, not connections |
+| 16 paths, one connection each (0002) | same | **22.6-23.6 ms** total, **1.41-1.47 ms** per path |
+| 256 paths, one connection each (0002) | same | **277.7 ms** total, **1.08 ms** per path — no degradation with the count, and 995 KiB of RSS per connection for both ends together, consistent with B-011's 750-850 KiB at 64 |
+| The refusal point | same | with `max_connections = 8`, connections 0 through 7 are accepted and the ninth dial fails with `Error::LimitExceeded` — "resource limit exceeded". The server completes the handshake first and then closes with `LIMIT_EXCEEDED` on purpose, so a peer can tell overload from a routing mistake (`crates/weida/src/listener.rs`) |
+
+The consequence for B-017's `Limits` profiles: **a per-path bulk connection is affordable in
+time and linear in memory, but it converts a path count into a connection count against
+`max_connections`** — a default of 1024 accepted connections per binding is 1024 paths' worth
+of fan from a *single* client if nothing else bounds it, which is why
+`max_connections_per_peer` is a named bound before the code exists
+([INVARIANTS.md](INVARIANTS.md), [PROTOCOL.md](PROTOCOL.md) §10.1). A client that dials 256
+paths pays 278 ms of handshakes where it pays 1.5 ms today, so the bulk tier wants lazy
+per-path connections — a path dialled is not a path used — while the control connection stays
+eager per B-011.
+
+**One regression found, not caused by this item.** `connect/cold_handshake` moved from
+1.02-1.10 ms to **1.18-1.24 ms** (+12 %, p = 0.00) against criterion's stored baseline, and the
+baseline was recorded before B-016 landed. The cause is visible in the code rather than
+inferred: `Exec::resolve` allocates the host string, spawns a task and awaits its join handle
+on **every** `connect`, including for a literal `127.0.0.1` that needs no lookup at all
+(`crates/weida/src/runtime.rs`, `crates/weida/src/pool.rs`). Filed as B-025.
+
 ---
 
 ## 5. Decisions
