@@ -1172,3 +1172,10 @@ addressing namespace itself. The decision — required before any adapter maps a
 hierarchical namespace onto weida endpoints — is whether the invariant is amended (with the
 reasoning recorded first, as [INVARIANTS] itself requires) or whether adapters keep their
 hierarchy entirely inside their own crate.
+
+**Closed by [0007](../decisions/0007-topic-namespace.md):** the invariant is not amended.
+Endpoint paths stay opaque and exactly matched; the hierarchy lives in the Pub/Sub topic
+namespace, whose filters become segmented patterns — separator `.`, `*` for exactly one
+segment, trailing `#` for zero or more — and a ZeroMQ byte-prefix subscription maps to a
+segment boundary as a named loss. The note carries the mapping table for MQTT `+`/`#`,
+NATS `*`/`>` and AMQP 0-9-1 `*`/`#`.
