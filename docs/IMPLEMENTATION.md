@@ -569,6 +569,17 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Certificate generation | `rcgen`, behind default feature `generate` | `Identity::generate()` is what lets a pinned deployment handle no PEM at all, so it is on by default; behind a feature so a deployment that only loads issued certificates does not link a certificate builder. |
 | Fingerprint dependencies | `rustls-webpki` (SPKI parsing) and `ring` (SHA-256) as direct dependencies | Both were already in the tree through rustls, so naming them directly adds no third-party code and no build time, which is what master doc §72's dependency discipline asks. Neither parsing a leaf's SPKI nor hashing it is something rustls exposes. |
 
+### Runtime ownership decisions (B-016)
+
+| Decision | Value | Rationale |
+| --- | --- | --- |
+| Three constructors | `Runtime::new` (ambient reactor), `Runtime::with_handle(handle, config)`, `Runtime::owned(config)` | `quinn` needs a Tokio reactor and nothing else in the crate does. Making the reactor something the runtime holds — borrowed, handed over, or created — removes "you must already be inside `#[tokio::main]`" from weida's contract, which is the prerequisite for the Phase 10 bindings, where the host language owns the thread the call arrives on. |
+| `worker_threads` | `RuntimeConfig::worker_threads`, default 1, `0` rejected | A messaging runtime is I/O bound, and every extra worker is a thread a library takes from its host process without being asked. `0` is a configuration error rather than something to correct silently ([GUARANTEES.md](GUARANTEES.md) §4). |
+| Owned-runtime teardown | `shutdown_background()` from `Drop`, not a plain drop | The last `Runtime` clone may go out of scope on one of that runtime's own worker threads, where dropping a Tokio runtime panics inside a destructor — which aborts rather than unwinds. |
+| One runtime surface | `Exec` in `crates/weida/src/runtime.rs`: `spawn`, `sleep`, `resolve`, `enter` | One place to see what the crate asks of tokio, and the thing that makes a non-tokio caller possible at all. `grep -n 'tokio::spawn\|tokio::time\|lookup_host' crates/weida/src` matches `runtime.rs` and one comment. |
+| Client handshake placement | spawned **on** the runtime, awaited by the caller as a join handle | Completing a `quinn::Connecting` spawns the connection driver from inside the poll, so the polling thread would need an ambient reactor. Spawning it keeps `Runtime::connect` pollable from any executor and keeps the future `Send`, which holding an `EnterGuard` across the await would not. |
+| `futures-io` beside `tokio::io` | both trait pairs on `OutgoingTransfer`/`IncomingTransfer`, `futures-io` delegating to the tokio impl | A caller on `futures`, `smol` or `async-std` should not have to wrap a compat shim around a payload stream. Delegating keeps the end-of-payload bookkeeping in one place. |
+
 ---
 
 ## 6. Known debt and deferred work
