@@ -883,6 +883,39 @@ replaced would have been ~0.5 ns per comparison in isolation, so a hot-path-only
 have preferred it; what it could not do is express a segment boundary at all, which is the
 trade 0007 recorded and these numbers price.
 
+### Verified results — the dedup key's allocation per call (B-040)
+
+`DedupWindow::is_duplicate` builds its lookup key with `scope: scope.into()`, which allocates
+a `Box<str>` on **every** call — including the two paths that insert nothing: a duplicate that
+is found, and the probe before an insert. The worker who wrote B-034 noticed it and refused to
+restructure the key on suspicion; this is the number that decides it.
+
+It cannot be measured through the public surface. `DedupWindow` is `pub(crate)` and its only
+public path is a negotiated connection receiving DATA, where one loopback message costs
+microseconds and would bury a nanosecond answer — so the `dedup_key` group of
+`crates/weida/benches/patterns.rs` measures the two *shapes* as pure functions, the way B-021
+measured the byte prefix it had replaced. Tables hold `max_dedup_entries = 4096` entries over
+eight scopes, with a 19-byte scope string. Two runs, release, same idle machine.
+
+| Shape | Miss | Hit |
+| --- | --- | --- |
+| **owned** — today: one flat `HashMap<Identity, _>`, key allocates per probe | **41.1-41.3 ns** | **43.8-48.1 ns** |
+| the same table, key built once (the allocation removed, nothing else) | 31.4 ns | 35.1-35.6 ns |
+| **borrowed** — the candidate: `HashMap<Box<str>, HashMap<(producer, sequence), _>>`, outer lookup borrows `&str` | 42.0-42.8 ns | 44.7-46.3 ns |
+
+`cargo bench -p weida --bench patterns -- dedup_key --warm-up-time 1 --measurement-time 3`
+
+**The allocation costs ~10 ns**, which the middle row isolates: 41.2 against 31.4 on a miss,
+and the same gap on a hit.
+
+**And removing it does not pay.** The candidate shape is *slower* on a miss — 42.0-42.8 ns
+against 41.1-41.3 — and the same within noise on a hit, because a two-level table hashes twice
+and the second hash costs what the allocation cost. That is the whole finding: the obvious
+optimization buys nothing, so the flat key stays and `dedup.rs` now says so with the number
+beside it. For scale, 10 ns is **0.13 %** of a 1 KiB push (~7.9 µs), and deduplication is
+opt-in — a connection that negotiated `core` allocates nothing here at all, which the
+capacity assertions in `dedup.rs` already prove.
+
 ---
 
 ## 5. Decisions

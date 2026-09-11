@@ -399,11 +399,139 @@ fn wire_bytes(endpoint: &str, meta: &TransferMeta, payload: usize) -> usize {
     encode_frame(FrameKind::Data, &header.encode()).len() + payload
 }
 
+/// What the dedup key costs per call (B-040).
+///
+/// `DedupWindow::is_duplicate` builds its lookup key with
+/// `scope: scope.into()`, which allocates a `Box<str>` on **every** call —
+/// including the two that never insert anything: a duplicate that is found,
+/// and a miss whose entry is then written from the same allocation. The
+/// question is whether that is worth restructuring the key for.
+///
+/// It cannot be measured through the public surface. `DedupWindow` is
+/// `pub(crate)` and its only public path is a negotiated connection receiving
+/// DATA, where a loopback message costs microseconds and would bury the
+/// answer — so this measures the two *shapes* as pure functions, the way
+/// B-021 measured the byte prefix it had replaced. What the numbers price is
+/// the difference between the shapes, not weida's code:
+///
+/// * **owned** — today's shape: one flat `HashMap<Identity, _>` whose key
+///   owns its scope, so every probe allocates.
+/// * **borrowed** — the candidate: `HashMap<Box<str>, HashMap<(producer,
+///   sequence), _>>`, where the outer lookup borrows `&str` (`Box<str>`
+///   borrows as `str`) and the inner key is `Copy`, so nothing allocates
+///   except a scope seen for the first time.
+fn bench_dedup_key(c: &mut Criterion) {
+    use std::collections::HashMap;
+
+    /// The count cap `Limits::max_dedup_entries` ships with, so the tables are
+    /// as full as they are ever allowed to get.
+    const ENTRIES: usize = 4096;
+    /// Scopes a receiver is plausibly tracking at once: a handful of paths or
+    /// topics, each with many sequence numbers behind it.
+    const SCOPES: usize = 8;
+
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct Owned {
+        producer: Option<[u8; 32]>,
+        scope: Box<str>,
+        sequence: u64,
+    }
+
+    let scopes: Vec<String> = (0..SCOPES).map(|i| format!("/md/instrument-{i}")).collect();
+    let producer = Some([7u8; 32]);
+
+    /// The candidate's inner table: producer and sequence are both `Copy`, so
+    /// a probe borrows everything and allocates nothing.
+    type BySequence = HashMap<(Option<[u8; 32]>, u64), u64>;
+
+    let mut owned: HashMap<Owned, u64> = HashMap::new();
+    let mut borrowed: HashMap<Box<str>, BySequence> = HashMap::new();
+    for i in 0..ENTRIES {
+        let scope = &scopes[i % SCOPES];
+        let sequence = i as u64;
+        owned.insert(
+            Owned {
+                producer,
+                scope: scope.as_str().into(),
+                sequence,
+            },
+            sequence,
+        );
+        borrowed
+            .entry(scope.as_str().into())
+            .or_default()
+            .insert((producer, sequence), sequence);
+    }
+
+    // A number that is present and one that is not: the hit path and the miss
+    // path differ, and the allocation is paid on both.
+    let present = (ENTRIES / 2) as u64;
+    let absent = ENTRIES as u64 * 3;
+    let scope = scopes[(present as usize) % SCOPES].as_str();
+
+    let mut group = c.benchmark_group("dedup_key");
+    group.bench_function("owned_hit", |b| {
+        b.iter(|| {
+            let key = Owned {
+                producer,
+                scope: black_box(scope).into(),
+                sequence: black_box(present),
+            };
+            black_box(owned.contains_key(&key))
+        })
+    });
+    group.bench_function("owned_miss", |b| {
+        b.iter(|| {
+            let key = Owned {
+                producer,
+                scope: black_box(scope).into(),
+                sequence: black_box(absent),
+            };
+            black_box(owned.contains_key(&key))
+        })
+    });
+    // The allocation on its own: the same flat table probed with a key built
+    // once. The difference against `owned_*` is what `scope.into()` costs and
+    // nothing else.
+    let prebuilt_hit = Owned {
+        producer,
+        scope: scope.into(),
+        sequence: present,
+    };
+    let prebuilt_miss = Owned {
+        producer,
+        scope: scope.into(),
+        sequence: absent,
+    };
+    group.bench_function("prebuilt_hit", |b| {
+        b.iter(|| black_box(owned.contains_key(black_box(&prebuilt_hit))))
+    });
+    group.bench_function("prebuilt_miss", |b| {
+        b.iter(|| black_box(owned.contains_key(black_box(&prebuilt_miss))))
+    });
+    group.bench_function("borrowed_hit", |b| {
+        b.iter(|| {
+            black_box(borrowed.get(black_box(scope)).is_some_and(|by_sequence| {
+                by_sequence.contains_key(&(producer, black_box(present)))
+            }))
+        })
+    });
+    group.bench_function("borrowed_miss", |b| {
+        b.iter(|| {
+            black_box(borrowed.get(black_box(scope)).is_some_and(|by_sequence| {
+                by_sequence.contains_key(&(producer, black_box(absent)))
+            }))
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_push,
     bench_fanout,
     bench_filters,
-    bench_header_cost
+    bench_header_cost,
+    bench_dedup_key
 );
 criterion_main!(benches);
