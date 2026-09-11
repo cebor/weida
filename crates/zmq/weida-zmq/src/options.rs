@@ -18,6 +18,8 @@
 
 use std::time::Duration;
 
+use weida_zmtp::SocketType;
+
 use crate::error::{Error, Result};
 use crate::identity::RoutingId;
 use crate::message::{DEFAULT_MAX_MESSAGE_FRAMES, DEFAULT_MAX_MESSAGE_SIZE, MessageLimits};
@@ -133,6 +135,31 @@ pub struct SocketOptions {
     /// Refusing at configuration time is 0013 §4.4 item 4's rule; libzmq
     /// documents the hazard and allows it, and that difference is named here.
     pub req_relaxed: bool,
+    /// `ZMQ_ROUTER_MANDATORY`: report an unroutable message instead of
+    /// dropping it silently.
+    ///
+    /// libzmq: `0` "discards silently when it cannot be routed or the peer's
+    /// SNDHWM is reached"; `1` reports `EHOSTUNREACH` when unroutable and
+    /// `EAGAIN` at the high-water mark under `ZMQ_DONTWAIT`, blocking
+    /// otherwise (`docs/research/zeromq.md` §4.2). ROUTER's own default is
+    /// the brutal one, and it is kept: a ROUTER that blocked on one slow
+    /// peer would stall every other.
+    pub router_mandatory: bool,
+    /// `ZMQ_ROUTER_HANDOVER`: let a newcomer claim an identity an existing
+    /// peer already holds, disconnecting the incumbent.
+    ///
+    /// `false` — libzmq's default — rejects the newcomer instead, which is
+    /// the safe answer when an identity is a name two peers may both believe
+    /// they own.
+    pub router_handover: bool,
+    /// `ZMQ_PROBE_ROUTER`: send an empty message on every new connection, so
+    /// that a ROUTER peer learns of this socket before it has anything to
+    /// say.
+    ///
+    /// Legal on REQ, DEALER and ROUTER only — "the option must not be set
+    /// against other socket types" — and refused at construction elsewhere.
+    /// The receiving application must filter the empty message out.
+    pub probe_router: bool,
     /// `ZMQ_ROUTING_ID`: the identity this socket announces in its `READY`,
     /// so that a ROUTER peer can address it by a name it chose rather than
     /// by a generated one (`docs/research/zeromq.md` §4.2).
@@ -179,6 +206,9 @@ impl Default for SocketOptions {
             recv_timeout: None,
             req_correlate: false,
             req_relaxed: false,
+            router_mandatory: false,
+            router_handover: false,
+            probe_router: false,
             routing_id: None,
             pipe: PipeConfig::default(),
             max_resolved_addresses: DEFAULT_MAX_RESOLVED_ADDRESSES,
@@ -252,6 +282,52 @@ impl SocketOptions {
                 "ZMQ_HEARTBEAT_TIMEOUT is set while the heartbeat is off \
                  (ZMQ_HEARTBEAT_IVL = 0), so nothing would ever measure the silence"
                     .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuses an option this socket *type* cannot honour, which no
+    /// type-blind [`SocketOptions::validate`] can see.
+    ///
+    /// 0013 §4.4 item 4's rule is "honoured or refused, never silently
+    /// ignored", and an option that means nothing for a socket type is the
+    /// case libzmq itself names: `ZMQ_PROBE_ROUTER` "must not be set against
+    /// other socket types" (`docs/research/zeromq.md` §4.2).
+    pub fn validate_for(&self, socket_type: SocketType) -> Result<()> {
+        if self.probe_router
+            && !matches!(
+                socket_type,
+                SocketType::Req | SocketType::Dealer | SocketType::Router
+            )
+        {
+            return Err(Error::EINVAL(
+                format!(
+                    "ZMQ_PROBE_ROUTER is a REQ, DEALER and ROUTER option; a {} socket \
+                     cannot honour it",
+                    socket_type.as_str()
+                )
+                .into(),
+            ));
+        }
+        if (self.router_mandatory || self.router_handover) && socket_type != SocketType::Router {
+            return Err(Error::EINVAL(
+                format!(
+                    "ZMQ_ROUTER_MANDATORY and ZMQ_ROUTER_HANDOVER are ROUTER options; a {} \
+                     socket cannot honour them",
+                    socket_type.as_str()
+                )
+                .into(),
+            ));
+        }
+        if (self.req_correlate || self.req_relaxed) && socket_type != SocketType::Req {
+            return Err(Error::EINVAL(
+                format!(
+                    "ZMQ_REQ_CORRELATE and ZMQ_REQ_RELAXED are REQ options; a {} socket \
+                     cannot honour them",
+                    socket_type.as_str()
+                )
+                .into(),
             ));
         }
         Ok(())

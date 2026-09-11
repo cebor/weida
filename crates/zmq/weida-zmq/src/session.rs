@@ -41,7 +41,7 @@ use weida_zmtp::{
 use crate::engine::{Connection, Session, SessionFuture};
 use crate::error::{Error, Result};
 use crate::identity::RoutingId;
-use crate::message::{Decoded, MessageLimits, Multipart};
+use crate::message::{Decoded, Message, MessageLimits, Multipart};
 use crate::options::SocketOptions;
 use crate::pipe::{Queue, Sent};
 
@@ -106,6 +106,7 @@ async fn drive(ours: SocketType, connection: Connection) -> Result<()> {
         options,
         exec,
         mut handshake,
+        identity,
         role: _,
     } = connection;
 
@@ -113,6 +114,10 @@ async fn drive(ours: SocketType, connection: Connection) -> Result<()> {
     let negotiated = handshake_on(&mut wire, ours, &options).await?;
     // The engine's ZMQ_HANDSHAKE_IVL stops counting here.
     handshake.complete();
+    // A ROUTER addresses this peer by what it just announced — and needs to
+    // know that the handshake has happened at all, because a peer exists
+    // before its READY is read.
+    identity.announce(negotiated.identity.clone());
     tracing::debug!(
         %peer,
         endpoint = %endpoint,
@@ -122,6 +127,15 @@ async fn drive(ours: SocketType, connection: Connection) -> Result<()> {
         identity = ?negotiated.identity,
         "ZMTP handshake complete"
     );
+
+    if options.probe_router {
+        // ZMQ_PROBE_ROUTER: "send an empty message on every new connection",
+        // so the peer's ROUTER learns this peer exists before it has
+        // anything to say. Sent here rather than by the socket, because this
+        // is where "a new connection" happens.
+        wire.write_message(&Multipart::single(Message::empty()))
+            .await?;
+    }
 
     pump(&mut wire, &pipe, &options, &exec, negotiated.version).await
 }
@@ -644,6 +658,7 @@ mod tests {
             options,
             exec: Exec::current().expect("ambient reactor"),
             handshake: HandshakeGate::detached(),
+            identity: crate::engine::AnnouncedIdentity::default(),
         };
         let session = ZmtpSession::new(ours);
         let task = tokio::spawn(async move { session.run(connection).await });

@@ -145,6 +145,10 @@ impl SocketCore {
         socket_type: SocketType,
         options: SocketOptions,
     ) -> Result<SocketCore> {
+        // Type-blind validation happens in `Engine::new`; this is the half
+        // only a socket type can judge — an option that means nothing for
+        // this pattern is refused rather than ignored (0013 §4.4 item 4).
+        options.validate_for(socket_type)?;
         let session: Arc<dyn Session> = Arc::new(ZmtpSession::new(socket_type));
         let engine = Engine::new(context, options, session)?;
         Ok(SocketCore {
