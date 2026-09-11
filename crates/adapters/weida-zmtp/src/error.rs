@@ -1,6 +1,6 @@
-//! Why a greeting, a frame or a command was rejected.
+//! Why a greeting, a frame, a command or a piece of Z85 was rejected.
 //!
-//! Three types, split by the layer that produces them, because the layers
+//! Four types, split by the layer that produces them, because the layers
 //! disagree about what "not enough bytes" means:
 //!
 //! * a **greeting** is 64 octets read once per connection, and a short read is
@@ -9,10 +9,15 @@
 //!   expected and is not a protocol violation;
 //! * a **command body** is decoded from an already-complete frame body, where a
 //!   field that runs off the end is a violation and never a request for more
-//!   bytes.
+//!   bytes. [`CommandError`] speaks for NULL and PLAIN, [`CurveError`] for
+//!   CURVE, whose commands are fixed-size or have a minimum size and whose
+//!   names collide with the other mechanisms';
+//! * [`Z85Error`] is not a wire error at all: it is a key or a printable blob
+//!   that a human or a configuration file got wrong, and it has no
+//!   connection to close.
 //!
-//! Every type answers [`is_violation`](FrameError::is_violation): true means
-//! close the connection, which is the only remedy ZMTP defines
+//! Every wire type answers [`is_violation`](FrameError::is_violation): true
+//! means close the connection, which is the only remedy ZMTP defines
 //! ([37/ZMTP](https://rfc.zeromq.org/spec/37/), "Error Handling").
 
 use std::fmt;
@@ -210,3 +215,131 @@ impl fmt::Display for CommandError {
 }
 
 impl std::error::Error for CommandError {}
+
+/// Why a CURVE command body was rejected, on the way in or on the way out.
+///
+/// CURVE's commands are laid out by count rather than by delimiter: `HELLO`
+/// is 200 octets and nothing else, `WELCOME` is 168, and the three variable
+/// ones have a minimum below which their boxes cannot exist. So the errors
+/// are counts too, and they carry the command name because the same names
+/// belong to NULL and PLAIN with other bodies entirely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CurveError {
+    /// The command name is empty, runs past the body, or contains an octet
+    /// other than a letter.
+    BadName,
+    /// A command name CURVE does not define. `ERROR` is the notable one: it
+    /// is shared with the other mechanisms and stays with [`CommandError`].
+    UnknownName,
+    /// A fixed-size command of the wrong size. The interesting instance is a
+    /// 198-octet `HELLO`, which is what 26/CURVEZMQ's prose describes and its
+    /// own grammar and totals contradict.
+    BadLength {
+        /// The command name, as it was on the wire.
+        name: &'static str,
+        /// The only length this command has.
+        expected: usize,
+        /// What arrived.
+        actual: usize,
+    },
+    /// A variable-size command, or an opened `INITIATE` box, below the
+    /// minimum its own fields require.
+    TooShort {
+        /// The command name, as it was on the wire.
+        name: &'static str,
+        /// The smallest legal length.
+        minimum: usize,
+        /// What arrived.
+        actual: usize,
+    },
+    /// `hello-version` is not 1.0, the only version 26/CURVEZMQ defines.
+    UnsupportedVersion(u8, u8),
+    /// The metadata inside an opened `INITIATE` or `READY` box is malformed.
+    Metadata(CommandError),
+}
+
+impl CurveError {
+    /// True if the error is fatal for the connection. Every CURVE error is:
+    /// a command body arrives whole, and a handshake command that does not
+    /// parse cannot be retried.
+    pub const fn is_violation(self) -> bool {
+        true
+    }
+}
+
+impl fmt::Display for CurveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CurveError::BadName => f.write_str("malformed command name"),
+            CurveError::UnknownName => f.write_str("not a CURVE command name"),
+            CurveError::BadLength {
+                name,
+                expected,
+                actual,
+            } => write!(f, "CURVE {name} is {expected} octets, not {actual}"),
+            CurveError::TooShort {
+                name,
+                minimum,
+                actual,
+            } => write!(
+                f,
+                "CURVE {name} of {actual} octets is below its minimum of {minimum}"
+            ),
+            CurveError::UnsupportedVersion(major, minor) => {
+                write!(f, "CURVE version {major}.{minor} is not 1.0")
+            }
+            CurveError::Metadata(e) => write!(f, "CURVE metadata: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CurveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CurveError::Metadata(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Why a Z85 conversion failed.
+///
+/// Not a protocol error: Z85 is how a CURVE key is written down in a
+/// configuration file or on a command line, so these are a person's or a
+/// file's mistakes and the remedy is to say which octet or which length was
+/// wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Z85Error {
+    /// The binary length is not a multiple of four, which the encoding
+    /// cannot express: it has no padding form.
+    BinaryLength(usize),
+    /// The text length is not a multiple of five, or not the 40 characters a
+    /// CURVE key must be.
+    TextLength(usize),
+    /// An octet outside the 85-character alphabet. The alphabet excludes the
+    /// quote and backslash characters on purpose, so that a key survives
+    /// being pasted into source code.
+    NotZ85(u8),
+    /// Five legal characters whose base-85 value does not fit in four
+    /// octets - `#####` is 4437053124, above `u32::MAX`.
+    Overflow,
+}
+
+impl fmt::Display for Z85Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Z85Error::BinaryLength(n) => {
+                write!(f, "{n} octets is not a multiple of 4")
+            }
+            Z85Error::TextLength(n) => {
+                write!(f, "{n} characters is not a Z85 length here")
+            }
+            Z85Error::NotZ85(b) => {
+                write!(f, "octet {b:#04X} is not a Z85 character")
+            }
+            Z85Error::Overflow => f.write_str("a Z85 group exceeds four octets"),
+        }
+    }
+}
+
+impl std::error::Error for Z85Error {}

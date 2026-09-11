@@ -16,7 +16,9 @@
 //! rather than fail it.
 
 use weida_zmtp::error::{FrameError, GreetingError};
-use weida_zmtp::{Command, Greeting, Mechanism, Metadata, SocketType, frame, greeting};
+use weida_zmtp::{
+    Command, CurveCommand, Greeting, Mechanism, Metadata, SocketType, curve, frame, greeting, z85,
+};
 
 const ITERATIONS: usize = 100_000;
 /// Deliberately small: every declared length above it must be refused from the
@@ -159,6 +161,95 @@ fn fuzz_smoke_command_bodies_from_valid_prefixes() {
 }
 
 #[test]
+fn fuzz_smoke_curve_command_bodies() {
+    // CURVE's commands are laid out by count, so the hostile input that
+    // matters is a body one or two octets away from a legal length: every
+    // field behind the padding of a short HELLO is displaced, and a decoder
+    // that trusted the name would read a signature box out of phase.
+    let names: [&[u8]; 6] = [
+        b"\x05HELLO",
+        b"\x07WELCOME",
+        b"\x08INITIATE",
+        b"\x05READY",
+        b"\x07MESSAGE",
+        b"\x05ERROR",
+    ];
+    let lengths = [
+        0usize,
+        1,
+        curve::MESSAGE_MIN_LEN - 1,
+        curve::READY_MIN_LEN,
+        curve::WELCOME_LEN - 1,
+        curve::WELCOME_LEN,
+        curve::HELLO_LEN - 2,
+        curve::HELLO_LEN,
+        curve::INITIATE_MIN_LEN,
+        curve::INITIATE_MIN_LEN + 1,
+    ];
+    let mut rng = Rng::new(0xC1234);
+    let mut accepted = 0usize;
+    for _ in 0..ITERATIONS {
+        let name = names[rng.below(names.len())];
+        let total = lengths[rng.below(lengths.len())];
+        let mut body = name.to_vec();
+        while body.len() < total {
+            body.push(rng.byte());
+        }
+        body.truncate(total.max(name.len()));
+        // A HELLO only ever gets past the length check with its version
+        // octets intact, so half the draws set them: without this the
+        // interesting path is never reached.
+        if body.len() > 8 && rng.below(2) == 0 {
+            body[6] = 1;
+            body[7] = 0;
+        }
+        match CurveCommand::decode(&body) {
+            Ok(command) => {
+                accepted += 1;
+                check_curve_command(&command);
+                let re = command.encode().expect("an accepted command re-encodes");
+                let (_, body2, _) = frame::decode(&re, CAP).expect("decode");
+                assert_eq!(CurveCommand::decode(body2).expect("re-decode"), command);
+            }
+            Err(e) => assert!(e.is_violation()),
+        }
+    }
+    // The length table above is built from the real minima, so every command
+    // must have been accepted at some point; a table that only ever produced
+    // refusals would be a test of nothing.
+    assert!(
+        accepted > ITERATIONS / 100,
+        "only {accepted} of {ITERATIONS} bodies were accepted"
+    );
+}
+
+#[test]
+fn fuzz_smoke_z85() {
+    // Z85 is where text a human typed becomes a key, so the property is that
+    // no input panics and every accepted one round-trips: five legal
+    // characters can still name a value above four octets, which is the case
+    // a decoder that only checked the alphabet would wrap on.
+    let mut rng = Rng::new(0x2585);
+    for _ in 0..ITERATIONS {
+        let text: String = (0..rng.below(11))
+            .map(|_| {
+                let pick = rng.below(90);
+                char::from(*z85::ALPHABET.get(pick).unwrap_or(&b'"'))
+            })
+            .collect();
+        if let Ok(data) = z85::decode(&text) {
+            assert!(data.len().is_multiple_of(4));
+            assert_eq!(z85::encode(&data).expect("re-encode"), text);
+        }
+        let data = rng.bytes(12);
+        if let Ok(text) = z85::encode(&data) {
+            assert_eq!(text.len(), data.len() / 4 * 5);
+            assert_eq!(z85::decode(&text).expect("re-decode"), data);
+        }
+    }
+}
+
+#[test]
 fn fuzz_smoke_metadata() {
     let mut rng = Rng::new(0xFEED);
     for _ in 0..ITERATIONS {
@@ -280,4 +371,37 @@ fn check_command(command: &Command<'_>) {
         "{} decoded but will not encode",
         command.name()
     );
+}
+
+/// Every documented bound an accepted CURVE command must respect. The boxes
+/// are opaque here as everywhere: what is checkable is their length.
+fn check_curve_command(command: &CurveCommand<'_>) {
+    match command {
+        CurveCommand::Hello { .. } | CurveCommand::Welcome { .. } => {
+            // Both are fixed-size, and the array types in the variant make
+            // any other length unrepresentable; the encoder's total is the
+            // remaining claim.
+        }
+        CurveCommand::Initiate { initiate_box, .. } => {
+            assert!(initiate_box.len() >= curve::INITIATE_BOX_MIN_LEN);
+        }
+        CurveCommand::Ready { ready_box, .. } => {
+            assert!(ready_box.len() >= curve::READY_BOX_MIN_LEN);
+        }
+        CurveCommand::Message { message_box, .. } => {
+            assert!(message_box.len() >= curve::MESSAGE_BOX_MIN_LEN);
+        }
+    }
+    let mut body = Vec::new();
+    command
+        .encode_body(&mut body)
+        .expect("an accepted CURVE command re-encodes");
+    let expected = match command {
+        CurveCommand::Hello { .. } => curve::HELLO_LEN,
+        CurveCommand::Welcome { .. } => curve::WELCOME_LEN,
+        CurveCommand::Initiate { .. } => body.len().max(curve::INITIATE_MIN_LEN),
+        CurveCommand::Ready { .. } => body.len().max(curve::READY_MIN_LEN),
+        CurveCommand::Message { .. } => body.len().max(curve::MESSAGE_MIN_LEN),
+    };
+    assert_eq!(body.len(), expected, "{}", command.name());
 }

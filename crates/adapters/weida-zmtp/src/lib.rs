@@ -23,10 +23,19 @@
 //!   mechanism's own warning - it is "not robust against even the simplest
 //!   traffic snooping or spoofing attacks" - is a property of the mechanism
 //!   rather than of the encoding, and this crate still depends on nothing.
+//! * [`curve`] - CURVE's `HELLO`, `WELCOME`, `INITIATE`, `READY` and
+//!   `MESSAGE` ([26/CURVEZMQ]) as byte layouts, with every cryptographic box
+//!   an **opaque range**. No key is generated, sealed or opened here; that is
+//!   `weida-zmq`'s single cryptographic dependency, and the split is what
+//!   keeps the layouts checkable against a hex dump.
+//! * [`z85`] - the printable key encoding of [32/Z85], 40 characters per
+//!   32-octet key, both ways.
 //! * [`metadata`] - the `READY` property dictionary and the `Socket-Type`
 //!   table, including which peer types are legal opposite which.
 //!
 //! [24/ZMTP-PLAIN]: https://rfc.zeromq.org/spec/24/
+//! [26/CURVEZMQ]: https://rfc.zeromq.org/spec/26/
+//! [32/Z85]: https://rfc.zeromq.org/spec/32/
 //!
 //! Decoders borrow: a decoded frame body is a slice of the caller's buffer and
 //! a decoded [`Command`] points into that body, so the only allocation on the
@@ -86,17 +95,24 @@
 //! * **`JOIN`/`LEAVE` are not implemented.** They belong to RADIO/DISH, which
 //!   the adapter's socket-type mapping does not carry; they decode to
 //!   [`CommandError::UnknownName`].
+//! * **CURVE's HELLO padding is 72 octets, not 70.** 26/CURVEZMQ's ABNF says
+//!   `hello-padding = 72%x00` and its prose says 70; only 72 makes the
+//!   specification's own 200-octet HELLO add up. The grammar wins again, in
+//!   both directions - see [`curve`] and `docs/research/zeromq.md` §10.
 
 #![warn(missing_docs)]
 
 pub mod command;
+pub mod curve;
 pub mod error;
 pub mod frame;
 pub mod greeting;
 pub mod metadata;
+pub mod z85;
 
 pub use command::{Command, MAX_PING_CONTEXT, MAX_PLAIN_FIELD};
-pub use error::{CommandError, FrameError, GreetingError};
+pub use curve::{CurveCommand, InitiatePlaintext};
+pub use error::{CommandError, CurveError, FrameError, GreetingError, Z85Error};
 pub use frame::{FrameHeader, FrameKind};
 pub use greeting::{GREETING_LEN, Greeting, Mechanism, VERSION, Version};
 pub use metadata::{Metadata, SocketType};
