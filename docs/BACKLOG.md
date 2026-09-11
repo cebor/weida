@@ -37,8 +37,9 @@ kind: spec | size: 45 | status: ready | needs: [B-006, B-007]
 acceptance: PATTERNS §1.3 narrowed to "bulk writers on the same path's connection", §1.4 states the stream budget is the L0 message credit, §1.6 cites 0005, §4 gains subscriber-side drop detection and segmented filters; INVARIANTS permits a control connection while forbidding a multiplexed control stream, adds the reassembly cap and per-peer connection count to the named bounds; ARCHITECTURE §5 describes the two pool tiers and two Limits profiles; SYNTHESIS §8 entries carry their decision numbers.
 
 ### B-009 — Measure: DATA header cost at high message rate
-kind: measure | size: 60 | status: ready | needs: []
+kind: measure | size: 60 | status: done 178a95c | needs: []
 acceptance: a criterion bench in `crates/weida/benches/patterns.rs` pushing 64-byte payloads with a minimal header versus a header carrying two extra uint keys (simulated via `content_len` and `topic` today), messages per second and bytes per message on loopback; numbers in IMPLEMENTATION.md verified results.
+note: `topic` is settable only by a publisher, so the second key is simulated by a `sha256:<64 hex>` `content_type` — the wire shape of the producer identity of 0008 — rather than by `topic`. The measured +80 B is therefore the worst case for DATA keys 6 and 7, and it is what 0008 §4.4 used to fix the encoding.
 
 ### B-010 — Measure: reassembly buffer under cross-stream reordering
 kind: measure | size: 60 | status: ready | needs: []
