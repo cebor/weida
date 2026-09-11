@@ -469,6 +469,18 @@ while writing the codec, and the vectors take a side:
 | Message frame, 256-octet body | `02 00 00 00 00 00 00 01 00` | 256 octets — the smallest long frame |
 | Multipart `A`, `B` | `01 01` then `00 01` | `41`, then `42` — MORE on all but the last |
 | Long command frame | `06` + eight-octet size | a `READY` beyond 255 octets |
+| `HELLO`, user `admin`, password `secret` (PLAIN) | `04 13` | `05 HELLO 05 "admin" 06 "secret"` |
+| `HELLO`, both fields empty | `04 08` | `05 HELLO 00 00` — the length octets stay |
+| `WELCOME` (PLAIN) | `04 08` | `07 WELCOME` — no data at all |
+| `INITIATE`, `Socket-Type=DEALER` (PLAIN) | `04 1F` | `08 INITIATE 0B "Socket-Type" 00 00 00 06 "DEALER"` |
+
+The four PLAIN rows are [24/ZMTP-PLAIN]'s grammar rather than 37/ZMTP's: `hello = command-size
+%d5 "HELLO" username password` with a one-octet length before each field, `welcome =
+command-size %d7 "WELCOME"` carrying nothing, and `initiate = command-size %d8 "INITIATE"
+metadata` carrying what NULL puts in `READY`. They live in the codec because they are octets;
+the mechanism's own warning — PLAIN is "not robust against even the simplest traffic snooping
+or spoofing attacks" — is a property of the mechanism and not of the encoding, and the codec
+still depends on nothing at all.
 
 The encoder always picks the shortest size field, which is what the specification recommends;
 the decoder accepts a long size for a short body, because a peer that sends one is odd rather

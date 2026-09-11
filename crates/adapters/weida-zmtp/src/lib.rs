@@ -18,9 +18,15 @@
 //! * [`frame`] - the flags octet and one- or eight-octet size field, with the
 //!   cap that a long frame's declared length is checked against **before** the
 //!   body is touched.
-//! * [`command`] - `READY`, `ERROR`, `SUBSCRIBE`, `CANCEL`, `PING`, `PONG`.
+//! * [`command`] - `READY`, `ERROR`, `SUBSCRIBE`, `CANCEL`, `PING`, `PONG`,
+//!   and PLAIN's `HELLO`, `WELCOME` and `INITIATE` ([24/ZMTP-PLAIN]). The
+//!   mechanism's own warning - it is "not robust against even the simplest
+//!   traffic snooping or spoofing attacks" - is a property of the mechanism
+//!   rather than of the encoding, and this crate still depends on nothing.
 //! * [`metadata`] - the `READY` property dictionary and the `Socket-Type`
 //!   table, including which peer types are legal opposite which.
+//!
+//! [24/ZMTP-PLAIN]: https://rfc.zeromq.org/spec/24/
 //!
 //! Decoders borrow: a decoded frame body is a slice of the caller's buffer and
 //! a decoded [`Command`] points into that body, so the only allocation on the
@@ -89,7 +95,7 @@ pub mod frame;
 pub mod greeting;
 pub mod metadata;
 
-pub use command::{Command, MAX_PING_CONTEXT};
+pub use command::{Command, MAX_PING_CONTEXT, MAX_PLAIN_FIELD};
 pub use error::{CommandError, FrameError, GreetingError};
 pub use frame::{FrameHeader, FrameKind};
 pub use greeting::{GREETING_LEN, Greeting, Mechanism, VERSION, Version};

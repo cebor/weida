@@ -260,6 +260,18 @@ fn check_command(command: &Command<'_>) {
         Command::Ping { context, .. } | Command::Pong { context } => {
             assert!(context.len() <= weida_zmtp::MAX_PING_CONTEXT);
         }
+        Command::Hello { username, password } => {
+            // Each field's own length octet is its bound, so anything that
+            // decoded fits and anything longer could not have been written.
+            assert!(username.len() <= weida_zmtp::MAX_PLAIN_FIELD);
+            assert!(password.len() <= weida_zmtp::MAX_PLAIN_FIELD);
+        }
+        Command::Welcome => {}
+        Command::Initiate(md) => {
+            for (name, _) in md.properties() {
+                assert!(!name.is_empty());
+            }
+        }
     }
     // A command that decoded must also encode; the two halves share their
     // length rules, so one accepting what the other refuses is a bug.

@@ -1,4 +1,5 @@
-//! Commands: `READY`, `ERROR`, `SUBSCRIBE`, `CANCEL`, `PING`, `PONG`.
+//! Commands: `READY`, `ERROR`, `SUBSCRIBE`, `CANCEL`, `PING`, `PONG`, and
+//! PLAIN's `HELLO`, `WELCOME` and `INITIATE`.
 //!
 //! ```text
 //! command-body = command-name command-data
@@ -23,6 +24,10 @@ use crate::metadata::Metadata;
 
 /// Largest `PING`/`PONG` context: "0*16OCTET", echoed verbatim by `PONG`.
 pub const MAX_PING_CONTEXT: usize = 16;
+
+/// Longest PLAIN username or password: `*-length = 1OCTET`, so the field's
+/// own length octet is the bound (24/ZMTP-PLAIN).
+pub const MAX_PLAIN_FIELD: usize = 255;
 
 /// A decoded command.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +60,32 @@ pub enum Command<'a> {
         /// The context of the `PING` being answered.
         context: &'a [u8],
     },
+    /// PLAIN's first command: the username and password in clear text, sent
+    /// by the client (24/ZMTP-PLAIN).
+    ///
+    /// ```text
+    /// hello = command-size %d5 "HELLO" username password
+    /// username = username-length username-value
+    /// username-length = 1OCTET
+    /// password = password-length password-value
+    /// ```
+    ///
+    /// The mechanism is "not robust against even the simplest traffic
+    /// snooping or spoofing attacks" and says so in its own RFC; this codec's
+    /// job is that the octets are right, not that they are safe.
+    Hello {
+        /// `username-value = *OCTET`, at most [`MAX_PLAIN_FIELD`] octets.
+        username: &'a [u8],
+        /// `password-value = *OCTET`, at most [`MAX_PLAIN_FIELD`] octets.
+        password: &'a [u8],
+    },
+    /// PLAIN's answer to an accepted `HELLO`, with no data at all:
+    /// `welcome = command-size %d7 "WELCOME"`. A refusal is `ERROR`.
+    Welcome,
+    /// PLAIN's second client command, carrying the client's metadata the way
+    /// `READY` carries it for NULL: `initiate = command-size %d8 "INITIATE"
+    /// metadata`.
+    Initiate(Metadata<'a>),
 }
 
 impl<'a> Command<'a> {
@@ -67,6 +98,9 @@ impl<'a> Command<'a> {
             Command::Cancel(_) => "CANCEL",
             Command::Ping { .. } => "PING",
             Command::Pong { .. } => "PONG",
+            Command::Hello { .. } => "HELLO",
+            Command::Welcome => "WELCOME",
+            Command::Initiate(_) => "INITIATE",
         }
     }
 
@@ -105,6 +139,23 @@ impl<'a> Command<'a> {
                 check_context(data)?;
                 Ok(Command::Pong { context: data })
             }
+            b"HELLO" => {
+                let (username, rest) = take_field(data)?;
+                let (password, rest) = take_field(rest)?;
+                if !rest.is_empty() {
+                    // `hello = %d5 "HELLO" username password` and nothing
+                    // else: trailing octets are a different command.
+                    return Err(CommandError::Truncated);
+                }
+                Ok(Command::Hello { username, password })
+            }
+            b"WELCOME" => {
+                if !data.is_empty() {
+                    return Err(CommandError::Truncated);
+                }
+                Ok(Command::Welcome)
+            }
+            b"INITIATE" => Ok(Command::Initiate(Metadata::decode(data)?)),
             _ => Err(CommandError::UnknownName),
         }
     }
@@ -133,6 +184,12 @@ impl<'a> Command<'a> {
                 check_context(context)?;
                 out.extend_from_slice(context);
             }
+            Command::Hello { username, password } => {
+                put_field(username, out)?;
+                put_field(password, out)?;
+            }
+            Command::Welcome => {}
+            Command::Initiate(metadata) => metadata.encode(out)?,
         }
         Ok(())
     }
@@ -143,6 +200,25 @@ impl<'a> Command<'a> {
         self.encode_body(&mut body)?;
         Ok(frame::encode(FrameKind::Command, &body))
     }
+}
+
+/// `username = username-length username-value`, and the same shape for the
+/// password: one length octet, then that many octets.
+fn take_field(data: &[u8]) -> Result<(&[u8], &[u8]), CommandError> {
+    let len = usize::from(*data.first().ok_or(CommandError::Truncated)?);
+    let value = data.get(1..1 + len).ok_or(CommandError::Truncated)?;
+    Ok((value, &data[1 + len..]))
+}
+
+/// The other direction, refusing a field the length octet cannot describe —
+/// which is the only way a PLAIN field can be malformed.
+fn put_field(value: &[u8], out: &mut Vec<u8>) -> Result<(), CommandError> {
+    if value.len() > MAX_PLAIN_FIELD {
+        return Err(CommandError::FieldTooLong(value.len()));
+    }
+    out.push(value.len() as u8);
+    out.extend_from_slice(value);
+    Ok(())
 }
 
 /// `ping-context = 0*16OCTET`, for both `PING` and `PONG`.

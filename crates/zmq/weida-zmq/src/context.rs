@@ -248,15 +248,6 @@ impl Context {
         &self.inner.inproc
     }
 
-    /// The namespace as a handle a connection task can keep.
-    ///
-    /// A task dialling an `inproc://` name outlives the call that started it
-    /// and must not keep the socket alive, so it holds this rather than a
-    /// `Context`.
-    pub(crate) fn inproc_shared(&self) -> Arc<Inproc> {
-        Arc::clone(&self.inner.inproc)
-    }
-
     /// Sockets currently open on this context.
     pub fn socket_count(&self) -> usize {
         self.lock().open

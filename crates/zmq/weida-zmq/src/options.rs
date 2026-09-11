@@ -64,6 +64,45 @@ pub const DEFAULT_MAX_PEERS: usize = 1024;
 /// deciseconds in a `u16`, so 6553.5 s (`docs/research/zeromq.md` §11).
 pub const MAX_HEARTBEAT_TTL: Duration = Duration::from_millis(6_553_500);
 
+/// Longest `ZMQ_ZAP_DOMAIN`, in bytes.
+///
+/// **Not a libzmq limit**: 27/ZAP requires the domain frame to be non-empty
+/// and says nothing about its length, and a domain reaches a handler as a
+/// frame it must read. 256 is the same number this library uses for every
+/// other name a peer or a configuration can set.
+pub const MAX_ZAP_DOMAIN_BYTES: usize = 256;
+
+/// Which security mechanism a socket speaks, and on which side.
+///
+/// One per socket, announced in the greeting and never negotiated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Security {
+    /// No authentication and no confidentiality. `as-server` MUST be zero
+    /// and "the peer that binds SHALL be the server".
+    Null,
+    /// PLAIN, as the server: the side that receives `HELLO`, asks the ZAP
+    /// handler and answers `WELCOME` or `ERROR`.
+    PlainServer,
+    /// PLAIN, as the client: the side that sends `HELLO` and `INITIATE`.
+    PlainClient,
+}
+
+impl Security {
+    /// The mechanism field this puts in the greeting.
+    pub const fn mechanism(&self) -> weida_zmtp::Mechanism {
+        match self {
+            Security::Null => weida_zmtp::Mechanism::NULL,
+            Security::PlainServer | Security::PlainClient => weida_zmtp::Mechanism::PLAIN,
+        }
+    }
+
+    /// The `as-server` octet: set only for a PLAIN server, and refused by the
+    /// codec under NULL.
+    pub const fn as_server(&self) -> bool {
+        matches!(self, Security::PlainServer)
+    }
+}
+
 /// What a socket's connection engine is configured with.
 ///
 /// The socket types of the later slices own the rest of the option surface —
@@ -226,6 +265,52 @@ pub struct SocketOptions {
     pub pipe: PipeConfig,
     /// See [`DEFAULT_MAX_RESOLVED_ADDRESSES`].
     pub max_resolved_addresses: usize,
+    /// `ZMQ_PLAIN_SERVER`: this socket is the PLAIN **server**, and every
+    /// connection it makes or accepts announces the PLAIN mechanism with the
+    /// `as-server` octet set (24/ZMTP-PLAIN, `docs/research/zeromq.md` §6).
+    ///
+    /// A PLAIN server authorizes nothing by itself: the username and
+    /// password go to the ZAP handler, which decides
+    /// ([27/ZAP](https://rfc.zeromq.org/spec/27/)). A PLAIN server with no
+    /// handler bound refuses every connection rather than admitting one it
+    /// never checked.
+    pub plain_server: bool,
+    /// `ZMQ_PLAIN_USERNAME`: this socket is a PLAIN **client** and sends this
+    /// username in its `HELLO`.
+    ///
+    /// Setting it chooses the mechanism, as in libzmq: "setting 0 shall reset
+    /// the socket security to NULL", and setting a username selects PLAIN.
+    /// At most [`weida_zmtp::MAX_PLAIN_FIELD`] octets — the field's own
+    /// length octet is the bound.
+    pub plain_username: Option<String>,
+    /// `ZMQ_PLAIN_PASSWORD`: the password sent with the username, in clear
+    /// text. PLAIN "is not robust against even the simplest traffic snooping
+    /// or spoofing attacks" and its own RFC says so.
+    ///
+    /// Required whenever a username is set, including when it is empty: the
+    /// `HELLO` carries both fields, so an unset password is a configuration
+    /// gap rather than an empty string.
+    pub plain_password: Option<String>,
+    /// `ZMQ_ZAP_DOMAIN`: the authorization domain this socket's connections
+    /// are checked under, and the switch that turns authorization on.
+    ///
+    /// libzmq: "A ZAP domain must be specified to enable authentication. When
+    /// the ZAP domain is empty, which is the default, ZAP authentication is
+    /// disabled" — and that is exactly the behaviour here, for NULL. PLAIN
+    /// always authenticates, because a username nobody checks is theatre.
+    ///
+    /// The domain's meaning is the application's: 27/ZAP calls it "the only
+    /// scoping string" and leaves it at that.
+    pub zap_domain: String,
+    /// `ZMQ_ZAP_ENFORCE_DOMAIN`: refuse to authenticate without a domain
+    /// instead of sending an empty one.
+    ///
+    /// 27/ZAP requires a non-empty domain in a request; libzmq sent an empty
+    /// one for years and this option is its way back. Here it is a
+    /// configuration check: with it set, a socket that would run a ZAP
+    /// dialog without a domain is refused at construction rather than at the
+    /// handshake.
+    pub zap_enforce_domain: bool,
 }
 
 impl Default for SocketOptions {
@@ -260,6 +345,11 @@ impl Default for SocketOptions {
             routing_id: None,
             pipe: PipeConfig::default(),
             max_resolved_addresses: DEFAULT_MAX_RESOLVED_ADDRESSES,
+            plain_server: false,
+            plain_username: None,
+            plain_password: None,
+            zap_domain: String::new(),
+            zap_enforce_domain: false,
         }
     }
 }
@@ -300,6 +390,65 @@ impl SocketOptions {
         if self.max_message_frames == 0 {
             return Err(Error::EINVAL(
                 "max_message_frames is zero, so every message would be refused".into(),
+            ));
+        }
+        if self.plain_server && self.plain_username.is_some() {
+            return Err(Error::EINVAL(
+                "a socket is the PLAIN server or a PLAIN client, not both: ZMQ_PLAIN_SERVER with \
+                 ZMQ_PLAIN_USERNAME has no meaning on the wire, where one as-server octet decides"
+                    .into(),
+            ));
+        }
+        match (&self.plain_username, &self.plain_password) {
+            (Some(_), None) => {
+                return Err(Error::EINVAL(
+                    "ZMQ_PLAIN_USERNAME without ZMQ_PLAIN_PASSWORD: HELLO carries both fields, so \
+                     an unset password is a gap rather than an empty one"
+                        .into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(Error::EINVAL(
+                    "ZMQ_PLAIN_PASSWORD without ZMQ_PLAIN_USERNAME, so the mechanism would still \
+                     be NULL and the password would never be sent"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+        for (option, value) in [
+            ("ZMQ_PLAIN_USERNAME", &self.plain_username),
+            ("ZMQ_PLAIN_PASSWORD", &self.plain_password),
+        ] {
+            if let Some(value) = value
+                && value.len() > weida_zmtp::MAX_PLAIN_FIELD
+            {
+                return Err(Error::EINVAL(
+                    format!(
+                        "{option} is {} octets; the field's own length octet bounds it at {}",
+                        value.len(),
+                        weida_zmtp::MAX_PLAIN_FIELD
+                    )
+                    .into(),
+                ));
+            }
+        }
+        if self.zap_enforce_domain && self.zap_domain.is_empty() {
+            return Err(Error::EINVAL(
+                "ZMQ_ZAP_ENFORCE_DOMAIN with an empty ZMQ_ZAP_DOMAIN: the option exists to stop \
+                 an empty domain reaching the handler, so a socket that would send one is \
+                 refused here"
+                    .into(),
+            ));
+        }
+        if !self.zap_domain.is_empty() && self.zap_domain.len() > MAX_ZAP_DOMAIN_BYTES {
+            return Err(Error::EINVAL(
+                format!(
+                    "ZMQ_ZAP_DOMAIN is {} octets; this library bounds it at {MAX_ZAP_DOMAIN_BYTES} \
+                     because it is a frame a handler must read",
+                    self.zap_domain.len()
+                )
+                .into(),
             ));
         }
         if self.max_resolved_addresses == 0 {
@@ -409,6 +558,36 @@ impl SocketOptions {
     /// The two ceilings one peer's subscription table lives under.
     pub const fn subscription_limits(&self) -> (usize, usize) {
         (self.max_subscriptions, self.max_subscription_bytes)
+    }
+
+    /// The security mechanism these options select, and which side of it
+    /// this socket is.
+    ///
+    /// "Security in ZMTP is *assertive* in that all peers on a given socket
+    /// have the same, required level of security. This prevents downgrade
+    /// attacks" (`docs/research/zeromq.md` §6), so this is one answer per
+    /// socket and there is no negotiation.
+    pub fn security(&self) -> Security {
+        match (self.plain_server, self.plain_username.is_some()) {
+            (true, _) => Security::PlainServer,
+            (_, true) => Security::PlainClient,
+            _ => Security::Null,
+        }
+    }
+
+    /// Whether a connection this socket **accepted or bound** must be
+    /// authorized by a ZAP handler.
+    ///
+    /// PLAIN always is: the credentials are only worth sending if somebody
+    /// checks them. NULL is when a domain is configured, which is libzmq's
+    /// switch — "when the ZAP domain is empty… ZAP authentication is
+    /// disabled".
+    pub fn authorizes(&self) -> bool {
+        match self.security() {
+            Security::PlainServer => true,
+            Security::PlainClient => false,
+            Security::Null => !self.zap_domain.is_empty(),
+        }
     }
 
     /// What bounds one inbound message: `ZMQ_MAXMSGSIZE` and the frame
