@@ -55,12 +55,16 @@
 //!   lockstep: unrestricted in both directions, ROUTER addressing peers by
 //!   the [`RoutingKey`] a peer announced or one it was given, with
 //!   `ZMQ_ROUTER_MANDATORY`, `ZMQ_ROUTER_HANDOVER` and `ZMQ_PROBE_ROUTER`.
+//! - [`PushSocket`] and [`PullSocket`] — the pipeline: round-robin over the
+//!   workers with room, blocking rather than discarding, fair-queued at the
+//!   sink.
+//! - [`PairSocket`] — the exclusive pair: one peer, no auto-reconnect, and a
+//!   further incoming connection terminated while one is live.
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
 //!
 //! The remaining socket types — `PubSocket`, `SubSocket`, `XPubSocket`,
-//! `XSubSocket`, `PushSocket`, `PullSocket`, `PairSocket` — are the
-//! following slices, as are security and
+//! `XSubSocket` — are the following slices, as are security and
 //! authorization and the rest of the option surface [0013 §5.3]. They are
 //! named here so that a reader knows what this crate is for and what it does
 //! not do yet; nothing stands in for them, and in particular there is no
@@ -105,7 +109,9 @@ pub mod error;
 pub mod identity;
 pub mod message;
 pub mod options;
+pub mod pair;
 pub mod pipe;
+pub mod pipeline;
 pub mod reqrep;
 pub mod session;
 pub mod socket;
@@ -131,9 +137,11 @@ pub use options::{
     DEFAULT_BACKLOG, DEFAULT_HANDSHAKE_IVL, DEFAULT_MAX_RESOLVED_ADDRESSES, DEFAULT_RECONNECT_IVL,
     SocketOptions,
 };
+pub use pair::PairSocket;
 pub use pipe::{
     DEFAULT_RCVHWM, DEFAULT_SNDHWM, MuteAction, Pipe, PipeConfig, Queue, QueueConfig, Sent,
 };
+pub use pipeline::{PullSocket, PushSocket};
 pub use reqrep::{RepSocket, ReqSocket};
 pub use session::{Incoming, Negotiated, Wire, ZmtpSession};
 pub use socket::{Delivered, SocketCore};

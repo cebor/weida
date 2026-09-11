@@ -284,22 +284,20 @@ impl RouterSocket {
         // ZMQ_ROUTER_MANDATORY without ZMQ_DONTWAIT: wait for room, bounded
         // by ZMQ_SNDTIMEO.
         let limit = self.core.options().send_timeout;
-        let queued = self
-            .core
-            .within(limit, async {
-                loop {
-                    queue.wait_for_room().await;
-                    if queue.is_closed() {
-                        return Err(Error::EHOSTUNREACH(
-                            "the peer went away while its queue was full".into(),
-                        ));
-                    }
-                    if queue.has_room() {
-                        return Ok(());
-                    }
+        let queued = crate::socket::within(self.core.exec(), limit, async {
+            loop {
+                queue.wait_for_room().await;
+                if queue.is_closed() {
+                    return Err(Error::EHOSTUNREACH(
+                        "the peer went away while its queue was full".into(),
+                    ));
                 }
-            })
-            .await;
+                if queue.has_room() {
+                    return Ok(());
+                }
+            }
+        })
+        .await;
         match queued {
             Ok(()) => {
                 queue.try_send(body)?;
