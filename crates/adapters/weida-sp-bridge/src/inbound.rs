@@ -112,6 +112,19 @@ pub struct InboundConfig {
     /// accepting, so a new peer waits in the kernel's backlog rather than
     /// being served badly.
     pub max_connections: usize,
+    /// An octet written between the topic and the payload when presenting
+    /// `PUB`, or `None` for the two concatenated.
+    ///
+    /// SP has no topic field: the topic is the leading bytes of the body and
+    /// nothing on the wire says where it ends
+    /// (`docs/research/nanomsg-nng.md` §3), so a peer matching a byte prefix
+    /// needs no delimiter and gets none by default. One is needed the moment
+    /// the *other* side has to recover the topic - an SP consumer that
+    /// re-publishes, or this crate's own [`crate::Outbound`] with a matching
+    /// [`crate::TopicSplit::Delimiter`], which is the pairing the
+    /// cross-adapter slice needs. `0x00` is the octet to use: a weida topic
+    /// is text, so NUL can never occur inside one.
+    pub topic_delimiter: Option<u8>,
     /// The weida runtime configuration.
     ///
     /// Its guarantee set must be `core`: SP has no transfer point at all, no
@@ -133,6 +146,7 @@ impl InboundConfig {
             max_hops: backtrace::DEFAULT_MAX_HOPS,
             max_in_flight: 4,
             max_connections: 64,
+            topic_delimiter: None,
             runtime: RuntimeConfig::default(),
         }
     }
@@ -443,7 +457,14 @@ async fn serve_pub(
                 // (`docs/research/nanomsg-nng.md` §4); both sides drop and
                 // neither stalls the publisher, which is the pairing
                 // `docs/adapters/nng.md` §4 requires.
-                session.write_message(&[topic.as_bytes(), &payload]).await?;
+                match config.topic_delimiter {
+                    Some(byte) => {
+                        session
+                            .write_message(&[topic.as_bytes(), &[byte], &payload])
+                            .await?
+                    }
+                    None => session.write_message(&[topic.as_bytes(), &payload]).await?,
+                }
             }
         }
     }
