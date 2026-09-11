@@ -28,13 +28,11 @@ use std::time::Duration;
 use weida_zmtp::SocketType;
 
 use crate::context::Context;
-use crate::endpoint::Endpoint;
-use crate::engine::Discarded;
 use crate::error::{Error, Result};
 use crate::message::Multipart;
 use crate::options::SocketOptions;
 use crate::pipe::MuteAction;
-use crate::socket::SocketCore;
+use crate::socket::{SocketCore, socket_endpoints};
 
 /// A PAIR socket: one peer, both directions, no reconnect.
 #[derive(Debug)]
@@ -64,12 +62,6 @@ impl PairSocket {
         })
     }
 
-    /// Binds an endpoint. A connection arriving while one is already live is
-    /// terminated, which is the pattern's rule and the engine's ceiling.
-    pub async fn bind(&self, endpoint: &str) -> Result<Endpoint> {
-        self.core.bind(endpoint).await
-    }
-
     /// Connects the one endpoint this socket may have.
     ///
     /// Fails with `EINVAL` on a second call: "at most one peer", and a PAIR
@@ -83,22 +75,6 @@ impl PairSocket {
         self.core.connect(endpoint)
     }
 
-    /// Stops accepting on an endpoint.
-    pub fn unbind(&self, endpoint: &str) -> Result<()> {
-        self.core.unbind(endpoint)
-    }
-
-    /// Disconnects the endpoint, destroying its queue and reporting what it
-    /// held. After this the socket may connect again.
-    pub fn disconnect(&self, endpoint: &str) -> Result<Discarded> {
-        self.core.disconnect(endpoint)
-    }
-
-    /// `ZMQ_LAST_ENDPOINT`.
-    pub fn last_endpoint(&self) -> Option<Endpoint> {
-        self.core.last_endpoint()
-    }
-
     /// Whether the one peer is **connected** right now.
     ///
     /// A dialled endpoint keeps its queue when its connection is lost —
@@ -107,16 +83,6 @@ impl PairSocket {
     /// application asks is about the connection rather than about the entry.
     pub fn has_peer(&self) -> bool {
         self.core.engine().peers().iter().any(|peer| peer.connected)
-    }
-
-    /// The socket type this socket announces.
-    pub fn socket_type(&self) -> SocketType {
-        self.core.socket_type()
-    }
-
-    /// `zmq_close`.
-    pub fn close(&self) {
-        self.core.close();
     }
 
     /// Sends a message to the peer, waiting for it to exist or to have room.
@@ -202,6 +168,11 @@ impl PairSocket {
         }
     }
 }
+
+// `connect` above is PAIR's own; everything else about an endpoint is every
+// socket's, and taking it from here is also what puts PAIR on the list the
+// thread-rule harness reads.
+socket_endpoints!(PairSocket, no_connect);
 
 #[cfg(test)]
 mod tests {

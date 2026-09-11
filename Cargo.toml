@@ -56,3 +56,6 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 # turns "we agree with ourselves" into interoperability
 # (`docs/adapters/zmtp.md` §10 item 3). Tests and benches only.
 zeromq = "0.6"
+# Proves a negative the type system holds and no runtime test can see: a
+# socket shared between threads must not compile (B-102). Tests only.
+trybuild = "1"
