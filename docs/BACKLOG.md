@@ -75,9 +75,9 @@ kind: code | size: 90 | status: ready | needs: [B-014]
 acceptance: a sending endpoint configured `PerProducer(detect)` numbers its transfers per (connection, path/topic); the receiver reports gaps through `IncomingMeta` (gap count, expected vs seen) without holding anything back; dedup with a time window drops repeats and counts them; both allocate nothing when negotiated off (INVARIANTS); tests for gap detection through a Pub/Sub drop.
 
 ### B-016 — Runtime ownership and centralized spawn/timer/DNS
-kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T04:05Z | needs: []
+kind: code | size: 90 | status: done 2741dfd | needs: []
 acceptance: `Runtime::owned(config)` (multi-thread, `worker_threads` configurable, default 1) and `Runtime::with_handle`; all `tokio::spawn`, `tokio::time::sleep` and `lookup_host` calls go through `runtime.rs`; a test drives a full Req/Rep round trip under `futures::executor::block_on` with no `#[tokio::test]`; `futures-io` `AsyncRead`/`AsyncWrite` implemented beside the tokio traits.
-note: built by the parallel worker on branch `b016-runtime` in the worktree `../weida-b016` with its own `CARGO_TARGET_DIR`, so this tree's build lock is untouched. On delivery it is merged here (`--no-ff`), gated in this tree, and finished per LOOP §1.5; a red gate goes back to the worker rather than to a revert.
+note: built by the parallel worker on branch `b016-runtime` in the worktree `../weida-b016` (commits 6dee879 code, bfc5fee docs), merged here `--no-ff` as 2741dfd with no conflicts, and gated in this tree: fmt clean, clippy in both feature configurations, 222 tests pass with 1 ignored (the new `foreign_executor` suite among them), rustdoc with `-D warnings`. Verified against the acceptance line: `Runtime::owned` rejects `worker_threads: 0`, `Exec` in `runtime.rs` is the only place calling `tokio::spawn`, `tokio::time::sleep` or `lookup_host`, `futures_io::AsyncWrite`/`AsyncRead` are implemented on both transfer types, and `a_req_rep_round_trip_runs_without_a_tokio_executor` is a plain `#[test]`.
 
 ### B-017 — Control connection per peer, bulk per path
 kind: code | size: 90 | status: ready | needs: [B-014, B-011, B-012]
@@ -99,3 +99,11 @@ acceptance: a criterion bench comparing byte-prefix `starts_with` against the se
 ### B-022 — Reassembly mode, capped, and subscriber-side drop detection
 kind: code | size: 90 | status: ready | needs: [B-015]
 acceptance: `PerProducer(reassemble)` holds out-of-order transfers and releases them in sequence order, with the hold bounded by a named `Limits` field and the bound enforced by refusing or releasing out of order rather than by growing — B-010 measured the peak at N − 1 of the transfers in flight, and 84 of 256 with no adversarial pattern, so the cap is a configured number and not an assumption about arrival order; the cap appears in INVARIANTS' named bounds; a subscriber in detect or reassemble mode reports a Pub/Sub drop through `IncomingMeta`; a test drives reordering with the two FIN modes of `reverse_order_completion_measures_the_reorder_buffer`.
+
+### B-023 — Foreign-executor coverage for Push/Pull and Pub/Sub
+kind: code | size: 45 | status: ready | needs: [B-016]
+acceptance: `crates/weida/tests/foreign_executor.rs` gains a Push/Pull and a Pub/Sub round trip as plain `#[test]`s under `futures::executor::block_on`, so the claim "weida needs no ambient reactor" is proved for every pattern rather than for Req/Rep alone; each test bounds every await with the suite's deadline helper; a pattern that cannot run without a tokio context is a bug in `runtime.rs`, not a reason to skip the test. Proposed by the B-016 worker.
+
+### B-024 — An example without `#[tokio::main]`
+kind: code | size: 30 | status: ready | needs: [B-016]
+acceptance: one existing example (or a new small one) drives a full exchange from a plain `fn main` using `Runtime::owned`, showing what a caller with no async runtime of its own writes; the README's build-and-run section names it; `cargo run -p weida --example <name>` works. Proposed by the B-016 worker, and it is the user-visible half of `Runtime::owned` — the API exists but nothing in the tree demonstrates it.
