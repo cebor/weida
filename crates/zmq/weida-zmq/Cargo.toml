@@ -92,6 +92,14 @@ required-features = ["blocking"]
 name = "paranoid_pirate"
 
 [[example]]
+# The zguide's Majordomo (18/MDP 0.2): broker, worker and client.
+name = "majordomo"
+
+[[example]]
+# The zguide's Freelance, models one and two (10/FLP).
+name = "freelance"
+
+[[example]]
 # The zguide's Hello World, in the shape its C original has.
 name = "hello_world"
 required-features = ["blocking"]
