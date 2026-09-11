@@ -5,13 +5,13 @@ first, then the numbers, then the chronology.
 
 ## Review needed
 
-**Nothing is waiting on disk.** `b057-cross-adapter` and
-`b059-local-block` are both merged (`525db84`, `6ca89ad`), the gate is green at **505 tests**,
-and the tree is clean. One item is in flight: B-070, the `weida-runtime` extraction, delegated
-to the parallel worker on `b070-weida-runtime`. Phase A is complete but for its two named gaps
-(A5 parked by 0011, A9's Windows half blocked on a runner); Phase B is the shape
+**Nothing is waiting on disk.** Everything delivered is merged — last `b070-weida-runtime`
+as `ff9131a` — the gate is green at **522 tests**, one ignored, and the tree is clean. One
+item is in flight: B-071, the `weida-zmq` context, delegated to the parallel worker on
+`b071-zmq-context`. Phase A is complete but for its two named gaps (A5 parked by 0011, A9's
+Windows half blocked on a runner); Phase B is the shape
 [decision 0013](decisions/0013-competitor-libraries.md) gave it, so B1 and B2 are complete as
-bridges and reopen as libraries.
+bridges and reopen as libraries, and the shared crate they need now exists.
 
 **Then read these three, in this order.**
 
@@ -44,14 +44,14 @@ bridges and reopen as libraries.
   it: 0011 §4.3 parks 0002 §6.3's per-peer control connection, because the rule 0011 settles
   leaves that tier with no frame to carry. 0002 and 0003 carry amendment markers; neither was
   rewritten.
-- **No stashes; one delegation, B-070.** Blocked: B-039 only, on the runner above. Parked:
+- **No stashes; one delegation, B-071.** Blocked: B-039 only, on the runner above. Parked:
   B-045, the control connection, with a written revival condition, and B-058, the Python
-  binding, at your decision that Phase C waits for B3. Thirty-three items are `ready`:
+  binding, at your decision that Phase C waits for B3. Thirty-two items are `ready`:
   B-060 (the CLI), B-061 (CI), B-062 (the MQTT mapping document), the five filed from the
   zeughaus requirements note now at
   [requirements/zeughaus-video.md](requirements/zeughaus-video.md) — B-064 streaming fan-out,
   B-065 conflation, B-066 peer authorization, B-067 per-topic drop counters, B-068 a pinnable
-  release — and B-071..B-095, the ZeroMQ library of 0013 §5.3.
+  release — and B-072..B-095, the rest of the ZeroMQ library of 0013 §5.3.
 - **One process mistake of mine, for the record.** `docs/adapters/nng.md` reached main through
   my own `git add docs` rather than through the worker's branch: a directory-wide stage swept
   an item that was still being written. Nothing was lost and the document was complete, but
