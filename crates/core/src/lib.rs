@@ -17,7 +17,7 @@ pub mod limits;
 pub mod trace;
 
 pub use addr::{EndpointAddr, MAX_PATH_BYTES, SCHEME, validate_endpoint_path};
-pub use error::{Error, ErrorCode, Result, StopReason};
+pub use error::{Error, ErrorCode, LossCause, Result, StopReason};
 pub use identity::Fingerprint;
 pub use limits::Limits;
 pub use trace::{TraceContext, TraceError};

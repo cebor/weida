@@ -53,7 +53,8 @@ mod tls;
 mod transfer;
 
 pub use weida_core::{
-    EndpointAddr, Error, ErrorCode, Fingerprint, Limits, Result, StopReason, TraceContext,
+    EndpointAddr, Error, ErrorCode, Fingerprint, Limits, LossCause, Result, StopReason,
+    TraceContext,
 };
 pub use weida_protocol::{ALPN, VERSION, codes};
 

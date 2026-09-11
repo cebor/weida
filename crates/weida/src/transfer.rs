@@ -683,7 +683,7 @@ impl ReplyStream {
 /// Re-labels a lost connection while awaiting a reply.
 fn indeterminate_on_loss(e: Error) -> Error {
     match e {
-        Error::ConnectionLost => Error::Indeterminate,
+        Error::ConnectionLost(_) => Error::Indeterminate,
         other => other,
     }
 }

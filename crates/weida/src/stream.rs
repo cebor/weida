@@ -19,10 +19,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{Mutex, mpsc};
-use weida_core::{EndpointAddr, Error};
+use weida_core::{EndpointAddr, Error, LossCause};
 
 use crate::config::ClientTls;
-use crate::conn::ConnHandle;
+use crate::conn::{ConnHandle, conn_error};
 use crate::runtime::RuntimeInner;
 use crate::transfer::{
     IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream, TransferMeta, data_header,
@@ -78,19 +78,29 @@ impl PeerSet {
     }
 
     /// Picks the next live peer, round-robin.
+    ///
+    /// When every peer is closed, the error says **why** the last one
+    /// examined died rather than flattening all of them into a bare
+    /// `ConnectionLost`: an application deciding whether to redial needs to
+    /// tell an idle timeout from a peer that closed deliberately, and this is
+    /// the only place that knowledge was being thrown away.
     fn pick(&self) -> Result<(ConnHandle, Arc<str>), Error> {
         let peers = self.peers.lock().expect("peer list poisoned");
         if peers.is_empty() {
             return Err(Error::NotConnected);
         }
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+        let mut cause = None;
         for offset in 0..peers.len() {
             let peer = &peers[(start + offset) % peers.len()];
-            if peer.conn.conn.close_reason().is_none() {
-                return Ok((Arc::clone(&peer.conn), Arc::clone(&peer.path)));
+            match peer.conn.conn.close_reason() {
+                None => return Ok((Arc::clone(&peer.conn), Arc::clone(&peer.path))),
+                Some(reason) => cause = Some(conn_error(reason)),
             }
         }
-        Err(Error::ConnectionLost)
+        // A closed connection always has a reason, so the fallback is
+        // unreachable in practice and exists to keep the mapping total.
+        Err(cause.unwrap_or(Error::ConnectionLost(LossCause::LocallyClosed)))
     }
 
     /// Runs `f` for every peer whose connection is still open.

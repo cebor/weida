@@ -23,7 +23,7 @@ use common::{Certs, Server};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use weida::{Binding, Error, Limits, Listener, Runtime, RuntimeConfig, TransferMeta};
+use weida::{Binding, Error, Limits, Listener, LossCause, Runtime, RuntimeConfig, TransferMeta};
 
 /// Generous ceiling: everything that must settle settles in milliseconds.
 const DEADLINE: Duration = Duration::from_secs(15);
@@ -649,7 +649,7 @@ async fn after_the_server_restarts_the_pusher_must_reconnect() {
     })
     .await;
     assert!(
-        matches!(err, Error::ConnectionLost),
+        matches!(err, Error::ConnectionLost(_)),
         "a closed peer must be reported as ConnectionLost, got {err:?}"
     );
     assert_eq!(attempts, 1, "the first send after the close already fails");
@@ -726,9 +726,12 @@ async fn idle_timeout_reports_loss_within_the_window() {
     let err = within(requester.request(b"x"))
         .await
         .expect_err("an idled-out connection must not serve a request");
+    // The cause, not merely the outcome: an application deciding whether to
+    // redial must be able to tell an idle timeout from a peer that closed
+    // deliberately, and peer selection used to flatten both into one error.
     assert!(
-        matches!(err, Error::ConnectionLost),
-        "a timed-out peer surfaces through peer selection as ConnectionLost, got {err:?}"
+        matches!(err, Error::ConnectionLost(LossCause::IdleTimeout)),
+        "a timed-out peer must surface as an idle timeout, got {err:?}"
     );
 
     client.shutdown().await;

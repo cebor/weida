@@ -148,13 +148,16 @@ is why it is negotiated rather than default ([GUARANTEES.md](GUARANTEES.md) §3)
   default), the smaller of the two peers' values governing both.
 - Only the **dialling** side sends keep-alives (`RuntimeConfig::keep_alive`, 10 s default). A
   binding with an idle timeout shorter than its clients' keep-alive interval drops them.
-- Loss surfaces as `Error::ConnectionLost` from the next operation, on the pattern APIs
-  without the cause. `Peer::peer_count` stops counting the dead peer.
+- Loss surfaces as `Error::ConnectionLost(cause)` from the next operation, and the cause is
+  kept rather than flattened: `IdleTimeout`, `PeerClosed`, `LocallyClosed`, `Reset` or
+  `TransportError`. It is not a second outcome — the failure is definite whichever it is —
+  but it is what tells an application whether redialling makes sense. `Peer::peer_count`
+  stops counting the dead peer.
 - **Nothing reconnects.** The application calls `connect` again, with the same or a new
   address; the dead entry is reaped then. A `Subscriber` re-sends its filters on `connect`.
 
 *`idle_timeout_reports_loss_within_the_window` (server idle timeout 500 ms, client
-keep-alive 10 s, `ConnectionLost` after 1.5 s of silence);
+keep-alive 10 s, `ConnectionLost(IdleTimeout)` after 1.5 s of silence);
 `after_the_server_restarts_the_pusher_must_reconnect`.*
 
 ### 1.9 Identity: who is on the other side

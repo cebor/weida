@@ -798,6 +798,7 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | `futures-io` beside `tokio::io` | both trait pairs on `OutgoingTransfer`/`IncomingTransfer`, `futures-io` delegating to the tokio impl | A caller on `futures`, `smol` or `async-std` should not have to wrap a compat shim around a payload stream. Delegating keeps the end-of-payload bookkeeping in one place. |
 | `shutdown_timeout` | `RuntimeConfig::shutdown_timeout`, default 1 s (B-031) | `shutdown` closes every endpoint and then waited for the sockets to go idle **without a bound**, so the length of a process's exit was decided by the path rather than by the caller: measured against a peer that has gone silent, the draining period alone is **96 ms** on loopback and grows with round-trip time and loss. One second is generous on any network where a clean close was possible at all. The bound is one budget for the whole shutdown, not one per endpoint, because what a caller waits for is the call ([decisions/0009](decisions/0009-drain.md) §4.4). |
 | Address selection | try every resolved address in order, capped by `Limits::max_resolved_addresses` (8), each attempt but the last bounded by `RuntimeConfig::connect_attempt_timeout` (250 ms) (B-029) | Taking the first address made `weida://localhost:…` unreachable wherever `localhost` resolves to `::1` before `127.0.0.1`, which is the common Linux ordering and this machine's. Sequential attempts with a per-attempt bound rather than RFC 8305's parallel happy-eyeballs: the failure being fixed is an address that answers *nothing*, where QUIC has no refusal to observe, and 250 ms is RFC 8305's own Connection Attempt Delay for exactly that case. Measured on the regression test: **30 s before, 1.3 s after**. The last address keeps the full handshake budget, so an IP literal and a single-address name behave exactly as before. |
+| Loss cause | `Error::ConnectionLost(LossCause)` — `IdleTimeout`, `PeerClosed`, `LocallyClosed`, `Reset`, `TransportError` (B-028) | `PeerSet::pick` reported a bare `ConnectionLost` for every closed peer, and `conn_error` mapped `TimedOut`, `Reset` and an unrecognized application close to the same value, so the distinction did not exist anywhere in the API. A payload rather than new top-level variants: the *outcome* is identical in all five cases — nothing in flight completed, `is_definite_failure()` stays true — and only the next action differs, so a second outcome vocabulary would have been the wrong shape ([FAILURE_MODEL.md](FAILURE_MODEL.md) §4). Five causes because each one changes what an application should do; `pick` now reports the cause of the peer it rejected. |
 
 ---
 
@@ -849,12 +850,6 @@ Recorded deliberately, not discovered later.
   would be worse.
 - **Publisher direction is fixed.** Pub and Pull bind; Sub and Push connect. The reverse
   directions wait for a use case that demands them.
-- **The cause of a lost connection is erased at peer selection.** `PeerSet::pick` reports
-  `Error::ConnectionLost` for any peer whose connection has closed, without consulting the
-  `quinn::ConnectionError`, so an idle timeout, a peer SHUTDOWN and a transport error are
-  indistinguishable there. `conn_error` has the richer mapping; through the pattern APIs it is
-  unreachable once every peer entry is closed. An application deciding whether to reconnect or
-  to give up cannot tell why it lost the peer. Filed as B-028.
 - **No automatic reconnect.** A dead peer is never redialled by the library; the application
   calls `connect` again, and dead entries are reaped at that moment (`PeerSet::add`), not
   before.
