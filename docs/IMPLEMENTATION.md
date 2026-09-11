@@ -635,6 +635,66 @@ the pool is not a special case: nothing above the transport knows it is there. 1
   [ARCHITECTURE.md](ARCHITECTURE.md), deliberately not implemented until a use case asks.
 - Router/Dealer as first-class types, and the broker work they would actually require
   (master doc §47, §85, Phase 6).
+
+**Delivered in the thirteenth increment — the SP codec (B-050):**
+
+`crates/adapters/weida-sp`, the Phase B2 counterpart of `weida-zmtp` and under the same
+rule: an **empty `[dependencies]`**, not even `weida-core`, so the codec is checkable
+against a foreign specification instead of against our reading of it
+([ARCHITECTURE.md](ARCHITECTURE.md) §4). Four modules, one per decode entry point: the
+8-octet TCP protocol header (`header`), the 64-bit message framing (`message`), the
+REQ/REP and survey tag stack (`backtrace`), and PAIR v1's hop count (`pair`). Every
+decode takes its bound as an argument — a byte cap for the message, a hop cap for the two
+header stacks — and rejects from the declared value alone, before anything is allocated.
+42 tests: 21 unit, 13 golden vectors, 7 hostile-input smoke tests, 1 doctest, plus five
+`cargo fuzz` targets (`header`, `message`, `message_stream`, `backtrace`, `pair`).
+
+**Four places where the specification, the research sheet and NNG disagree.** Each is a
+decision here rather than a comment in the code, because each one changes what a real peer
+will accept ([docs/adapters/nng.md](adapters/nng.md) §11 carries them as open questions the
+interop bench settles):
+
+1. **Endpoint type numbers are the implementation's.** The SP RFCs assign the 12-bit
+   protocol IDs and delegate the 4-bit endpoint role to the per-protocol RFCs, which never
+   published them (sp-protocol-ids-01 §1-§2). **Decision:** take the role halves from NNG's
+   registry (`NNI_PROTO(major, minor) = major * 16 + minor`, `src/core/protocol.h`), which
+   is what both NNG and mangos put on the wire, and publish all eleven as golden vectors so
+   the assumption is visible rather than buried in a match arm.
+2. **PAIR v1's initial hop count differs by one.** The research sheet says the counter is
+   "initialized to one and incremented at each node"
+   ([research/nanomsg-nng.md](research/nanomsg-nng.md) §4); NNG's current source appends
+   `0` on a cooked send and increments on receipt (`src/sp/protocol/pair1/pair.c`).
+   **Decision:** encode NNG's `0`, decode both without complaint — the difference is a
+   count, not a format — and name the disagreement in the module documentation, in
+   `pair::INITIAL_HOPS` and in the mapping document. A test against a real NNG peer is what
+   would close it; until then this codec is interoperable with the implementation rather
+   than with the prose.
+3. **The hop ceiling has two values.** The sheet documents `MAXTTL` as 1-255 with 8 the
+   common default (§11); NNG's `NNI_MAX_MAX_TTL` is **15** (`src/core/defs.h`), and its own
+   comment says the buffer sizing is why. **Decision:** ship all three as named constants
+   (`DEFAULT_MAX_HOPS = 8`, `NNG_MAX_HOPS = 15`, `SPEC_MAX_HOPS = 255`) and make the bound a
+   parameter of `backtrace::decode`. A codec that picked 255 would accept stacks a real peer
+   drops; one that picked 15 would silently narrow the specification. The caller chooses and
+   the unit test asserts that the two ceilings are in fact different.
+4. **An oversized message is fatal here and recoverable in NNG.** NNG discards a message
+   beyond `RECVMAXSZ` and keeps the pipe (§8), which it can do because it owns the socket
+   and can drain the declared octets. **Decision:** `MessageError::BodyTooLarge` reports
+   `is_violation() == true`, because a sans-I/O decoder cannot drain anything — the next
+   message begins after a body it refused to read — and draining is left to a caller that
+   has the socket. The same reasoning already applies to `weida-zmtp`'s `BodyTooLarge`, for
+   a different upstream reason (libzmq disconnects).
+
+**What the golden vectors are for.** `docs/adapters/nng.md` §10.1 publishes 20 accept
+vectors and 6 rejection vectors; `tests/golden_vectors.rs` asserts every accept vector in
+**both** directions and every rejection vector on the decoder. Encoding alone would not
+catch a decoder wrong in the same way, which is the failure mode that matters when the peer
+is NNG and not us — and it is what B-043 showed pays, since the ZMTP vectors were what made
+a foreign peer's disagreements interpretable rather than mysterious.
+
+**Not in this slice:** no bridge, no I/O, no weida types, and no PUB/SUB topic handling —
+SP has no topic field, only the leading bytes of a body, so the split is adapter
+configuration and belongs to the bridge slice ([adapters/nng.md](adapters/nng.md) §6).
+
 ---
 
 ## 2. Mandatory development loop per phase
