@@ -199,7 +199,7 @@ kind: code | size: 90 | status: ready | needs: [B-037]
 acceptance: `weida+pipe://<name>/<path>` mapped to `\\.\pipe\<name>` and never a UNC path, per [0010](decisions/0010-local-transport.md) §4.5: message mode, an explicit DACL rather than the default that grants read to Everyone and the anonymous account, `PIPE_REJECT_REMOTE_CLIENTS` always set, both accept-loop races handled (`ERROR_PIPE_CONNECTED` treated as success, `ERROR_PIPE_BUSY` retried after `WaitNamedPipe`), the client token SID through `ImpersonateNamedPipeClient` as the identity with `RevertToSelf` guaranteed, and `max_local_streams` reconciled with the 1-255 instance cap; the tests are `#[ignore]` with the reason off Windows, and CI parity is out of scope until a Windows runner exists.
 
 ### B-040 — Measure: the dedup key's allocation per call
-kind: measure | size: 45 | status: ready | needs: [B-034]
+kind: measure | size: 45 | status: in_progress 2026-09-11T14:00Z | needs: [B-034]
 acceptance: a criterion bench over `DedupWindow::is_duplicate` at a realistic entry count showing what the per-call `scope` boxing costs against a borrowed-key lookup, in the shape B-021 used for the filter matcher (measure through the public surface where possible, and say plainly where a `pub(crate)` item forced a different approach); the number goes in IMPLEMENTATION.md verified results, and it decides whether the key is worth restructuring — if it is not, the note in `dedup.rs` says so with the number beside it. Noticed by the worker while writing B-034 and deliberately not fixed there: an unmeasured allocation is not a reason to complicate a key.
 
 ### B-041 — ZMTP bridge slice 2: inbound, foreign peers into weida
