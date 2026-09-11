@@ -1294,6 +1294,67 @@ it that a merely slow peer cannot trip it, which is the only failure mode that m
 request lost to a silent ROUTER costs one exchange, a deadline that fires early costs correct
 ones.
 
+### Verified results — what the local transports cost against QUIC (B-059)
+
+The number [0010](decisions/0010-local-transport.md) §4.2 chose "the OS connection **is** the
+stream, one per transfer" without: the same patterns over all three transports, at a payload
+where the overhead is the whole figure and at one where the copies are. The bench is
+`crates/weida/benches/transports.rs`, same machine as the runs above, release profile, both
+ends in this process, loopback for the QUIC rows. Two runs; the spread below is the two runs'
+point estimates.
+
+`cargo bench -p weida --bench transports -- --warm-up-time 1 --measurement-time 3`
+
+| Pattern | Payload | QUIC (loopback) | inproc | `AF_UNIX` |
+| --- | --- | --- | --- | --- |
+| Req/Rep round trip | 1 KiB | **58.3-58.8 µs** | **13.2-13.5 µs** (4.4×) | **50.6-50.8 µs** (1.2×) |
+| Req/Rep round trip | 1 MiB | **2.70-2.73 ms** | **144-145 µs** (18.6-19.0×) | **266-312 µs** (8.7-10.3×) |
+| Push one-way | 1 KiB | **7.97-8.08 µs** | **2.03-2.07 µs** (3.9×) | **24.0-24.1 µs** (0.33×) |
+| Push one-way | 1 MiB | **1.358-1.362 ms** | **57.7-79.5 µs** (17.1-23.6×) | **130-147 µs** (9.2-10.5×) |
+| RSS per live connection | — | **995 KiB** (B-012) | **430-1761 B** | **0-655 B** |
+
+The ratio in brackets is against the QUIC row; above 1 means the local transport is that much
+faster. B-043's reading applies to the one-way rows and is the reason Req/Rep is the
+comparison: a Push returns when the transport has taken the bytes, which locally is a kernel
+buffer or a channel slot, so those rows compare enqueue rates and not delivery. The memory
+row is the delta over 200 live transfer connections read from `VmRSS`, and it varies with
+what the process already has: 1761 B (inproc) and 655 B (`AF_UNIX`) per connection when the
+report runs alone, 430 B and 0 B after the timing rows have already grown the heap. Either
+way it is **two to three orders of magnitude** under the 995 KiB a QUIC connection costs, and
+at the low end it is below what RSS can resolve.
+
+**What one connection per transfer costs, plainly.** Compare the two local transports at the
+same payload: the only structural difference between them is that `AF_UNIX` mints a real OS
+connection per transfer where inproc mints a channel pair. At 1 KiB that is **22 µs** per
+one-way message (24.0 against 2.03) — a `connect`, a preamble write, an accept and the
+credential check on the far side, all per message. At 1 MiB it is **~70 µs** against a figure
+dominated by copying, i.e. the same fixed cost, no longer visible as a ratio. Holding the
+connections open costs nothing worth counting: 200 live ones are 0-128 KiB of RSS in total.
+
+**Where the answer changes is the small end, not the large one.** At 1 MiB the choice is free:
+`AF_UNIX` beats loopback QUIC 9-10× on the round trip and inproc ~19×, and the per-transfer
+connection is lost in the copies. At 1 KiB the same fixed 22 µs is most of a local round trip,
+and an `AF_UNIX` round trip is only **1.2×** faster than a full QUIC one over loopback —
+7.7 µs of margin against a transport that does TLS, congestion control and packet framing.
+On the one-way row it has already crossed: a 1 KiB Push over `AF_UNIX` costs **3× a QUIC
+one** (24.0 µs against 8.0), because QUIC opens a stream inside a connection it already has
+while `AF_UNIX` opens a connection. So 0010 §4.2's structural argument holds for bulk and for
+in-process work, and the transport to reach for at high message rates over `AF_UNIX` is the
+one weida does not have — which is the price of not reimplementing QUIC's stream layer, now
+with a number beside it.
+
+**Two bugs, both found by running this bench rather than by reading.** First, a receipt
+parked for the drain holds its send half, which locally is a descriptor, and the parked set
+was sized by QUIC's stream budgets — so a sequential run exhausted `max_local_streams` with
+nothing in flight (`81d70e7`, and the parked set is now bounded by half the local ceiling).
+Second, the Push rows could not complete at all: a transfer holds its slot until both ends
+are done with it, so a sender that outran its puller hit the ceiling and `open` **refused**
+with `LimitExceeded` — `Reject` where [GUARANTEES.md](GUARANTEES.md) §6 promises `Block`. A
+local `open` now waits for a slot exactly as a QUIC `open` waits on the peer's stream budget,
+cancelled by dropping the future and bounded by the caller's own deadline;
+`push_pull_waits_for_a_slot_over_{inproc,unix}` pins it and fails on the old code at the
+256th send.
+
 ---
 
 ## 5. Decisions
