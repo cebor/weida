@@ -88,6 +88,23 @@ impl Link {
         }
     }
 
+    /// True where a stream is an operating-system object counted against
+    /// `max_local_streams` rather than a QUIC stream inside one connection.
+    ///
+    /// What depends on it: how many receipts the drain may park. A parked
+    /// receipt holds its send half, and on these transports that half is a
+    /// descriptor ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
+    /// §4.2), so a parked set sized for QUIC's stream budgets would hold the
+    /// whole local ceiling and leave nothing to open with.
+    pub(crate) fn streams_are_local(&self) -> bool {
+        match self {
+            Link::Quic(_) => false,
+            Link::Local(_) => true,
+            #[cfg(unix)]
+            Link::Unix(_) => true,
+        }
+    }
+
     /// An identifier stable for the life of this connection, for the
     /// subscription registry.
     pub(crate) fn stable_id(&self) -> usize {

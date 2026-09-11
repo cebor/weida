@@ -159,15 +159,32 @@ pub(crate) struct ConnDrain {
     /// Cap on this connection's parked set, taken from the stream budgets:
     /// what can plausibly be unacknowledged at once is what can be in flight
     /// at once, so this adds no new knob (0009 §5 asks for none).
+    ///
+    /// **On a local transport the budget is a different quantity**, and using
+    /// the QUIC one was a bug B-059 found by measuring: a parked receipt holds
+    /// its send half, which there is an OS connection counted against
+    /// `max_local_streams`, so a parked set sized 1024+1024 quietly consumed
+    /// all 255 descriptors and the next `open` failed with `LimitExceeded`
+    /// after 127 sequential exchanges — nothing in flight, nothing wrong, no
+    /// way for the caller to know. Locally the cap is therefore **half** the
+    /// local ceiling: parked receipts may hold at most half the descriptors,
+    /// which leaves the other half to open with, and a drain still sees every
+    /// receipt whose outcome is open.
     max_parked: usize,
 }
 
 impl ConnDrain {
-    pub(crate) fn new(limits: &Limits) -> ConnDrain {
+    pub(crate) fn new(limits: &Limits, streams_are_local: bool) -> ConnDrain {
+        let by_stream_budget = limits.max_concurrent_uni_streams as usize
+            + limits.max_concurrent_bidi_streams as usize;
+        let max_parked = if streams_are_local {
+            by_stream_budget.min(limits.max_local_streams / 2).max(1)
+        } else {
+            by_stream_budget
+        };
         ConnDrain {
             parked: Mutex::new(VecDeque::new()),
-            max_parked: limits.max_concurrent_uni_streams as usize
-                + limits.max_concurrent_bidi_streams as usize,
+            max_parked,
         }
     }
 
@@ -189,6 +206,21 @@ impl ConnDrain {
         }
         parked.push_back(receipt);
         lost
+    }
+
+    /// Drops every parked receipt that has already settled, and reports how
+    /// many went.
+    ///
+    /// Called when opening a stream has just failed with `LimitExceeded`, for
+    /// the reason `ConnCtx::reap_parked` documents: on a local transport a
+    /// parked receipt holds a file descriptor, and the parked set's own cap is
+    /// too coarse to notice. Nothing is thrown away that has not settled, so a
+    /// drain still sees every receipt whose outcome is still open.
+    pub(crate) fn reap(&self) -> usize {
+        let mut parked = self.parked.lock().expect("drain state poisoned");
+        let before = parked.len();
+        parked.retain_mut(|receipt| settled(receipt).is_none());
+        before - parked.len()
     }
 
     /// Takes this connection's receipts, for a drain.

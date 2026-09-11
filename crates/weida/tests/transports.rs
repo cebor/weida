@@ -425,6 +425,66 @@ async fn pub_sub_over_inproc() {
     pub_sub_fan_out(&Harness::start(Transport::Inproc).await).await;
 }
 
+/// Claim: a long run of local exchanges reclaims its stream slots, so the
+/// only thing `max_local_streams` bounds is what is really live.
+///
+/// The bug this pins, found by measuring in B-059 rather than by reading:
+/// locally a stream **is** an OS object counted against `max_local_streams`
+/// (255), and a receipt parked for the drain holds its send half — so a
+/// parked set sized by QUIC's stream budgets held every descriptor and the
+/// 128th sequential exchange failed with `LimitExceeded`, with nothing in
+/// flight and nothing wrong. A thousand exchanges is four times the ceiling,
+/// so any per-transfer leak fails this well before the end.
+async fn sequential_exchanges_reclaim_their_slots(h: &Harness) {
+    const EXCHANGES: u32 = 1000;
+
+    let replier = h.listener.replier("/echo").expect("replier");
+    let handler = tokio::spawn(async move {
+        while let Ok(mut request) = replier.accept().await {
+            let Ok(body) = request.take_body().collect(4096).await else {
+                continue;
+            };
+            let Ok(mut reply) = request.reply(TransferMeta::default()).await else {
+                continue;
+            };
+            if reply.write_all(&body).await.is_ok() {
+                let _ = reply.finish();
+            }
+        }
+    });
+
+    let client = h.client();
+    let requester = client.requester(h.trust());
+    within(requester.connect(&h.url("/echo")))
+        .await
+        .expect("connect");
+    for i in 0..EXCHANGES {
+        let reply = within(requester.request(b"ping"))
+            .await
+            .unwrap_or_else(|e| panic!("exchange {i} of {EXCHANGES} failed: {e:?}"));
+        let body = within(reply.collect(64)).await.expect("reply body");
+        assert_eq!(body, b"ping");
+    }
+
+    client.shutdown().await;
+    handler.abort();
+}
+
+#[tokio::test]
+async fn sequential_exchanges_reclaim_their_slots_over_inproc() {
+    let h = Harness::start(Transport::Inproc).await;
+    sequential_exchanges_reclaim_their_slots(&h).await;
+    h.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sequential_exchanges_reclaim_their_slots_over_unix() {
+    let h = Harness::start(Transport::Unix).await;
+    sequential_exchanges_reclaim_their_slots(&h).await;
+    h.shutdown().await;
+}
+
 /// Claim: a bus nobody bound is unreachable, and the address rules of
 /// [0010 §4.8] are enforced before anything is dialled.
 #[tokio::test]

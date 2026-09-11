@@ -49,5 +49,9 @@ harness = false
 name = "connections"
 harness = false
 
+[[bench]]
+name = "transports"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"

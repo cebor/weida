@@ -99,6 +99,7 @@ impl ConnCtx {
         let (agreed_tx, agreed_rx) = watch::channel(None);
         let agreed_tx = Arc::new(agreed_tx);
 
+        let streams_are_local = conn.streams_are_local();
         let ctx = Arc::new(ConnCtx {
             peer: conn.peer(),
             conn,
@@ -120,7 +121,7 @@ impl ConnCtx {
                 guarantees.dedup_window_ms,
                 limits.max_dedup_entries,
             ),
-            parked: crate::drain::ConnDrain::new(&limits),
+            parked: crate::drain::ConnDrain::new(&limits, streams_are_local),
             shared,
             agreed: agreed_rx,
         });
@@ -184,7 +185,13 @@ impl ConnCtx {
 
     /// Opens a unidirectional stream.
     pub(crate) async fn open_uni(&self) -> Result<SendHalf, Error> {
-        self.conn.open_uni().await
+        match self.conn.open_uni().await {
+            Err(Error::LimitExceeded) => {
+                self.reap_parked();
+                self.conn.open_uni().await
+            }
+            other => other,
+        }
     }
 
     /// Opens a bidirectional stream.
@@ -193,7 +200,42 @@ impl ConnCtx {
     /// the DATA header is always written first, so an exchange never announces
     /// itself before it says what it is.
     pub(crate) async fn open_bi(&self) -> Result<(SendHalf, RecvHalf), Error> {
-        self.conn.open_bi().await
+        match self.conn.open_bi().await {
+            Err(Error::LimitExceeded) => {
+                self.reap_parked();
+                self.conn.open_bi().await
+            }
+            other => other,
+        }
+    }
+
+    /// Frees the parked receipts that have already settled, then lets the
+    /// caller try again.
+    ///
+    /// This exists because of what a stream slot **is** on a local transport:
+    /// one OS connection or one channel pair, counted against
+    /// `max_local_streams`
+    /// ([0010](../../../docs/decisions/0010-local-transport.md) §4.2) — and a
+    /// receipt parked for the drain holds its send half, so it holds a slot
+    /// ([0009](../../../docs/decisions/0009-drain.md) §4.2). The parked set is
+    /// bounded by the QUIC stream budgets, which have nothing to do with that
+    /// local ceiling, so a long run of local transfers used to exhaust the
+    /// descriptors while the parked set sat below its own cap, quite happy:
+    /// `LimitExceeded` after 127 sequential exchanges (255 slots, two per
+    /// exchange), with nothing in flight and nothing wrong.
+    ///
+    /// Reaping only on pressure keeps the cost where it belongs. The QUIC path
+    /// never reaches this, because a QUIC stream slot is not a descriptor and
+    /// `LimitExceeded` there means the *peer's* budget is full, which reaping
+    /// this side cannot fix — the second attempt then fails identically.
+    fn reap_parked(&self) {
+        let freed = self.parked.reap();
+        if freed > 0 {
+            tracing::debug!(
+                freed,
+                "reaped settled receipts to make room for another stream"
+            );
+        }
     }
 }
 
