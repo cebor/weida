@@ -29,12 +29,12 @@
   <rect x="20" y="126" width="920" height="80" class="band"/>
   <text x="28" y="142" class="side">ADAPTERS</text>
   <text x="28" y="156" class="sub">crates/zmq/*, crates/nng/*</text>
-  <rect x="140" y="138" width="150" height="56" rx="4" class="built"/><text x="148" y="156" class="lbl">weida-zmtp</text><text x="148" y="170" class="sub">codec, no deps, fuzzed</text><text x="148" y="184" class="sub">weida-zmtp-bridge in/out</text>
-  <rect x="300" y="138" width="150" height="56" rx="4" class="built"/><text x="308" y="156" class="lbl">weida-sp</text><text x="308" y="170" class="sub">codec, no deps, fuzzed</text><text x="308" y="184" class="sub">weida-sp-bridge in/out</text>
+  <rect x="140" y="138" width="150" height="56" rx="4" class="built"/><text x="148" y="156" class="lbl">weida-zmtp</text><text x="148" y="170" class="sub">codec, no deps, fuzzed</text><text x="148" y="184" class="sub">weida-zmq + weida-zmq-bridge</text>
+  <rect x="300" y="138" width="150" height="56" rx="4" class="built"/><text x="308" y="156" class="lbl">weida-sp</text><text x="308" y="170" class="sub">codec, no deps, fuzzed</text><text x="308" y="184" class="sub">weida-nng-bridge in/out</text>
   <rect x="460" y="138" width="150" height="56" rx="4" class="missing"/><text x="468" y="156" class="lbl">weida-mqtt</text>
   <rect x="620" y="138" width="150" height="56" rx="4" class="missing"/><text x="628" y="156" class="lbl">weida-amqp, weida-nats</text>
   <rect x="780" y="138" width="150" height="56" rx="4" class="missing"/><text x="788" y="156" class="lbl">weida-py (PyO3)</text><text x="788" y="170" class="sub">B-058 ready to start</text>
-  <rect x="140" y="196" width="310" height="8" rx="2" class="partial"/><text x="455" y="203" class="sub">cross-tests: ZMTP ↔ SP, 9 chains, on branch</text>
+  <rect x="140" y="196" width="310" height="8" rx="2" class="built"/><text x="455" y="203" class="sub">crates/interop/cross-tests: ZMTP ↔ SP, 9 chains, merged</text>
 
   <!-- arrows adapters -> runtime -->
   <path d="M215,206 L215,232" class="arrow"/>
@@ -43,13 +43,13 @@
   <!-- band: runtime -->
   <rect x="20" y="232" width="920" height="120" class="band"/>
   <text x="28" y="248" class="side">RUNTIME</text>
-  <text x="28" y="262" class="sub">crates/weida</text>
+  <text x="28" y="262" class="sub">crates/weida, crates/runtime</text>
   <rect x="140" y="244" width="120" height="40" rx="4" class="built"/><text x="148" y="260" class="lbl">Patterns</text><text x="148" y="274" class="sub">Req/Rep, Push/Pull, Pub/Sub</text>
   <rect x="270" y="244" width="120" height="40" rx="4" class="built"/><text x="278" y="260" class="lbl">Ordering</text><text x="278" y="274" class="sub">detect + reassemble</text>
   <rect x="400" y="244" width="120" height="40" rx="4" class="built"/><text x="408" y="260" class="lbl">Dedup</text><text x="408" y="274" class="sub">Bounded(window)</text>
   <rect x="530" y="244" width="120" height="40" rx="4" class="built"/><text x="538" y="260" class="lbl">Drain / shutdown</text><text x="538" y="274" class="sub">bounded, counted</text>
   <rect x="660" y="244" width="120" height="40" rx="4" class="built"/><text x="668" y="260" class="lbl">Pool</text><text x="668" y="274" class="sub">one conn per path</text>
-  <rect x="790" y="244" width="140" height="40" rx="4" class="built"/><text x="798" y="260" class="lbl">Runtime::owned</text><text x="798" y="274" class="sub">no ambient reactor needed</text>
+  <rect x="790" y="244" width="140" height="40" rx="4" class="built"/><text x="798" y="260" class="lbl">weida-runtime</text><text x="798" y="274" class="sub">Exec, three reactor owners</text>
   <rect x="140" y="292" width="250" height="40" rx="4" class="built"/><text x="148" y="308" class="lbl">weida-protocol</text><text x="148" y="322" class="sub">DATA keys 0–7, HELLO guarantee sets, filter grammar, fuzz</text>
   <rect x="400" y="292" width="250" height="40" rx="4" class="built"/><text x="408" y="308" class="lbl">weida-core</text><text x="408" y="322" class="sub">Address (3 schemes), Limits (every bound named), errors</text>
   <rect x="660" y="292" width="270" height="40" rx="4" class="partial"/><text x="668" y="308" class="lbl">Guarantee sets</text><text x="668" y="322" class="sub">core + supersets negotiated; Stored/Replicated reserved for L2</text>

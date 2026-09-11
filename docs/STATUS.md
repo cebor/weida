@@ -6,10 +6,13 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `bd40383`, 2026-09-11 ~13:10 UTC. Tree clean, gate green, 505 tests
-(218 at the start of the session). Twelve decision notes (0001–0012), all `accepted`.
-Eight crates: `weida-core`, `weida-protocol`, `weida`, `weida-zmtp`, `weida-zmq-bridge`,
-`weida-sp`, `weida-nng-bridge` and `cross-tests`.
+**Snapshot:** main `742d905`, 2026-09-11 ~23:34 UTC. Tree clean, gate green, **764 tests**
+(218 at the start of the session), plus 228 under `weida-zmq`'s non-default `blocking` feature
+and 18 in the libzmq interop matrix that runs `#[ignore]`d against the system library.
+Thirteen decision notes (0001–0013), all `accepted`. Eleven crates in one directory per
+protocol family: `weida-core`, `weida-protocol`, `weida-runtime`, `weida`, then
+`crates/zmq/{weida-zmtp, weida-zmq, weida-zmq-bridge}`,
+`crates/nng/{weida-sp, weida-nng-bridge}` and `crates/interop/cross-tests`.
 
 ## 1. The roadmap
 
@@ -20,15 +23,17 @@ rather than on a design. The control-connection tier (A5) is not a gap: decision
 it with a revival condition, because no existing or reserved frame is peer-scoped. The last
 open question in it, what a
 local `open` does at its ceiling, is answered: it **waits for a slot**, so `Block` means the
-same thing on every transport (B-059). **Phase B has two protocols complete** — ZMTP and SP,
-all six slices each, both interoperating with the real upstream (`zeromq`, and the `nng` C
-library), and the sixth slice is one test crate they share. **Phase B is redefined by
-[decision 0013](decisions/0013-competitor-libraries.md)**: each foreign protocol now produces
-a standalone library beside weida — `weida-zmq`, then `weida-nng` — and the bridges shrink to
-forwarders that terminate both sides, which is about 36 hours of item time for ZeroMQ alone
-(B-070..B-095). B1 and B2 are therefore **complete as bridges and reopen as libraries**, and
-the boxes above say so. MQTT is next among the mapping documents, because it is the first
-protocol with a session and weida deliberately has none.
+same thing on every transport (B-059). **Phase B's first protocol is complete as a library**:
+`weida-zmq` is [decision 0013](decisions/0013-competitor-libraries.md)'s definition of done,
+all twenty-six items B-070..B-095 merged — eleven socket types against `zmq_socket(3)`'s twenty
+rows, three transports, NULL/PLAIN/CURVE with the ZAP dialog, a 98-row option table decided
+row by row, the monitor and the devices, a non-default blocking facade, nine zguide recipes,
+interop in both roles against `zeromq` 0.6 and against libzmq 4.3.5, and a parity table where
+every row carries its evidence. The forwarder was rebuilt on it and lost 1352 lines. **B2 has
+its codec, its mapping document and its bridge in both directions** — all interoperating with
+the `nng` C library — and reopens as `weida-nng` under the same six slices; its items are not
+filed yet. MQTT is next among the mapping documents, because it is the first protocol with a
+session and weida deliberately has none.
 Phase C's prerequisite (`Runtime::owned`) exists; its first slice is parked until MQTT.
 AMQP 0-9-1 (RabbitMQ) is deliberately not a Phase B adapter: its clients come with the broker (D2), and B4's AMQP 1.0 client already reaches RabbitMQ 4.x.
 
@@ -42,12 +47,18 @@ patterns, ordering, dedup, drain — is transport-blind, and `tests/transports.r
 running one Req/Rep, one Push/Pull and one Pub/Sub body over QUIC, inproc and `AF_UNIX`
 unchanged. Everything below it is one variant each; Windows named pipes would be a fourth.
 
-The **adapters** sit outside the core on purpose. Each codec crate has an empty
-`[dependencies]` section so that it can be checked against its RFC rather than against our
-reading of it; each bridge is its own crate so that the codec never learns what weida is. The
-review pass of B-051 found the only two unbounded remote-influenced allocations of the session
-in a bridge, not in the core — the invariant sweep now covers the foreign-protocol crates
-(`crates/zmq/`, `crates/nng/`) too.
+The **reactor is its own crate** now: `weida-runtime` holds `Exec`, the three reactor-ownership
+constructors, the capped resolver, the `AF_UNIX` hygiene and the name registry, and it depends
+on `weida-core` and `tokio` and nothing else — which is what lets a ZeroMQ user open a socket
+without linking quinn, rustls and weida's pattern layer. Above it the tree is **one directory
+per protocol family** (`crates/zmq/`, `crates/nng/`, `crates/interop/`) rather than one
+`adapters/` bucket, so the directory list answers "does this repository ship a ZeroMQ?". Each
+codec crate still has an **empty `[dependencies]`** section, so it can be checked against its
+RFC rather than against our reading of it; each library depends on the codec and the runtime
+and never on `weida`; each forwarder is the only crate that names both sides. The review pass
+of B-051 found the session's first two unbounded remote-influenced allocations in a bridge
+rather than in the core, and B-097 found two more in the new library — so the invariant sweep
+covers the foreign-protocol crates too, and every bound they added is named where it is taken.
 
 ## 3. The first message across two protocols
 
@@ -96,9 +107,18 @@ One thing, and it is the same one [NIGHTLOG.md](NIGHTLOG.md) leads with:
 
 ## 7. Where the loop stands
 
-- **Paused, not stopped, and nothing is in flight.** Both branches of the session are merged
-  (`525db84` the cross-adapter test, `6ca89ad` the local `Block` fix), the gate is green at
-  505 tests and the tree is clean. No worktree holds unmerged work.
-- Resuming is one instruction: take the first `ready` item of [BACKLOG.md](BACKLOG.md). That
-  is B-060, the `weida` CLI; B-062, the MQTT mapping document, is the one that moves the
-  roadmap.
+- **Paused, not stopped, and nothing is in flight.** Every branch of the session is merged —
+  the last was `b095-crate-move` as `bcdfdff` — the gate is green at 764 tests with one
+  ignored, and the tree is clean. No worktree holds unmerged work.
+- **14 items are `ready`, one is `blocked`** (B-039, named pipes, §6) and **two are `parked`**
+  (A5's control tier by 0011 §4.3, the Python binding by your decision until MQTT).
+- Resuming is one instruction, and the choice is yours: **`weida-nng` as a library**, which is
+  B2's half of [decision 0013](decisions/0013-competitor-libraries.md) and needs its items
+  filed first — the ZeroMQ line is the template, twenty-six items in one day — or **B-062, the
+  MQTT mapping document**, which is the one that moves the roadmap, because MQTT is the first
+  protocol with a session and weida deliberately has none.
+- Five small items are ready and would cost under two hours together: B-104 (write the
+  pipe-pairing diagnosis where somebody would try it again), B-106 (a regression test for the
+  `Queue` lost wakeup that landed without one), B-107 (one sentence so LOOP §6's gate compiles
+  the non-default `blocking` feature), B-109 (the codec's `MESSAGE` encoder still frames a
+  command) and B-110 (the interop port probe races).

@@ -41,8 +41,8 @@
   <!-- Phase B -->
   <text x="20" y="160" class="phase">Phase B — libraries and forwarders (6 slices each: codec, doc, library, forwarder, interop, cross)</text>
   <g transform="translate(20,170)">
-    <rect x="0"   y="0" width="220" height="58" rx="4" class="partial"/>
-    <text x="8" y="18" class="lbl">B1 ZMTP 3.1</text><text x="8" y="34" class="sub">bridge done; library per 0013</text><text x="8" y="48" class="sub">weida-zmq: B-070..B-095 filed</text>
+    <rect x="0"   y="0" width="220" height="58" rx="4" class="done"/>
+    <text x="8" y="18" class="lbl">B1 ZMTP 3.1</text><text x="8" y="34" class="sub">library + forwarder; interop vs libzmq 4.3.5</text><text x="8" y="48" class="sub">weida-zmq: B-070..B-095 done (0013)</text>
     <rect x="228" y="0" width="220" height="58" rx="4" class="partial"/>
     <text x="236" y="18" class="lbl">B2 NNG / SP</text><text x="236" y="34" class="sub">bridge done; library per 0013</text><text x="236" y="48" class="sub">weida-nng: not filed yet</text>
     <rect x="456" y="0" width="220" height="58" rx="4" class="ready"/>

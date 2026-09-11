@@ -5,132 +5,68 @@ first, then the numbers, then the chronology.
 
 ## Review needed
 
-**Decision 0013's definition of done is closed: the repository ships two products.** Everything
-delivered is merged — last `b095-crate-move` as `bcdfdff` — the gate is green at **764 tests** one
-ignored, **228** under `blocking`, the libzmq matrix at **18 passed**, the interop bench Success,
-and the tree is clean. **Nothing is in flight.** `crates/` now reads `core interop nng protocol
-runtime weida zmq`: one directory per protocol family, `crates/adapters/` gone. Phase A is
-complete but for its two named gaps (A5 parked by 0011, A9's Windows half blocked on a runner).
+**The ZeroMQ library is done and nothing is in flight.** main `742d905`, tree clean, gate green:
+**764 tests** with one ignored, plus **228** under `weida-zmq`'s non-default `blocking` feature,
+**18** in the libzmq interop matrix run for real against this machine's 4.3.5, and the interop
+bench Success on all four cases. All twenty-six items of
+[decision 0013](decisions/0013-competitor-libraries.md) — B-070..B-095 — are merged, so its
+definition of done is closed and the repository ships two products: weida, and a ZeroMQ anybody
+can use with no weida in the picture. `crates/` reads `core interop nng protocol runtime weida
+zmq`: one directory per protocol family.
 
-**What exists now that did not this morning:** a ZeroMQ library with all eleven socket types,
-three transports, three security mechanisms and the ZAP dialog, an option table decided row by
-row, a monitor, the devices and a blocking facade; interop in both roles against zmq.rs *and*
-against libzmq 4.3.5, with CURVE boxes opening in libsodium and libsodium's in ours; nine zguide
-recipes that assert the guide's own claims; a parity table where every row carries its evidence;
-and a bridge **1352 lines smaller** because the library does the protocol now. Five small items
-are unassigned and named rather than tidied away: B-104, B-106, B-107, B-109 and B-110.
+**The evidence behind that sentence, one line each.** Every claim below is a test or a document
+in the tree, not a summary of intent:
 
-**One flake, and it arrived with a name — which is what B-100's gate change bought.**
-`our_req_is_answered_by_a_zmq_rs_rep` failed once with `AddrInUse`, the re-run was 764/0, and the
-cause is in the test helper rather than in either library: `free_endpoint` probes a port, **drops
-the listener** and hands the number over, which is a time-of-check-to-time-of-use window that the
-parallel suite can walk into. Filed as **B-110** with the fix shape named. A month ago this would
-have been "one test failed of 75" with nothing to chase.
+- **Socket types:** all twenty rows of `zmq_socket(3)`'s table decided — eleven of the twelve
+  stable types implemented with their mute action, routing and alternation, `ZMQ_STREAM` absent
+  with what is missing named, the eight draft types absent as a family with their RFC numbers.
+- **Transports:** `tcp://`, `inproc://` and `ipc://`, each with its own length budget and its own
+  test file; the eight libzmq names we do not implement are refused by name at parse.
+- **Security:** NULL, PLAIN and CURVE with the ZAP dialog over `inproc://zeromq.zap.01`, 200/300/
+  400/500, and `ZapUserId` deliberately unconnected to any weida identity.
+- **Interop, both roles:** **13** tests against `zeromq` 0.6 in the ordinary suite and **18**
+  against libzmq 4.3.5 behind `--ignored`, every pairing with our socket bound *and* connecting.
+  CURVE opens in both directions: our boxes in libsodium, libsodium's in ours.
+- **The zguide:** **9** recipes — the three pirates, Majordomo, Freelance, Clone, Binary Star,
+  Espresso, the last-value cache — each asserting the guide's own claim, with the test files
+  *including* the examples so the recipe under test is the one a reader runs.
+- **The parity table:** `docs/libraries/zmq.md`, every row carrying its evidence, no aggregate
+  verdicts, and a 98-row option table generated from the code rather than transcribed.
 
-**The bug is the thing to read: a subscription made between `connect` and the handshake reached
-the publisher twice.** The socket queued the announcement *and* the session replayed the socket's
-table — and because 29/PUBSUB subscriptions **count** rather than set, the publisher then wanted
-two `CANCEL`s for something the application holds once, so the first `unsubscribe` did nothing and
-an XPUB reported nothing. It surfaced because **Espresso's captured trace had no unsubscriptions
-in it** — a recipe noticing what a unit test could not — and it was confirmed with a throwaway
-probe before being believed. Fixed, with a regression test in the gap where it lived, and the
-libzmq matrix re-run afterwards to be sure the wire had not moved.
+**One thing needs you, and it is the same one as this morning.** **B-039, named pipes**, is
+`blocked: needs a Windows runner` by my judgement rather than by a missing design — 0012 §4.6
+leaves nothing to decide and the slice is writable today, but every line of it is
+`#[cfg(windows)]`, so this tree's gate cannot compile it, cannot run it and cannot fail on it,
+and the details are exactly the hostile kind (a DACL that must not grant Everyone, two
+accept-loop races, `RevertToSelf` on every exit from an impersonation, the 1-255 instance cap).
+The `AF_UNIX` slice found a design hole no amount of reading had found; the pipe slice would find
+its own and nobody would see them. Overrule me if you want it written blind. **B-058, the Python
+binding, is `parked`** at your decision that Phase C waits for B3, and **B-045, the per-peer
+control connection, is `parked`** by 0011 §4.3 with a written revival condition.
 
-**Four small items are unassigned and each one is a loose end I would rather you saw named than
-tidied away:** B-104 (write the pipe-pairing diagnosis where someone would try it again, 15 min),
-B-106 (a regression test for the `Queue` lost wakeup that landed without one), B-107 (the gate
-line below), and **B-109**, which
-I found on merging B-089: the codec's public `CurveCommand::encode()` still frames a `MESSAGE` as
-a *command*, which is the one form libzmq closes the connection on, and a golden vector pins it.
-Nothing is broken — the library frames it correctly and all 18 interop tests pass — but after
-B-108 corrected the published vector to the wire form, the table and that test disagree, and the
-function is the one that is wrong.
+**Five small items are ready and would cost under two hours together**, each one a loose end I
+would rather you saw named than tidied away: **B-104** (write the pipe-pairing diagnosis where
+somebody would try that harness again — already diagnosed, nothing is broken), **B-106** (a
+regression test for the `Queue` lost wakeup that landed without one), **B-107** (one sentence so
+LOOP §6's gate compiles the non-default `blocking` feature, which it currently never does),
+**B-109** (the codec's public `CurveCommand::encode()` still frames a `MESSAGE` as a command, the
+one form libzmq closes the connection on, and a golden vector pins it) and **B-110** (the zmq.rs
+interop helper probes a port, drops the listener and hands the number over, so the parallel suite
+can take it first — it failed once today and passed on re-run).
 
-**One sentence of yours would close B-107.** B-087 is the first item here to add a **non-default
-feature**, and LOOP §6's four commands compile `weida-zmq` *without* it — so 600 lines of
-`blocking.rs`, its example and 195 feature tests are invisible to the gate that decides whether a
-commit may land. I ran the three extra commands plus the example myself before finishing the item,
-and recorded that in its note, so nothing is unverified today; what is missing is an instruction
-for the next session. LOOP.md is yours, so I have not touched it.
+**Two standing caveats, so a red gate is read correctly rather than panicked over.** B-102's
+compile-fail harness carries **384 lines of `rustc 1.98.0` diagnostics** committed to the tree, so
+a toolchain upgrade can redden it for a wording change: regenerate with `TRYBUILD=overwrite` and
+*read the diff*, because the pass case and the `Enumerated` guard are the halves that cannot break
+that way. And B-110 above is the only flake of the day — it arrived **with a name, a file and a
+line**, which is what your one-sentence change to LOOP §6 bought; a month ago it would have been
+"one test failed of 75" with nothing to chase.
 
-**B-104 is diagnosed, and the answer is that nothing is broken.** The B-084 worker hit a symptom
-it worked around rather than explained — two of this crate's own sessions driven against each
-other over a TCP pair in one process deliver nothing, under NULL as much as under CURVE — so I
-chased it read-only rather than passing the sentence along. `Pipe` is oriented from the
-**socket's** perspective: `outgoing()` is the queue headed *for* this peer, `incoming()` what came
-*from* it, and a session pumps against that orientation. Pairing two sessions therefore needs two
-pipes with their halves **crossed**, and `Pipe::new(config)` is the only constructor there is — a
-pipe cannot be assembled from two given queues, so the crossing is not expressible through the
-public API at all. Share one pipe instead, which is the obvious move, and both sessions pop the
-same outgoing queue and push the same incoming one, so a message is raced by both readers and
-never arrives where the test looks. **No library code is implicated**: the engine pairs a session
-with a *socket*, one pipe per peer, which is why every socket-level test over TCP delivers. Two
-hypotheses I had written down before looking are eliminated too — the NULL handshake is symmetric,
-both sides writing and reading `READY`, so neither a shared role nor an uncompleted handshake gate
-can stall it. What is left of the item is 15 minutes of writing that where somebody would try it
-again, which is why the worker's instinct to drive the wire with the codec instead was right.
-
-**Nothing needs your word any more.** The one thing that did — LOOP §6's test command — is
-amended on your approval (`e16867f`): the gate's third step is
-`cargo test --workspace --no-fail-fast` and keeps the failures block, because a count without
-names is not a gate result. That closes **B-100**, whose single unreproduced failure stays
-unreproduced on purpose: it is recorded rather than chased, and if it returns it returns with a
-name. B-101 removed the likeliest cause on the way past, turning the two tightest timing tests
-into tests that wait for their event instead of sleeping past it.
-
-**B-102 is closed, and the invariant only the type system can hold is now held by it.** A
-`weida-zmq` socket is `Send` and not `Sync`, which is libzmq's own rule, and a `trybuild` harness
-asserts both halves: sharing one across threads does not compile, and a spawned future that owns
-one does. One thing to know before it ever goes red: its expected stderr is 384 lines of
-`rustc 1.98.0` diagnostics committed to the tree, so a toolchain upgrade can turn it red for a
-wording change — regenerate with `TRYBUILD=overwrite` and *read the diff*, because the two
-text-independent halves (the pass case and the `Enumerated` guard) are the ones that cannot break
-that way. B-102's backlog entry says the same thing where whoever hits it will look.
-
-**Then read these three, in this order.**
-
-1. **B-058, the Python binding, is `parked`** at your decision: Phase C does not start before
-   B3 (MQTT). Nothing depends on it and the prerequisite (`Runtime::owned`) is not going away.
-2. **B-039, named pipes**, blocked on a Windows runner by my judgement — the paragraph below
-   says why, and it is the one place I have overruled an acceptance line on grounds of
-   verifiability rather than design.
-3. **What the interop runs cost us in corrections.** Three of B-043's four findings were wrong
-   assumptions in our own code, and every one of them was invisible until an independent
-   implementation was on the other end (`decisions/README.md` has the shape; zmtp.md's header
-   lists them). That is the argument for keeping slice 5 in every adapter's plan.
-
-- **A Windows decision, and it is the only thing here that needs you.** B-039, named pipes, is
-  `blocked: needs a Windows runner` by my judgement rather than by a missing design — 0012 §4.6
-  leaves nothing to decide and the slice is writable today. That is the problem: every line of
-  it is `#[cfg(windows)]`, so this tree's gate cannot compile it, cannot run it and cannot fail
-  on it, and the details are exactly the hostile kind (a DACL that must not grant Everyone, two
-  accept-loop races, `RevertToSelf` on every exit from an impersonation, the 1-255 instance cap
-  against `max_local_streams`). The `AF_UNIX` slice found a **design hole** that no amount of
-  reading had found; the pipe slice would find its own and nobody would see them. Overrule me
-  if you want the code written blind — revival is otherwise mechanical: a Windows CI runner or
-  a Windows host the loop can reach.
-- **Decisions 0001-0013 are all `accepted`; nothing is provisional any more.** 0012 was
-  provisional for one section — §4.4's parked reverse connections, the one part with no
-  precedent in the sheets — and B-048 built it: the shape held, the shared Pub/Sub test body
-  now runs over `AF_UNIX` exactly as over QUIC and inproc, an exhausted pool is a counted drop
-  that leaves the subscription alive, and a subscriber that parks nothing is refused at
-  subscribe time. One decision **parks** a previously accepted design rather than contradicting
-  it: 0011 §4.3 parks 0002 §6.3's per-peer control connection, because the rule 0011 settles
-  leaves that tier with no frame to carry. 0002 and 0003 carry amendment markers; neither was
-  rewritten.
-- **No stashes; one delegation, B-072.** Blocked: B-039 only, on the runner above. Parked:
-  B-045, the control connection, with a written revival condition, and B-058, the Python
-  binding, at your decision that Phase C waits for B3. Thirty-one items are `ready`:
-  B-060 (the CLI), B-061 (CI), B-062 (the MQTT mapping document), the five filed from the
-  zeughaus requirements note now at
-  [requirements/zeughaus-video.md](requirements/zeughaus-video.md) — B-064 streaming fan-out,
-  B-065 conflation, B-066 peer authorization, B-067 per-topic drop counters, B-068 a pinnable
-  release — and B-073..B-095, the rest of the ZeroMQ library of 0013 §5.3.
-- **One process mistake of mine, for the record.** `docs/adapters/nng.md` reached main through
-  my own `git add docs` rather than through the worker's branch: a directory-wide stage swept
-  an item that was still being written. Nothing was lost and the document was complete, but
-  the instruction was explicit paths and I stopped following it under load. Both of us are
-  back on explicit paths, and the worker has been told which files are mine alone.
+**Decisions 0001-0013 are all `accepted`; nothing is provisional.** No stashes, no worktree
+holding unmerged work, and **14 items are `ready`, 1 `blocked`, 2 `parked`** of 110 filed. The two
+candidates that move the roadmap are `weida-nng` as a library — B2's half of 0013, whose items are
+not filed yet, with the ZeroMQ line as the template — and **B-062**, the MQTT mapping document,
+because MQTT is the first protocol with a session and weida deliberately has none.
 
 ## Numbers
 
