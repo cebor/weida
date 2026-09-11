@@ -396,16 +396,18 @@ note: merged `--no-ff` as 8d611c8 and gated here: **567 tests**, one ignored. On
 note: the `ZMQ_MAXMSGSIZE` test feeds a **nine-octet** buffer — a long header declaring 2^63-1 and no body — and gets `EMSGSIZE` from the declared length, which is the only order in which that declaration is survivable; the check is `weida-zmtp`'s own rather than a second copy of the arithmetic. The exposure this leaves is a product, and it is stated in `DEFAULT_MAX_MESSAGE_SIZE`'s docs: the HWM counts **messages**, so the defaults are 1000 × 1 MiB per direction per peer — the same arithmetic B-051 forced onto the bridge. Filed as B-096.
 
 ### B-073 — The connection engine: bind, connect, reconnect
-kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T16:45Z | needs: [B-072]
+kind: code | size: 90 | status: done 88568b7 | needs: [B-072]
 acceptance: one socket binds and connects many endpoints; `ZMQ_RECONNECT_IVL`/`_IVL_MAX` backoff, `ZMQ_HANDSHAKE_IVL`, `ZMQ_CONNECT_TIMEOUT`, `ZMQ_IMMEDIATE`, `ZMQ_BACKLOG`, `ZMQ_LAST_ENDPOINT` after a wildcard bind, `unbind`/`disconnect`; a queue exists for a peer that never connected, per the RFCs' "whether or not the connection is established".
 note: from 0013 §5.3.
 note: on branch `b073-zmq-engine` by the parallel worker, off the B-072 merge 8d611c8.
+note: merged `--no-ff` as 88568b7 and gated here: **581 tests**, one ignored. One commit (154ebe4), only `crates/zmq/weida-zmq/*` and `Cargo.lock`; the manifest gained `tracing` (already a workspace dependency of `weida` itself) and still names no `weida` and no `weida-protocol`. `Engine` holds the endpoints: `bind` returns the endpoint it actually got, which *is* `ZMQ_LAST_ENDPOINT` after a wildcard rather than a field kept beside it; `connect` returns immediately with a peer that already has a `Pipe`, which is the RFCs' "whether or not the connection is established" made structural; `unbind`/`disconnect` answer `ENOENT` for an endpoint this socket does not hold. One listener task per bound endpoint, one connecter task per connected endpoint, `ZMQ_RECONNECT_IVL`/`_IVL_MAX` doubling towards the ceiling in `SocketOptions::next_reconnect_ivl`, and every timer through `Exec::sleep`/`within` — no task in this crate can wait on a clock the tests do not own.
+note: **the pipe belongs to the endpoint, not to the connection**, and that asymmetry is the design worth keeping: a connected endpoint keeps its queue across reconnects, which is the only thing that makes `ZMQ_IMMEDIATE` mean anything, while an accepted peer has no endpoint of its own and its queue dies with the connection per the RFCs' "discarding any messages it contains" — `disconnect` returns those counts as `Discarded { outgoing, incoming }` instead of dropping them silently. `ZMQ_HANDSHAKE_IVL` is enforced by racing a `HandshakeGate` the session must signal, so a peer that connects and says nothing is dropped; the `Session` trait has **no default implementation** and its test double is `#[cfg(test)]` only, so the crate cannot ship a socket that speaks nothing while B-074 is still open. `transport.rs` is a single-variant `Stream` (`Tcp`) that refuses `ipc`/`inproc` with `EPROTONOSUPPORT` rather than holding an empty variant open for them.
 
 ### B-074 — The ZMTP session on the existing codec
-kind: adapter | size: 90 | status: ready | needs: [B-073]
+kind: adapter | size: 90 | status: in_progress (delegated) 2026-09-11T16:56Z | needs: [B-073]
 acceptance: greeting with the 3.0 downgrade, NULL handshake, `READY` metadata with `Socket-Type` and `Identity`, MORE/COMMAND framing through `weida-zmtp` unchanged, `PING`/`PONG` gated on the negotiated version, `ERROR` sent and understood; zmtp.md §10.1's vectors still assert byte-for-byte and the codec's `[dependencies]` is still empty.
 note: from 0013 §5.3.
-note: queued after B-073 on `b074-zmq-session`.
+note: on branch `b074-zmq-session` by the parallel worker, off the B-073 tip 154ebe4.
 
 ### B-075 — REQ and REP
 kind: code | size: 90 | status: ready | needs: [B-074]
