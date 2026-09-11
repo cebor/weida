@@ -52,6 +52,11 @@ use crate::endpoint::{Endpoint, TcpHost};
 use crate::error::{Error, Result};
 use crate::identity::RoutingId;
 use crate::inproc::InprocBinding;
+use crate::monitor::{
+    EVENT_ACCEPTED, EVENT_BIND_FAILED, EVENT_CLOSED, EVENT_CONNECT_DELAYED, EVENT_CONNECT_RETRIED,
+    EVENT_CONNECTED, EVENT_DISCONNECTED, EVENT_HANDSHAKE_SUCCEEDED, EVENT_LISTENING, Monitor,
+    MonitorEvent, MonitorEvents, MonitorSink,
+};
 use crate::options::SocketOptions;
 use crate::pipe::Pipe;
 use crate::subscriptions::Subscriptions;
@@ -354,6 +359,11 @@ struct EngineInner {
     /// blocking mute action with nothing to send to — waits on this instead
     /// of polling.
     peers_changed: Notify,
+    /// Where connection-lifecycle events are published, and the mask the
+    /// one installed monitor asked for. `zmq_socket_monitor`'s events are
+    /// one source rendered two ways, and this is the source
+    /// ([`crate::monitor`]).
+    monitor: MonitorSink,
 }
 
 impl Drop for EngineInner {
@@ -390,6 +400,7 @@ struct TaskCtx {
     exec: Exec,
     session: Arc<dyn Session>,
     options: SocketOptions,
+    monitor: MonitorSink,
 }
 
 impl Engine {
@@ -422,6 +433,7 @@ impl Engine {
                     closed: false,
                 }),
                 peers_changed: Notify::new(),
+                monitor: MonitorSink::default(),
             }),
         })
     }
@@ -453,6 +465,36 @@ impl Engine {
     /// `inproc://`, which takes a name in the context's namespace instead:
     /// there is no kernel queue to size and nobody to steal the name.
     pub async fn bind(&self, endpoint: &Endpoint) -> Result<Endpoint> {
+        match self.bind_inner(endpoint).await {
+            Ok(bound) => {
+                self.inner
+                    .monitor
+                    .publish(EVENT_LISTENING, || MonitorEvent::Listening {
+                        endpoint: bound.to_string(),
+                    });
+                Ok(bound)
+            }
+            Err(e) => {
+                self.inner
+                    .monitor
+                    .publish(EVENT_BIND_FAILED, || MonitorEvent::BindFailed {
+                        endpoint: endpoint.to_string(),
+                        reason: e.to_string(),
+                    });
+                Err(e)
+            }
+        }
+    }
+
+    /// Installs a monitor for `events`, replacing any previous one:
+    /// `zmq_socket_monitor`, with the event stream typed. The
+    /// `inproc://` PAIR form is [`crate::monitor::serve_pair`] over the same
+    /// stream.
+    pub fn monitor(&self, events: MonitorEvents) -> Monitor {
+        self.inner.monitor.install(events)
+    }
+
+    async fn bind_inner(&self, endpoint: &Endpoint) -> Result<Endpoint> {
         self.alive()?;
         check_transport(endpoint)?;
         let (bound, task) = match endpoint {
@@ -575,6 +617,14 @@ impl Engine {
             peer,
             task,
         });
+        // `ZMQ_EVENT_CONNECT_DELAYED`: the peer exists with no connection
+        // behind it, which is the state `ZMQ_IMMEDIATE` is about. Published
+        // here because `zmq_connect` returning is exactly that moment.
+        self.inner
+            .monitor
+            .publish(EVENT_CONNECT_DELAYED, || MonitorEvent::ConnectDelayed {
+                endpoint: endpoint.to_string(),
+            });
         self.inner.peers_changed.notify_waiters();
         Ok(peer)
     }
@@ -745,6 +795,10 @@ impl Engine {
         state.accepted = 0;
         drop(state);
         self.inner.peers_changed.notify_waiters();
+        // One `ZMQ_EVENT_CLOSED` per connection is published by the sessions
+        // as they end; what closing the socket adds is the last event a
+        // monitor will ever see.
+        self.inner.monitor.stop();
     }
 
     /// Refuses an operation on a closed socket or a terminated context.
@@ -786,6 +840,7 @@ impl Engine {
             exec: self.inner.exec.clone(),
             session: Arc::clone(&self.inner.session),
             options: self.inner.options.clone(),
+            monitor: self.inner.monitor.clone(),
         }
     }
 
@@ -1210,6 +1265,7 @@ async fn ipc_accept_loop(ctx: TaskCtx, binding: crate::ipc::IpcBinding, endpoint
 /// Dials one endpoint, forever, with `ZMQ_RECONNECT_IVL` backoff.
 async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
     let mut delay: Option<Duration> = None;
+    let mut retried = false;
     loop {
         if let Some(delay) = delay {
             ctx.exec.sleep(delay).await;
@@ -1274,13 +1330,25 @@ async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
             }
             Err(e) => {
                 tracing::debug!(%peer, endpoint = %endpoint, error = %e, "connect failed");
+                // The next attempt is a retry, and the interval it waits is
+                // what `ZMQ_EVENT_CONNECT_RETRIED` carries.
+                retried = true;
             }
         }
 
         // The pipe survives, because it belongs to the endpoint rather than to
         // the connection; what ends here is only the attempt.
         match ctx.options.next_reconnect_ivl(delay) {
-            Some(next) => delay = Some(next),
+            Some(next) => {
+                delay = Some(next);
+                if retried {
+                    ctx.monitor
+                        .publish(EVENT_CONNECT_RETRIED, || MonitorEvent::ConnectRetried {
+                            endpoint: endpoint.to_string(),
+                            interval: next,
+                        });
+                }
+            }
             // ZMQ_RECONNECT_IVL = -1: one attempt, and this endpoint is done.
             None => return,
         }
@@ -1400,8 +1468,31 @@ struct PeerSession {
     user: AuthenticatedUser,
 }
 
-/// Hands a connection to the session, enforcing `ZMQ_HANDSHAKE_IVL`.
+/// Hands a connection to the session, enforcing `ZMQ_HANDSHAKE_IVL` and
+/// publishing the connection's lifecycle to the monitor.
+///
+/// Every connection of every transport passes through here, dialled or
+/// accepted, which is why the monitor events live here rather than in each
+/// accept loop: one place that knows a connection started, whether its
+/// handshake completed, and how it ended.
 async fn run_session(ctx: &TaskCtx, stream: Stream, peer: PeerSession) -> Result<()> {
+    let endpoint = peer.endpoint.to_string();
+    let role = peer.role;
+    ctx.monitor.publish(
+        match role {
+            Role::Binder => EVENT_ACCEPTED,
+            Role::Connecter => EVENT_CONNECTED,
+        },
+        || match role {
+            Role::Binder => MonitorEvent::Accepted {
+                endpoint: endpoint.clone(),
+            },
+            Role::Connecter => MonitorEvent::Connected {
+                endpoint: endpoint.clone(),
+            },
+        },
+    );
+
     let (done, handshaken) = oneshot::channel();
     let connection = Connection {
         stream,
@@ -1420,29 +1511,70 @@ async fn run_session(ctx: &TaskCtx, stream: Stream, peer: PeerSession) -> Result
         user: peer.user,
     };
     let mut session = ctx.session.run(connection);
+    let mut handshaken = handshaken;
+    let mut succeeded = false;
 
-    let Some(limit) = ctx.options.handshake_ivl else {
-        // ZMQ_HANDSHAKE_IVL = 0: no limit, which is also how a silent peer
-        // holds a connection open. Not the default.
-        return session.await;
+    // `ZMQ_HANDSHAKE_IVL = 0` is no limit, which is also how a silent peer
+    // holds a connection open; it is not the default. Either way the gate is
+    // watched, because the handshake completing is itself an event.
+    let limit = ctx.options.handshake_ivl;
+    let deadline = async {
+        match limit {
+            Some(limit) => ctx.exec.sleep(limit).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(deadline);
+
+    let early: Option<Result<()>> = tokio::select! {
+        outcome = &mut session => Some(outcome),
+        // The gate closed: `Ok` is the handshake completing, `Err` is the
+        // sender dropped because the session is ending. Either way the
+        // handshake bound is spent.
+        gate = &mut handshaken => {
+            if gate.is_ok() {
+                succeeded = true;
+                ctx.monitor.publish(EVENT_HANDSHAKE_SUCCEEDED, || {
+                    MonitorEvent::HandshakeSucceeded { endpoint: endpoint.clone() }
+                });
+            }
+            None
+        }
+        () = &mut deadline => Some(Err(Error::ETIMEDOUT(
+            format!(
+                "the handshake did not complete within {:?} (ZMQ_HANDSHAKE_IVL)",
+                limit.unwrap_or_default()
+            )
+            .into(),
+        ))),
+    };
+    // Dropping the session future drops the stream it owns, which is how
+    // libzmq's "the connection is closed" happens here.
+    let outcome = match early {
+        Some(outcome) => outcome,
+        None => session.await,
     };
 
-    let deadline = ctx.exec.sleep(limit);
-    let expired = tokio::select! {
-        outcome = &mut session => return outcome,
-        // The gate closed, either completed or dropped because the session is
-        // ending; the handshake bound is spent either way.
-        _ = handshaken => false,
-        () = deadline => true,
-    };
-    if expired {
-        // Dropping the session future drops the stream it owns, which is how
-        // libzmq's "the connection is closed" happens here.
-        return Err(Error::ETIMEDOUT(
-            format!("the handshake did not complete within {limit:?} (ZMQ_HANDSHAKE_IVL)").into(),
-        ));
+    match &outcome {
+        // The pipe was destroyed: this side closed the connection.
+        Ok(()) => ctx
+            .monitor
+            .publish(EVENT_CLOSED, || MonitorEvent::Closed { endpoint }),
+        // A connection that got past its handshake and then ended is a
+        // disconnect; one that did not is a handshake failure, split the way
+        // libzmq splits it.
+        Err(_) if succeeded => {
+            ctx.monitor
+                .publish(EVENT_DISCONNECTED, || MonitorEvent::Disconnected {
+                    endpoint,
+                })
+        }
+        Err(e) => {
+            let event = MonitorEvent::handshake_failure(endpoint, e);
+            ctx.monitor.publish(event.id(), || event);
+        }
     }
-    session.await
+    outcome
 }
 
 #[cfg(test)]
