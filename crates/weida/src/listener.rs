@@ -11,17 +11,20 @@ use std::sync::{Arc, RwLock};
 
 use quinn::VarInt;
 use tokio::sync::mpsc;
-use weida_core::{Error, Fingerprint, validate_endpoint_path};
+use weida_core::{Error, Fingerprint, Limits, validate_endpoint_path};
 use weida_protocol::codes;
+use weida_protocol::header::GuaranteeSet;
 
 use crate::config::ServerTls;
 use crate::conn::ConnCtx;
 use crate::endpoint::{Endpoint, PubState, Publisher, PullState, Puller, RepState, Replier};
+use crate::inproc;
 use crate::pubsub::SubRegistry;
-use crate::runtime::RuntimeInner;
+use crate::runtime::{Exec, RuntimeInner, Shared};
 use crate::stream::{Acceptor, Incoming};
 use crate::tls;
 use crate::transfer::{IncomingRequest, IncomingTransfer};
+use crate::transport::Link;
 
 /// What a registered endpoint path does with an inbound transfer.
 pub(crate) enum Route {
@@ -180,6 +183,35 @@ impl Listener {
         })
     }
 
+    /// Binds this Listener's endpoints on an in-process bus.
+    ///
+    /// The counterpart of [`Listener::bind_quic`] for the transport that has
+    /// no socket: `weida+inproc://<bus>/<path>` reaches the same endpoints
+    /// from the same process, with the same frames, the same HELLO and the
+    /// same negotiation, and without TLS or credentials
+    /// (`docs/PROTOCOL.md` §2.1,
+    /// [decisions/0010](../../../docs/decisions/0010-local-transport.md)
+    /// §4.1). The bus name is at most 256 bytes and unique within the
+    /// process; binding a name twice fails with
+    /// [`Error::AlreadyRegistered`].
+    pub fn bind_inproc(&self, bus: &str) -> Result<LocalBinding, Error> {
+        let incoming = inproc::bind(bus)?;
+        let exec = self.inner.runtime.exec.clone();
+        exec.spawn(accept_local(
+            incoming,
+            Arc::clone(&self.inner.namespace),
+            Arc::clone(&self.inner.subs),
+            self.inner.runtime.config.limits,
+            exec.clone(),
+            self.inner.runtime.config.guarantees,
+            self.inner.runtime.shared(),
+        ));
+        tracing::info!(bus, "inproc binding listening");
+        Ok(LocalBinding {
+            bus: bus.to_owned(),
+        })
+    }
+
     /// Registers a replier for `path`.
     ///
     /// The path must be a valid endpoint path and must not already be
@@ -256,6 +288,69 @@ impl Binding {
     pub async fn close(&self) {
         self.endpoint.close(shutdown_code(), b"binding closed");
         self.endpoint.wait_idle().await;
+    }
+}
+
+/// One in-process binding: a bus name and nothing else.
+///
+/// No socket, no TLS and no credentials — there is nothing to configure and
+/// nobody to prove ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
+/// §4.1, §4.4). Dropping it unregisters the bus, after which a dial to that
+/// name fails as a dial to a closed port does.
+#[derive(Debug)]
+pub struct LocalBinding {
+    bus: String,
+}
+
+impl LocalBinding {
+    /// The bus this binding answers on.
+    pub fn bus(&self) -> &str {
+        &self.bus
+    }
+}
+
+impl Drop for LocalBinding {
+    fn drop(&mut self) {
+        inproc::unbind(&self.bus);
+    }
+}
+
+/// Accepts in-process connections until the bus is unbound.
+async fn accept_local(
+    mut incoming: mpsc::UnboundedReceiver<inproc::LocalConn>,
+    namespace: Arc<Namespace>,
+    subs: Arc<SubRegistry>,
+    limits: Limits,
+    exec: Exec,
+    guarantees: GuaranteeSet,
+    shared: Arc<Shared>,
+) {
+    while let Some(conn) = incoming.recv().await {
+        if shared.drain.is_draining() {
+            // Admission stopped: the same rule as on a QUIC binding
+            // (`docs/decisions/0009-drain.md` §4.5).
+            conn.close(codes::SHUTDOWN, "runtime draining");
+            continue;
+        }
+        let namespace = Arc::clone(&namespace);
+        let subs = Arc::clone(&subs);
+        let exec_for_conn = exec.clone();
+        let shared = Arc::clone(&shared);
+        exec.spawn(async move {
+            let ctx = ConnCtx::spawn(
+                Link::Local(conn),
+                limits,
+                namespace,
+                Some(Arc::clone(&subs)),
+                exec_for_conn,
+                guarantees,
+                shared,
+            );
+            let conn_id = ctx.conn.stable_id();
+            let reason = ctx.conn.closed().await;
+            subs.remove_connection(conn_id);
+            tracing::debug!(%reason, "local connection closed");
+        });
     }
 }
 
@@ -385,7 +480,7 @@ async fn accept_connections(endpoint: quinn::Endpoint, listener: Arc<ListenerInn
                         // The handle must outlive the connection: it owns the
                         // actor's control channel.
                         let _ctx = ConnCtx::spawn(
-                            conn.clone(),
+                            Link::Quic(conn.clone()),
                             limits,
                             namespace,
                             Some(Arc::clone(&subs)),

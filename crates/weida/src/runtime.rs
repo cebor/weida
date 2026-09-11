@@ -20,12 +20,13 @@ use weida_core::{EndpointAddr, Error};
 use weida_protocol::codes;
 
 use crate::config::{ClientTls, RuntimeConfig};
-use crate::conn::ConnHandle;
+use crate::conn::{ConnCtx, ConnHandle};
 use crate::drain::{self, DrainState, Drained};
 use crate::endpoint::{Endpoint, PushState, Pusher, ReqState, Requester, SubState, Subscriber};
 use crate::listener::Listener;
 use crate::pool::ClientPool;
 use crate::stream::Peer;
+use crate::transport::Link;
 
 /// The crate's whole surface onto the async runtime: tasks, timers and DNS.
 ///
@@ -194,6 +195,33 @@ impl RuntimeInner {
         tls: &Arc<ClientTls>,
     ) -> Result<ConnHandle, Error> {
         self.pool.connect(&self.config, &self.exec, addr, tls).await
+    }
+
+    /// Dials an in-process bus, with no pool and no TLS.
+    ///
+    /// Nothing is pooled because nothing is expensive: a local connection is
+    /// a pair of channels, and each caller keeps the handle it dialled
+    /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
+    /// §4.2).
+    pub(crate) async fn connect_local(&self, bus: &str) -> Result<ConnHandle, Error> {
+        let conn = crate::inproc::dial(
+            bus,
+            self.config.limits.max_local_streams,
+            self.config.limits.stream_receive_window as usize,
+        )?;
+        let handle = ConnCtx::spawn(
+            Link::Local(conn),
+            self.config.limits,
+            Arc::new(crate::listener::Namespace::new()),
+            None,
+            self.exec.clone(),
+            self.config.guarantees,
+            self.shared(),
+        );
+        // The same rule as on QUIC: negotiation completes before the caller
+        // can send anything (`docs/PROTOCOL.md` §2.3).
+        handle.negotiated().await?;
+        Ok(handle)
     }
 
     /// The state handed to every connection this runtime owns.
@@ -427,6 +455,14 @@ impl Runtime {
                 b"runtime shutting down",
             );
         }
+        // A local connection has no endpoint to close, so the connections
+        // themselves are the only handle: closing the registered links is
+        // what makes a local peer see the shutdown
+        // (`docs/decisions/0010-local-transport.md` §4.2).
+        self.inner
+            .shared
+            .drain
+            .close_all(codes::SHUTDOWN, "runtime shutting down");
 
         // One budget for the whole close, not one per endpoint: what a
         // caller cares about is when the call returns.

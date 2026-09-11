@@ -140,6 +140,89 @@ impl fmt::Display for EndpointAddr {
     }
 }
 
+/// URL scheme of the in-process transport.
+pub const SCHEME_INPROC: &str = "weida+inproc";
+
+/// Longest in-process bus name, in bytes: libzmq's budget for the same thing
+/// ([decisions/0010](../../../docs/decisions/0010-local-transport.md) §4.8).
+pub const MAX_BUS_BYTES: usize = 256;
+
+/// A parsed `weida+inproc://<bus>/<path>` address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InprocAddr {
+    /// Bus name, unique within the process.
+    pub bus: String,
+    /// Opaque endpoint identifier, starting with `/`.
+    pub path: String,
+}
+
+impl fmt::Display for InprocAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{SCHEME_INPROC}://{}{}", self.bus, self.path)
+    }
+}
+
+/// An address of any transport.
+///
+/// The transport is part of the address and nothing falls back from one to
+/// another on its own: that would change who may connect and what proves
+/// them without saying so [0010 §4.6].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Address {
+    /// `weida://[fingerprint@]host:port/path` — the network transport.
+    Quic(EndpointAddr),
+    /// `weida+inproc://bus/path` — in process, no socket and no identity.
+    Inproc(InprocAddr),
+}
+
+impl Address {
+    /// Parses an address of either transport, by scheme.
+    pub fn parse(input: &str) -> Result<Address, Error> {
+        match input
+            .strip_prefix(SCHEME_INPROC)
+            .and_then(|r| r.strip_prefix("://"))
+        {
+            Some(rest) => parse_inproc(input, rest).map(Address::Inproc),
+            None => EndpointAddr::parse(input).map(Address::Quic),
+        }
+    }
+
+    /// The endpoint path, whatever the transport.
+    pub fn path(&self) -> &str {
+        match self {
+            Address::Quic(a) => &a.path,
+            Address::Inproc(a) => &a.path,
+        }
+    }
+}
+
+fn parse_inproc(input: &str, rest: &str) -> Result<InprocAddr, Error> {
+    let invalid = |m: &str| Error::InvalidAddress(format!("{m}: {input:?}"));
+
+    let (bus, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => return Err(invalid("missing endpoint path")),
+    };
+    // There is no key to pin on a local transport, and an address that looks
+    // like it authenticates but does not is worse than one that plainly does
+    // not [0010 §4.8].
+    if bus.contains('@') {
+        return Err(invalid("a local address carries no fingerprint"));
+    }
+    if bus.is_empty() || bus.len() > MAX_BUS_BYTES {
+        return Err(invalid("bus name must be 1..=256 bytes"));
+    }
+    if bus.bytes().any(|b| b < 0x20) {
+        return Err(invalid("invalid byte in bus name"));
+    }
+    validate_endpoint_path(path).map_err(|_| invalid("invalid endpoint path"))?;
+
+    Ok(InprocAddr {
+        bus: bus.to_owned(),
+        path: path.to_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

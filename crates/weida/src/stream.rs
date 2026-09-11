@@ -19,10 +19,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{Mutex, mpsc};
-use weida_core::{EndpointAddr, Error, LossCause};
+use weida_core::{Address, Error, LossCause};
 
 use crate::config::ClientTls;
-use crate::conn::{ConnHandle, conn_error};
+use crate::conn::ConnHandle;
 use crate::runtime::RuntimeInner;
 use crate::transfer::{
     IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream, TransferMeta, data_header,
@@ -95,7 +95,7 @@ impl PeerSet {
             let peer = &peers[(start + offset) % peers.len()];
             match peer.conn.conn.close_reason() {
                 None => return Ok((Arc::clone(&peer.conn), Arc::clone(&peer.path))),
-                Some(reason) => cause = Some(conn_error(reason)),
+                Some(reason) => cause = Some(reason),
             }
         }
         // A closed connection always has a reason, so the fallback is
@@ -195,14 +195,31 @@ impl Peer {
 
     /// Dials and records a peer, returning the connection and the path.
     ///
+    /// The scheme picks the transport and nothing falls back to anything
+    /// else: `weida://` dials QUIC on `tls`'s terms, `weida+inproc://`
+    /// reaches a bus in this process with no TLS at all
+    /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
+    /// §4.6, §4.8). The trust configuration is simply unused on a local
+    /// address — there is no key to check.
+    ///
     /// Crate-internal because a `Sub` needs the connection handle itself: it
     /// registers its path in that connection's namespace so fanned-out copies
     /// have somewhere to land.
     pub(crate) async fn dial(&self, url: &str) -> Result<(ConnHandle, Arc<str>), Error> {
-        let addr = EndpointAddr::parse(url)?;
-        let conn = self.runtime.connect(&addr, &self.tls).await?;
-        self.peers.add(ConnHandle::clone(&conn), &addr.path);
-        Ok((conn, Arc::from(addr.path.as_str())))
+        let (conn, path) = match Address::parse(url)? {
+            Address::Quic(addr) => {
+                // B-017: the pool keys on the dialled path as well as the
+                // authority, and checks the fingerprint it gets back.
+                let conn = self.runtime.connect(&addr, &self.tls).await?;
+                (conn, addr.path)
+            }
+            Address::Inproc(addr) => {
+                let conn = self.runtime.connect_local(&addr.bus).await?;
+                (conn, addr.path)
+            }
+        };
+        self.peers.add(ConnHandle::clone(&conn), &path);
+        Ok((conn, Arc::from(path.as_str())))
     }
 
     pub(crate) fn for_each_live(&self, f: impl FnMut(&ConnHandle, &str)) {

@@ -182,6 +182,122 @@ impl Server {
     }
 }
 
+/// Which transport a parametrized test runs over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// Native QUIC on loopback, with TLS and a generated identity.
+    Quic,
+    /// In process: `weida+inproc://<bus>/<path>`, no socket, no TLS
+    /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)).
+    Inproc,
+}
+
+/// A server reachable over either transport, so that one test body can be
+/// run over both.
+///
+/// This is the point of the boundary B-037 introduced: nothing in the bodies
+/// below knows which transport it is on, because above the transport the
+/// frames, the HELLO exchange and the patterns are the same
+/// (`docs/PROTOCOL.md` §2.1).
+pub struct Harness {
+    pub transport: Transport,
+    pub runtime: Runtime,
+    pub listener: Listener,
+    quic: Option<(Binding, Certs)>,
+    local: Option<weida::LocalBinding>,
+}
+
+impl Harness {
+    pub async fn start(transport: Transport) -> Harness {
+        Harness::start_with(transport, RuntimeConfig::default()).await
+    }
+
+    pub async fn start_with(transport: Transport, config: RuntimeConfig) -> Harness {
+        let runtime = Runtime::new(config).expect("runtime");
+        let listener = runtime.listener();
+        match transport {
+            Transport::Quic => {
+                let certs = Certs::generate();
+                let binding = listener
+                    .bind_quic(
+                        "127.0.0.1:0".parse().expect("loopback address"),
+                        certs.server_tls(),
+                    )
+                    .await
+                    .expect("bind");
+                Harness {
+                    transport,
+                    runtime,
+                    listener,
+                    quic: Some((binding, certs)),
+                    local: None,
+                }
+            }
+            Transport::Inproc => {
+                static BUS: AtomicU32 = AtomicU32::new(0);
+                let bus = format!(
+                    "weida-test-{}-{}",
+                    std::process::id(),
+                    BUS.fetch_add(1, Ordering::Relaxed)
+                );
+                let binding = listener.bind_inproc(&bus).expect("bind inproc");
+                Harness {
+                    transport,
+                    runtime,
+                    listener,
+                    quic: None,
+                    local: Some(binding),
+                }
+            }
+        }
+    }
+
+    /// An address for `path` on this server, in the scheme of its transport.
+    pub fn url(&self, path: &str) -> String {
+        match (&self.quic, &self.local) {
+            (Some((binding, _)), _) => {
+                format!("weida://127.0.0.1:{}{}", binding.local_addr().port(), path)
+            }
+            (_, Some(binding)) => format!("weida+inproc://{}{}", binding.bus(), path),
+            _ => unreachable!("a harness always has one binding"),
+        }
+    }
+
+    /// Trust for a dialling endpoint. On a local address there is no key to
+    /// check, so the terms are simply unused [0010 §4.4].
+    pub fn trust(&self) -> ClientTls {
+        match &self.quic {
+            Some((_, certs)) => certs.client_tls(),
+            None => ClientTls::new(Trust::by_address()),
+        }
+    }
+
+    /// A client runtime for this harness.
+    pub fn client(&self) -> Runtime {
+        self.client_with(RuntimeConfig::default())
+    }
+
+    /// A client runtime with a whole configuration.
+    pub fn client_with(&self, config: RuntimeConfig) -> Runtime {
+        Runtime::new(config).expect("client runtime")
+    }
+
+    /// Shuts the server down, closing its connections on either transport.
+    pub async fn shutdown(self) {
+        let Harness {
+            runtime,
+            listener,
+            quic,
+            local,
+            ..
+        } = self;
+        drop(listener);
+        drop(quic);
+        drop(local);
+        runtime.shutdown().await;
+    }
+}
+
 /// Raw wire-protocol peers.
 ///
 /// These speak `weida-protocol` over bare `quinn` so the hostile-peer suite can

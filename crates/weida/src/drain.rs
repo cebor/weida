@@ -37,9 +37,10 @@ use weida_core::Limits;
 
 use crate::conn::ConnCtx;
 
-/// One finished transfer's acknowledgement, as quinn reports it.
+/// One finished transfer's acknowledgement, as the transport reports it:
+/// `Ok(None)` delivered, `Ok(Some(code))` refused, `Err` connection gone.
 pub(crate) type Receipt =
-    Pin<Box<dyn Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>> + Send + Sync>>;
+    Pin<Box<dyn Future<Output = Result<Option<u64>, weida_core::Error>> + Send + Sync>>;
 
 /// What a drain achieved, counted locally.
 ///
@@ -110,6 +111,18 @@ impl DrainState {
             connections.retain(|conn| conn.strong_count() > 0);
         }
         connections.push(Arc::downgrade(conn));
+    }
+
+    /// Closes every live connection this runtime owns.
+    ///
+    /// A QUIC connection is closed by closing its endpoint; a local one has
+    /// no endpoint to close, so the connection itself is the only handle
+    /// there is.
+    pub(crate) fn close_all(&self, code: u64, reason: &str) {
+        let connections = self.connections.lock().expect("drain state poisoned");
+        for conn in connections.iter().filter_map(|conn| conn.upgrade()) {
+            conn.conn.close(code, reason);
+        }
     }
 
     /// Counts one receipt that was dropped before it could settle.
@@ -187,9 +200,7 @@ impl ConnDrain {
 
 /// Polls one parked receipt without a real waker: `Some` when it has settled.
 ///
-/// A receipt only ever needs one look — either the stream is acknowledged or
-/// it is not — so reaping costs a poll and never a wake-up registration.
-fn settled(receipt: &mut Receipt) -> Option<Result<Option<quinn::VarInt>, quinn::StoppedError>> {
+fn settled(receipt: &mut Receipt) -> Option<Result<Option<u64>, weida_core::Error>> {
     let mut cx = Context::from_waker(Waker::noop());
     match receipt.as_mut().poll(&mut cx) {
         Poll::Ready(outcome) => Some(outcome),

@@ -19,12 +19,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use quinn::VarInt;
+use crate::transport::{RecvHalf, SendHalf};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use weida_core::{Error, ErrorCode, Fingerprint, TraceContext};
 use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes, encode_preamble};
 
-use crate::conn::{ConnHandle, Ctl, read_error, read_frame, write_error, write_error_frame};
+use crate::conn::{ConnHandle, Ctl, read_frame, write_error_frame};
 use crate::drain::Receipt;
 use crate::ordering::Gap;
 
@@ -171,7 +171,7 @@ pub(crate) fn data_header(
 /// destination. [`OutgoingTransfer::finish`] marks the FIN and hands back the
 /// [`Delivery`] receipt.
 pub struct OutgoingTransfer {
-    stream: quinn::SendStream,
+    stream: SendHalf,
     trace: TraceContext,
     settled: bool,
     /// The connection this stream belongs to: where an unawaited receipt is
@@ -181,11 +181,7 @@ pub struct OutgoingTransfer {
 }
 
 impl OutgoingTransfer {
-    pub(crate) fn new(
-        stream: quinn::SendStream,
-        trace: TraceContext,
-        conn: ConnHandle,
-    ) -> OutgoingTransfer {
+    pub(crate) fn new(stream: SendHalf, trace: TraceContext, conn: ConnHandle) -> OutgoingTransfer {
         OutgoingTransfer {
             stream,
             trace,
@@ -205,7 +201,7 @@ impl OutgoingTransfer {
     /// [`Error::Rejected`], [`Error::UnknownEndpoint`], [`Error::Unsupported`]
     /// or [`Error::Canceled`].
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), Error> {
-        self.stream.write_all(buf).await.map_err(write_error)
+        self.stream.write_all(buf).await
     }
 
     /// Marks the end of the payload and returns the delivery receipt.
@@ -218,13 +214,11 @@ impl OutgoingTransfer {
     /// connection went away — in which case no FIN was ever sent.
     pub fn finish(mut self) -> Result<Delivery, Error> {
         self.settled = true;
-        self.stream
-            .finish()
-            .map_err(|_| Error::Transport("stream already closed".into()))?;
+        self.stream.finish()?;
         // `stopped()` yields a `'static` future, so the receipt outlives the
         // handle it came from.
         Ok(Delivery {
-            stopped: Some(Box::pin(self.stream.stopped())),
+            stopped: Some(self.stream.stopped()),
             conn: Arc::clone(&self.conn),
         })
     }
@@ -232,7 +226,7 @@ impl OutgoingTransfer {
     /// Abandons the transfer, resetting the stream with `CANCELED`.
     pub fn cancel(mut self) {
         self.settled = true;
-        let _ = self.stream.reset(canceled());
+        self.stream.reset(codes::CANCELED);
     }
 }
 
@@ -242,7 +236,7 @@ impl Drop for OutgoingTransfer {
             // Dropping without `finish` is an abandoned transfer: reset the
             // stream so the peer discards the partial payload instead of
             // waiting for a FIN that will never come.
-            let _ = self.stream.reset(canceled());
+            self.stream.reset(codes::CANCELED);
         }
     }
 }
@@ -324,11 +318,8 @@ impl Delivery {
         let stopped = self.stopped.take().expect("receipt taken only here");
         match stopped.await {
             Ok(None) => Ok(()),
-            Ok(Some(code)) => Err(codes::stop_reason(code.into_inner()).into()),
-            Err(quinn::StoppedError::ConnectionLost(_)) => Err(Error::Indeterminate),
-            Err(quinn::StoppedError::ZeroRttRejected) => {
-                Err(Error::Transport("0-RTT data rejected by the peer".into()))
-            }
+            Ok(Some(code)) => Err(codes::stop_reason(code).into()),
+            Err(e) => Err(e),
         }
     }
 }
@@ -352,18 +343,14 @@ impl std::fmt::Debug for Delivery {
     }
 }
 
-fn canceled() -> VarInt {
-    VarInt::from_u32(codes::CANCELED as u32)
-}
-
-/// An inbound transfer: a QUIC receive stream plus the metadata that described
+/// An inbound transfer: one receive stream plus the metadata that described
 /// it.
 ///
 /// Implements [`AsyncRead`]. Reaching EOF is just EOF: the v0 core emits no
 /// acknowledgement, because a brokerless one would only restate what QUIC's
 /// own transport receipt already says.
 pub struct IncomingTransfer {
-    stream: quinn::RecvStream,
+    stream: RecvHalf,
     meta: Arc<IncomingMeta>,
     /// Set once the payload ended, was reset, or was refused: `Drop` then has
     /// nothing left to stop.
@@ -371,7 +358,7 @@ pub struct IncomingTransfer {
 }
 
 impl IncomingTransfer {
-    pub(crate) fn new(stream: quinn::RecvStream, meta: Arc<IncomingMeta>) -> IncomingTransfer {
+    pub(crate) fn new(stream: RecvHalf, meta: Arc<IncomingMeta>) -> IncomingTransfer {
         IncomingTransfer {
             stream,
             meta,
@@ -387,9 +374,7 @@ impl IncomingTransfer {
     /// Refuses the payload with `STOP_SENDING(code)` and forgets the transfer.
     pub(crate) fn refuse(mut self, code: u64) {
         self.done = true;
-        let _ = self
-            .stream
-            .stop(VarInt::from_u64(code).expect("application codes are small"));
+        self.stream.stop(code);
     }
 
     /// Reads the whole remaining payload, refusing to exceed `max_bytes`.
@@ -411,7 +396,7 @@ impl IncomingTransfer {
                 Ok(Some(n)) => {
                     if out.len() + n > max_bytes {
                         self.done = true;
-                        let _ = self.stream.stop(rejected());
+                        self.stream.stop(codes::REJECTED);
                         return Err(Error::LimitExceeded);
                     }
                     out.extend_from_slice(&chunk[..n]);
@@ -422,7 +407,7 @@ impl IncomingTransfer {
                 }
                 Err(e) => {
                     self.done = true;
-                    return Err(read_error(e));
+                    return Err(e);
                 }
             }
         }
@@ -439,13 +424,9 @@ impl Drop for IncomingTransfer {
         if !self.done {
             // The application walked away mid-payload: refuse the rest rather
             // than draining bytes nobody wants.
-            let _ = self.stream.stop(rejected());
+            self.stream.stop(codes::REJECTED);
         }
     }
-}
-
-fn rejected() -> VarInt {
-    VarInt::from_u32(codes::REJECTED as u32)
 }
 
 impl std::fmt::Debug for IncomingTransfer {
@@ -505,7 +486,7 @@ impl futures_io::AsyncRead for IncomingTransfer {
 /// non-blocking `notify`, because a destructor may run on a thread with no
 /// reactor.
 struct ReplyHalf {
-    send: Option<quinn::SendStream>,
+    send: Option<SendHalf>,
     conn: ConnHandle,
 }
 
@@ -533,11 +514,7 @@ pub struct IncomingRequest {
 }
 
 impl IncomingRequest {
-    pub(crate) fn new(
-        body: IncomingTransfer,
-        send: quinn::SendStream,
-        conn: ConnHandle,
-    ) -> IncomingRequest {
+    pub(crate) fn new(body: IncomingTransfer, send: SendHalf, conn: ConnHandle) -> IncomingRequest {
         IncomingRequest {
             meta: Arc::clone(&body.meta),
             body: Some(body),
@@ -655,14 +632,14 @@ impl std::fmt::Debug for IncomingRequest {
 
 /// Writes the preamble and DATA header of an outgoing transfer.
 pub(crate) async fn write_data_preamble(
-    stream: &mut quinn::SendStream,
+    stream: &mut SendHalf,
     header: &DataHeader,
 ) -> Result<(), Error> {
     let encoded = header.encode();
     let mut buf = Vec::with_capacity(weida_protocol::MAX_PREAMBLE_LEN + encoded.len());
     encode_preamble(FrameKind::Data, encoded.len() as u64, &mut buf);
     buf.extend_from_slice(&encoded);
-    stream.write_all(&buf).await.map_err(write_error)
+    stream.write_all(&buf).await
 }
 
 /// The reply half of an exchange the requester is waiting on.
@@ -672,12 +649,12 @@ pub(crate) async fn write_data_preamble(
 /// stop replaces the CANCEL frame of earlier drafts: the stream carries the
 /// correlation, so cancellation needs no identifier and no control frame.
 pub struct ReplyStream {
-    recv: Option<quinn::RecvStream>,
+    recv: Option<RecvHalf>,
     conn: ConnHandle,
 }
 
 impl ReplyStream {
-    pub(crate) fn new(recv: quinn::RecvStream, conn: ConnHandle) -> ReplyStream {
+    pub(crate) fn new(recv: RecvHalf, conn: ConnHandle) -> ReplyStream {
         ReplyStream {
             recv: Some(recv),
             conn,
@@ -730,7 +707,7 @@ fn indeterminate_on_loss(e: Error) -> Error {
 impl Drop for ReplyStream {
     fn drop(&mut self) {
         if let Some(mut recv) = self.recv.take() {
-            let _ = recv.stop(canceled());
+            recv.stop(codes::CANCELED);
         }
     }
 }

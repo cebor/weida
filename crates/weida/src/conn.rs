@@ -9,11 +9,10 @@
 //! streams directly, so writing and reading a transfer costs no task hop and
 //! takes no lock (master doc §49).
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use quinn::VarInt;
 use tokio::sync::{mpsc, watch};
 use weida_core::{Error, ErrorCode, Fingerprint, Limits, LossCause};
 use weida_protocol::header::GuaranteeSet;
@@ -23,13 +22,13 @@ use weida_protocol::{
 };
 
 use crate::dedup::DedupWindow;
-use crate::drain::ConnDrain;
 use crate::listener::{Namespace, Route};
 use crate::ordering::{GapDetector, Reassembler, Sequencer};
 use crate::pubsub::SubRegistry;
 use crate::runtime::{Exec, Shared};
 use crate::stream::Incoming;
 use crate::transfer::{IncomingMeta, IncomingRequest, IncomingTransfer};
+use crate::transport::{Link, RecvHalf, SendHalf};
 
 /// Depth of the control channel between API handles and the actor.
 const CTL_QUEUE: usize = 1024;
@@ -42,15 +41,12 @@ pub(crate) enum Ctl {
     /// Emit an UNSUBSCRIBE frame.
     SendUnsubscribe { path: Arc<str>, filter: String },
     /// Report a failure on the reply half of an exchange and close it.
-    ReplyError {
-        send: quinn::SendStream,
-        code: ErrorCode,
-    },
+    ReplyError { send: SendHalf, code: ErrorCode },
 }
 
 /// Shared, cheaply clonable handle to one connection.
 pub(crate) struct ConnCtx {
-    pub conn: quinn::Connection,
+    pub conn: Link,
     pub ctl: mpsc::Sender<Ctl>,
     pub limits: Limits,
     /// Endpoint routing table. Client connections get a fresh empty one rather
@@ -79,7 +75,7 @@ pub(crate) struct ConnCtx {
     pub dedup: DedupWindow,
     /// Receipts of finished transfers on this connection that nobody is
     /// waiting on, for [`crate::Runtime::drain`].
-    pub parked: ConnDrain,
+    pub parked: crate::drain::ConnDrain,
     /// Counters and flags shared with every other connection of this
     /// runtime: the duplicate count and the drain's admission flag.
     pub shared: Arc<Shared>,
@@ -91,7 +87,7 @@ pub(crate) type ConnHandle = Arc<ConnCtx>;
 impl ConnCtx {
     /// Spawns the actor, both accept loops and the HELLO exchange for `conn`.
     pub(crate) fn spawn(
-        conn: quinn::Connection,
+        conn: Link,
         limits: Limits,
         namespace: Arc<Namespace>,
         subs: Option<Arc<SubRegistry>>,
@@ -104,8 +100,8 @@ impl ConnCtx {
         let agreed_tx = Arc::new(agreed_tx);
 
         let ctx = Arc::new(ConnCtx {
-            peer: crate::tls::peer_fingerprint(&conn),
-            conn: conn.clone(),
+            peer: conn.peer(),
+            conn,
             ctl: ctl_tx,
             limits,
             namespace,
@@ -124,7 +120,7 @@ impl ConnCtx {
                 guarantees.dedup_window_ms,
                 limits.max_dedup_entries,
             ),
-            parked: ConnDrain::new(&limits),
+            parked: crate::drain::ConnDrain::new(&limits),
             shared,
             agreed: agreed_rx,
         });
@@ -133,11 +129,11 @@ impl ConnCtx {
         // parked receipts from here.
         ctx.shared.drain.register(&ctx);
 
-        exec.spawn(driver(conn.clone(), ctl_rx, exec.clone()));
+        exec.spawn(driver(Arc::downgrade(&ctx), ctl_rx, exec.clone()));
         exec.spawn(hello_deadline(Arc::clone(&ctx), Arc::clone(&agreed_tx)));
         exec.spawn(accept_uni_loop(Arc::clone(&ctx), agreed_tx));
         exec.spawn(accept_bi_loop(Arc::clone(&ctx)));
-        exec.spawn(send_hello(conn, limits, guarantees));
+        exec.spawn(send_hello(Arc::clone(&ctx), limits, guarantees));
         ctx
     }
 
@@ -164,15 +160,13 @@ impl ConnCtx {
                         // The sender is gone because the connection is: the
                         // accept loops and the deadline hold it and end with
                         // it. Report why, not merely that.
-                        return Err(self.conn.close_reason().map_or(
-                            // A closed connection always has a reason; this
-                            // arm exists so the mapping is total.
-                            Error::ConnectionLost(LossCause::LocallyClosed),
-                            conn_error,
-                        ));
+                        return Err(self
+                            .conn
+                            .close_reason()
+                            .unwrap_or(Error::ConnectionLost(LossCause::LocallyClosed)));
                     }
                 }
-                reason = self.conn.closed() => return Err(conn_error(reason)),
+                reason = self.conn.closed() => return Err(reason),
             }
         }
     }
@@ -189,8 +183,8 @@ impl ConnCtx {
     }
 
     /// Opens a unidirectional stream.
-    pub(crate) async fn open_uni(&self) -> Result<quinn::SendStream, Error> {
-        self.conn.open_uni().await.map_err(conn_error)
+    pub(crate) async fn open_uni(&self) -> Result<SendHalf, Error> {
+        self.conn.open_uni().await
     }
 
     /// Opens a bidirectional stream.
@@ -198,8 +192,8 @@ impl ConnCtx {
     /// The peer learns of the stream only once the first bytes are written, and
     /// the DATA header is always written first, so an exchange never announces
     /// itself before it says what it is.
-    pub(crate) async fn open_bi(&self) -> Result<(quinn::SendStream, quinn::RecvStream), Error> {
-        self.conn.open_bi().await.map_err(conn_error)
+    pub(crate) async fn open_bi(&self) -> Result<(SendHalf, RecvHalf), Error> {
+        self.conn.open_bi().await
     }
 }
 
@@ -278,25 +272,24 @@ pub(crate) fn read_error(e: quinn::ReadError) -> Error {
 }
 
 /// The connection actor: serializes the frames destructors ask for.
-async fn driver(conn: quinn::Connection, mut rx: mpsc::Receiver<Ctl>, exec: Exec) {
-    loop {
-        tokio::select! {
-            msg = rx.recv() => match msg {
-                Some(ctl) => handle_ctl(&conn, ctl, &exec),
-                None => break,
-            },
-            _ = conn.closed() => break,
-        }
+///
+/// Holds the connection weakly. A transport handle is not clonable — a local
+/// connection owns its channels — so the actor borrows the one the context
+/// owns, and ends when the last handle to that context goes away and the
+/// control queue closes with it.
+async fn driver(ctx: Weak<ConnCtx>, mut rx: mpsc::Receiver<Ctl>, exec: Exec) {
+    while let Some(ctl) = rx.recv().await {
+        let Some(ctx) = ctx.upgrade() else { break };
+        handle_ctl(ctx, ctl, &exec);
     }
 }
 
-fn handle_ctl(conn: &quinn::Connection, ctl: Ctl, exec: &Exec) {
+fn handle_ctl(ctx: ConnHandle, ctl: Ctl, exec: &Exec) {
     match ctl {
         Ctl::SendUnsubscribe { path, filter } => {
-            let conn = conn.clone();
             let header = SubscriptionHeader::new(&*path, filter).encode();
             exec.spawn(async move {
-                if let Err(e) = write_control(&conn, FrameKind::Unsubscribe, &header).await {
+                if let Err(e) = write_control(&ctx.conn, FrameKind::Unsubscribe, &header).await {
                     tracing::debug!(error = %e, "failed to send an UNSUBSCRIBE frame");
                 }
             });
@@ -315,30 +308,21 @@ fn handle_ctl(conn: &quinn::Connection, ctl: Ctl, exec: &Exec) {
 ///
 /// ERROR is legal nowhere else: it is the alternative to a reply, so it needs
 /// neither a transfer id nor a stream of its own.
-pub(crate) async fn write_error_frame(
-    send: &mut quinn::SendStream,
-    code: ErrorCode,
-) -> Result<(), Error> {
+pub(crate) async fn write_error_frame(send: &mut SendHalf, code: ErrorCode) -> Result<(), Error> {
     let frame = encode_frame(FrameKind::Error, &ErrorHeader::new(code).encode());
-    send.write_all(&frame).await.map_err(write_error)?;
+    send.write_all(&frame).await?;
     send.finish()
-        .map_err(|_| Error::Transport("reply half already closed".into()))
 }
 
 /// Writes one header-only control frame on its own unidirectional stream.
 pub(crate) async fn write_control(
-    conn: &quinn::Connection,
+    conn: &Link,
     kind: FrameKind,
     header: &[u8],
 ) -> Result<(), Error> {
-    let mut stream = conn.open_uni().await.map_err(conn_error)?;
-    stream
-        .write_all(&encode_frame(kind, header))
-        .await
-        .map_err(write_error)?;
-    stream
-        .finish()
-        .map_err(|_| Error::Transport("control stream closed early".into()))?;
+    let mut stream = conn.open_uni().await?;
+    stream.write_all(&encode_frame(kind, header)).await?;
+    stream.finish()?;
     Ok(())
 }
 
@@ -360,9 +344,9 @@ fn hello_for(limits: Limits, guarantees: GuaranteeSet) -> Hello {
 }
 
 /// Sends our HELLO, declaring the configured guarantee set.
-async fn send_hello(conn: quinn::Connection, limits: Limits, guarantees: GuaranteeSet) {
+async fn send_hello(ctx: ConnHandle, limits: Limits, guarantees: GuaranteeSet) {
     let hello = hello_for(limits, guarantees);
-    if let Err(e) = write_control(&conn, FrameKind::Hello, &hello.encode()).await {
+    if let Err(e) = write_control(&ctx.conn, FrameKind::Hello, &hello.encode()).await {
         tracing::debug!(error = %e, "failed to send HELLO");
     }
 }
@@ -377,7 +361,7 @@ async fn hello_deadline(ctx: ConnHandle, agreed_tx: Arc<watch::Sender<Option<Agr
     }
     if agreed_tx.borrow().is_none() {
         tracing::debug!("peer HELLO did not arrive in time");
-        close(&ctx.conn, codes::NEGOTIATION_FAILED, "hello timeout");
+        ctx.conn.close(codes::NEGOTIATION_FAILED, "hello timeout");
     }
 }
 
@@ -421,7 +405,7 @@ async fn accept_bi_loop(ctx: ConnHandle) {
             Ok((mut send, recv)) => {
                 if ctx.shared.drain.is_draining() {
                     refuse_uni(recv);
-                    let _ = send.reset(shutdown_code());
+                    send.reset(codes::SHUTDOWN);
                     continue;
                 }
                 let ctx = Arc::clone(&ctx);
@@ -439,29 +423,14 @@ async fn accept_bi_loop(ctx: ConnHandle) {
     }
 }
 
-/// The application code a draining runtime answers a new stream with.
-fn shutdown_code() -> VarInt {
-    VarInt::from_u32(codes::SHUTDOWN as u32)
-}
-
 /// Refuses an inbound stream without reading it: the drain's answer to work
 /// that arrived too late.
-fn refuse_uni(mut stream: quinn::RecvStream) {
-    let _ = stream.stop(shutdown_code());
-}
-
-fn close(conn: &quinn::Connection, code: u64, reason: &str) {
-    conn.close(
-        VarInt::from_u64(code).expect("application codes are small"),
-        reason.as_bytes(),
-    );
+fn refuse_uni(mut stream: RecvHalf) {
+    stream.stop(codes::SHUTDOWN);
 }
 
 /// Reads one preamble byte by byte, enforcing the header cap before allocating.
-async fn read_preamble(
-    stream: &mut quinn::RecvStream,
-    max_header_bytes: u64,
-) -> Result<Preamble, Error> {
+async fn read_preamble(stream: &mut RecvHalf, max_header_bytes: u64) -> Result<Preamble, Error> {
     // The preamble is at most ten bytes, and the header length cap is checked
     // inside `parse_preamble` before anything is allocated.
     let mut scratch = [0u8; MAX_PREAMBLE_LEN];
@@ -478,11 +447,7 @@ async fn read_preamble(
                         "preamble exceeds its maximum length".into(),
                     ));
                 }
-                match stream
-                    .read(&mut scratch[have..have + 1])
-                    .await
-                    .map_err(read_error)?
-                {
+                match stream.read(&mut scratch[have..have + 1]).await? {
                     Some(0) => continue,
                     Some(n) => have += n,
                     None => return Err(Error::Protocol("stream ended inside the preamble".into())),
@@ -493,21 +458,15 @@ async fn read_preamble(
     }
 }
 
-async fn read_header(
-    stream: &mut quinn::RecvStream,
-    preamble: &Preamble,
-) -> Result<Vec<u8>, Error> {
+async fn read_header(stream: &mut RecvHalf, preamble: &Preamble) -> Result<Vec<u8>, Error> {
     let mut header = vec![0u8; preamble.header_len as usize];
-    stream
-        .read_exact(&mut header)
-        .await
-        .map_err(|e| Error::Protocol(format!("truncated {} header: {e}", preamble.kind)))?;
+    stream.read_exact(&mut header).await?;
     Ok(header)
 }
 
 /// Reads a whole frame head: preamble plus the header bytes it announces.
 pub(crate) async fn read_frame(
-    stream: &mut quinn::RecvStream,
+    stream: &mut RecvHalf,
     max_header_bytes: u64,
 ) -> Result<(Preamble, Vec<u8>), Error> {
     let preamble = read_preamble(stream, max_header_bytes).await?;
@@ -520,7 +479,7 @@ pub(crate) async fn read_frame(
 async fn handle_stream(
     ctx: &ConnHandle,
     agreed_tx: &watch::Sender<Option<Agreed>>,
-    mut stream: quinn::RecvStream,
+    mut stream: RecvHalf,
 ) -> Result<(), Error> {
     let preamble = match read_preamble(&mut stream, ctx.limits.max_header_bytes).await {
         Ok(preamble) => preamble,
@@ -552,7 +511,7 @@ async fn handle_stream(
 
 fn violation(ctx: &ConnHandle, reason: &str) -> Result<(), Error> {
     tracing::debug!(reason, "closing connection: protocol violation");
-    close(&ctx.conn, codes::PROTOCOL_VIOLATION, reason);
+    ctx.conn.close(codes::PROTOCOL_VIOLATION, reason);
     Err(Error::Protocol(reason.to_owned()))
 }
 
@@ -588,8 +547,7 @@ fn handle_subscription(ctx: &ConnHandle, header: &[u8], subscribe: bool) -> Resu
                 max = ctx.limits.max_subscriptions,
                 "subscription limit reached; closing the connection"
             );
-            close(
-                &ctx.conn,
+            ctx.conn.close(
                 codes::LIMIT_EXCEEDED,
                 "too many subscriptions on one connection",
             );
@@ -623,7 +581,7 @@ fn handle_hello(
         }
         Err(e) => {
             tracing::debug!(error = %e, "negotiation failed");
-            close(&ctx.conn, codes::NEGOTIATION_FAILED, &e.to_string());
+            ctx.conn.close(codes::NEGOTIATION_FAILED, &e.to_string());
             Err(e.into())
         }
     }
@@ -634,11 +592,7 @@ fn handle_hello(
 /// A misroute is answered with `STOP_SENDING`, not with a frame: there is no
 /// reply half here to carry one, and the stop code says everything an ERROR
 /// header would have.
-async fn handle_data(
-    ctx: &ConnHandle,
-    stream: quinn::RecvStream,
-    header: &[u8],
-) -> Result<(), Error> {
+async fn handle_data(ctx: &ConnHandle, stream: RecvHalf, header: &[u8]) -> Result<(), Error> {
     let header = match DataHeader::decode(header) {
         Ok(h) => h,
         Err(e) => return violation(ctx, &e.to_string()),
@@ -703,7 +657,7 @@ async fn handle_data(
 /// which is what keeps reassembly inside the "core transport does not require
 /// payload materialization" invariant (`docs/INVARIANTS.md`).
 pub(crate) struct Held {
-    stream: quinn::RecvStream,
+    stream: RecvHalf,
     meta: IncomingMeta,
     path: String,
 }
@@ -747,14 +701,9 @@ async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
 /// it, and the sender would read that as a refusal
 /// ([FAILURE_MODEL.md](../../../docs/FAILURE_MODEL.md) §4) — which a
 /// successfully deduplicated message is not.
-async fn drain(mut stream: quinn::RecvStream) -> Result<(), Error> {
+async fn drain(mut stream: RecvHalf) -> Result<(), Error> {
     let mut scratch = [0u8; 8 * 1024];
-    while stream
-        .read(&mut scratch)
-        .await
-        .map_err(read_error)?
-        .is_some()
-    {}
+    while stream.read(&mut scratch).await?.is_some() {}
     Ok(())
 }
 
@@ -762,11 +711,7 @@ async fn drain(mut stream: quinn::RecvStream) -> Result<(), Error> {
 ///
 /// Only DATA may open one. A misroute is answered on the reply half with a
 /// real ERROR frame, which is the whole reason the reply half exists.
-async fn handle_bi(
-    ctx: &ConnHandle,
-    send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-) -> Result<(), Error> {
+async fn handle_bi(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Result<(), Error> {
     let preamble = match read_preamble(&mut recv, ctx.limits.max_header_bytes).await {
         Ok(preamble) => preamble,
         Err(Error::Protocol(reason)) => return violation(ctx, &reason),

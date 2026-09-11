@@ -62,6 +62,13 @@ pub struct Limits {
     /// hold as a whole. At the cap the oldest held transfer is released out
     /// of order with its gap reported, never held in a growing buffer.
     pub max_reorder_hold: usize,
+    /// Live transfers on one **local** connection, where the OS connection
+    /// *is* the stream and there is no multiplexing
+    /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
+    /// §4.2). Windows caps named-pipe instances at 1-255, which is the
+    /// tightest platform limit and therefore the one the default respects;
+    /// opening past the cap fails with `LimitExceeded` rather than queueing.
+    pub max_local_streams: usize,
 
     /// Identities a receiver remembers per connection for `Bounded`
     /// deduplication. The window bounds how long an identity is kept, not
@@ -97,6 +104,7 @@ impl Default for Limits {
             subscriber_buffer_bytes: 8 * 1024 * 1024,
             max_sequence_scopes: 1024,
             max_reorder_hold: 256,
+            max_local_streams: 255,
 
             max_dedup_entries: 4096,
         }
@@ -122,6 +130,7 @@ mod tests {
         assert_eq!(l.subscriber_buffer_bytes, 8 << 20);
         assert_eq!(l.max_sequence_scopes, 1024);
         assert_eq!(l.max_reorder_hold, 256);
+        assert_eq!(l.max_local_streams, 255);
 
         assert_eq!(l.max_dedup_entries, 4096);
     }

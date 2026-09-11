@@ -35,6 +35,7 @@ use crate::conn::{ConnCtx, ConnHandle, conn_error};
 use crate::listener::Namespace;
 use crate::runtime::{Exec, Shared};
 use crate::tls;
+use crate::transport::Link;
 
 pub(crate) struct ClientPool {
     state: Mutex<PoolState>,
@@ -236,7 +237,7 @@ impl ClientPool {
         // path here so fanned-out copies have somewhere to go. It is not the
         // listener's namespace — a client serves nothing on its own account.
         let handle = ConnCtx::spawn(
-            conn,
+            Link::Quic(conn),
             config.limits,
             Arc::new(Namespace::new()),
             None,

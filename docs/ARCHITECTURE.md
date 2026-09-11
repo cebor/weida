@@ -490,6 +490,28 @@ take their `Exec` from the `ConnCtx` they already hold. Three consequences worth
   `write_all` and the socket: no task hop and no allocation was added to the hot path
   ([INVARIANTS.md](INVARIANTS.md)).
 
+### The transport boundary
+
+One place in the runtime knows which transport a connection is: `crates/weida/src/transport.rs`,
+which defines exactly three types — `Link`, a connection that opens and accepts streams,
+and `SendHalf`/`RecvHalf`, the two halves of one stream. Everything above it — the frame
+readers, the patterns, the guarantees, the drain — is written once and runs over any
+transport, which is what makes `docs/PROTOCOL.md` §2.1's "same frames, same HELLO, same
+negotiation" a fact about the code rather than an intention.
+
+It is an **enum, not a trait object**. The set of transports is closed, small and decided
+in this crate, and the payload path must stay a direct call: dispatching `write_all`
+through a vtable would put an indirection on exactly the path that is otherwise free of
+task hops and locks. Adding `AF_UNIX` and named pipes is one variant each
+([decisions/0010](decisions/0010-local-transport.md) §4.1) and no new concept.
+
+The first non-QUIC variant is the in-process transport, `crates/weida/src/inproc.rs`: a
+process-global registry of bus names, and a connection that mints a channel pair per
+stream. That pair *is* the stream, which is §4.2's "the OS connection is the stream" with
+the only object an in-process transport has, and it is why `max_local_streams` bounds live
+transfers there. A local connection carries no TLS, so there is no key and no identity:
+`IncomingMeta::peer` is `None` [0010 §4.4].
+
 ### Connection driver
 
 There is **one `ConnDriver` actor task per connection**, running identical code on both
@@ -886,6 +908,9 @@ impl Listener {
     // interfaces of one service may present different identities.
     pub async fn bind_quic(&self, addr: SocketAddr, tls: impl Into<ServerTls>)
         -> Result<Binding, Error>;                           // a bare Identity works
+    // The same endpoints on the in-process transport: no socket, no TLS, no
+    // credentials, bus name ≤ 256 B and unique in the process [0010 §4.1, §4.8].
+    pub fn bind_inproc(&self, bus: &str) -> Result<LocalBinding, Error>;
     pub fn replier(&self, path: &str) -> Result<Replier, Error>;   // Error::InvalidEndpointPath / AlreadyRegistered
     pub fn puller(&self, path: &str) -> Result<Puller, Error>;     // same path-uniqueness rule
     pub fn publisher(&self, path: &str) -> Result<Publisher, Error>;
@@ -893,6 +918,8 @@ impl Listener {
 }
 pub struct Binding;
 impl Binding { pub fn local_addr(&self) -> SocketAddr; pub async fn close(&self); }
+pub struct LocalBinding;                                     // unbinds the bus when dropped
+impl LocalBinding { pub fn bus(&self) -> &str; }
 
 // ---- L0: the stream core -------------------------------------------------------------
 pub struct Peer;                                             // dialling side; multi-peer, round-robin
