@@ -44,6 +44,7 @@ mod conn;
 mod dedup;
 mod drain;
 mod endpoint;
+mod inproc;
 mod listener;
 mod ordering;
 mod pool;
@@ -52,6 +53,7 @@ mod runtime;
 mod stream;
 mod tls;
 mod transfer;
+mod transport;
 
 pub use weida_core::{
     EndpointAddr, Error, ErrorCode, Fingerprint, Limits, LossCause, Result, StopReason,
@@ -65,7 +67,7 @@ pub use endpoint::{
     Endpoint, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher, Rep, Replier, Req, Requester,
     Sub, Subscriber,
 };
-pub use listener::{Binding, Listener};
+pub use listener::{Binding, Listener, LocalBinding};
 pub use ordering::Gap;
 // The guarantee vocabulary of `docs/PROTOCOL.md` §6.5, for `RuntimeConfig`.
 // `Delivery` keeps its transfer-receipt meaning at this level, so the

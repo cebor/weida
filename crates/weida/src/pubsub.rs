@@ -22,7 +22,7 @@ use weida_core::{Error, Limits, TraceContext};
 use weida_protocol::header::OrderingMode;
 use weida_protocol::{DataHeader, filter};
 
-use crate::conn::{ConnHandle, write_error};
+use crate::conn::ConnHandle;
 use crate::ordering::Sequencer;
 use crate::transfer::write_data_preamble;
 
@@ -357,14 +357,12 @@ async fn write_one(ctx: &ConnHandle, path: &str, msg: &PubMsg) -> Result<(), Err
 
     let mut stream = ctx.open_uni().await?;
     write_data_preamble(&mut stream, &header).await?;
-    stream.write_all(&msg.payload).await.map_err(write_error)?;
-    stream
-        .finish()
-        .map_err(|_| Error::Transport("fan-out stream closed early".into()))?;
+    stream.write_all(&msg.payload).await?;
+    stream.finish()?;
     // A published copy is a finished transfer like any other, and nobody
     // holds a receipt for it: park it on this connection so a drain waits
     // for it (`docs/decisions/0009-drain.md` §4.2).
-    if ctx.parked.park(Box::pin(stream.stopped())) {
+    if ctx.parked.park(stream.stopped()) {
         ctx.shared.drain.evict();
     }
     Ok(())

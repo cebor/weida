@@ -1,0 +1,297 @@
+//! The transport boundary: what the runtime needs from a transport, and
+//! nothing more.
+//!
+//! Until [decision 0010](../../../docs/decisions/0010-local-transport.md)
+//! there was one transport and the runtime spoke `quinn` directly. The local
+//! transports of that note — in process first, then `AF_UNIX`, then named
+//! pipes — carry the same frames, the same HELLO and the same negotiation
+//! (`docs/PROTOCOL.md` §2.1), so what differs is exactly the three types
+//! below: a connection that opens and accepts streams, and the two halves of
+//! a stream.
+//!
+//! An enum rather than a trait object, deliberately. The set of transports is
+//! closed and small, it is decided in this crate, and the payload path must
+//! stay a direct call: dispatching a `write_all` through a vtable would put
+//! an indirection on exactly the path `docs/INVARIANTS.md` keeps free of task
+//! hops and locks. Adding `AF_UNIX` (B-038) and named pipes (B-039) means
+//! one variant each and no new concept.
+//!
+//! Everything transport-specific lives behind these types: error mapping,
+//! the stream-kind vocabulary, and the two codes that can cross a stream
+//! (`STOP_SENDING` and `RESET_STREAM`, or their local equivalents).
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use quinn::VarInt;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use weida_core::{Error, Fingerprint};
+
+use crate::conn::{conn_error, read_error, write_error};
+use crate::inproc::{LocalConn, LocalRecv, LocalSend};
+
+/// One connection: a QUIC connection, or one in-process link.
+pub(crate) enum Link {
+    Quic(quinn::Connection),
+    Local(LocalConn),
+}
+
+/// The writing half of one stream.
+pub(crate) enum SendHalf {
+    Quic(quinn::SendStream),
+    Local(LocalSend),
+}
+
+/// The reading half of one stream.
+pub(crate) enum RecvHalf {
+    Quic(quinn::RecvStream),
+    Local(LocalRecv),
+}
+
+impl Link {
+    /// The peer's proved key, or `None`.
+    ///
+    /// A local peer has no key to present; who proves it, and whether anybody
+    /// does, is the transport's business [0010 §4.4]. In process there is
+    /// nobody else, so there is nothing to prove and nothing to report.
+    pub(crate) fn peer(&self) -> Option<Fingerprint> {
+        match self {
+            Link::Quic(conn) => crate::tls::peer_fingerprint(conn),
+            Link::Local(_) => None,
+        }
+    }
+
+    /// An identifier stable for the life of this connection, for the
+    /// subscription registry.
+    pub(crate) fn stable_id(&self) -> usize {
+        match self {
+            Link::Quic(conn) => conn.stable_id(),
+            Link::Local(conn) => conn.stable_id(),
+        }
+    }
+
+    /// Why this connection is closed, or `None` while it is live.
+    pub(crate) fn close_reason(&self) -> Option<Error> {
+        match self {
+            Link::Quic(conn) => conn.close_reason().map(conn_error),
+            Link::Local(conn) => conn.close_reason(),
+        }
+    }
+
+    pub(crate) fn close(&self, code: u64, reason: &str) {
+        match self {
+            Link::Quic(conn) => conn.close(
+                VarInt::from_u64(code).expect("application codes are small"),
+                reason.as_bytes(),
+            ),
+            Link::Local(conn) => conn.close(code, reason),
+        }
+    }
+
+    /// Resolves when the connection closes, with the reason.
+    pub(crate) async fn closed(&self) -> Error {
+        match self {
+            Link::Quic(conn) => conn_error(conn.closed().await),
+            Link::Local(conn) => conn.closed().await,
+        }
+    }
+
+    pub(crate) async fn open_uni(&self) -> Result<SendHalf, Error> {
+        match self {
+            Link::Quic(conn) => conn
+                .open_uni()
+                .await
+                .map(SendHalf::Quic)
+                .map_err(conn_error),
+            Link::Local(conn) => conn.open_uni().map(SendHalf::Local),
+        }
+    }
+
+    pub(crate) async fn open_bi(&self) -> Result<(SendHalf, RecvHalf), Error> {
+        match self {
+            Link::Quic(conn) => conn
+                .open_bi()
+                .await
+                .map(|(s, r)| (SendHalf::Quic(s), RecvHalf::Quic(r)))
+                .map_err(conn_error),
+            Link::Local(conn) => conn
+                .open_bi()
+                .map(|(s, r)| (SendHalf::Local(s), RecvHalf::Local(r))),
+        }
+    }
+
+    pub(crate) async fn accept_uni(&self) -> Result<RecvHalf, Error> {
+        match self {
+            Link::Quic(conn) => conn
+                .accept_uni()
+                .await
+                .map(RecvHalf::Quic)
+                .map_err(conn_error),
+            Link::Local(conn) => conn.accept_uni().await.map(RecvHalf::Local),
+        }
+    }
+
+    pub(crate) async fn accept_bi(&self) -> Result<(SendHalf, RecvHalf), Error> {
+        match self {
+            Link::Quic(conn) => conn
+                .accept_bi()
+                .await
+                .map(|(s, r)| (SendHalf::Quic(s), RecvHalf::Quic(r)))
+                .map_err(conn_error),
+            Link::Local(conn) => conn
+                .accept_bi()
+                .await
+                .map(|(s, r)| (SendHalf::Local(s), RecvHalf::Local(r))),
+        }
+    }
+}
+
+impl SendHalf {
+    pub(crate) async fn write_all(&mut self, buf: &[u8]) -> Result<(), Error> {
+        match self {
+            SendHalf::Quic(s) => s.write_all(buf).await.map_err(write_error),
+            SendHalf::Local(s) => s.write_all(buf).await,
+        }
+    }
+
+    /// Queues the FIN. Synchronous on every transport: nothing is flushed
+    /// here, which is what keeps a fire-and-forget send free of an await.
+    pub(crate) fn finish(&mut self) -> Result<(), Error> {
+        match self {
+            SendHalf::Quic(s) => s
+                .finish()
+                .map_err(|_| Error::Transport("stream already closed".into())),
+            SendHalf::Local(s) => s.finish(),
+        }
+    }
+
+    /// Abandons the payload: `RESET_STREAM`, or its local equivalent.
+    pub(crate) fn reset(&mut self, code: u64) {
+        match self {
+            SendHalf::Quic(s) => {
+                let _ = s.reset(VarInt::from_u64(code).expect("application codes are small"));
+            }
+            SendHalf::Local(s) => s.reset(code),
+        }
+    }
+
+    /// The receipt: `Ok(None)` once the peer's transport holds the payload,
+    /// `Ok(Some(code))` if the peer refused it, `Err` if the connection went
+    /// away first.
+    pub(crate) fn stopped(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, Error>> + Send + Sync>> {
+        match self {
+            SendHalf::Quic(s) => {
+                let stopped = s.stopped();
+                Box::pin(async move {
+                    match stopped.await {
+                        Ok(code) => Ok(code.map(VarInt::into_inner)),
+                        // The payload may or may not have arrived, which is
+                        // exactly what `Indeterminate` is for.
+                        Err(quinn::StoppedError::ConnectionLost(_)) => Err(Error::Indeterminate),
+                        Err(quinn::StoppedError::ZeroRttRejected) => {
+                            Err(Error::Transport("0-RTT data rejected by the peer".into()))
+                        }
+                    }
+                })
+            }
+            SendHalf::Local(s) => Box::pin(s.stopped()),
+        }
+    }
+}
+
+impl RecvHalf {
+    /// Reads what is available; `None` at the end of the payload.
+    pub(crate) async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Error> {
+        match self {
+            RecvHalf::Quic(r) => r.read(buf).await.map_err(read_error),
+            RecvHalf::Local(r) => r.read(buf).await,
+        }
+    }
+
+    pub(crate) async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+        match self {
+            RecvHalf::Quic(r) => r
+                .read_exact(buf)
+                .await
+                .map_err(|e| Error::Protocol(format!("truncated header: {e}"))),
+            RecvHalf::Local(r) => r.read_exact(buf).await,
+        }
+    }
+
+    /// Refuses the rest of the payload: `STOP_SENDING`, or its local
+    /// equivalent.
+    pub(crate) fn stop(&mut self, code: u64) {
+        match self {
+            RecvHalf::Quic(r) => {
+                let _ = r.stop(VarInt::from_u64(code).expect("application codes are small"));
+            }
+            RecvHalf::Local(r) => r.stop(code),
+        }
+    }
+}
+
+impl AsyncWrite for SendHalf {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            SendHalf::Quic(s) => AsyncWrite::poll_write(Pin::new(s), cx, buf),
+            SendHalf::Local(s) => match s.io_mut() {
+                Some(io) => Pin::new(io).poll_write(cx, buf),
+                None => Poll::Ready(Err(closed_io())),
+            },
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            SendHalf::Quic(s) => AsyncWrite::poll_flush(Pin::new(s), cx),
+            SendHalf::Local(s) => match s.io_mut() {
+                Some(io) => Pin::new(io).poll_flush(cx),
+                None => Poll::Ready(Ok(())),
+            },
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            SendHalf::Quic(s) => AsyncWrite::poll_shutdown(Pin::new(s), cx),
+            SendHalf::Local(s) => match s.io_mut() {
+                Some(io) => Pin::new(io).poll_shutdown(cx),
+                None => Poll::Ready(Ok(())),
+            },
+        }
+    }
+}
+
+impl AsyncRead for RecvHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            RecvHalf::Quic(r) => AsyncRead::poll_read(Pin::new(r), cx, buf),
+            RecvHalf::Local(r) => {
+                let reset = r.reset_code();
+                match r.io_mut() {
+                    Some(io) => match Pin::new(io).poll_read(cx, buf) {
+                        Poll::Ready(Ok(())) if buf.filled().is_empty() && reset.is_some() => {
+                            Poll::Ready(Err(std::io::Error::other("stream reset by the peer")))
+                        }
+                        other => other,
+                    },
+                    None => Poll::Ready(Ok(())),
+                }
+            }
+        }
+    }
+}
+
+fn closed_io() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stream already closed")
+}
