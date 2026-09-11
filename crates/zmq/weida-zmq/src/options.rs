@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use weida_zmtp::SocketType;
 
+use crate::curve::{CurvePublicKey, CurveSecretKey};
 use crate::error::{Error, Result};
 use crate::identity::RoutingId;
 use crate::message::{DEFAULT_MAX_MESSAGE_FRAMES, DEFAULT_MAX_MESSAGE_SIZE, MessageLimits};
@@ -85,6 +86,13 @@ pub enum Security {
     PlainServer,
     /// PLAIN, as the client: the side that sends `HELLO` and `INITIATE`.
     PlainClient,
+    /// CURVE, as the server: the side that holds `s`, answers a `HELLO` with
+    /// a `WELCOME` and a cookie, and learns the client's long-term key from
+    /// the `INITIATE` box ([`crate::curve`]).
+    CurveServer,
+    /// CURVE, as the client: the side that knows `S`, sends `HELLO` and
+    /// `INITIATE`, and proves its own long-term key with a vouch.
+    CurveClient,
 }
 
 impl Security {
@@ -93,13 +101,20 @@ impl Security {
         match self {
             Security::Null => weida_zmtp::Mechanism::NULL,
             Security::PlainServer | Security::PlainClient => weida_zmtp::Mechanism::PLAIN,
+            Security::CurveServer | Security::CurveClient => weida_zmtp::Mechanism::CURVE,
         }
     }
 
-    /// The `as-server` octet: set only for a PLAIN server, and refused by the
-    /// codec under NULL.
+    /// The `as-server` octet: set for the server side of PLAIN and CURVE,
+    /// and refused by the codec under NULL.
     pub const fn as_server(&self) -> bool {
-        matches!(self, Security::PlainServer)
+        matches!(self, Security::PlainServer | Security::CurveServer)
+    }
+
+    /// Whether this mechanism encrypts what follows the handshake, so that
+    /// every frame travels inside a `MESSAGE` box.
+    pub const fn encrypts(&self) -> bool {
+        matches!(self, Security::CurveServer | Security::CurveClient)
     }
 }
 
@@ -291,13 +306,43 @@ pub struct SocketOptions {
     /// `HELLO` carries both fields, so an unset password is a configuration
     /// gap rather than an empty string.
     pub plain_password: Option<String>,
+    /// `ZMQ_CURVE_SERVER`: this socket is the CURVE **server**, and every
+    /// connection it makes or accepts announces the CURVE mechanism with the
+    /// `as-server` octet set (26/CURVEZMQ, [`crate::curve`]).
+    ///
+    /// It needs [`Self::curve_secretkey`] and nothing else: "a server does
+    /// not need to know its own public key", because X25519 derives it.
+    pub curve_server: bool,
+    /// `ZMQ_CURVE_PUBLICKEY`: this socket's own long-term public key — `C`
+    /// for a client, `S` for a server that states it.
+    ///
+    /// 32 binary octets or 40 characters of Z85, as
+    /// [`CurvePublicKey::parse`] takes them. A client must set it, because
+    /// the key travels inside its `INITIATE` box and is what a ZAP handler
+    /// is given; a server may, and a server that states one that does not
+    /// belong to its secret key is refused rather than trusted.
+    pub curve_publickey: Option<CurvePublicKey>,
+    /// `ZMQ_CURVE_SECRETKEY`: this socket's own long-term secret key, `c`
+    /// or `s`. 32 binary octets or 40 characters of Z85.
+    pub curve_secretkey: Option<CurveSecretKey>,
+    /// `ZMQ_CURVE_SERVERKEY`: the server's long-term public key `S`, which
+    /// makes this socket a CURVE **client**.
+    ///
+    /// Setting it chooses the mechanism and the side, as `ZMQ_PLAIN_USERNAME`
+    /// does for PLAIN. A client that does not hold `S` cannot get past
+    /// `HELLO`, which is what the signature box is for — and is also why
+    /// CURVE needs no certificate authority and offers no discovery:
+    /// "CurveCP does not explain how keys are exchanged".
+    pub curve_serverkey: Option<CurvePublicKey>,
     /// `ZMQ_ZAP_DOMAIN`: the authorization domain this socket's connections
     /// are checked under, and the switch that turns authorization on.
     ///
     /// libzmq: "A ZAP domain must be specified to enable authentication. When
     /// the ZAP domain is empty, which is the default, ZAP authentication is
-    /// disabled" — and that is exactly the behaviour here, for NULL. PLAIN
-    /// always authenticates, because a username nobody checks is theatre.
+    /// disabled" — and that is exactly the behaviour here, for NULL and for
+    /// CURVE, where an empty domain is 26/CURVEZMQ's first security model,
+    /// "where the server does not check client keys at all". PLAIN always
+    /// authenticates, because a username nobody checks is theatre.
     ///
     /// The domain's meaning is the application's: 27/ZAP calls it "the only
     /// scoping string" and leaves it at that.
@@ -348,6 +393,10 @@ impl Default for SocketOptions {
             plain_server: false,
             plain_username: None,
             plain_password: None,
+            curve_server: false,
+            curve_publickey: None,
+            curve_secretkey: None,
+            curve_serverkey: None,
             zap_domain: String::new(),
             zap_enforce_domain: false,
         }
@@ -432,6 +481,60 @@ impl SocketOptions {
                     .into(),
                 ));
             }
+        }
+        let plain_set = self.plain_server || self.plain_username.is_some();
+        let curve_set = self.curve_server
+            || self.curve_serverkey.is_some()
+            || self.curve_publickey.is_some()
+            || self.curve_secretkey.is_some();
+        if plain_set && curve_set {
+            return Err(Error::EINVAL(
+                "a socket speaks one mechanism: \"security in ZMTP is assertive in that all \
+                 peers on a given socket have the same, required level of security\", and one \
+                 mechanism field in the greeting is all there is to announce it"
+                    .into(),
+            ));
+        }
+        if self.curve_server && self.curve_serverkey.is_some() {
+            return Err(Error::EINVAL(
+                "a socket is the CURVE server or a CURVE client, not both: ZMQ_CURVE_SERVER \
+                 with ZMQ_CURVE_SERVERKEY names two sides of one connection"
+                    .into(),
+            ));
+        }
+        if self.curve_server && self.curve_secretkey.is_none() {
+            return Err(Error::EINVAL(
+                "ZMQ_CURVE_SERVER without ZMQ_CURVE_SECRETKEY: a server needs s to open a \
+                 HELLO, and no default key exists to fall back on"
+                    .into(),
+            ));
+        }
+        if self.curve_serverkey.is_some()
+            && (self.curve_secretkey.is_none() || self.curve_publickey.is_none())
+        {
+            return Err(Error::EINVAL(
+                "a CURVE client needs ZMQ_CURVE_PUBLICKEY and ZMQ_CURVE_SECRETKEY beside \
+                 ZMQ_CURVE_SERVERKEY: C travels in the INITIATE box and is the credential a \
+                 ZAP handler is given, and c signs the vouch"
+                    .into(),
+            ));
+        }
+        if !self.curve_server && self.curve_serverkey.is_none() && curve_set {
+            return Err(Error::EINVAL(
+                "a CURVE key pair with neither ZMQ_CURVE_SERVER nor ZMQ_CURVE_SERVERKEY \
+                 selects no mechanism, so the greeting would still say NULL and the keys \
+                 would never be used"
+                    .into(),
+            ));
+        }
+        if let (Some(public), Some(secret)) = (&self.curve_publickey, &self.curve_secretkey)
+            && secret.public_key() != *public
+        {
+            return Err(Error::EINVAL(
+                "ZMQ_CURVE_PUBLICKEY is not the public key of ZMQ_CURVE_SECRETKEY; X25519 \
+                 derives one from the other, so the pair cannot be half right"
+                    .into(),
+            ));
         }
         if self.zap_enforce_domain && self.zap_domain.is_empty() {
             return Err(Error::EINVAL(
@@ -568,9 +671,16 @@ impl SocketOptions {
     /// attacks" (`docs/research/zeromq.md` §6), so this is one answer per
     /// socket and there is no negotiation.
     pub fn security(&self) -> Security {
-        match (self.plain_server, self.plain_username.is_some()) {
-            (true, _) => Security::PlainServer,
-            (_, true) => Security::PlainClient,
+        match (
+            self.curve_server,
+            self.curve_serverkey.is_some(),
+            self.plain_server,
+            self.plain_username.is_some(),
+        ) {
+            (true, ..) => Security::CurveServer,
+            (_, true, ..) => Security::CurveClient,
+            (.., true, _) => Security::PlainServer,
+            (.., true) => Security::PlainClient,
             _ => Security::Null,
         }
     }
@@ -579,14 +689,17 @@ impl SocketOptions {
     /// authorized by a ZAP handler.
     ///
     /// PLAIN always is: the credentials are only worth sending if somebody
-    /// checks them. NULL is when a domain is configured, which is libzmq's
-    /// switch — "when the ZAP domain is empty… ZAP authentication is
-    /// disabled".
+    /// checks them. NULL and CURVE are when a domain is configured, which is
+    /// libzmq's switch — "when the ZAP domain is empty… ZAP authentication
+    /// is disabled". For CURVE that switch is also the choice between
+    /// 26/CURVEZMQ's security models: no domain is "the server does not
+    /// check client keys at all", and a domain hands every client's
+    /// long-term key to the handler ([`crate::curve::SecurityModel`]).
     pub fn authorizes(&self) -> bool {
         match self.security() {
             Security::PlainServer => true,
-            Security::PlainClient => false,
-            Security::Null => !self.zap_domain.is_empty(),
+            Security::PlainClient | Security::CurveClient => false,
+            Security::Null | Security::CurveServer => !self.zap_domain.is_empty(),
         }
     }
 
@@ -695,6 +808,83 @@ mod tests {
             SocketOptions {
                 reconnect_ivl: None,
                 reconnect_ivl_max: Some(Duration::from_millis(100)),
+                ..SocketOptions::default()
+            },
+        ] {
+            let err = broken.validate().unwrap_err();
+            assert_eq!(err.errno(), "EINVAL", "{err}");
+            assert!(!err.cause().is_empty());
+        }
+    }
+
+    /// Claim: the four CURVE options select the mechanism and the side, and
+    /// every half-configured combination is refused where it is set rather
+    /// than at the handshake.
+    #[test]
+    fn the_curve_options_are_honoured_or_refused() {
+        let (server_public, server_secret) = crate::curve::keypair();
+        let (client_public, client_secret) = crate::curve::keypair();
+
+        let server = SocketOptions {
+            curve_server: true,
+            curve_secretkey: Some(server_secret.clone()),
+            ..SocketOptions::default()
+        };
+        server
+            .validate()
+            .expect("a server needs only its secret key");
+        assert_eq!(server.security(), Security::CurveServer);
+        assert!(server.security().as_server());
+        assert!(server.security().encrypts());
+        assert!(!server.authorizes(), "no domain is model 1");
+
+        let client = SocketOptions {
+            curve_publickey: Some(client_public),
+            curve_secretkey: Some(client_secret.clone()),
+            curve_serverkey: Some(server_public),
+            ..SocketOptions::default()
+        };
+        client.validate().expect("a client needs all three");
+        assert_eq!(client.security(), Security::CurveClient);
+        assert!(!client.security().as_server());
+        assert!(!client.authorizes(), "a client authorizes nobody");
+
+        for broken in [
+            // A server with no key at all.
+            SocketOptions {
+                curve_server: true,
+                ..SocketOptions::default()
+            },
+            // A client missing its own pair.
+            SocketOptions {
+                curve_serverkey: Some(server_public),
+                ..SocketOptions::default()
+            },
+            // Both sides of one connection.
+            SocketOptions {
+                curve_server: true,
+                curve_secretkey: Some(server_secret.clone()),
+                curve_serverkey: Some(server_public),
+                ..SocketOptions::default()
+            },
+            // Keys that select no mechanism.
+            SocketOptions {
+                curve_publickey: Some(client_public),
+                curve_secretkey: Some(client_secret.clone()),
+                ..SocketOptions::default()
+            },
+            // A pair that is half right.
+            SocketOptions {
+                curve_publickey: Some(server_public),
+                curve_secretkey: Some(client_secret.clone()),
+                curve_serverkey: Some(server_public),
+                ..SocketOptions::default()
+            },
+            // Two mechanisms on one socket.
+            SocketOptions {
+                curve_server: true,
+                curve_secretkey: Some(server_secret),
+                plain_server: true,
                 ..SocketOptions::default()
             },
         ] {

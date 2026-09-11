@@ -150,9 +150,20 @@ pub const MESSAGE_BOX_MIN_LEN: usize = 1 + BOX_OVERHEAD;
 pub const MESSAGE_MIN_LEN: usize = 8 + SHORT_NONCE_LEN + MESSAGE_BOX_MIN_LEN;
 
 /// `message-flags`, bit 0: more frames follow, the MORE flag of an
-/// unencrypted message frame moved inside the box. Bits 7-1 are reserved and
-/// zero.
+/// unencrypted message frame moved inside the box.
 pub const MESSAGE_FLAG_MORE: u8 = 0x01;
+
+/// `message-flags`, bit 1: the box holds a **command** rather than a message
+/// frame.
+///
+/// 26/CURVEZMQ's grammar reserves bits 7-1 and says nothing about this one,
+/// but a CURVE connection has no plaintext after its `READY` and 37/ZMTP's
+/// commands do not stop being needed: a `SUBSCRIBE`, a `PING` or an `ERROR`
+/// after the handshake has to travel inside a `MESSAGE` box like everything
+/// else. libzmq puts it in bit 1 - `flags |= 0x02` for a command frame - so
+/// that is what interoperates, and the reserved-bits sentence is what the
+/// grammar has instead of a rule.
+pub const MESSAGE_FLAG_COMMAND: u8 = 0x02;
 
 /// Nonce prefix of a `HELLO` signature box.
 pub const PREFIX_HELLO: &[u8; SHORT_NONCE_PREFIX_LEN] = b"CurveZMQHELLO---";

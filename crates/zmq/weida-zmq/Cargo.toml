@@ -21,6 +21,12 @@ weida-zmtp.workspace = true
 # Connection lifecycle logging: a reconnect loop that says nothing is a
 # reconnect loop nobody can debug.
 tracing.workspace = true
+# CURVE's cryptography, and the only cryptographic dependency this crate has:
+# `crypto_box` **is** NaCl's `crypto_box`, which is the construction
+# 26/CURVEZMQ is written in terms of. The layouts stay in `weida-zmtp`, whose
+# own manifest is still empty, and `unsafe_code = "forbid"` below survives
+# this because the crate is pure Rust.
+crypto_box.workspace = true
 
 [dev-dependencies]
 # Drives the owned-context doctest and tests from an executor that is not
