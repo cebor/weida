@@ -31,7 +31,7 @@
     <rect x="102" y="0" width="96" height="46" rx="4" class="done"/>   <text x="110" y="18" class="lbl">A2 spec sync</text><text x="110" y="34" class="sub">5 documents</text>
     <rect x="204" y="0" width="96" height="46" rx="4" class="done"/>   <text x="212" y="18" class="lbl">A3 measures</text><text x="212" y="34" class="sub">header, reorder, conn</text>
     <rect x="306" y="0" width="96" height="46" rx="4" class="done"/>   <text x="314" y="18" class="lbl">A4 wire</text><text x="314" y="34" class="sub">keys 6/7, HELLO sets</text>
-    <rect x="408" y="0" width="96" height="46" rx="4" class="partial"/><text x="416" y="18" class="lbl">A5 conn tiers</text><text x="416" y="34" class="sub">per path ✓, control parked</text>
+    <rect x="408" y="0" width="96" height="46" rx="4" class="done"/><text x="416" y="18" class="lbl">A5 conn tiers</text><text x="416" y="34" class="sub">per path; control parked (0011)</text>
     <rect x="510" y="0" width="96" height="46" rx="4" class="done"/>   <text x="518" y="18" class="lbl">A6 reassembly</text><text x="518" y="34" class="sub">capped hold, gaps</text>
     <rect x="612" y="0" width="96" height="46" rx="4" class="done"/>   <text x="620" y="18" class="lbl">A7 topic filters</text><text x="620" y="34" class="sub">segmented * #</text>
     <rect x="714" y="0" width="96" height="46" rx="4" class="done"/>   <text x="722" y="18" class="lbl">A8 runtime</text><text x="722" y="34" class="sub">owned, futures-io</text>

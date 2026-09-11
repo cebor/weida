@@ -167,8 +167,10 @@ A3 The four measurements of 0001/0002 §8 as benches or probes on the current tr
    into IMPLEMENTATION.md.
 A4 0001 on the wire: DATA keys 6 and 7, HELLO guarantee declarations, negotiation
    intersection, detector mode, dedup window, golden vectors, fuzz targets, hostile tests.
-A5 0002: control connection per peer, bulk connection per path, two `Limits` profiles,
-   fingerprint binding, the named overload condition; stream probes updated.
+A5 0002 as amended by 0011: one connection per dialled path, bound to the peer by the
+   proved fingerprint, the named overload condition; the per-peer control connection and its
+   second `Limits` profile are parked under 0011 §4.3 until a peer-scoped, latency-sensitive
+   frame exists (B-045).
 A6 Reassembly mode (eager, capped) and subscriber-side drop detection.
 A7 Segmented topic filters with wildcards.
 A8 Runtime ownership (`Runtime::owned`, `with_handle`), spawn/timer/DNS centralized in

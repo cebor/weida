@@ -15,9 +15,10 @@ Eight crates: `weida-core`, `weida-protocol`, `weida`, `weida-zmtp`, `weida-zmtp
 
 ![Roadmap](status/roadmap.svg)
 
-Reading it: **Phase A is complete** except two deliberate gaps — the control-connection tier
-(A5) is parked because after decision 0011 no frame needs it, and named pipes (A9) are
-blocked on a Windows runner rather than on a design. The last open question in it, what a
+Reading it: **Phase A is complete** except named pipes (A9), blocked on a Windows runner
+rather than on a design. The control-connection tier (A5) is not a gap: decision 0011 parks
+it with a revival condition, because no existing or reserved frame is peer-scoped. The last
+open question in it, what a
 local `open` does at its ceiling, is answered: it **waits for a slot**, so `Block` means the
 same thing on every transport (B-059). **Phase B has two protocols complete** — ZMTP and SP,
 all six slices each, both interoperating with the real upstream (`zeromq`, and the `nng` C
