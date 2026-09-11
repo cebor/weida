@@ -34,6 +34,7 @@ weida endpoints, and weida endpoints onto foreign ZeroMQ peers
 | [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md) | failure scope, required scenarios, sender outcome rules, `Indeterminate` |
 | [docs/INVARIANTS.md](docs/INVARIANTS.md) | the short invariant list every change is checked against |
 | [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) | phase tracker, development loop, agent rules, acceptance, known debt |
+| [docs/libraries/zmq.md](docs/libraries/zmq.md) | the ZeroMQ feature-parity table against libzmq 4.3.5, row by row, with [docs/libraries/README.md](docs/libraries/README.md) as the index that says what a library parity document is and how it differs from an adapter mapping |
 | [Master Architecture and Implementation Plan — QUIC-native Messaging Framework.md](Master%20Architecture%20and%20Implementation%20Plan%20%E2%80%94%20QUIC-native%20Messaging%20Framework.md) | the normative architectural source of truth for the whole project |
 
 ## Crates
