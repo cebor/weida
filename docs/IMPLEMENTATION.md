@@ -242,6 +242,33 @@ B-009 header-cost numbers below still describe what the tree sends. The keys exi
 the ordering work of [0001](decisions/0001-sequence-field.md) has a wire to land on, not
 because anything uses them yet.
 
+**Delivered in the fifth increment — HELLO guarantee declarations (B-014):**
+
+`Hello` gained `guarantees_offered` and `guarantees_required`, both
+`Option<GuaranteeSet>` and both encoded as the nested map of
+[PROTOCOL.md](PROTOCOL.md) §6.5. `GuaranteeSet` is ten `Copy` fields — delivery,
+acknowledgement, the durability and replica axes, ordering, deduplication and its window,
+backpressure, producer naming, control isolation — with `GuaranteeSet::CORE` as the default
+and `is_core()` as the reason nothing is written for it. `negotiate()` now computes the
+effective set as the weaker of the two offers (`GuaranteeSet::intersect`) and fails with
+`NEGOTIATION_FAILED` when it does not reach either side's requirement
+(`GuaranteeSet::reaches`); `Agreed` carries the result.
+
+Three properties are pinned rather than asserted in prose. **A v0 peer that declares nothing
+still negotiates `core`** (`two_v0_peers_negotiate_core_unchanged`), and a HELLO whose
+declarations are explicitly `core` encodes to the same bytes as one with none
+(`golden_hello_with_guarantees_frame`). **A required level the peer does not offer fails the
+handshake**, in both directions, and over a real connection in
+`crates/weida/tests/hostile.rs`. **A malformed declaration is a framing violation, not a
+negotiation failure**: the hostile suite builds six illegal guarantee maps byte by byte —
+the library's encoder cannot produce one — and each closes the connection with
+`PROTOCOL_VIOLATION`.
+
+No new bound was needed for [INVARIANTS.md](INVARIANTS.md): a guarantee set is fixed-size
+`Copy` data whose enclosing map is already bounded by `max_header_bytes`, so it adds no
+remote-influenced allocation. Nothing in `crates/weida` declares anything yet; the runtime
+still sends `Hello::v0`, which is why the wire is unchanged.
+
 **Deliberately deferred** (recorded now, not discovered later):
 
 - Connecting publishers and binding pushers; v0 fixes Pub/Pull as binders and Sub/Push as
