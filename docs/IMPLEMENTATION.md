@@ -802,6 +802,43 @@ would settle §11's PAIR v1 hop-count disagreement, L10's "is a close really all
 learns", and this slice's own new question — whether an NNG `REP` minds a requester that
 never retransmits.
 
+**Delivered in the sixteenth increment — the cross-adapter test (B-057):**
+
+`crates/adapters/cross-tests` is Phase B slice 6 ([LOOP.md](LOOP.md) §9): a message enters
+through one adapter and leaves through the other. It is its own crate with no library code,
+because `weida-zmtp-bridge` and `weida-sp-bridge` each know one foreign protocol and nothing
+of the other — the property that keeps either checkable against its own specification
+([ARCHITECTURE.md](ARCHITECTURE.md) §4) — so a chain belongs to neither.
+
+**Nine tests, both foreign ends the real implementations**: `zeromq` in pure Rust and the
+`nng` C library through its Rust binding, neither `#[ignore]`d. Six are the pattern chains —
+REQ→REP with the reply returning, PUSH→PULL, PUB→SUB through both topic conventions, and the
+three reversed — and what they assert is that **neither envelope crosses**: the 28/REQREP
+delimiter is consumed on the ZMTP side and the 32-bit tag stack is written on the SP side, so
+the far peer answering the right bytes is the proof that each protocol was terminated rather
+than forwarded.
+
+**The chain's honest guarantee is `BestEffort`, and it is asserted rather than described.**
+A ZeroMQ send that returns has handed the message to a socket
+([adapters/zmtp.md](adapters/zmtp.md) §7); SP has no transfer point at all
+([adapters/nng.md](adapters/nng.md) §7). `the_chain_is_best_effort_end_to_end` sends with the
+NNG puller closed and asserts the pair — the send succeeded, the message is gone — which is
+what neither mapping document may be read as promising more than.
+
+**The composed losses are the part no single document could state.** A ZMTP multipart is
+refused at hop one, so the SP edge never sees it (L1 of zmtp.md §8); with a 4 KiB ZMTP cap
+against the SP side's 1 MiB, **the smaller cap decides** and the far edge buffers nothing; and
+an SP `MAXTTL` ceiling reached at the *second* hop reaches the first peer **as silence**,
+because SP has no error frame (L10) and the ZMTP bridge has no reply to attach its `ERROR` to.
+That conversion — a refusal at the far hop becoming silence at the near one — is what the
+chain adds to either document alone. That one test's SP peer is raw TCP on `weida-sp`, because
+a reply carrying three forwarder ids needs an `nng_device` topology that belongs to the interop
+bench.
+
+**What it settles from the increment above.** The `nng` run is no longer owed for the REQ
+question: a real `Rep0` answers this bridge's raw requester, which never retransmits. PAIR is
+not in any chain, so §11's hop-count disagreement is still open on the wire.
+
 ---
 
 ## 2. Mandatory development loop per phase

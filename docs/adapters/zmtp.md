@@ -425,9 +425,15 @@ which is the outcome [LOOP §2]'s supervisor rule was there to make safe.
    them [LOOP §5 measure]. *Done, slice 5*:
    `cargo bench -p weida-zmtp-bridge --bench interop`, and the two numbers §11 was holding
    open are decided there.
-7. **Cross-adapter test** (Phase B slice 6, once a second adapter exists): a message enters
-   through ZMTP and leaves through the other protocol, with the guarantees of both mapping
-   documents asserted [LOOP §9].
+7. **Cross-adapter (slice 6).** `crates/adapters/cross-tests` runs a message in through one
+   adapter and out through the other against `zeromq` and `nng`: the three pattern chains in
+   both directions, the composed losses (a ZMTP multipart refused at hop one — L1, so the
+   second protocol never sees it — the smaller `max_message_bytes` deciding, an SP hop-count
+   ceiling arriving as silence), and `BestEffort` end to end asserted rather than described.
+   *Done, slice 6*: nine tests, both foreign ends the real implementations. The claim is the
+   composition of §7 and [nng.md](nng.md) §7 — `delivered()` proves the ZeroMQ hop's
+   transport, SP has no transfer point at all — so a ZeroMQ send succeeds with the NNG end
+   closed and nothing arrives, which is the test rather than the caveat [LOOP §9].
 
 ### 10.1 The vectors
 

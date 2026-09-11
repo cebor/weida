@@ -539,6 +539,20 @@ Consequences, following [LOOP §2] and [LOOP §5]:
    the adapter against the same patterns native on both sides, and the message rate at which
    the SP side starts dropping under PUB/SUB — the drop being the protocol's documented answer
    [nanomsg-nng §5], the number being ours.
+7. **Cross-adapter (slice 6).** `crates/adapters/cross-tests` runs a message in through one
+   adapter and out through the other against `zeromq` and `nng`: the three pattern chains in
+   both directions, the composed losses (a ZMTP multipart refused at hop one, the smaller
+   `max_message_bytes` deciding, an SP hop-count ceiling arriving as silence — L11 observed
+   from the far side, since a ceiling reached at the second hop has no way back to the
+   first peer), and `BestEffort` end to end asserted rather than described. *Done, slice 6*:
+   nine tests, the SP end the real `nng` C library through its Rust binding and not
+   `#[ignore]`d, because the crate builds here — so this item is also the independent run
+   items 3 and 4 are owed, and it answers §11's first question: a real NNG `REP0` replies to
+   this bridge's raw requester, which never retransmits. PAIR is not in the chain and stays
+   untested against a live peer.
+   The chain can claim nothing above `BestEffort` for the reason §7 gives alone: SP has no
+   transfer point, so a ZeroMQ send succeeds with the NNG end closed and nothing arrives
+   [LOOP §9].
 
 ### 10.1 Golden vectors
 
