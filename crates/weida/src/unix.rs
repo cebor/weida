@@ -33,7 +33,7 @@
 //!
 //! **Not here yet:** a server cannot open a stream toward a local peer, so
 //! Pub/Sub fan-out over this transport is refused with `Unsupported` until the
-//! parked reverse connections of [0012 §4.4] land (B-047).
+//! parked reverse connections of [0012 §4.4] land (B-048).
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;

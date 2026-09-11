@@ -567,7 +567,7 @@ a node behind, binds over it and checks the mode. The path budget is checked aft
 percent-decoding, against 107 bytes on Linux and 104 on macOS.
 
 **What is not here.** Pub/Sub over `AF_UNIX`: a publisher has no stream to a peer that
-dialled it, so the reverse pool of [0012 §4.4] is filed as **B-047** and the transport
+dialled it, so the reverse pool of [0012 §4.4] is filed as **B-048** and the transport
 refuses with `Unsupported` in the meantime rather than pretending. No pooling, and no
 control/bulk split, for the same reasons as inproc. The suite is `#[cfg(unix)]`, so Windows
 builds compile the transport out entirely; B-039 adds the pipe variant to the same shape.

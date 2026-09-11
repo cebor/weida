@@ -159,9 +159,10 @@ direction that does not.
   hygiene of 0010 §4.5 (explicit mode, unlink-then-bind, the decoded path budget), and
   `IncomingMeta::peer` carrying the local principal. Req/Rep and Push/Pull work over
   `weida+unix://`; Pub/Sub does not.
-- **Follow-up item, filed with this note:**
+- **Follow-up item, filed with this note** (as B-048: B-047 is the id this note itself was
+  written under, and ids are never reused):
 
-  > ### B-047 — AF_UNIX: parked reverse connections for fan-out
+  > ### B-048 — AF_UNIX: parked reverse connections for fan-out
   > kind: code | size: 90 | status: ready | needs: [B-038]
   > acceptance: a subscriber over `weida+unix://` parks spare connections carrying the `reverse`
   > preamble and its group token, bounded by the new `Limits::max_parked_reverse` and counted
@@ -178,12 +179,12 @@ direction that does not.
   sends before its first frame (the token, and later the `reverse` marker), and the rule that an
   unbound connection is refused. This is a *local* framing detail, not a wire-version change:
   nothing about it appears on a QUIC connection.
-- **[INVARIANTS.md](../INVARIANTS.md)** gains `max_parked_reverse` as a named bound when B-047
+- **[INVARIANTS.md](../INVARIANTS.md)** gains `max_parked_reverse` as a named bound when B-048
   lands; `max_local_streams` already covers the connections themselves.
 - **[GUARANTEES.md](../GUARANTEES.md) §6** records that Pub/Sub over a socket transport depends
   on the reverse pool, and that an exhausted pool is a counted drop.
 - **Status is provisional** because the reverse pool of §4.4 has no precedent in the sheets and
-  no measurement behind its bound. It becomes accepted when B-047 has run: if the pool turns out
+  no measurement behind its bound. It becomes accepted when B-048 has run: if the pool turns out
   to be the wrong shape, §4.4 is what changes, and §4.1-§4.3 stand on their own.
 
 ## 6. Sources
