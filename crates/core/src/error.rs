@@ -241,6 +241,9 @@ pub enum StopReason {
     UnknownEndpoint,
     /// `UNSUPPORTED`: the endpoint exists but does not serve this stream kind.
     Unsupported,
+    /// `SHUTDOWN`: the peer's runtime has stopped admitting work — it is
+    /// draining or closing, and this stream arrived too late.
+    ShuttingDown,
     /// Any other code, kept for diagnostics.
     Other(u64),
 }
@@ -252,6 +255,13 @@ impl From<StopReason> for Error {
             StopReason::Canceled => Error::Canceled,
             StopReason::UnknownEndpoint => Error::UnknownEndpoint,
             StopReason::Unsupported => Error::Unsupported,
+            // A refusal, and a definite one: nothing of this transfer was
+            // taken, and the peer will not take it later either. It is
+            // `Rejected` rather than a variant of its own because the outcome
+            // an application must act on is identical — do not retry against
+            // this peer — and a second word for the same outcome is what
+            // `LossCause` was introduced to avoid.
+            StopReason::ShuttingDown => Error::Rejected,
             StopReason::Other(code) => {
                 Error::Transport(format!("peer stopped receiving with code {code}"))
             }

@@ -446,9 +446,25 @@ drift. The expiry test gives the peer its own single-threaded reactor and blocks
 thread outright — socket open, connection up, nothing read or acknowledged — and a
 200 ms drain returns at its deadline with `outstanding = 1`, `delivered = 0` and no error.
 
-Not covered by a test: the admission refusals. Both are three lines in the accept loops and
-neither has an observable that does not need a second frozen peer to hold a drain open long
-enough to race a connect against it.
+**The admission refusals, and what testing them needed (B-046).** Both are three lines in an
+accept loop, and neither has an observable unless a drain is *in flight* — a drain with
+nothing outstanding returns at once, so there is no window to race a connect against. The
+`Draining` harness in `crates/weida/tests/drain.rs` makes one: a runtime that is a server
+**and** a stalled sender, holding a binding plus one finished transfer to a frozen peer whose
+receipt can never settle, so its drain runs for its whole deadline. Inside that window a new
+dial is refused (the control is in the same test: the same client dials one path before the
+drain and another during it, which one connection per dialled path makes a real handshake
+rather than a reuse), and a new stream on the connection that already exists is refused with
+`SHUTDOWN`. Both fail under mutation: disabling either `is_draining()` check makes exactly its
+own test fail.
+
+Writing them exposed a vocabulary gap. `STOP_SENDING(SHUTDOWN)` fell through
+`codes::stop_reason` to `StopReason::Other(6)` and reached the sender as
+`Error::Transport("peer stopped receiving with code 6")` — a refusal the application could only
+recognize by parsing a string. `StopReason::ShuttingDown` now names it and maps to
+`Error::Rejected`: the *outcome* is the same as any other refusal — nothing of the transfer was
+taken and the peer will not take it later — and a second word for one outcome is what B-028's
+`LossCause` exists to avoid.
 
 **Deliberately deferred** (recorded now, not discovered later):
 
