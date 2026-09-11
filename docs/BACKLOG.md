@@ -101,7 +101,7 @@ note: delegated to the parallel worker on branch `b020-segment-filter` in the wo
 note: merged `--no-ff` as 6250448 (it carried B-013 with it) and gated here: 244 tests. Verified: the walker is one left-to-right pass with no backtracking and no allocation, `weida_protocol::filter::validate` rejects `*` that does not own its segment and `#` that is not final, `SubscriptionHeader::decode` turns that into `HeaderError::InvalidFilter` at the codec boundary, `Subscriber::subscribe` refuses locally before the frame is written, and the renamed `subscribe_filters_topics_by_segment` asserts that `sensors.temp` does not select `sensors.temperature` — the assertion that fails on the old matcher. Three existing tests moved from `px.` to `px.#`: that is the contract changing, not a test being weakened, and the same change is why PROTOCOL's Status section now reads as history rather than as a pending defect (b4f77b3).
 
 ### B-021 — Measure: segment matching in the fan-out path
-kind: measure | size: 45 | status: ready | needs: [B-020]
+kind: measure | size: 45 | status: in_progress 2026-09-11T07:06Z | needs: [B-020]
 acceptance: a criterion bench comparing byte-prefix `starts_with` against the segment walker at a realistic subscriber and filter count (the objection recorded in `crates/weida/src/pubsub.rs` asserts a cost without a number); publish-to-all-drained time per subscriber count for both matchers; numbers in IMPLEMENTATION.md verified results, which is what 0007 §6 asks for.
 
 ### B-022 — Reassembly mode, capped, and subscriber-side drop detection
