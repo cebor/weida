@@ -167,7 +167,7 @@ kind: spec | size: 30 | status: ready | needs: [B-032]
 acceptance: PATTERNS §1.1 keeps "the one thing that cuts a finished transfer short" for `shutdown` and gains `drain` as its counterpart; GUARANTEES §3 notes that the drain waits on the transport receipt and inherits its meaning, including that a drained transfer may still have been discarded by the peer's application (0005 §4.2); PROTOCOL §11 lists drain as a *local* operation with no wire representation, so nobody invents a quiescence frame; `grep` shows no document still calling §8.6 open.
 
 ### B-035 — Spec sync: the two guarantee dimensions B-014 added
-kind: spec | size: 30 | status: ready | needs: []
+kind: spec | size: 30 | status: in_progress 2026-09-11T08:58Z | needs: []
 acceptance: GUARANTEES §3 gains `ProducerNaming` (`Fingerprint` | `Stable`, unordered) and `ControlIsolated` (`No` | `Yes`, ordered) as dimensions beside the five it lists, each with its levels, its ordering and the decision it comes from ([0001](decisions/0001-sequence-field.md) §7.3 and [0008](decisions/0008-session-identity.md) §4.3 for the first, [0002](decisions/0002-control-and-bulk-separation.md) §6.1 for the second); the guarantee-set subsection stops saying a set has one level per dimension of the *five* and says what it now is; [0006](decisions/0006-guarantee-sets.md) §5 gains a consequence line recording that PROTOCOL §6.5 keys `8` and `9` extended the vocabulary with B-014, so "a guarantee set introduces no new words" reads as "no new words without a dimension entry"; `grep` shows no document listing five dimensions where there are seven. Found by reviewing B-014's delivery: the wire and the code carry two dimensions the guarantee vocabulary does not.
 
 ### B-036 — Spec sync: the local transport of 0010
