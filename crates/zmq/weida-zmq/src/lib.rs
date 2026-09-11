@@ -51,12 +51,16 @@
 //!   stripped, round-robin out and last-peer in, a reply to a vanished
 //!   requester discarded rather than blocking, `ZMQ_REQ_CORRELATE` and
 //!   `ZMQ_REQ_RELAXED`.
+//! - [`DealerSocket`] and [`RouterSocket`] — the same pattern without the
+//!   lockstep: unrestricted in both directions, ROUTER addressing peers by
+//!   the [`RoutingKey`] a peer announced or one it was given, with
+//!   `ZMQ_ROUTER_MANDATORY`, `ZMQ_ROUTER_HANDOVER` and `ZMQ_PROBE_ROUTER`.
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
 //!
-//! The remaining socket types — `DealerSocket`, `RouterSocket`, `PubSocket`,
-//! `SubSocket`, `XPubSocket`, `XSubSocket`, `PushSocket`, `PullSocket`,
-//! `PairSocket` — are the following slices, as are security and
+//! The remaining socket types — `PubSocket`, `SubSocket`, `XPubSocket`,
+//! `XSubSocket`, `PushSocket`, `PullSocket`, `PairSocket` — are the
+//! following slices, as are security and
 //! authorization and the rest of the option surface [0013 §5.3]. They are
 //! named here so that a reader knows what this crate is for and what it does
 //! not do yet; nothing stands in for them, and in particular there is no
@@ -94,6 +98,7 @@
 #![warn(missing_docs)]
 
 pub mod context;
+pub mod dealerrouter;
 pub mod endpoint;
 pub mod engine;
 pub mod error;
@@ -110,12 +115,14 @@ pub use context::{
     Context, ContextConfig, DEFAULT_CLOSE_BUDGET, DEFAULT_MAX_SOCKETS, InprocDial, SocketId,
     SocketSlot, Terminated,
 };
+pub use dealerrouter::{DealerSocket, RouterSocket};
 pub use endpoint::{Endpoint, MAX_INPROC_NAME_BYTES, MAX_IPC_ENDPOINT_BYTES, TcpHost};
 pub use engine::{
-    Connection, Discarded, Engine, HandshakeGate, Peer, PeerId, Role, Session, SessionFuture,
+    AnnouncedIdentity, Connection, Discarded, Engine, HandshakeGate, Peer, PeerId, Role, Session,
+    SessionFuture,
 };
 pub use error::{Cause, Error, Result};
-pub use identity::{MAX_ROUTING_ID_BYTES, RoutingId};
+pub use identity::{MAX_ROUTING_ID_BYTES, RoutingId, RoutingKey};
 pub use message::{
     DEFAULT_MAX_MESSAGE_FRAMES, DEFAULT_MAX_MESSAGE_SIZE, Decoded, Message, MessageLimits,
     Multipart,

@@ -91,6 +91,73 @@ impl std::fmt::Debug for RoutingId {
     }
 }
 
+/// What a ROUTER addresses a peer by: the identity the peer announced, or
+/// one the ROUTER made up.
+///
+/// The two are distinguishable on purpose, and libzmq's convention is the
+/// leading octet: a peer's own routing id "must not be zero" in its first
+/// byte precisely because "v3.0 and later generate 5 bytes, `0` plus a
+/// random 32-bit integer" for a peer that named itself nothing
+/// (`docs/research/zeromq.md` §4.2). So a [`RoutingId`] is always
+/// self-asserted, and a generated key is the other case — which is why this
+/// type exists beside it rather than relaxing that rule.
+///
+/// **The generated form counts rather than randomizes.** libzmq uses a
+/// random `u32`; a counter is enough, because the only property the pattern
+/// needs is uniqueness among one ROUTER's live peers, and an opaque handle
+/// that is also unguessable buys nothing when it never leaves the process
+/// except to the peer it names. The difference is named here rather than
+/// hidden.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RoutingKey(Vec<u8>);
+
+impl RoutingKey {
+    /// The key for a peer that announced an `Identity`.
+    pub fn announced(identity: &RoutingId) -> RoutingKey {
+        RoutingKey(identity.as_bytes().to_vec())
+    }
+
+    /// A key for a peer that announced nothing: a zero octet and `n`, the
+    /// shape libzmq generates.
+    pub fn generated(n: u32) -> RoutingKey {
+        let mut bytes = Vec::with_capacity(5);
+        bytes.push(0);
+        bytes.extend_from_slice(&n.to_be_bytes());
+        RoutingKey(bytes)
+    }
+
+    /// Takes a key off the wire, where it is just bytes: a ROUTER's peer
+    /// sends back whatever the ROUTER handed it.
+    pub fn from_wire(bytes: &[u8]) -> RoutingKey {
+        RoutingKey(bytes.to_vec())
+    }
+
+    /// The bytes, as the routing-id frame carries them.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Whether this key was made up rather than announced — the leading
+    /// zero.
+    pub fn is_generated(&self) -> bool {
+        self.0.first() == Some(&0)
+    }
+}
+
+impl std::fmt::Debug for RoutingKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_generated() {
+            write!(f, "RoutingKey(generated ")?;
+        } else {
+            write!(f, "RoutingKey(")?;
+        }
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        write!(f, ")")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
