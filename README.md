@@ -42,6 +42,7 @@ weida endpoints, and weida endpoints onto foreign ZeroMQ peers
 | --- | --- | --- |
 | `crates/core` | `weida-core` | I/O-free model: errors, endpoint addresses, limits, trace context |
 | `crates/protocol` | `weida-protocol` | wire codec, no I/O: varints, framing, CBOR headers, negotiation, error codes |
+| `crates/runtime` | `weida-runtime` | the reactor and the OS plumbing, with no protocol in it: tasks, timers, DNS with a capped resolver, the three reactor-ownership constructors, a bounded close budget, an in-process name registry and `AF_UNIX` bind hygiene with peer credentials |
 | `crates/weida` | `weida` | runtime, the QUIC and in-process transports, the raw stream core, and the Req/Rep, Push/Pull and Pub/Sub patterns |
 | `crates/adapters/weida-zmtp` | `weida-zmtp` | ZMTP 3.1 codec — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |
 | `crates/adapters/weida-zmtp-bridge` | `weida-zmtp-bridge` | bridges ZeroMQ peers and weida endpoints in both directions, terminating both protocols |

@@ -231,20 +231,17 @@ impl Listener {
     #[cfg(unix)]
     pub fn bind_unix(&self, path: impl AsRef<std::path::Path>) -> Result<UnixBinding, Error> {
         let path = path.as_ref();
-        if path.as_os_str().len() > weida_core::MAX_SOCKET_PATH_BYTES {
-            return Err(Error::InvalidAddress(format!(
-                "socket path exceeds this platform's {}-byte sun_path budget: {}",
-                weida_core::MAX_SOCKET_PATH_BYTES,
-                path.display()
-            )));
-        }
         let exec = self.inner.runtime.exec.clone();
         let (binding, listener) = {
             // Inside the runtime context: tokio registers the socket with the
             // reactor as it is constructed, and the calling thread may have
             // no reactor of its own.
             let _guard = exec.enter();
-            crate::unix::UnixBinding::bind(path)?
+            // The bind hygiene — the `sun_path` budget, the socket-type
+            // check, unlink-then-bind and the explicit mode — is
+            // `weida-runtime`'s, because `ipc://` on any protocol needs the
+            // same four answers [0010 §4.5].
+            weida_runtime::BoundUnixSocket::bind(path)?
         };
         exec.spawn(accept_unix(
             listener,
@@ -366,7 +363,7 @@ impl Drop for LocalBinding {
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct UnixBinding {
-    inner: crate::unix::UnixBinding,
+    inner: weida_runtime::BoundUnixSocket,
 }
 
 #[cfg(unix)]

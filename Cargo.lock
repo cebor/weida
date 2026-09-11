@@ -1916,6 +1916,7 @@ dependencies = [
  "weida",
  "weida-core",
  "weida-protocol",
+ "weida-runtime",
 ]
 
 [[package]]
@@ -1944,6 +1945,15 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "minicbor",
+ "weida-core",
+]
+
+[[package]]
+name = "weida-runtime"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "tokio",
  "weida-core",
 ]
 

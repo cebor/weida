@@ -14,6 +14,11 @@ generate = ["dep:rcgen"]
 [dependencies]
 weida-core.workspace = true
 weida-protocol.workspace = true
+# The reactor, the resolver and the local-transport OS hygiene. Nothing in
+# `weida` calls `tokio::spawn`, `tokio::time` or `lookup_host`: it all goes
+# through this crate's `Exec`
+# (`docs/decisions/0013-competitor-libraries.md` §4.2).
+weida-runtime.workspace = true
 quinn.workspace = true
 tokio.workspace = true
 bytes.workspace = true

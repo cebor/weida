@@ -1,21 +1,26 @@
 //! The process-level runtime: configuration, the client connection pool,
 //! shutdown, and the one place this crate touches the async runtime.
 //!
-//! Every task, timer and name lookup in `weida` goes through [`Exec`]. That
-//! is what lets a caller drive weida from an executor that is not Tokio:
-//! `quinn` needs a Tokio reactor for its sockets and timers, nothing else
-//! here does, so the reactor is an implementation detail the runtime owns
-//! rather than an ambient requirement on every caller.
+//! Every task, timer and name lookup in `weida` goes through [`Exec`], which
+//! lives in `weida-runtime` and is re-exported here. That is what lets a
+//! caller drive weida from an executor that is not Tokio: `quinn` needs a
+//! Tokio reactor for its sockets and timers, nothing else here does, so the
+//! reactor is an implementation detail the runtime owns rather than an
+//! ambient requirement on every caller.
+//!
+//! The reactor, the resolver and the close budget are not weida's protocol
+//! wearing a runtime's clothes, so they are not weida's code any more: a
+//! standalone implementation of a foreign protocol needs exactly them and
+//! none of the rest
+//! ([decisions/0013](../../../docs/decisions/0013-competitor-libraries.md)
+//! §4.2).
 
-use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use quinn::VarInt;
-use tokio::runtime::Handle;
-use tokio::task::JoinHandle;
 use weida_core::{EndpointAddr, Error};
 use weida_protocol::codes;
 
@@ -30,129 +35,11 @@ use crate::transport::Link;
 
 /// The crate's whole surface onto the async runtime: tasks, timers and DNS.
 ///
-/// An `Exec` is a Tokio handle and nothing more. It never owns the runtime,
-/// so a task holding one can neither keep the runtime alive nor drop it from
-/// inside itself. Cloning is a handle clone.
-#[derive(Clone)]
-pub(crate) struct Exec {
-    handle: Handle,
-}
-
-impl Exec {
-    pub(crate) fn from_handle(handle: Handle) -> Exec {
-        Exec { handle }
-    }
-
-    /// The ambient handle, for [`Runtime::new`].
-    pub(crate) fn current() -> Result<Exec, Error> {
-        Handle::try_current()
-            .map(Exec::from_handle)
-            .map_err(|_| Error::Runtime("Runtime::new requires an ambient tokio runtime".into()))
-    }
-
-    /// Enters the runtime context, for the two `quinn` constructors that
-    /// register a socket with the reactor. Held around the constructor only,
-    /// never across an await.
-    pub(crate) fn enter(&self) -> tokio::runtime::EnterGuard<'_> {
-        self.handle.enter()
-    }
-
-    /// Spawns a task on the runtime. Works from any thread, with or without
-    /// an ambient reactor — which is why nothing in this crate calls
-    /// `tokio::spawn`.
-    pub(crate) fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        self.handle.spawn(future)
-    }
-
-    /// A timer on this runtime's wheel. The `Sleep` is created inside the
-    /// runtime context, so the returned future may be awaited anywhere.
-    pub(crate) fn sleep(&self, duration: Duration) -> tokio::time::Sleep {
-        let _guard = self.handle.enter();
-        tokio::time::sleep(duration)
-    }
-
-    /// Awaits `future`, giving up after `limit`.
-    ///
-    /// `None` means the future had not finished; it is dropped, so whatever
-    /// it held is released. This is the only place the crate bounds an await
-    /// on wall-clock time, for the same reason `sleep` lives here: the timer
-    /// belongs to the runtime, not to the caller.
-    pub(crate) async fn within<F: Future>(&self, limit: Duration, future: F) -> Option<F::Output> {
-        let deadline = self.sleep(limit);
-        tokio::select! {
-            output = future => Some(output),
-            () = deadline => None,
-        }
-    }
-
-    /// Resolves `host:port` to every address the resolver offers, in its
-    /// order, at most `max_addresses` of them.
-    ///
-    /// An address that is already an IP literal is not resolved at all: it is
-    /// parsed in place, with no allocation, no task and no join handle. Every
-    /// pinned deployment dials literals — the address carries the peer's
-    /// fingerprint, not a name — and the round trip through the runtime cost
-    /// 12 % of a cold handshake when it applied to them too
-    /// (`docs/IMPLEMENTATION.md` §4, B-012, B-025).
-    ///
-    /// A real hostname keeps the task: `lookup_host` needs a Tokio context,
-    /// and awaiting the join handle does not. All of the addresses are
-    /// returned rather than the first, because the first is not necessarily
-    /// reachable: `localhost` commonly resolves to both `::1` and
-    /// `127.0.0.1`, and a server bound to one of them is unreachable through
-    /// the other. The caller tries them in order (`pool::dial`). The count is
-    /// capped because a resolver answer is remote input
-    /// (`docs/INVARIANTS.md`).
-    pub(crate) async fn resolve(
-        &self,
-        host: &str,
-        port: u16,
-        max_addresses: usize,
-    ) -> Result<Vec<SocketAddr>, Error> {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            return Ok(vec![SocketAddr::new(ip, port)]);
-        }
-        let query = (host.to_owned(), port);
-        let looked_up = self
-            .spawn(async move {
-                tokio::net::lookup_host(query)
-                    .await
-                    .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
-            })
-            .await
-            .map_err(|e| Error::Runtime(format!("name resolution task failed: {e}")))?;
-        let addrs: Vec<SocketAddr> = looked_up
-            .map_err(|e| Error::InvalidAddress(format!("cannot resolve {host}:{port}: {e}")))?
-            .into_iter()
-            .take(max_addresses)
-            .collect();
-        if addrs.is_empty() {
-            return Err(Error::InvalidAddress(format!(
-                "{host}:{port} resolved to no addresses"
-            )));
-        }
-        Ok(addrs)
-    }
-}
-
-/// Keeps a Tokio runtime created by [`Runtime::owned`] alive for as long as
-/// the weida runtime that created it.
-struct OwnedRuntime(Option<tokio::runtime::Runtime>);
-
-impl Drop for OwnedRuntime {
-    fn drop(&mut self) {
-        if let Some(runtime) = self.0.take() {
-            // The last `Runtime` clone may go out of scope on one of this
-            // runtime's own worker threads. Dropping a Tokio runtime there
-            // panics; shutting it down in the background does not.
-            runtime.shutdown_background();
-        }
-    }
-}
+/// Re-exported from `weida-runtime`, where it is public and documented for a
+/// consumer with no weida in the picture. `pub(crate)` here, so it is not
+/// part of `weida`'s surface: every module of this crate takes its `Exec`
+/// from the `ConnCtx`, `RuntimeInner` or `Namespace` it already holds.
+pub(crate) use weida_runtime::{CloseBudget, Exec, OwnedReactor};
 
 /// What every connection of one runtime shares: the counters and flags that
 /// outlive any single connection.
@@ -169,7 +56,7 @@ pub(crate) struct RuntimeInner {
     pub(crate) exec: Exec,
     /// Present only for a runtime created by [`Runtime::owned`]; dropped with
     /// the last handle.
-    _owned: Option<OwnedRuntime>,
+    _owned: Option<OwnedReactor>,
     /// Every QUIC endpoint this runtime owns, for shutdown.
     endpoints: Mutex<Vec<quinn::Endpoint>>,
     pub(crate) shared: Arc<Shared>,
@@ -302,26 +189,11 @@ impl Runtime {
     ///
     /// Fails when `worker_threads` is `0`, or when the OS refuses the threads.
     pub fn owned(config: RuntimeConfig) -> Result<Runtime, Error> {
-        if config.worker_threads == 0 {
-            return Err(Error::Runtime(
-                "RuntimeConfig::worker_threads must be at least 1".into(),
-            ));
-        }
-        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(config.worker_threads)
-            .thread_name("weida")
-            .build()
-            .map_err(Error::Io)?;
-        let exec = Exec::from_handle(tokio_runtime.handle().clone());
-        Ok(Runtime::from_parts(
-            config,
-            exec,
-            Some(OwnedRuntime(Some(tokio_runtime))),
-        ))
+        let (exec, reactor) = Exec::owned(config.worker_threads, "weida")?;
+        Ok(Runtime::from_parts(config, exec, Some(reactor)))
     }
 
-    fn from_parts(config: RuntimeConfig, exec: Exec, owned: Option<OwnedRuntime>) -> Runtime {
+    fn from_parts(config: RuntimeConfig, exec: Exec, owned: Option<OwnedReactor>) -> Runtime {
         // One set of counters and flags per runtime: the pool hands it to the
         // connections it dials, the listener to the connections it accepts.
         let shared = Arc::new(Shared {
@@ -420,7 +292,7 @@ impl Runtime {
     /// loss — so a process that must exit within a budget of its own could not
     /// use it [0009 §4.4].
     pub async fn shutdown(self) {
-        let budget = self.inner.config.shutdown_timeout;
+        let budget = CloseBudget::start(self.inner.config.shutdown_timeout);
         self.close(budget).await;
     }
 
@@ -453,21 +325,22 @@ impl Runtime {
     /// non-zero [`Drained::outstanding`] is **not an error** — it is a number
     /// to log, retry against or ignore [0009 §4.6].
     pub async fn drain(self, deadline: Duration) -> Drained {
-        let started = Instant::now();
+        // One budget for the drain and the close that follows it: nothing
+        // about process exit may depend on a peer's behaviour [0009 §4.4].
+        let budget = CloseBudget::start(deadline);
         self.inner.shared.drain.begin();
 
         let (receipts, evicted) = self.inner.shared.drain.take();
-        let drained = drain::wait_for(receipts, evicted, self.inner.exec.sleep(deadline)).await;
+        let wait = self.inner.exec.sleep(budget.remaining());
+        let drained = drain::wait_for(receipts, evicted, wait).await;
 
-        // The close gets what is left of the same deadline: nothing about
-        // process exit may depend on a peer's behaviour [0009 §4.4].
-        self.close(deadline.saturating_sub(started.elapsed())).await;
+        self.close(budget).await;
         drained
     }
 
-    /// Closes every binding and pooled connection and waits, for at most
-    /// `budget`, for the sockets to go idle.
-    async fn close(self, budget: Duration) {
+    /// Closes every binding and pooled connection and waits, for whatever is
+    /// left of `budget`, for the sockets to go idle.
+    async fn close(self, budget: CloseBudget) {
         let endpoints: Vec<quinn::Endpoint> = self
             .inner
             .endpoints
@@ -499,11 +372,12 @@ impl Runtime {
                 endpoint.wait_idle().await;
             }
         };
-        let deadline = self.inner.exec.sleep(budget);
+        let remaining = budget.remaining();
+        let deadline = self.inner.exec.sleep(remaining);
         tokio::select! {
             () = idle => {}
             () = deadline => tracing::debug!(
-                timeout_ms = budget.as_millis(),
+                timeout_ms = remaining.as_millis(),
                 "timeout reached before the sockets went idle"
             ),
         }
@@ -527,6 +401,7 @@ impl std::fmt::Debug for Runtime {
 mod tests {
     use super::*;
     use crate::config::{ClientTls, Identity, Trust};
+    use tokio::runtime::Handle;
     use weida_core::Limits;
 
     /// An endpoint that trusts only what an address names; a plain address
@@ -583,42 +458,6 @@ mod tests {
         assert!(Handle::try_current().is_err());
         assert_eq!(rt.config().worker_threads, 1);
         assert_eq!(rt.requester(no_trust()).peer_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn resolves_ip_literals_without_dns() {
-        let exec = Exec::current().expect("ambient runtime");
-        assert_eq!(
-            exec.resolve("127.0.0.1", 7443, 8).await.unwrap(),
-            vec![SocketAddr::from(([127, 0, 0, 1], 7443))]
-        );
-        let v6 = exec.resolve("::1", 7443, 8).await.unwrap();
-        assert_eq!(v6.len(), 1);
-        assert_eq!(v6[0].port(), 7443);
-        assert!(v6[0].is_ipv6());
-    }
-
-    /// Claim: a hostname yields every address the resolver offers, in its
-    /// order and no more than the cap. `localhost` is the case that matters —
-    /// it commonly resolves to both `::1` and `127.0.0.1`, and dialling only
-    /// the first reaches a server bound to the other never.
-    #[tokio::test]
-    async fn a_hostname_resolves_to_every_address_up_to_the_cap() {
-        let exec = Exec::current().expect("ambient runtime");
-        let all = exec.resolve("localhost", 7443, 8).await.unwrap();
-        assert!(!all.is_empty());
-        assert!(all.iter().all(|a| a.port() == 7443));
-
-        let capped = exec.resolve("localhost", 7443, 1).await.unwrap();
-        assert_eq!(capped.len(), 1, "the cap must bound the answer");
-        assert_eq!(capped[0], all[0], "and it must keep the resolver's order");
-    }
-
-    #[tokio::test]
-    async fn an_unresolvable_host_is_an_address_error() {
-        let exec = Exec::current().expect("ambient runtime");
-        let err = exec.resolve("host.invalid.", 7443, 8).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
     }
 
     #[tokio::test]
