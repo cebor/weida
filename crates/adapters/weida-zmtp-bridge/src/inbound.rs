@@ -62,19 +62,31 @@ pub struct InboundConfig {
     /// choosing the allocation. It also bounds the other direction: a weida
     /// payload beyond it is refused rather than truncated.
     ///
-    /// The default, 8 MiB, is `subscriber_buffer_bytes` — the weida-side
-    /// neighbour, since `ZMQ_MAXMSGSIZE` has no default at all. §11 of the
-    /// mapping document leaves the measured number to the interop bench.
+    /// **1 MiB, from the interop bench** (B-043). The cost through the bridge
+    /// is linear in message size with no cliff anywhere — a megabyte costs
+    /// 3.37 ms round-trip against 439 µs for a direct ZeroMQ pair — so the
+    /// number is not a latency choice but a memory one, and the memory is
+    /// `max_message_bytes` per direction per connection against
+    /// `max_connections`. At the previous 8 MiB and a default 1024 connections
+    /// that product was 8 GiB, which nobody had chosen; 1 MiB is
+    /// `stream_receive_window`, the weida per-stream budget the bridge's own
+    /// reads already live inside [PROTOCOL §10].
     pub max_message_bytes: u64,
     /// What to do with a subscription whose byte prefix does not end at a
     /// segment boundary (loss L2).
     pub mid_segment: MidSegment,
-    /// Messages the bridge may hold for one `SUB` peer that is not reading.
+    /// Bytes the bridge may hold for one `SUB` peer that is not reading.
     ///
     /// Dropping at the bound is ZeroMQ's own rule for PUB and weida's for
     /// fan-out, so both sides agree that a slow subscriber loses messages
     /// rather than stalling anyone.
-    pub queue_depth: usize,
+    ///
+    /// Bytes rather than a message count, and 8 MiB: the count was the other
+    /// half of the 8 GiB above, since a depth times `max_message_bytes` is
+    /// what a slow subscriber can really pin. 8 MiB is
+    /// `subscriber_buffer_bytes`, which bounds exactly this on the weida side,
+    /// so the two ends of the chain now have comparable ceilings [PROTOCOL §10].
+    pub queue_bytes: usize,
     /// The weida runtime configuration.
     ///
     /// Its guarantee set must be `core`: the ZeroMQ side has no mechanism to
@@ -92,9 +104,9 @@ impl InboundConfig {
             listen,
             weida_url: weida_url.into(),
             presenting,
-            max_message_bytes: 8 * 1024 * 1024,
+            max_message_bytes: 1024 * 1024,
             mid_segment: MidSegment::Refuse,
-            queue_depth: 1024,
+            queue_bytes: 8 * 1024 * 1024,
             runtime: RuntimeConfig::default(),
         }
     }
@@ -317,7 +329,7 @@ async fn serve_pub(
     let subscriber = runtime.subscriber(tls.clone());
     subscriber.connect(&config.weida_url).await?;
     let mut subs = Subscriptions::default();
-    let mut queue = DropQueue::new(config.queue_depth);
+    let mut queue = DropQueue::new(config.queue_bytes);
     let cap = usize::try_from(config.max_message_bytes).unwrap_or(usize::MAX);
 
     loop {
@@ -360,9 +372,9 @@ async fn serve_pub(
                         if queue.push(payload) {
                             tracing::warn!(
                                 dropped = queue.dropped(),
-                                depth = config.queue_depth,
+                                budget = config.queue_bytes,
                                 "the ZeroMQ subscriber is not keeping up; dropped its oldest \
-                                 queued message"
+                                 queued messages to make room"
                             );
                         }
                         while let Some(message) = queue.pop() {

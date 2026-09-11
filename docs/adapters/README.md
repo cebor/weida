@@ -79,7 +79,8 @@ Two rules keep these documents honest:
 
 | File | Protocol | Sheet | Status |
 | --- | --- | --- | --- |
-| `zmtp.md` | ZeroMQ ZMTP 3.1 (libzmq 4.3.x, CURVE/ZAP) | [`zeromq.md`](../research/zeromq.md) | mapping written; no adapter crate yet |
+| `zmtp.md` | ZeroMQ ZMTP 3.1 (libzmq 4.3.x, CURVE/ZAP) | [`zeromq.md`](../research/zeromq.md) | codec, both bridge directions and the interop run against the pure-Rust `zeromq` crate |
+| `nng.md` | nanomsg / NNG Scalability Protocols (SP v1 RFCs rev 01, NNG 1.10.0) | [`nanomsg-nng.md`](../research/nanomsg-nng.md) | mapping written; codec built (`weida-sp`), bridges next |
 
-Planned, in the order Phase B builds them ([LOOP.md](../LOOP.md) §9): NNG/SP, MQTT 5,
-AMQP 1.0, NATS core. Each gets its document in the same shape before its bridge code exists.
+Planned, in the order Phase B builds them ([LOOP.md](../LOOP.md) §9): MQTT 5, AMQP 1.0,
+NATS core. Each gets its document in the same shape before its bridge code exists.

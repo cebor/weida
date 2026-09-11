@@ -1183,6 +1183,59 @@ capacity assertions in `dedup.rs` already prove.
 
 ---
 
+### Verified results — what the ZMTP bridge costs, against no bridge (B-043)
+
+The comparison [adapters/zmtp.md](adapters/zmtp.md) §10 item 6 asks for: the same work through
+the adapter and with no adapter in it, the foreign peer being the pure-Rust `zeromq` crate
+0.6 on both sides of the comparison. `direct` is zmq.rs to zmq.rs over loopback TCP with no
+weida at all; `bridged` is zmq.rs to the inbound bridge to a weida endpoint — one TCP hop, one
+QUIC hop and two protocol terminations. One process, one machine, so what the difference
+contains is the bridge and the second transport rather than a network.
+
+| Exchange | Payload | direct (zmq.rs ↔ zmq.rs) | bridged (zmq.rs → weida) | Ratio |
+| --- | --- | --- | --- | --- |
+| REQ/REP round trip | 1 KiB | **20.4-20.6 µs** | **80.9-81.4 µs** | 4.0× |
+| REQ/REP round trip | 1 MiB | **437-441 µs** | **3.34-3.41 ms** | 7.7× |
+| PUSH one-way | 1 KiB | **4.28-4.31 µs** | **5.16-5.28 µs** | 1.2× |
+| PUSH one-way | 1 MiB | **202-224 µs** | **1.43-1.45 ms** | 6.8× |
+
+`cargo bench -p weida-zmtp-bridge --bench interop -- --warm-up-time 1 --measurement-time 3`
+
+**What the one-way rows do and do not say.** A PUSH that returns is a message accepted by a
+socket, not delivered to anybody: the direct 1 MiB row at 4.6 GiB/s is zmq.rs buffering into
+its own queue, and the bridged row is bounded by the bridge actually reading the message and
+forwarding it. So the honest reading of PUSH is the small-payload row — **+0.93 µs per
+message** for a whole ZMTP termination, a weida DATA header and a QUIC stream — and the
+round-trip rows are where a real end-to-end cost appears.
+
+**The cost is linear in size with no cliff**, which is the finding the two open questions
+needed. Between 1 KiB and 1 MiB the bridged round trip grows 41× for 1024× the bytes, and
+nothing in the adapter changes behaviour at a threshold in between.
+
+**§11's first open question, `max_message_bytes`, is therefore not a latency choice: it is a
+memory one, and it is now 1 MiB** (was 8 MiB, a number borrowed from `subscriber_buffer_bytes`
+for lack of anything better). The bridge holds at most one whole message per direction per
+connection, because a ZeroMQ peer cannot be handed a body before it is complete — so the
+exposure is `max_message_bytes × max_connections`, and at 8 MiB against the default 1024
+connections that product was **8 GiB** nobody had chosen. 1 MiB is `stream_receive_window`,
+the per-stream budget the bridge's own reads already live inside [PROTOCOL §10], and it is
+three orders of magnitude above the payload size these patterns are for.
+
+**The same arithmetic corrected a second bound the question had not asked about.** The PUB
+side's queue was `queue_depth: 1024` *messages*, which multiplies by the cap into the real
+figure: a slow subscriber could pin a gigabyte. It is now `queue_bytes: 8 MiB` — a byte budget,
+dropping the oldest until the new message fits, with `subscriber_buffer_bytes` as the weida
+neighbour it can be compared against. A message larger than the whole budget is still queued
+alone, because it passed `max_message_bytes` and a ZMTP message cannot be split.
+
+**The reply deadline of B-042 stays at 10 s, now with a ratio behind it.** The slowest exchange
+the cap allows measures 3.37 ms, so the default is ~3000× the working range: far enough above
+it that a merely slow peer cannot trip it, which is the only failure mode that matters — a
+request lost to a silent ROUTER costs one exchange, a deadline that fires early costs correct
+ones.
+
+---
+
 ## 5. Decisions
 
 ### Serialization: CBOR via `minicbor` (Phase 0)
@@ -1316,6 +1369,25 @@ and is not.
 
 ---
 
+### ZMTP interop decisions (Phase 9 slice 5, B-043)
+
+Every row here exists because a foreign implementation disagreed with us. Nothing in this
+table could have been decided from the specification alone, which is the argument for the
+slice.
+
+| Decision | Value | Rationale |
+| --- | --- | --- |
+| A ZMTP **3.0** peer | accepted by downgrading, not refused | The codec's floor was 3.1 ("a peer MUST accept protocol versions greater or equal to 3.1") and the other half of the same rule permits a downgrade. Refusing 3.0 refuses the entire installed base of implementations that never adopted 3.1 — `zeromq` 0.6 announces 3.0 — and for a *bridge* that is not caution but uselessness. `Greeting::accept_downgrading` is a separate entry point rather than a relaxation of `accept`, so a caller that wants the strict floor still has it, and it **returns** the negotiated version instead of assuming one. |
+| `PING`/`PONG` toward a 3.0 peer | suppressed, whatever the configuration says | PING/PONG are 3.1 commands. Sending one to a 3.0 peer is a protocol violation, and the price is exact: `zeromq` answers any command but `READY` with "Unknown command received" and drops the connection. So the configuration asks for a heartbeat and the negotiated version decides whether it can be honoured, logged once per connection rather than left as a silent difference. |
+| The legacy subscription form | **accepted** on the PUB side, never sent by default | 3.x subscriptions are `SUBSCRIBE`/`CANCEL` commands; ZMTP 2.0's form is a one-frame message beginning `1` or `0`, which is also how libzmq presents subscriptions to an XPUB application. `zeromq` 0.6 sends and reads only the legacy form, so a bridge that accepts only commands has no subscribers from that implementation. Accepting both is unambiguous — a SUB peer may not send application messages at all — and sending is a configuration choice (`SubscriptionForm`) whose default stays the specified command, because libzmq is the reference and a knob is better than a guess. |
+| An over-cap payload | refuses **that transfer**, not the connection | Both loops used to propagate `LimitExceeded` and end the ZMTP connection over one oversized message the peer never saw. weida keeps refusals per stream — "a refusal is per-stream, a violation ends the connection" ([PROTOCOL.md](PROTOCOL.md) §3) — and `collect` has already sent `STOP_SENDING(REJECTED)` and buffered nothing, so the loop continues; the exchange form also refuses the requester with `ERROR{REJECTED}` rather than leaving it for the deadline. |
+| `max_message_bytes` | **1 MiB**, from the bench | The cost is linear in size, so the number bounds memory, not latency: one whole message per direction per connection against `max_connections`, which at the old 8 MiB was 8 GiB nobody had chosen. See the verified results above. |
+| The PUB-side queue | **bytes** (`queue_bytes`, 8 MiB), not messages | A depth of 1024 messages multiplies by the cap into the exposure that matters. Bytes make the ceiling the number an operator cares about and give it a weida neighbour to be compared against, `subscriber_buffer_bytes`. |
+| `max_pending_exchanges` (B-053) | 64, checked **before** the body is read | The review pass found the outbound DEALER loop holding one request *and* its body per waiting exchange with no ceiling at all, the count being whatever weida clients open — a bound the transport does not supply, since it limits concurrent streams per connection and not the sum across clients. 64 is `max_connections_per_peer`'s number, and the product it fixes is stated rather than implied: 64 MiB against a 1 MiB cap. Checked before the body because a request refused early costs this side nothing, and refused *immediately* rather than parked because a requester that will never be answered should not wait out the deadline to learn it. |
+| The subscription table's ceilings (B-054) | 256 prefixes of at most 256 B, refused with `ERROR`; a **repeat** always accepted | ZeroMQ subscriptions are additive and non-idempotent, which the sheet records as a denial-of-service surface in libzmq itself [zeromq §11] — so what needs a ceiling is the number of *distinct* prefixes and the length of each, since a repeat only increments a counter. Both numbers are weida's own for the same thing (`max_subscriptions`, and the wire's 256 B cap on a SUBSCRIBE `filter`), which makes the exposure comparable across the hop: 64 KiB of prefixes per peer. A repeat is accepted even at the ceiling because loss L3's count is the thing being preserved: refusing the second SUBSCRIBE would make the first cancellable by one CANCEL where the peer sent two. |
+
+---
+
 ### Connection-tier decisions (B-017)
 
 | Decision | Value | Rationale |
@@ -1340,10 +1412,15 @@ Recorded deliberately, not discovered later.
   never retried by the library ([GUARANTEES.md](GUARANTEES.md) §6). Retry policy arrives in
   Phase 4.
 - **No persistence.** No payload store, no WAL, no recovery. Phase 5.
-- **No deduplication.** No idempotency ids, no dedup window — and since `transfer_id` left
-  the wire there is not even an identifier a receiver could deduplicate on. This is why an
-  `Indeterminate` result may only be retried for idempotent operations
-  ([FAILURE_MODEL.md](FAILURE_MODEL.md) §5).
+- **Deduplication is opt-in and bounded, not absent.** The entry here used to say weida had
+  no dedup at all and no identifier to deduplicate on; both stopped being true with DATA keys
+  6 and 7 ([decisions/0001](decisions/0001-sequence-field.md)). A connection that negotiated
+  `Deduplication::Bounded(window)` suppresses a repeat of `(producer, scope, sequence)`
+  inside `max_dedup_entries` (4096), and a `core` connection allocates nothing for it. What is
+  still absent is an **application-level idempotency id** — the key is the producer's sequence,
+  which only a sender that opted into per-producer ordering writes — so an `Indeterminate`
+  result may still only be retried for idempotent operations, or by a sender that numbers its
+  own transfers ([FAILURE_MODEL.md](FAILURE_MODEL.md) §5).
 - **Single reply per exchange.** The reply half carries one DATA transfer or one ERROR and
   then FIN. Answering one request several times needs either several exchanges or a framing
   convention inside the payload; v0 offers neither.
@@ -1358,17 +1435,21 @@ Recorded deliberately, not discovered later.
 - **No synchronous API wrapper.** The async API is the only surface. A blocking facade is a
   binding-layer concern (Phase 10).
 - **Fuzz runs need a nightly toolchain.** `cargo-fuzz` requires nightly, which is installed
-  and was used: all six targets ran 200 000 iterations each with no findings. On a host
-  without nightly the targets are still committed and the deterministic `fuzz_smoke_*` tests
-  cover the same properties on stable, at lower depth.
+  and was used: the `weida-protocol` targets ran 200 000 iterations each, the `weida-zmtp`
+  targets and the five `weida-sp` targets 20 000 each, with no findings. On a host without
+  nightly the targets are still committed and the deterministic `fuzz_smoke*` tests cover the
+  same properties on stable, at lower depth.
 - **`IncomingTransfer::read_capped` was added beyond the planned API surface.** The planned
   `collect(self, max_bytes)` cannot read a borrowed request body, so the borrowing form is
   the primitive and `collect` delegates to it.
-- **Pub/Sub fan-out drops are invisible to the subscriber.** A subscriber past its byte
-  budget at the publisher simply misses the message; nothing on the wire reports it. Only
-  the publisher counts it (`Publisher::dropped`). Making loss observable to the receiving
-  side would need a sequence field, which is the same prerequisite as per-producer
-  ordering.
+- **A fan-out drop is visible to a subscriber that asked for detection.** This entry used to
+  say the loss was invisible and would need a sequence field; the field arrived
+  ([decisions/0001](decisions/0001-sequence-field.md)) and `PerProducer(detect)` now reports
+  the gap to the subscriber, with `PerProducer(reassemble)` holding instead up to
+  `max_reorder_hold`. What remains true is the **default**: a `core` subscriber past its byte
+  budget at the publisher simply misses the message and only the publisher counts it
+  (`Publisher::dropped`), because nothing on the wire reports a drop to a receiver that
+  negotiated no ordering.
 - **One subscriber per path per connection.** A `Subscriber` claims its path in the dialling
   connection's namespace, so two subscribers on one pooled connection asking for the same
   path collide with `AlreadyRegistered`. Fanning one subscription out to several in-process

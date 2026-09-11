@@ -93,6 +93,11 @@ pub struct OutboundConfig {
     /// Which socket type to present to the ZeroMQ side.
     pub dialling: Dialling,
     /// Largest whole ZMTP message the bridge will hold, in octets.
+    ///
+    /// 1 MiB, the same number and the same reasoning as the inbound
+    /// direction's: the interop bench (B-043) found the cost linear in message
+    /// size with no cliff, so the number bounds memory rather than latency,
+    /// and the exposure is this cap per direction per connection.
     pub max_message_bytes: u64,
     /// How long an exchange may wait for its ZMTP reply before the weida
     /// requester is told there will not be one.
@@ -100,10 +105,35 @@ pub struct OutboundConfig {
     /// Mandatory and finite, for the reason the module documents: a ROUTER
     /// drops an unroutable request **silently** by default (loss L5), so the
     /// absence of a reply is the only observation available and a bridge
-    /// without a deadline would park the exchange forever. Ten seconds by
-    /// default, which is generous for a local ZeroMQ peer and short enough
-    /// that a caller notices.
+    /// without a deadline would park the exchange forever.
+    ///
+    /// **Ten seconds stays, and the interop bench is why** (B-043). A full
+    /// round trip through this bridge measured 81 µs at 1 KiB and 3.37 ms at
+    /// 1 MiB, so the default is some 3000 times the slowest exchange the
+    /// adapter's own cap allows: a deadline this far above the working range
+    /// cannot misfire on a merely slow peer, which is the only failure mode
+    /// that would matter here — a lost request costs one exchange, a deadline
+    /// that fires early costs correct ones. The measurement is what turns
+    /// "generous" into a number with a ratio behind it.
     pub reply_deadline: Duration,
+    /// Exchanges that may wait for a ZMTP reply at once.
+    ///
+    /// The bound the review pass of B-051 found missing. Each waiting exchange
+    /// holds a weida request **and** its body, already read, so the exposure
+    /// is `max_pending_exchanges × max_message_bytes` — 64 MiB at the
+    /// defaults, against a 1 MiB cap — and the count is whatever weida clients
+    /// choose to open, which is remote input. QUIC bounds concurrent streams
+    /// *per connection* and the reply deadline bounds how long an entry lives;
+    /// neither bounds the sum across clients, which is what this does.
+    ///
+    /// Sixty-four, the same number `max_connections_per_peer` took from
+    /// B-011: a foreign REP peer answers one exchange at a time, so a queue
+    /// this deep is already far past the point where a requester would rather
+    /// be refused than parked. Past it the exchange is refused immediately
+    /// with `ERROR{REJECTED}`, which is the honest answer — the alternative is
+    /// a requester waiting out the whole deadline for a peer that was never
+    /// going to reach it.
+    pub max_pending_exchanges: usize,
     /// Prefixes to subscribe with when presenting `SUB`.
     ///
     /// Configuration rather than translation: the weida side here is a
@@ -143,8 +173,9 @@ impl OutboundConfig {
             weida_listen,
             weida_path: weida_path.into(),
             dialling,
-            max_message_bytes: 8 * 1024 * 1024,
+            max_message_bytes: 1024 * 1024,
             reply_deadline: Duration::from_secs(10),
+            max_pending_exchanges: 64,
             subscribe: Vec::new(),
             subscription_form: SubscriptionForm::default(),
             heartbeat: Some(Duration::from_secs(5)),
@@ -181,6 +212,11 @@ impl Outbound {
         if config.max_message_bytes == 0 {
             return Err(BridgeError::Configuration(
                 "max_message_bytes is zero, so every message would be refused".into(),
+            ));
+        }
+        if config.max_pending_exchanges == 0 {
+            return Err(BridgeError::Configuration(
+                "max_pending_exchanges is zero, so every exchange would be refused".into(),
             ));
         }
         if config.reply_deadline.is_zero() {
@@ -274,6 +310,21 @@ async fn serve_dealer(
         tokio::select! {
             accepted = replier.accept() => {
                 let mut request = accepted?;
+                // The ceiling first, because it is the cheaper refusal: a
+                // request refused before its body is read costs this side
+                // nothing, where reading first would buffer up to
+                // `max_message_bytes` for an exchange that is about to be
+                // turned away. Refused now rather than parked and refused at
+                // the deadline, so the requester learns immediately.
+                if pending.len() >= config.max_pending_exchanges {
+                    tracing::warn!(
+                        ceiling = config.max_pending_exchanges,
+                        "refused a weida exchange: the ZMTP peer already has that many \
+                         replies outstanding"
+                    );
+                    request.refuse(ErrorCode::Rejected).await;
+                    continue;
+                }
                 // Same rule as the push loop: over the cap the payload is
                 // already refused with `STOP_SENDING(REJECTED)` and none of it
                 // buffered, and a refusal is per-stream. Here the requester

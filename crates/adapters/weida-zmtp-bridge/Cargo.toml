@@ -31,5 +31,9 @@ criterion.workspace = true
 # to be built from them.
 bytes.workspace = true
 
+[[bench]]
+name = "interop"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"
