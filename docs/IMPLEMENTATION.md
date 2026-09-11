@@ -505,9 +505,9 @@ the peer's buffer — in process, that *is* "the peer's transport holds every by
 local connection has no endpoint to close.
 
 **`max_local_streams` (255) is enforced, not just named.** Live transfers on one local
-connection are counted, and opening past the cap fails with `LimitExceeded` rather than
-queueing; the number is Windows' named-pipe instance limit, the tightest of the three
-platforms [0010 §4.2]. INVARIANTS' named-bounds table is down to one entry,
+connection are counted, and an `open` at the cap waits for one to end rather than
+refusing (B-059, below); the number is Windows' named-pipe instance limit, the tightest
+of the three platforms [0010 §4.2]. INVARIANTS' named-bounds table is down to one entry,
 `max_connections_per_peer`.
 
 **The tests are parametrized rather than copied.** `crates/weida/tests/transports.rs`
@@ -599,7 +599,9 @@ would have shrunk the pool for the whole duration of a long transfer.
 **Both bounds are real.** A parked connection is capped twice: by `max_parked_reverse`,
 the pool's own ceiling, and by `max_local_streams`, which counts it like any other live
 local connection — on this transport a stream is a file descriptor, so the pool is a
-descriptor budget. `StreamSlot::acquire` is now the one place that accounting happens.
+descriptor budget. A permit of the connection's slot semaphore is that accounting, and
+the pool takes its permits with `StreamSlot::try_acquire`: filling a pool is a refusal
+when the budget is spent, where a transfer waits (B-059).
 
 **An empty pool is a drop, not a stall and not a teardown.** `Link::open_uni` on the
 accepting side returns the new `Error::NoParkedConnection`, and the per-subscriber writer
