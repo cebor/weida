@@ -232,25 +232,64 @@ Spill
 Coalesce
 ```
 
-These names are provisional; semantics matter more than naming. Backpressure is also the one
-dimension that is **not** ordered: its levels are behaviours, not strengths, so two peers
-state the same one or fail to agree
+These names are provisional; semantics matter more than naming. Backpressure is one of the two
+dimensions that are **not** ordered — producer naming below is the other: its levels are
+behaviours, not strengths, so two peers state the same one or fail to agree
 ([decisions/0006](decisions/0006-guarantee-sets.md) §4.3).
+
+### Producer naming
+
+```text
+Fingerprint
+Stable
+```
+
+Which name a sequenced transfer's producer carries. `Fingerprint` is the default and needs no
+bytes on the wire at all: the receiver already knows the sending peer's proved fingerprint from
+the handshake, so the producer key is absent and the counter restarts with the connection
+([decisions/0008](decisions/0008-session-identity.md) §4.3, §4.4). `Stable` is the variant that
+survives a reconnect, whose supplier is an L2 subscription rather than an L0 session
+([decisions/0001](decisions/0001-sequence-field.md) §7.3), so a v0 peer cannot offer it.
+
+Like backpressure, this dimension is **not** ordered: the two values are names, not strengths,
+so two peers state the same one or fail to agree.
+
+### Control isolation
+
+```text
+No
+Yes
+```
+
+Whether control traffic can be stalled by bulk traffic on the way to this peer. `Yes` means the
+control connection of [decisions/0002](decisions/0002-control-and-bulk-separation.md) exists, so
+no amount of unread payload can withhold a control frame; `No` is one connection carrying both,
+which is what v0 does. This dimension **is** ordered — isolation is strictly stronger than none
+— so the intersection of two declarations is the logical AND: a peer gets isolation only if
+both sides run it. It is declarable because it is requirable: an adapter multiplexing many
+foreign sessions onto one weida connection is the case SYNTHESIS §8.2 named, and it needs to
+*require* isolation rather than hope for it.
 
 ### Guarantee sets
 
 A **guarantee set** is the unit of configuration: a tuple with one level per dimension above —
-delivery, acknowledgement/completion, ordering, deduplication, backpressure — where an
-acknowledgement level of `Stored` or `Replicated` carries the durability axes of §1. A set is
-never a single enum, and it introduces no new words: it is a way to carry the existing ones as
-one object ([decisions/0006](decisions/0006-guarantee-sets.md) §4.1).
+delivery, acknowledgement/completion, ordering, deduplication, backpressure, producer naming
+and control isolation — where an acknowledgement level of `Stored` or `Replicated` carries the
+durability axes of §1. A set is never a single enum, and it introduces no new words: it is a way
+to carry the existing ones as one object
+([decisions/0006](decisions/0006-guarantee-sets.md) §4.1). The dimension list is closed in the
+same sense as the invariant list — a wire key may not name a dimension this section does not,
+and the two that arrived with the HELLO declarations were added here rather than left implicit
+in the codec ([PROTOCOL.md](PROTOCOL.md) §6.5 keys `8` and `9`).
 
 **`core` is the default set, and it is what v0 does**: delivery `BestEffort`, acknowledgement
-`TransportReceipt`, ordering `None`, deduplication `None`, backpressure `Block`, with `Reject`
-at an endpoint's queue bound and `Drop` for fan-out only. §6 is the normative source for
-`core`, so that the default cannot drift away from what the code does. An endpoint configured
-with nothing gets `core`, and every adapter may assume `core` on the weida side without asking
-[0006 §4.2].
+`TransportReceipt`, ordering `None`, deduplication `None`, backpressure `Block` (with `Reject`
+at an endpoint's queue bound and `Drop` for fan-out only), producer naming `Fingerprint`,
+control isolation `No`. §6 is the normative source for `core`, so that the default cannot drift
+away from what the code does. An endpoint configured with nothing gets `core`, and every
+adapter may assume `core` on the weida side without asking [0006 §4.2]. On the wire a dimension
+left at its `core` level is **not written at all**, so a `core` declaration and no declaration
+are the same bytes ([PROTOCOL.md](PROTOCOL.md) §6.5).
 
 **Inside the weida network a configured set may only be a superset of `core`.** Set `B` is at
 least `A` when, for every dimension, `B`'s level is greater than or equal to `A`'s in that
@@ -371,6 +410,8 @@ name a level that is decided and specified but not yet implemented.
 | Ordering | `None` by default; `PerProducer(detect)` **implemented**, opt-in | QUIC guarantees byte order **within** one stream. A one-way transfer is one stream, and each half of an exchange is one stream, so a single payload is ordered end to end. Across streams there is no ordering guarantee of any kind, which is what `PerProducer` addresses: a runtime configured with it (`RuntimeConfig::guarantees`) numbers its one-way transfers per (producer, path or topic) in DATA key `6` and reports what is missing through `IncomingMeta::gap`, delivering every message as it arrives. The level is declared in HELLO and negotiated, so both ends agree or the handshake fails ([PROTOCOL.md](PROTOCOL.md) §2.3). *Spec ahead of code:* `PerProducer(reassemble)` is decided ([decisions/0001](decisions/0001-sequence-field.md) §7.5) and not implemented; `PerKey` is L2-only by decision [0001 §7.4]; `Total` is not specified. Exchanges are not numbered: a reply carries no endpoint, and the stream is the correlation. |
 | Deduplication | `None` | No idempotency ids, no dedup window. Nothing on the wire names a transfer — correlation is the stream itself — so a receiver could not deduplicate even if it wanted to. *Spec ahead of code:* `Bounded(window)` is decided [0001 §7.6] and needs the same wire work. |
 | Backpressure | `Block`, `Reject`, `Drop` | **The two credit units at L0 are bytes and streams, and there is no application credit.** Bytes: `stream_receive_window` and `connection_receive_window`. Streams: `max_concurrent_uni_streams` and `max_concurrent_bidi_streams`, which *are* weida's message credit — a consumer sizes its prefetch by granting them ([decisions/0003](decisions/0003-credit-unit.md) §4.1, §5). Both are receiver-granted through QUIC transport parameters and both are absolute and idempotent; nothing on the L0 wire grants credit at the application level, and the per-subscription message credit of [0003 §4.2] is L2 work with no v0 representation. `Block`: those two windows, those two budgets and bounded internal channels (`endpoint_queue`, the actor control channel) make senders await capacity; this is what Req/Rep and Push/Pull use. The budget lands on `open`, and a transfer parked in an accept queue still holds its stream, so a deeper queue does not raise it ([PATTERNS.md](PATTERNS.md) §1.4). `Reject`: `IncomingTransfer::read_capped` refuses a payload past its cap with `STOP_SENDING(REJECTED)` and `LimitExceeded` before buffering it, and `Publisher::publish` rejects a payload larger than `subscriber_buffer_bytes` locally. `Drop`: publisher fan-out only — a subscriber past `subscriber_buffer_bytes` loses the message rather than stalling the publisher. `Spill` and `Coalesce` are not implemented. |
+| Producer naming | `Fingerprint` only | The proved fingerprint names the producer and is therefore **not written**: the receiver has it from the handshake ([decisions/0008](decisions/0008-session-identity.md) §4.4). `Stable` needs a supplier that outlives a connection, which is an L2 subscription, so a v0 peer declares it neither offered nor required. |
+| Control isolation | `No` | One connection per peer carries control and bulk together, so a slow reader can stall a control frame ([PATTERNS.md](PATTERNS.md) §1.3). `Yes` is decided ([decisions/0002](decisions/0002-control-and-bulk-separation.md)) and is the pool work of B-017; it is declarable now, which is what lets a peer that needs it fail the handshake rather than discover the coupling under load. |
 | Indeterminate outcomes | implemented | First-class: `Error::Indeterminate` is deliberately excluded from `Error::is_definite_failure()`. See [FAILURE_MODEL.md](FAILURE_MODEL.md). |
 | Peer identity | implemented | Every inbound transfer carries the sending peer's proved public-key fingerprint in `IncomingMeta::peer` (`None` for an anonymous client). It comes from the TLS handshake, never from a header, so it can be authorized on but not claimed (master doc §47). Trust is stated per dialling endpoint (`Trust`: pins, anchors, or only what the address names) and optionally required of clients per binding (`ServerTls::require_client`). Authorization beyond "is this key trusted at all" is the application's decision on the fingerprint. The fingerprint is also the peer's name **across** connections — two connections that proved the same key are one peer, which is what binds a control connection to its bulk connections — and it carries no session: recognizing a peer restores nothing from a previous connection ([decisions/0008](decisions/0008-session-identity.md) §4.1, §4.2, §4.4). |
 | Hop-locality | implemented, trivially | Exactly one hop exists in v0 (direct connection). No composition of hops is possible yet. |

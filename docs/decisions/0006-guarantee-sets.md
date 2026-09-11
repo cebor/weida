@@ -211,6 +211,15 @@ Option B.
 - **Open, deliberately.** Whether a guarantee set may vary per endpoint on one connection, or
   only per connection, is left to the wire work: 0001 §7 already records the same question for
   ordering, and the answer must be one answer for both.
+- **Extended by the wire work (B-014), recorded here rather than silently.** §4.1 says a set
+  carries one level per dimension of [GUARANTEES.md](../GUARANTEES.md) §3 and "introduces no
+  new words". The HELLO fields needed two dimensions §3 did not have — producer naming
+  ([0001](0001-sequence-field.md) §7.3, [0008](0008-session-identity.md) §4.3) and control
+  isolation ([0002](0002-control-and-bulk-separation.md) §6.1) — and they arrived as
+  [PROTOCOL.md](../PROTOCOL.md) §6.5 keys `8` and `9`. Both were then added to GUARANTEES §3,
+  which is what keeps §4.1 true: the rule is not "these five dimensions forever" but **no wire
+  key may name a dimension the vocabulary does not**. A future dimension follows the same
+  order: vocabulary first, then a key.
 
 ## 6. Sources
 
