@@ -368,7 +368,7 @@ name a level that is decided and specified but not yet implemented.
 | --- | --- | --- |
 | Acknowledgement | transport receipt only | `Delivery::delivered()` resolves `Ok(())` when the peer's **transport** holds every byte and the FIN — explicitly not "the application read it" (§3). There is no application acknowledgement anywhere in the v0 core: `Accepted`, `Stored`, `Replicated` and `Processed` are reserved for the L2 broker layer and have no wire representation, not even a reserved code point ([PROTOCOL.md](PROTOCOL.md) §11). |
 | Delivery | `BestEffort` only | v0 performs no retries. A failed or indeterminate transfer is reported to the application, which decides. `AtMostOnce` and `AtLeastOnce` require retry and dedup machinery that does not exist yet. |
-| Ordering | `None` | QUIC guarantees byte order **within** one stream. A one-way transfer is one stream, and each half of an exchange is one stream, so a single payload is ordered end to end. Across streams there is no ordering guarantee of any kind. *Spec ahead of code:* `PerProducer(detect\|reassemble)` is decided ([decisions/0001](decisions/0001-sequence-field.md) §7.5) and needs the DATA sequence key, which is not on the wire yet; `PerKey` is L2-only by decision [0001 §7.4]; `Total` is not specified. |
+| Ordering | `None` by default; `PerProducer(detect)` **implemented**, opt-in | QUIC guarantees byte order **within** one stream. A one-way transfer is one stream, and each half of an exchange is one stream, so a single payload is ordered end to end. Across streams there is no ordering guarantee of any kind, which is what `PerProducer` addresses: a runtime configured with it (`RuntimeConfig::guarantees`) numbers its one-way transfers per (producer, path or topic) in DATA key `6` and reports what is missing through `IncomingMeta::gap`, delivering every message as it arrives. The level is declared in HELLO and negotiated, so both ends agree or the handshake fails ([PROTOCOL.md](PROTOCOL.md) §2.3). *Spec ahead of code:* `PerProducer(reassemble)` is decided ([decisions/0001](decisions/0001-sequence-field.md) §7.5) and not implemented; `PerKey` is L2-only by decision [0001 §7.4]; `Total` is not specified. Exchanges are not numbered: a reply carries no endpoint, and the stream is the correlation. |
 | Deduplication | `None` | No idempotency ids, no dedup window. Nothing on the wire names a transfer — correlation is the stream itself — so a receiver could not deduplicate even if it wanted to. *Spec ahead of code:* `Bounded(window)` is decided [0001 §7.6] and needs the same wire work. |
 | Backpressure | `Block`, `Reject`, `Drop` | **The two credit units at L0 are bytes and streams, and there is no application credit.** Bytes: `stream_receive_window` and `connection_receive_window`. Streams: `max_concurrent_uni_streams` and `max_concurrent_bidi_streams`, which *are* weida's message credit — a consumer sizes its prefetch by granting them ([decisions/0003](decisions/0003-credit-unit.md) §4.1, §5). Both are receiver-granted through QUIC transport parameters and both are absolute and idempotent; nothing on the L0 wire grants credit at the application level, and the per-subscription message credit of [0003 §4.2] is L2 work with no v0 representation. `Block`: those two windows, those two budgets and bounded internal channels (`endpoint_queue`, the actor control channel) make senders await capacity; this is what Req/Rep and Push/Pull use. The budget lands on `open`, and a transfer parked in an accept queue still holds its stream, so a deeper queue does not raise it ([PATTERNS.md](PATTERNS.md) §1.4). `Reject`: `IncomingTransfer::read_capped` refuses a payload past its cap with `STOP_SENDING(REJECTED)` and `LimitExceeded` before buffering it, and `Publisher::publish` rejects a payload larger than `subscriber_buffer_bytes` locally. `Drop`: publisher fan-out only — a subscriber past `subscriber_buffer_bytes` loses the message rather than stalling the publisher. `Spill` and `Coalesce` are not implemented. |
 | Indeterminate outcomes | implemented | First-class: `Error::Indeterminate` is deliberately excluded from `Error::is_definite_failure()`. See [FAILURE_MODEL.md](FAILURE_MODEL.md). |
@@ -390,16 +390,19 @@ Three points deserve emphasis, because each is easy to assume otherwise:
   ever could. `Requester::request` therefore drops the `Delivery` of the request half and
   waits on the reply; an ERROR frame on the reply half is equally conclusive. The receipt
   remains available to callers who drive the halves themselves with `Requester::open`.
-- **Pub/Sub drops are silent to the subscriber.** A subscriber whose byte budget at the
-  publisher is exhausted simply does not receive that message; nothing on the wire tells it
-  so. The publisher counts the drop locally (`Publisher::dropped`). This is the one place
-  where weida answers overload by discarding, and it is confined to fan-out (master doc
-  §17). With the detect mode of `PerProducer` a subscriber will be able to observe the gap
-  instead of missing it silently; that is decided
-  ([decisions/0001](decisions/0001-sequence-field.md) §7.2) and not yet on the wire.
-- **Ordering is `None` for the new patterns, not "usually ordered".** Each message is its
+- **Pub/Sub drops are silent to the subscriber under `core`, and visible under
+  `PerProducer(detect)`.** A subscriber whose byte budget at the publisher is exhausted
+  simply does not receive that message; the publisher counts the drop locally
+  (`Publisher::dropped`). This is the one place where weida answers overload by discarding,
+  and it is confined to fan-out (master doc §17). Under detect ordering the copy is numbered
+  before fan-out, so the number a dropped copy would have carried is missing from that
+  subscriber's sequence and the next copy it receives carries `IncomingMeta::gap` naming
+  exactly what it lost — the capability [decisions/0001](decisions/0001-sequence-field.md)
+  §7.2 required (`a_dropped_fan_out_copy_shows_up_as_a_gap`).
+- **Ordering is `None` for the new patterns unless it is configured.** Each message is its
   own stream and QUIC does not order streams relative to each other. A publisher's
   per-subscriber writer enqueues copies in publication order, but that is an implementation
-  property of one hop, not a guarantee an application may rely on. Per-producer ordering
-  requires a sequence field that v0 does not have, and §3 states the level it will carry
-  when it does.
+  property of one hop, not a guarantee an application may rely on. `PerProducer(detect)`
+  does not change delivery order either: it reports what is missing and holds nothing back.
+  Reordering on the receiving side is the `reassemble` level, which §3 specifies and no
+  code implements.

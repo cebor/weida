@@ -11,7 +11,7 @@ mod common;
 use std::time::Duration;
 
 use common::Server;
-use weida::{Error, Limits, Publisher, Subscriber};
+use weida::{Error, GuaranteeSet, Limits, OrderingMode, Publisher, RuntimeConfig, Subscriber};
 
 /// Generous ceiling: every assertion below should settle in milliseconds.
 const DEADLINE: Duration = Duration::from_secs(15);
@@ -474,6 +474,110 @@ async fn a_second_subscriber_on_one_connection_collides() {
         .await
         .expect_err("the path is already claimed on this connection");
     assert!(matches!(err, Error::AlreadyRegistered), "{err:?}");
+
+    client.shutdown().await;
+}
+
+/// Detect mode over a real Pub/Sub drop: the subscriber that lost a message
+/// to its byte budget sees the gap on the next one it receives.
+///
+/// This is the capability [decision 0001](../../docs/decisions/0001-sequence-field.md)
+/// §7.2 required: before the sequence field, a drop was silent on the wire
+/// and only the publisher counted it.
+#[tokio::test]
+async fn a_dropped_fan_out_copy_shows_up_as_a_gap() {
+    const MSG: usize = 32 * 1024;
+
+    let detect = GuaranteeSet {
+        ordering: OrderingMode::PerProducerDetect,
+        ..GuaranteeSet::CORE
+    };
+    // A budget that holds two messages, so a subscriber that stops reading
+    // starts losing copies while the publisher keeps going.
+    let server = Server::start_with_config(RuntimeConfig {
+        limits: Limits {
+            subscriber_buffer_bytes: 64 * 1024,
+            ..Limits::default()
+        },
+        guarantees: detect,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+
+    let client = server.client_runtime_with_config(RuntimeConfig {
+        limits: Limits {
+            connection_receive_window: 128 * 1024,
+            stream_receive_window: 64 * 1024,
+            ..Limits::default()
+        },
+        guarantees: detect,
+        ..RuntimeConfig::default()
+    });
+    let sub = client.subscriber(server.trust());
+    within(sub.connect(&server.url("/md")))
+        .await
+        .expect("connect");
+    within(sub.subscribe("px.#")).await.expect("subscribe");
+    await_filters(&publisher, 1).await;
+
+    let payload = vec![0u8; MSG];
+    // Publish until the publisher reports a drop for this subscriber: that is
+    // the moment a copy was lost, and it is observed rather than assumed.
+    let mut published = 0usize;
+    within(async {
+        while publisher.dropped() == 0 {
+            publisher
+                .publish("px.eur", payload.clone())
+                .expect("publish");
+            published += 1;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(published > 1, "the first copy must have been deliverable");
+
+    // Drain what did arrive. The lost copies are the last ones published, so
+    // nothing seen so far can carry their gap yet.
+    let lost = publisher.dropped();
+    let mut gaps = Vec::new();
+    let mut received = 0usize;
+    while received < published - lost as usize {
+        let transfer = within(sub.recv()).await.expect("recv");
+        let meta = transfer.meta().clone();
+        assert!(
+            meta.sequence.is_some(),
+            "detect mode numbers every fan-out copy"
+        );
+        if let Some(gap) = meta.gap {
+            gaps.push(gap);
+        }
+        within(transfer.collect(MSG)).await.expect("collect");
+        received += 1;
+    }
+    assert!(gaps.is_empty(), "nothing was missing yet: {gaps:?}");
+
+    // The budget is free again, so this one is delivered — and it is the
+    // message that reveals the hole the drops left.
+    publisher
+        .publish("px.eur", payload.clone())
+        .expect("publish the sentinel");
+    let sentinel = within(sub.recv()).await.expect("recv the sentinel");
+    let gap = sentinel
+        .meta()
+        .gap
+        .expect("the sentinel must carry the gap");
+    assert_eq!(
+        gap.missed(),
+        lost,
+        "the gap must name exactly the copies the publisher dropped: {gap:?}"
+    );
+    assert!(gap.seen > gap.expected, "{gap:?}");
+    assert_eq!(
+        publisher.dropped(),
+        lost,
+        "the sentinel must not be dropped"
+    );
 
     client.shutdown().await;
 }

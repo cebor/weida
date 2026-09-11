@@ -43,6 +43,7 @@ mod config;
 mod conn;
 mod endpoint;
 mod listener;
+mod ordering;
 mod pool;
 mod pubsub;
 mod runtime;
@@ -61,9 +62,18 @@ pub use endpoint::{
     Sub, Subscriber,
 };
 pub use listener::{Binding, Listener};
+pub use ordering::Gap;
+// The guarantee vocabulary of `docs/PROTOCOL.md` §6.5, for `RuntimeConfig`.
+// `Delivery` keeps its transfer-receipt meaning at this level, so the
+// dimension of the same name is re-exported under the name the guarantee
+// documents use for it.
 pub use runtime::Runtime;
 pub use stream::{Acceptor, Incoming, Peer};
 pub use transfer::{
     Delivery, IncomingMeta, IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream,
     TransferMeta,
+};
+pub use weida_protocol::header::{
+    Acknowledgement, Backpressure, Deduplication, Delivery as DeliveryLevel, Durability,
+    GuaranteeSet, OrderingMode, ProducerNaming,
 };

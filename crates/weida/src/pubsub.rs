@@ -19,9 +19,11 @@ use std::sync::{Arc, RwLock};
 use bytes::Bytes;
 use tokio::sync::{Semaphore, mpsc};
 use weida_core::{Error, Limits, TraceContext};
+use weida_protocol::header::OrderingMode;
 use weida_protocol::{DataHeader, filter};
 
 use crate::conn::{ConnHandle, write_error};
+use crate::ordering::Sequencer;
 use crate::transfer::write_data_preamble;
 
 /// Messages one subscriber's writer task may hold. The real bound is the byte
@@ -84,6 +86,9 @@ struct PubMsg {
     topic: Arc<str>,
     payload: Bytes,
     trace: TraceContext,
+    /// The producer's sequence number for this topic, assigned once per
+    /// published message. `None` unless `PerProducer` ordering is negotiated.
+    sequence: Option<u64>,
 }
 
 /// One subscribing connection's state for one publisher path.
@@ -111,14 +116,20 @@ pub(crate) struct SubRegistry {
     /// Filters held per connection, summed over paths, for `max_subscriptions`.
     per_conn: RwLock<HashMap<usize, usize>>,
     limits: Limits,
+    /// Numbers published messages per topic. The number belongs to the
+    /// *message*, not to a subscriber's copy, which is what makes a dropped
+    /// copy visible as a gap: the survivors keep the numbers the lost ones
+    /// would have had.
+    sequencer: Sequencer,
 }
 
 impl SubRegistry {
-    pub(crate) fn new(limits: Limits) -> SubRegistry {
+    pub(crate) fn new(limits: Limits, ordering: OrderingMode) -> SubRegistry {
         SubRegistry {
             paths: RwLock::new(HashMap::new()),
             per_conn: RwLock::new(HashMap::new()),
             limits,
+            sequencer: Sequencer::new(ordering),
         }
     }
 
@@ -231,6 +242,9 @@ impl SubRegistry {
         };
 
         let topic: Arc<str> = Arc::from(topic);
+        // Before fan-out, so every copy of one message carries one number and
+        // a copy dropped below leaves a hole rather than renumbering.
+        let sequence = self.sequencer.next(&topic);
         let mut sent = 0usize;
         for entry in &state.subs {
             if !entry.filters.iter().any(|f| matches_filter(&topic, f)) {
@@ -245,6 +259,7 @@ impl SubRegistry {
                 topic: Arc::clone(&topic),
                 payload: payload.clone(),
                 trace,
+                sequence,
             };
             match entry.tx.try_send(msg) {
                 Ok(()) => {
@@ -335,6 +350,10 @@ async fn write_one(ctx: &ConnHandle, path: &str, msg: &PubMsg) -> Result<(), Err
     header.topic = Some(msg.topic.to_string());
     header.content_len = Some(msg.payload.len() as u64);
     header.traceparent = Some(msg.trace.to_traceparent());
+    // The number the publisher assigned to this *message* (`None` under
+    // `core`): every subscriber's copy carries the same one, so a copy this
+    // subscriber lost shows up as a hole in its own sequence.
+    header.sequence = msg.sequence;
 
     let mut stream = ctx.open_uni().await?;
     write_data_preamble(&mut stream, &header).await?;

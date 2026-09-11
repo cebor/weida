@@ -150,9 +150,14 @@ impl Peer {
     ///
     /// The DATA header is written before this returns, so the caller gets a
     /// handle that is already addressed and can only carry payload.
+    ///
+    /// Under a negotiated `PerProducer` ordering the header also carries this
+    /// producer's next sequence number for the dialled path (DATA key `6`);
+    /// under `core` it carries none and the sequencer is never touched.
     pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
         let (conn, path) = self.peers.pick()?;
-        let (header, trace) = data_header(Some(&path), &meta, None);
+        let (mut header, trace) = data_header(Some(&path), &meta, None);
+        header.sequence = conn.sequencer.next(&path);
         let mut stream = conn.open_uni().await?;
         write_data_preamble(&mut stream, &header).await?;
         Ok(OutgoingTransfer::new(stream, trace))

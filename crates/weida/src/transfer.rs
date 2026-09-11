@@ -20,6 +20,7 @@ use weida_core::{Error, ErrorCode, Fingerprint, TraceContext};
 use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes, encode_preamble};
 
 use crate::conn::{ConnHandle, Ctl, read_error, read_frame, write_error, write_error_frame};
+use crate::ordering::Gap;
 
 /// Per-transfer metadata supplied by the application.
 #[derive(Clone, Debug, Default)]
@@ -78,6 +79,18 @@ pub struct IncomingMeta {
     /// from anything the peer wrote into a header, so it cannot be claimed —
     /// only proved (master doc §47).
     pub peer: Option<Fingerprint>,
+    /// The sender's per-producer sequence number, when it numbered this
+    /// transfer (DATA key `6`).
+    pub sequence: Option<u64>,
+    /// What went missing before this transfer, when the connection
+    /// negotiated `PerProducer(detect)` and a number was skipped.
+    ///
+    /// Detect mode reports the gap and delivers the message that arrived;
+    /// nothing is held back and nothing is refetched
+    /// ([decision 0001](https://github.com/tuco86/weida/blob/main/docs/decisions/0001-sequence-field.md)
+    /// §7.5). `None` means either that ordering is off or that nothing is
+    /// missing.
+    pub gap: Option<Gap>,
 }
 
 impl IncomingMeta {
@@ -93,7 +106,15 @@ impl IncomingMeta {
             tracestate: header.tracestate.clone(),
             topic: header.topic.clone(),
             peer,
+            sequence: header.sequence,
+            gap: None,
         }
+    }
+
+    /// Attaches what the connection's gap detector observed.
+    pub(crate) fn with_gap(mut self, gap: Option<Gap>) -> IncomingMeta {
+        self.gap = gap;
+        self
     }
 }
 

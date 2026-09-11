@@ -39,6 +39,11 @@ pub struct Limits {
     /// that does not fit is dropped for that subscriber and counted; the
     /// publisher never blocks on a slow consumer.
     pub subscriber_buffer_bytes: usize,
+    /// Producer scopes — paths and topics — a receiver tracks per connection
+    /// for gap detection, when `PerProducer` ordering is negotiated. The
+    /// peer chooses the scope names, so the table needs a ceiling; at the cap
+    /// a new scope is simply not tracked and no gap is reported for it.
+    pub max_sequence_scopes: usize,
 }
 
 impl Limits {
@@ -65,6 +70,7 @@ impl Default for Limits {
             hello_timeout_ms: 10_000,
             max_subscriptions: 256,
             subscriber_buffer_bytes: 8 * 1024 * 1024,
+            max_sequence_scopes: 1024,
         }
     }
 }
@@ -86,6 +92,7 @@ mod tests {
         assert_eq!(l.hello_timeout_ms, 10_000);
         assert_eq!(l.max_subscriptions, 256);
         assert_eq!(l.subscriber_buffer_bytes, 8 << 20);
+        assert_eq!(l.max_sequence_scopes, 1024);
     }
 
     #[test]

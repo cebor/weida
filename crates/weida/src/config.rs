@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use weida_core::{Error, Fingerprint, Limits};
+use weida_protocol::header::GuaranteeSet;
 
 /// Configuration for one [`crate::Runtime`].
 #[derive(Clone, Debug)]
@@ -42,6 +43,15 @@ pub struct RuntimeConfig {
     /// possible at all, and it is not a deadline anything waits for twice:
     /// every endpoint is closed first, and only the idle wait is capped.
     pub shutdown_timeout: Duration,
+    /// Guarantee set this runtime offers **and** requires of its peers
+    /// (`docs/PROTOCOL.md` §6.1, §6.5).
+    ///
+    /// Offered and required are one setting in v0 on purpose: a set is a
+    /// statement of what this side runs, and a peer that cannot match it
+    /// fails the handshake rather than quietly giving less
+    /// (`docs/decisions/0006-guarantee-sets.md` §4.4). The default is `core`,
+    /// which is what every v0 peer declares by declaring nothing.
+    pub guarantees: GuaranteeSet,
 }
 
 impl Default for RuntimeConfig {
@@ -52,6 +62,7 @@ impl Default for RuntimeConfig {
             idle_timeout: Duration::from_secs(30),
             worker_threads: 1,
             shutdown_timeout: Duration::from_secs(1),
+            guarantees: GuaranteeSet::CORE,
         }
     }
 }
