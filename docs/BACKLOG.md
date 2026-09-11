@@ -26,8 +26,9 @@ acceptance: `docs/decisions/0008-session-identity.md`, accepted: the proved fing
 note: 0008 §5 records that SYNTHESIS §8 never received the session entry 0001 §8 promised, so nothing is struck out there; the question and its answer live in 0001 §8 plus this note. Verified against the acceptance line, which asks only for the 0001 §8 item.
 
 ### B-006 — Spec sync: PROTOCOL.md on the decided state
-kind: spec | size: 45 | status: in_progress 2026-09-11T04:30Z | needs: [B-001, B-004, B-005]
+kind: spec | size: 45 | status: done 191043c | needs: [B-001, B-004, B-005]
 acceptance: reserved DATA keys 6 (sequence) and 7 (producer identity, encoding per 0008) in §6.2 with "optional, skipped by v0"; HELLO §2.3/§6.1 gains guarantee declarations and the intersection rule; §2 states the control connection and per-path bulk connections of 0002; §9 topic filter grammar per 0007; §10 split into control and bulk limits; §11 reserves the L2 credit frame kind (0003) and lists what is deferred; wire version stays 0 with the changes marked "spec ahead of code".
+note: the filter grammar landed in §6.4, where `filter` is defined, with §9.5 pointing at it — §9 was the wrong home for a header rule. Two additions the acceptance line did not ask for but the decisions require: §6.5 defines the guarantee-set encoding (the wire keys 0006 §5 left to the wire work), and §9.2 states that a refusal is not ordered against the receipt per 0005 §4.3. The filter grammar is the one non-additive change — the same SUBSCRIBE bytes can now select a different topic set — so the Status section says the implementation is a defect against the document until B-020 lands, and the §8 SUBSCRIBE vector carries a note that `px.` does not match `px.eur` under the grammar.
 
 ### B-007 — Spec sync: GUARANTEES.md
 kind: spec | size: 45 | status: done 30b8942 | needs: [B-001, B-003]
