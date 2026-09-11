@@ -1049,6 +1049,22 @@ Where a bridge must refuse or take responsibility itself:
 Questions the evidence leaves open, phrased as decisions to make. Each names what the evidence
 constrains and what it does not.
 
+Seven of the nine are now decided, and each carries a **Closed by** paragraph naming the note:
+§8.1 by [0003](../decisions/0003-credit-unit.md), §8.2 by
+[0002](../decisions/0002-control-and-bulk-separation.md), §8.3 by
+[0004](../decisions/0004-durability-levels.md), §8.4 by
+[0001](../decisions/0001-sequence-field.md), §8.5 by
+[0005](../decisions/0005-refusal-race.md), §8.7 by
+[0006](../decisions/0006-guarantee-sets.md), §8.9 by
+[0007](../decisions/0007-topic-namespace.md). The question text above each closing paragraph is
+left exactly as it was written, because a decision is only legible against the question it
+answered. **Still open: §8.6** (a bounded drain at shutdown, and whether it belongs to the
+runtime or to L2) and **§8.8** (a local transport, and which one per platform). A ninth
+question — a session concept and a stable producer name — was raised in
+[0001](../decisions/0001-sequence-field.md) §8 for this section and never added here; it is
+answered by [0008](../decisions/0008-session-identity.md) in that file instead, and is not
+created retroactively merely to strike it out.
+
 **8.1 What unit does weida's credit have, and is any of it receiver-granted at the application
 level?** Today the units are mixed — bytes for the windows, streams for the concurrent-stream
 budgets, messages for `endpoint_queue` [GUARANTEES §6], [PATTERNS §1.3], [PATTERNS §1.4] — and
@@ -1060,6 +1076,12 @@ byte windows plus the stream budget are the whole answer for a stream-native pro
 sub-decision: if credit is ever put on the wire, absolute-limit form (`delivery-count +
 link-credit`) makes it idempotent [amqp10 §5.1], which is a choice to make once.
 
+**Closed by [0003](../decisions/0003-credit-unit.md):** L0 carries no application credit at
+all — QUIC's byte windows are the byte credit and the concurrent-stream budget is the message
+credit, both receiver-granted and both already absolute and idempotent. L2 gets an explicit
+per-subscription message credit on the control connection, in the absolute delivery-limit form
+this entry named as the choice to make once; bytes stay with the transport.
+
 **8.2 Does the per-connection window's head-of-line coupling need a fix?** weida's connection
 window is shared, so one slow reader stalls every writer on the connection [PATTERNS §1.3].
 MQTT forbids exactly this for its own control traffic — acknowledgements, subscriptions and
@@ -1067,6 +1089,14 @@ pings "never stall behind a blocked publish path" [mqtt5 §5]. The decision is w
 and bulk traffic must be separated (separate connections, or a reserved window), and it becomes
 load-bearing for any adapter that multiplexes many foreign sessions onto one weida connection
 (§7.2).
+
+**Closed by [0002](../decisions/0002-control-and-bulk-separation.md):** separated, as
+connections rather than as a reserved window — one control connection per peer and one bulk
+connection per dialled path, bound together by the proved fingerprint
+([0008](../decisions/0008-session-identity.md) §4.2). The cost is measured: ~1.1 ms of
+handshake and under a megabyte of resident state for the pair
+([IMPLEMENTATION.md](../IMPLEMENTATION.md) §4, B-011), against head-of-line coupling that is
+unbounded.
 
 **8.3 Which acknowledgement states does L2 actually need, and what exactly certifies each?**
 `Accepted`, `Stored`, `Replicated(n)` and `Processed` are reserved with precise definitions and
@@ -1094,6 +1124,14 @@ detection, which today "needs a sequence field the wire does not have"
 detection in the shape of Kafka's `OUT_OF_ORDER_SEQUENCE_NUMBER` [kafka §11]. The decision is
 the scope — per producer, per key, per stream — and whether it belongs on the L0 wire or only
 in L2.
+
+**Closed by [0001](../decisions/0001-sequence-field.md):** two separate L0 DATA keys, not one —
+a monotone per-producer sequence scoped to (producer, endpoint or topic) for ordering and gap
+detection, and a distinct producer identity for bounded deduplication; `PerProducer` in a detect
+and a reassemble mode, `PerKey` closed as L2-only. Pub/Sub drop detection is the requirement
+that puts the counter at L0 rather than in L2. The producer key's encoding was left open there
+and is settled by [0008](../decisions/0008-session-identity.md) §4.4: absent by default, a raw
+32-byte `bstr` otherwise. Both keys are now in [PROTOCOL §6.2], marked spec ahead of code.
 
 **8.5 Should a refusal ever be guaranteed to beat the transport receipt?** Today a one-way
 transfer small enough to fit in flight can be acknowledged by the peer's transport before its

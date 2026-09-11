@@ -495,6 +495,28 @@ across the live ones, and `peer_count()` counts only peers whose connection is s
 `add()` reaps closed entries as it appends, so the set cannot grow with uptime — at most one
 dead entry per loss survives, until the next `connect()`.
 
+**Two tiers, and what binds them** (decided, not yet built —
+[decisions/0002](decisions/0002-control-and-bulk-separation.md),
+[PROTOCOL.md](PROTOCOL.md) §2.5). The pool becomes two tiers over the same
+`quinn::Endpoint`: one **control** entry per peer, and one **bulk** entry per dialled path.
+The pool key above gains the tier and, for bulk, the path; everything else about it stays,
+because the reason each part is load-bearing does not change. What ties a bulk entry to its
+control entry is the **proved fingerprint and nothing else**
+([decisions/0008](decisions/0008-session-identity.md) §4.2): no field names the control
+connection, a bulk connection whose peer proved a different key is a different peer, and two
+connections that proved no key at all — anonymous clients — are never treated as one peer.
+`Option<Fingerprint> from the address` remains a *dialling expectation*; the identity is what
+the handshake proved.
+
+Each tier carries its own `Limits` profile ([PROTOCOL.md](PROTOCOL.md) §10.1): `control` sized
+for a few short frames, `bulk` for payload, and the two are separate budgets rather than one
+shared one. A per-peer connection count (`max_connections_per_peer`) bounds the pair, because
+one connection per path otherwise lets a peer choose the number — 64 connections to one peer
+measured ~50 MiB of transport state across both ends, against a ~1.1 ms handshake each
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-011). That measurement is also why the control
+connection is not lazy: a millisecond and under a megabyte buys the isolation that no amount of
+window tuning inside one connection can.
+
 ### TLS
 
 Server: the binding's `Identity` supplies the certificate chain and key — from files or from

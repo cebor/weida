@@ -55,9 +55,15 @@ the accept queue).*
 Flow control is per stream and per connection, and the two behave differently:
 
 - **Per stream, transfers are isolated.** A stream nobody reads does not delay its siblings.
-- **Per connection, one slow reader stalls everyone.** The connection window is shared by every
-  stream on the connection. Unread streams consume it; when it is spent, every writer on the
-  connection blocks until the slow reader consumes at least an eighth of the window.
+- **Per connection, one slow reader stalls every other writer on that connection.** The
+  connection window is shared by every stream on the connection. Unread streams consume it;
+  when it is spent, every writer on the connection blocks until the slow reader consumes at
+  least an eighth of the window. Once the two connection tiers of
+  [decisions/0002](decisions/0002-control-and-bulk-separation.md) exist, "everyone" means
+  **bulk writers on the same path's connection** and nothing else: a control frame travels on
+  its own connection and cannot be withheld by stalled payload
+  ([PROTOCOL.md](PROTOCOL.md) §2.5). Today there is one connection per peer, so the narrower
+  statement is the one to design against and the wider one is what the tree still does.
 - **The header spends the window too.** The DATA header rides on the transfer's own stream, so
   the payload that fits in one window is `stream_receive_window - header`, and the last eighth
   only clears once the application reads. A payload sized exactly to the window therefore
@@ -81,6 +87,15 @@ transfer still owns its stream.
 `a_replier_that_stops_accepting_stalls_requesters_after_the_queue_fills` (bidi budget 2,
 queue 1: exactly two exchanges complete, the third waits in `open`, one `accept` releases it).*
 
+**The stream budget *is* weida's message credit at L0.** There is no application credit, at
+L0 or on the wire: QUIC's byte windows are the byte credit and the concurrent-stream budget is
+the message credit, both receiver-granted through transport parameters and both absolute and
+idempotent ([decisions/0003](decisions/0003-credit-unit.md) §4.1). A consumer that wants a
+prefetch of *n* messages grants `max_concurrent_uni_streams = n` on the connection it reads
+from — a bulk connection, once the tiers of §1.3 exist — and that is the whole mechanism
+[0003 §5]. A per-subscription message credit arrives with the L2 broker and travels on the
+control connection, never at L0 [0003 §4.2].
+
 ### 1.5 Cancel: never EOF, not a retraction
 
 `OutgoingTransfer::cancel` (and dropping an unfinished transfer) resets the stream. The reader
@@ -99,10 +114,16 @@ A peer refuses a one-way transfer with `STOP_SENDING` and a code (`UNKNOWN_ENDPO
 `UNSUPPORTED`, `REJECTED`). That is an application act, and it races the transport
 acknowledgement: a payload that fits in flight can be acknowledged by the peer's transport
 before its application refuses it, and `delivered()` then resolves `Ok` — truthfully, since a
-receipt says nothing about the application, including that it said no. The refusal is
-guaranteed to be observed only when the transfer cannot complete without the application
-acting, which is any payload beyond the stream receive window. Req/Rep has no such race: its
-refusal is an ERROR frame written by the application on the reply half.
+receipt says nothing about the application, including that it said no. **This is a decided
+position, not an open question** ([decisions/0005](decisions/0005-refusal-race.md)): no
+application-level signal is added to the L0 wire to order a refusal ahead of the receipt, and
+the deterministic counterpart is the reserved `Accepted` of an L2 broker hop. A refusal is
+guaranteed to be observed in exactly two constructions [0005 §4.3]: a payload beyond the peer's
+stream receive window, where flow control forces the application to act before the write can
+finish, and an exchange, whose ERROR frame is written by the application on the reply half and
+takes precedence over the request half's receipt. Once the receipt has resolved, a later
+refusal reaches **no observer at all** — the `Delivery` is consumed, and no counter, metric or
+late error is added for it [0005 §4.4].
 
 *`push_to_an_unknown_path_is_reported`, `push_to_rep_path_is_unsupported`,
 `a_publisher_path_refuses_inbound_transfers` (all with 2 MiB payloads for this reason);
@@ -114,7 +135,12 @@ Bytes within a stream arrive in order. Streams arrive in no particular order rel
 other: a peer that opens A then B may see B dispatched first. Every pattern's ordering is
 therefore `None` across messages ([GUARANTEES.md](GUARANTEES.md) §6), and the within-stream
 order is the only order there is. An application that needs message order must carry it in
-the payload or keep one long-lived stream (§5).
+the payload or keep one long-lived stream (§5). The sequence key of
+[PROTOCOL.md](PROTOCOL.md) §6.2 will let a receiver *detect* a gap or reassemble in order, and
+the cost of reassembling is measured: reverse-order completion forces a reorder buffer of
+N − 1 of the transfers in flight, and 84 of 256 were held with no adversarial pattern at all
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-010). Ordering is not free at the receiver, which
+is why it is negotiated rather than default ([GUARANTEES.md](GUARANTEES.md) §3).
 
 ### 1.8 Liveness: idle timeout, keep-alive, no reconnect
 
@@ -223,7 +249,14 @@ windows. Spreading work by capacity rather than by turn is broker work (L2).
 ## 4. Pub/Sub
 
 One unidirectional stream per subscriber per message, opened by the publisher's per-subscriber
-writer. Filters are byte prefixes carried in SUBSCRIBE/UNSUBSCRIBE frames.
+writer. Filters are **segmented patterns** carried in SUBSCRIBE/UNSUBSCRIBE frames: segments
+separated by `.`, `*` for exactly one whole segment, a trailing `#` for zero or more segments,
+everything else literal ([PROTOCOL.md](PROTOCOL.md) §6.4,
+[decisions/0007](decisions/0007-topic-namespace.md) §4.2). `sensors.*.temp` selects one
+segment, `sensors.#` selects `sensors` and everything under it, and `sensors.temp` does *not*
+select `sensors.temperature` — which a byte prefix did, and which is the reason the grammar
+changed. Endpoint **paths** are untouched by any of this: they stay opaque and are matched
+exactly [0007 §4.1].
 
 | | `Publisher` (`Pub`) | `Subscriber` (`Sub`) |
 | --- | --- | --- |
@@ -250,10 +283,17 @@ Failure modes:
 | Message beyond the budget | `LimitExceeded`, nothing sent | — |
 
 This is the one place weida answers overload by discarding, and it is confined to fan-out
-([GUARANTEES.md](GUARANTEES.md) §6). A subscriber cannot detect a drop; making loss
-observable needs a sequence field the wire does not have. Streaming fan-out — a publisher that
-hands out a stream per subscriber instead of a `Bytes` — is a recorded deferral.
-*`slow_subscriber_drops_not_blocks`, `subscribe_prefix_filters_topics`.*
+([GUARANTEES.md](GUARANTEES.md) §6). Today a subscriber cannot detect a drop; **subscriber-side
+drop detection is what the sequence key of [PROTOCOL.md](PROTOCOL.md) §6.2 exists for**
+([decisions/0001](decisions/0001-sequence-field.md) §7.2). A subscriber that has negotiated
+the detect level of `PerProducer` sees the gap — how many messages were missed, expected
+against seen — without anything being held back, which is the honest answer to a policy that
+drops on purpose. The reassemble level holds messages instead, at the buffer cost measured in
+[IMPLEMENTATION.md](IMPLEMENTATION.md) §4 (B-010). Neither is on the wire yet
+([PROTOCOL.md](PROTOCOL.md) §11). Streaming fan-out — a publisher that hands out a stream per
+subscriber instead of a `Bytes` — is a recorded deferral.
+*`slow_subscriber_drops_not_blocks`, `subscribe_prefix_filters_topics` (renamed and extended
+with the grammar when the matcher lands).*
 
 ---
 
@@ -295,3 +335,4 @@ publishers and binding pushers are recorded deferrals.
 | ordered messages to one peer | a raw stream | QUIC orders bytes within a stream and nowhere else (§1.7, §5) |
 | a signal larger than `subscriber_buffer_bytes` to many readers | a raw stream per reader, until streaming fan-out exists | Pub/Sub materializes a copy per subscriber (§4) |
 | proof the peer's application acted | Req/Rep, or an L2 broker (Phase 6) | a transport receipt never says that (§1.2); `Accepted`/`Stored`/`Processed` are reserved for a hop that owns the message |
+| to know whether the receiver accepted it | Req/Rep | a one-way refusal can lose the race with the receipt and then reaches no observer (§1.6, [decisions/0005](decisions/0005-refusal-race.md) §4.3) |
