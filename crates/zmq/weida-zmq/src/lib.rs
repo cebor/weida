@@ -153,5 +153,7 @@ pub use pubsub::{PubSocket, SubSocket};
 pub use reqrep::{RepSocket, ReqSocket};
 pub use session::{Incoming, Negotiated, Wire, ZmtpSession};
 pub use socket::{Delivered, SocketCore};
-pub use subscriptions::{SubscriptionForm, Subscriptions};
+pub use subscriptions::{
+    DEFAULT_MAX_SUBSCRIPTION_BYTES, DEFAULT_MAX_SUBSCRIPTIONS, SubscriptionForm, Subscriptions,
+};
 pub use transport::Stream;

@@ -161,7 +161,10 @@ impl SubSocket {
     /// through this socket either.
     pub fn with_options(context: &Context, mut options: SocketOptions) -> Result<SubSocket> {
         options.pipe.incoming.mute = MuteAction::Drop;
-        let mine = Arc::new(Subscriptions::new(options.max_subscriptions));
+        let mine = Arc::new(Subscriptions::new(
+            options.max_subscriptions,
+            options.max_subscription_bytes,
+        ));
         let session = ZmtpSession::subscribing(SocketType::Sub, Arc::clone(&mine));
         Ok(SubSocket {
             core: SocketCore::with_session(context, SocketType::Sub, options, Arc::new(session))?,

@@ -474,6 +474,7 @@ impl Engine {
                     identity: AnnouncedIdentity::default(),
                     subscriptions: Arc::new(Subscriptions::new(
                         self.inner.options.max_subscriptions,
+                        self.inner.options.max_subscription_bytes,
                     )),
                     endpoint: Some(endpoint.clone()),
                     connected: false,
@@ -780,7 +781,10 @@ impl EngineInner {
             PeerEntry {
                 pipe,
                 identity: AnnouncedIdentity::default(),
-                subscriptions: Arc::new(Subscriptions::new(self.options.max_subscriptions)),
+                subscriptions: Arc::new(Subscriptions::new(
+                    self.options.max_subscriptions,
+                    self.options.max_subscription_bytes,
+                )),
                 endpoint,
                 connected: true,
                 attempts: 0,
@@ -891,9 +895,12 @@ async fn accept_loop(ctx: TaskCtx, listener: TcpListener, endpoint: Endpoint) {
             Admitted::SocketClosed => return,
         };
         let identity = engine.identity_slot(peer).unwrap_or_default();
-        let subscriptions = engine
-            .subscriptions_of(peer)
-            .unwrap_or_else(|| Arc::new(Subscriptions::new(ctx.options.max_subscriptions)));
+        let subscriptions = engine.subscriptions_of(peer).unwrap_or_else(|| {
+            Arc::new(Subscriptions::new(
+                ctx.options.max_subscriptions,
+                ctx.options.max_subscription_bytes,
+            ))
+        });
         drop(engine);
 
         let ctx = ctx.clone();
@@ -942,9 +949,12 @@ async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
             return;
         };
         let identity = engine.identity_slot(peer).unwrap_or_default();
-        let subscriptions = engine
-            .subscriptions_of(peer)
-            .unwrap_or_else(|| Arc::new(Subscriptions::new(ctx.options.max_subscriptions)));
+        let subscriptions = engine.subscriptions_of(peer).unwrap_or_else(|| {
+            Arc::new(Subscriptions::new(
+                ctx.options.max_subscriptions,
+                ctx.options.max_subscription_bytes,
+            ))
+        });
         drop(engine);
 
         match dial(&ctx, &endpoint).await {

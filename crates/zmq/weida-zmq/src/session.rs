@@ -849,6 +849,7 @@ mod tests {
             identity: crate::engine::AnnouncedIdentity::default(),
             subscriptions: Arc::new(Subscriptions::new(
                 crate::subscriptions::DEFAULT_MAX_SUBSCRIPTIONS,
+                crate::subscriptions::DEFAULT_MAX_SUBSCRIPTION_BYTES,
             )),
         };
         let session = ZmtpSession::new(ours);
