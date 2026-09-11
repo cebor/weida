@@ -61,7 +61,19 @@ they cost 1.5 ms today) while the control connection stays eager.
 **Regression caught in passing:** `connect/cold_handshake` is **+12 %** (1.02-1.10 ms to
 1.18-1.24 ms, p = 0.00) since B-016, because `Exec::resolve` spawns a task and awaits a join
 handle on every `connect` even for a literal `127.0.0.1`. Filed as **B-025**, not fixed inside
-a measure item. Both recorded in IMPLEMENTATION.md §4.
+a measure item. Both recorded in IMPLEMENTATION.md §4. **Fixed by B-025:** back to
+**1.05-1.09 ms**, `change: −11.6 % (p = 0.00)`.
+
+**B-021 — segment matching in the fan-out path.**
+`cargo bench -p weida --bench patterns -- filters` (release, loopback). One connection holds N
+filters the topic matches none of, so a publish is N matcher calls and nothing else; N = 1
+against N = 64 subtracts the fixed cost out. **14.7 ns per filter** for a literal mismatch,
+**14.3 ns** for a middle `*`, **15.1 ns** for a trailing `#` — the shape does not matter, so
+the grammar is not the cost, registry iteration is. Sixty-four filters cost ~**1 µs** of a
+publish against **64.5 µs** for one matched eight-subscriber fan-out: under 2 %. The byte
+prefix it replaced is 0.46 ns per comparison as a pure function, which is the honest scale —
+and what it could not do at any price is express a segment boundary. Recorded in
+IMPLEMENTATION.md §4.
 
 ## Chronology
 
@@ -89,3 +101,4 @@ a measure item. Both recorded in IMPLEMENTATION.md §4.
 2026-09-11T06:45Z | B-024 | done 11c31d0 | new example `owned_runtime.rs`: a full Req/Rep exchange from a plain `fn main` under `futures::executor::block_on`, payload through the `futures-io` traits, halves joined rather than spawned because an executor with no reactor has nothing to spawn onto; README gained a "No reactor of your own" section naming all three constructors; verified by running it | next B-026, unless B-013 or B-020 is delivered first
 2026-09-11T07:00Z | B-013 | done 2a43e70 | `b013-data-keys` merged `--no-ff` and gated here (232 tests): DATA key 6 `sequence: Option<u64>`, key 7 `producer: Option<[u8; 32]>` — the array type makes a wrong length unconstructable and sharpened PROTOCOL §6.2 from "cap 32 B" to *exactly* 32, which I carried into the key table; sequenced and relayed golden vectors, fuzz targets extended, pinned v0 vectors byte-identical | next B-020's merge
 2026-09-11T07:02Z | B-020 | done 6250448 | `b020-segment-filter` merged `--no-ff` (carrying B-013) and gated here (**244 tests**): the segment walker replaces the byte prefix, `weida_protocol::filter::validate` rejects a misplaced `*` or `#` at the codec boundary as `HeaderError::InvalidFilter`, `Subscriber::subscribe` refuses locally, and `subscribe_filters_topics_by_segment` pins that `sensors.temp` no longer selects `sensors.temperature`. The implementation and PROTOCOL §6.4 agree again, so the Status section is history rather than a pending defect (b4f77b3) | next B-021; B-014 and B-015 delegated on `b014-hello-guarantees` and `b015-detect-dedup`
+2026-09-11T07:25Z | B-021 | done 2c157ac | `filters` group in `benches/patterns.rs` prices the segment matcher through the public API (N = 1 vs N = 64 non-matching filters): 14.3-15.1 ns per filter, shape-independent, ~1 µs for 64 filters against 64.5 µs for one fan-out; full gate green, 244 tests; numbers above and in IMPLEMENTATION.md §4 | next B-026
