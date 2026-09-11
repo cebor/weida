@@ -164,12 +164,13 @@ pub(crate) struct ConnDrain {
     /// the QUIC one was a bug B-059 found by measuring: a parked receipt holds
     /// its send half, which there is an OS connection counted against
     /// `max_local_streams`, so a parked set sized 1024+1024 quietly consumed
-    /// all 255 descriptors and the next `open` failed with `LimitExceeded`
-    /// after 127 sequential exchanges — nothing in flight, nothing wrong, no
-    /// way for the caller to know. Locally the cap is therefore **half** the
-    /// local ceiling: parked receipts may hold at most half the descriptors,
-    /// which leaves the other half to open with, and a drain still sees every
-    /// receipt whose outcome is open.
+    /// all 255 descriptors and the next `open` failed with `LimitExceeded` —
+    /// nothing in flight, nothing wrong, no way for the caller to know.
+    /// Locally the cap is therefore **half** the local ceiling: parked
+    /// receipts may hold at most half the descriptors, which leaves the other
+    /// half to open with, and a drain still sees every receipt whose outcome
+    /// is open. Since that `open` now waits for a slot instead of failing,
+    /// this half is also what keeps the wait finite.
     max_parked: usize,
 }
 

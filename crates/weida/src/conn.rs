@@ -184,14 +184,14 @@ impl ConnCtx {
     }
 
     /// Opens a unidirectional stream.
+    ///
+    /// Waits where the transport has no stream slot free: on QUIC inside
+    /// `quinn`, until the peer raises `max_concurrent_uni_streams`; on a local
+    /// transport inside `max_local_streams`. Either way this is `Block`
+    /// (`docs/GUARANTEES.md` §6) and the deadline is the caller's.
     pub(crate) async fn open_uni(&self) -> Result<SendHalf, Error> {
-        match self.conn.open_uni().await {
-            Err(Error::LimitExceeded) => {
-                self.reap_parked();
-                self.conn.open_uni().await
-            }
-            other => other,
-        }
+        self.free_local_slots();
+        self.conn.open_uni().await
     }
 
     /// Opens a bidirectional stream.
@@ -200,17 +200,12 @@ impl ConnCtx {
     /// the DATA header is always written first, so an exchange never announces
     /// itself before it says what it is.
     pub(crate) async fn open_bi(&self) -> Result<(SendHalf, RecvHalf), Error> {
-        match self.conn.open_bi().await {
-            Err(Error::LimitExceeded) => {
-                self.reap_parked();
-                self.conn.open_bi().await
-            }
-            other => other,
-        }
+        self.free_local_slots();
+        self.conn.open_bi().await
     }
 
-    /// Frees the parked receipts that have already settled, then lets the
-    /// caller try again.
+    /// Frees the parked receipts that have already settled, when a local
+    /// transport has no slot left for the open that follows.
     ///
     /// This exists because of what a stream slot **is** on a local transport:
     /// one OS connection or one channel pair, counted against
@@ -221,14 +216,19 @@ impl ConnCtx {
     /// bounded by the QUIC stream budgets, which have nothing to do with that
     /// local ceiling, so a long run of local transfers used to exhaust the
     /// descriptors while the parked set sat below its own cap, quite happy:
-    /// `LimitExceeded` after 127 sequential exchanges (255 slots, two per
-    /// exchange), with nothing in flight and nothing wrong.
+    /// `LimitExceeded` with nothing in flight and nothing wrong. Since the
+    /// local open waits instead of failing, not reaping here would turn that
+    /// into a wait nobody can end.
     ///
-    /// Reaping only on pressure keeps the cost where it belongs. The QUIC path
-    /// never reaches this, because a QUIC stream slot is not a descriptor and
-    /// `LimitExceeded` there means the *peer's* budget is full, which reaping
-    /// this side cannot fix — the second attempt then fails identically.
-    fn reap_parked(&self) {
+    /// Reaping only on pressure keeps the cost where it belongs: the check is
+    /// one atomic load, and the walk happens only with every slot taken.
+    /// The QUIC path never reaches it, because a QUIC stream slot is not a
+    /// descriptor — a full budget there is the *peer's*, which reaping this
+    /// side cannot fix.
+    fn free_local_slots(&self) {
+        if !self.conn.local_slots_exhausted() {
+            return;
+        }
         let freed = self.parked.reap();
         if freed > 0 {
             tracing::debug!(

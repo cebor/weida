@@ -221,10 +221,13 @@ transfer is one channel pair (inproc) or one OS connection (`AF_UNIX`).
   true by construction. What replaces it is a descriptor count — every live transfer is a
   file descriptor, bounded by `max_local_streams` (255, the number Windows' pipe instance cap
   fixes) rather than by a stream budget.
-- **§1.4's stream budget becomes that descriptor count.** `open` fails with
-  `Error::LimitExceeded` at the local ceiling instead of parking until a stream frees up, so
-  the backpressure is an error rather than a wait. A caller that wants the QUIC behaviour
-  retries.
+- **§1.4's stream budget becomes that descriptor count.** `open` waits for a descriptor at
+  the local ceiling exactly as it waits for a QUIC stream at the peer's budget: the
+  backpressure is a wait on every transport, bounded by the caller's own deadline and
+  cancelled by dropping the future (B-059). A descriptor comes free when a transfer ends,
+  which locally means when both ends are done with it — so a consumer that stops reading
+  slows its producer down instead of failing it. What `LimitExceeded` still means locally is
+  a refusal somebody decided on, the reverse pool of §4 below, and never a busy transport.
 - **§1.8's liveness is the kernel's.** There is no idle timeout and no keep-alive locally: a
   peer that goes away closes its socket or drops its channel, which arrives as
   `ConnectionLost(PeerClosed)` on the next operation. That is a *better* signal than a timer,

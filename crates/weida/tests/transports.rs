@@ -431,10 +431,10 @@ async fn pub_sub_over_inproc() {
 /// The bug this pins, found by measuring in B-059 rather than by reading:
 /// locally a stream **is** an OS object counted against `max_local_streams`
 /// (255), and a receipt parked for the drain holds its send half — so a
-/// parked set sized by QUIC's stream budgets held every descriptor and the
-/// 128th sequential exchange failed with `LimitExceeded`, with nothing in
-/// flight and nothing wrong. A thousand exchanges is four times the ceiling,
-/// so any per-transfer leak fails this well before the end.
+/// parked set sized by QUIC's stream budgets held every descriptor and a
+/// sequential run failed with `LimitExceeded` part way through, with nothing
+/// in flight and nothing wrong. A thousand exchanges is four times the
+/// ceiling, so any per-transfer leak fails this well before the end.
 async fn sequential_exchanges_reclaim_their_slots(h: &Harness) {
     const EXCHANGES: u32 = 1000;
 
@@ -482,6 +482,102 @@ async fn sequential_exchanges_reclaim_their_slots_over_inproc() {
 async fn sequential_exchanges_reclaim_their_slots_over_unix() {
     let h = Harness::start(Transport::Unix).await;
     sequential_exchanges_reclaim_their_slots(&h).await;
+    h.shutdown().await;
+}
+
+/// Claim: a local `open` waits for a free stream slot, so a fire-and-forget
+/// sender that outruns its puller is slowed down and every message still
+/// arrives.
+///
+/// What this pins, the second thing B-059 found by measuring: locally a
+/// stream **is** an OS object counted against `max_local_streams` (255) —
+/// one socket on `AF_UNIX`, one channel pair in process — and a transfer
+/// holds its slot until both ends are done with it. A sender that outruns
+/// its puller therefore reaches the ceiling with nothing wrong, and `open`
+/// used to refuse there with `LimitExceeded`: `Reject` where
+/// `docs/GUARANTEES.md` §6 promises `Block`, and on inproc a slow puller hit
+/// it after 256 sequential sends. The local open now parks on a slot exactly
+/// as QUIC's parks on the peer's stream budget, so the run completes at the
+/// puller's pace.
+///
+/// The sends are concurrent because that is what a fire-and-forget sender
+/// does and what reaches the ceiling on both transports: `AF_UNIX` frees a
+/// slot as soon as the sending side is done with the socket, so only
+/// outstanding transfers can pile up there.
+async fn push_pull_waits_for_a_slot(h: &Harness) {
+    /// More than twice `max_local_streams`, so the ceiling is reached with
+    /// hundreds of sends still to place.
+    const MESSAGES: usize = 600;
+    /// Per message: far slower than a local send, which is what makes the
+    /// transfers pile up against the ceiling.
+    const PULL_DELAY: Duration = Duration::from_micros(500);
+
+    let puller = h.listener.puller("/jobs").expect("puller");
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pulling = tokio::spawn(async move {
+        for _ in 0..MESSAGES {
+            tokio::time::sleep(PULL_DELAY).await;
+            let Ok(transfer) = puller.recv().await else {
+                break;
+            };
+            let Ok(body) = transfer.collect(64).await else {
+                break;
+            };
+            if seen_tx.send(body).is_err() {
+                break;
+            }
+        }
+    });
+
+    let client = h.client();
+    let pusher = client.pusher(h.trust());
+    within(pusher.connect(&h.url("/jobs")))
+        .await
+        .expect("connect");
+    let sends = (0..MESSAGES).map(|i| {
+        let pusher = &pusher;
+        async move {
+            pusher
+                .send(i.to_string().as_bytes())
+                .await
+                .unwrap_or_else(|e| panic!("send {i} of {MESSAGES} failed: {e:?}"));
+        }
+    });
+    within(futures::future::join_all(sends)).await;
+
+    // Every message, not every message in order: Push makes no ordering
+    // promise across transfers, and one connection per transfer is exactly
+    // the reason ([0010 §4.2]).
+    let mut arrived = Vec::with_capacity(MESSAGES);
+    for i in 0..MESSAGES {
+        let body = within(seen_rx.recv())
+            .await
+            .unwrap_or_else(|| panic!("only {i} of {MESSAGES} messages arrived"));
+        let text = String::from_utf8(body.to_vec()).expect("payload is its index");
+        arrived.push(text.parse::<usize>().expect("payload is its index"));
+    }
+    arrived.sort_unstable();
+    assert_eq!(
+        arrived,
+        (0..MESSAGES).collect::<Vec<_>>(),
+        "every pushed message must arrive exactly once"
+    );
+    within(pulling).await.expect("puller");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn push_pull_waits_for_a_slot_over_inproc() {
+    let h = Harness::start(Transport::Inproc).await;
+    push_pull_waits_for_a_slot(&h).await;
+    h.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn push_pull_waits_for_a_slot_over_unix() {
+    let h = Harness::start(Transport::Unix).await;
+    push_pull_waits_for_a_slot(&h).await;
     h.shutdown().await;
 }
 

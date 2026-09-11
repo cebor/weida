@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use weida_core::{Error, LossCause};
 use weida_protocol::codes;
 
@@ -109,9 +109,10 @@ pub(crate) struct LocalConn {
     uni_from_peer: tokio::sync::Mutex<mpsc::UnboundedReceiver<LocalRecv>>,
     bi_from_peer: tokio::sync::Mutex<mpsc::UnboundedReceiver<(LocalSend, LocalRecv)>>,
     state: Arc<LinkState>,
-    /// Live streams over this connection, bounded by `max_local_streams`.
-    live: Arc<AtomicUsize>,
-    max_streams: usize,
+    /// The slots live streams over this connection hold, one permit each:
+    /// `max_local_streams` of them, and an `open` with none free waits for
+    /// one rather than failing (`docs/GUARANTEES.md` §6).
+    slots: Arc<Semaphore>,
     buffer: usize,
 }
 
@@ -170,7 +171,7 @@ impl LocalConn {
         });
         // One budget per connection, shared by both directions: what the cap
         // bounds is the live transfers on this connection.
-        let live = Arc::new(AtomicUsize::new(0));
+        let slots = Arc::new(Semaphore::new(max_streams));
         let id = NEXT_ID.fetch_add(2, Ordering::Relaxed);
         (
             LocalConn {
@@ -180,8 +181,7 @@ impl LocalConn {
                 uni_from_peer: tokio::sync::Mutex::new(a_uni_rx),
                 bi_from_peer: tokio::sync::Mutex::new(a_bi_rx),
                 state: Arc::clone(&state),
-                live: Arc::clone(&live),
-                max_streams,
+                slots: Arc::clone(&slots),
                 buffer,
             },
             LocalConn {
@@ -191,8 +191,7 @@ impl LocalConn {
                 uni_from_peer: tokio::sync::Mutex::new(b_uni_rx),
                 bi_from_peer: tokio::sync::Mutex::new(b_bi_rx),
                 state,
-                live,
-                max_streams,
+                slots,
                 buffer,
             },
         )
@@ -220,23 +219,38 @@ impl LocalConn {
         }
     }
 
-    /// A slot for one more live stream, or `LimitExceeded` at the cap.
-    fn slot(&self) -> Result<StreamSlot, Error> {
-        let live = self.live.fetch_add(1, Ordering::Relaxed);
-        if live >= self.max_streams {
-            self.live.fetch_sub(1, Ordering::Relaxed);
-            return Err(Error::LimitExceeded);
-        }
-        Ok(StreamSlot {
-            live: Arc::clone(&self.live),
-        })
+    /// Whether every slot is taken right now.
+    ///
+    /// One atomic load, for the caller that has something to free before it
+    /// parks on a slot (`ConnCtx::open_uni`).
+    pub(crate) fn slots_exhausted(&self) -> bool {
+        self.slots.available_permits() == 0
     }
 
-    pub(crate) fn open_uni(&self) -> Result<LocalSend, Error> {
+    /// A slot for one more live transfer, waiting for one where the cap is
+    /// reached.
+    ///
+    /// This is the local shape of what `quinn` does with the peer's
+    /// `max_concurrent_uni_streams`: an `open` with no budget left parks
+    /// until a stream ends, and the deadline is the caller's, not the
+    /// transport's. Dropping the future is the cancellation, and it takes
+    /// nothing with it, because a waiter holds no slot.
+    async fn slot(&self) -> Result<Arc<StreamSlot>, Error> {
+        let waiting = Arc::clone(&self.slots).acquire_owned();
+        tokio::select! {
+            permit = waiting => match permit {
+                Ok(permit) => Ok(Arc::new(StreamSlot { _permit: permit })),
+                Err(_) => Err(Error::ConnectionLost(LossCause::PeerClosed)),
+            },
+            reason = self.closed() => Err(reason),
+        }
+    }
+
+    pub(crate) async fn open_uni(&self) -> Result<LocalSend, Error> {
         if let Some(closed) = self.state.close_reason() {
             return Err(closed);
         }
-        let slot = self.slot()?;
+        let slot = self.slot().await?;
         let (send, recv) = stream_pair(self.buffer, slot);
         self.uni_to_peer
             .send(recv)
@@ -244,12 +258,16 @@ impl LocalConn {
         Ok(send)
     }
 
-    pub(crate) fn open_bi(&self) -> Result<(LocalSend, LocalRecv), Error> {
+    pub(crate) async fn open_bi(&self) -> Result<(LocalSend, LocalRecv), Error> {
         if let Some(closed) = self.state.close_reason() {
             return Err(closed);
         }
-        let (send, peer_recv) = stream_pair(self.buffer, self.slot()?);
-        let (peer_send, recv) = stream_pair(self.buffer, self.slot()?);
+        // One transfer, one slot, as on the socket transports where an
+        // exchange is one connection [0012 §4.3]: the two channel pairs an
+        // in-process exchange needs share it and release it together.
+        let slot = self.slot().await?;
+        let (send, peer_recv) = stream_pair(self.buffer, Arc::clone(&slot));
+        let (peer_send, recv) = stream_pair(self.buffer, slot);
         self.bi_to_peer
             .send((peer_send, peer_recv))
             .map_err(|_| Error::ConnectionLost(LossCause::PeerClosed))?;
@@ -273,15 +291,10 @@ impl LocalConn {
     }
 }
 
-/// Keeps one live stream counted against `max_local_streams`.
+/// Keeps one live stream counted against `max_local_streams`: the permit is
+/// returned when both halves of the stream are gone.
 struct StreamSlot {
-    live: Arc<AtomicUsize>,
-}
-
-impl Drop for StreamSlot {
-    fn drop(&mut self) {
-        self.live.fetch_sub(1, Ordering::Relaxed);
-    }
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Per-stream signalling: the two codes that cross it and the FIN.
@@ -293,10 +306,10 @@ struct Signal {
     /// Set by the writer: the payload ended cleanly (FIN).
     finished: AtomicBool,
     changed: Notify,
-    _slot: StreamSlot,
+    _slot: Arc<StreamSlot>,
 }
 
-fn stream_pair(buffer: usize, slot: StreamSlot) -> (LocalSend, LocalRecv) {
+fn stream_pair(buffer: usize, slot: Arc<StreamSlot>) -> (LocalSend, LocalRecv) {
     let (writer, reader) = tokio::io::duplex(buffer);
     let signal = Arc::new(Signal {
         stop: AtomicU64::new(NO_CODE),
@@ -472,6 +485,8 @@ impl Drop for LocalRecv {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -487,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn a_stream_carries_bytes_and_its_fin() {
         let (a, _b) = LocalConn::pair(8, 64 * 1024);
-        let mut send = a.open_uni().expect("open");
+        let mut send = a.open_uni().await.expect("open");
         send.write_all(b"payload").await.expect("write");
         send.finish().expect("finish");
         let mut recv = _b.accept_uni().await.expect("accept");
@@ -498,25 +513,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_stream_budget_bounds_live_transfers() {
-        let (a, _b) = LocalConn::pair(2, 1024);
-        let _one = a.open_uni().expect("first");
-        let _two = a.open_uni().expect("second");
+    async fn the_stream_budget_makes_an_open_wait_for_a_slot() {
+        let (a, b) = LocalConn::pair(2, 1024);
+        let _one = a.open_uni().await.expect("first");
+        let _two = a.open_uni().await.expect("second");
+        let third = tokio::spawn(async move {
+            a.open_uni().await.expect("the third waits for a slot");
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            matches!(a.open_uni(), Err(Error::LimitExceeded)),
+            !third.is_finished(),
             "max_local_streams must bound live transfers"
         );
         drop(_one);
         // The slot is returned when both halves of that stream are gone.
-        let accepted = _b.accept_uni().await.expect("accept");
+        let accepted = b.accept_uni().await.expect("accept");
         drop(accepted);
-        a.open_uni().expect("a slot came free");
+        tokio::time::timeout(Duration::from_secs(5), third)
+            .await
+            .expect("a slot came free")
+            .expect("the waiting open completed");
     }
 
     #[tokio::test]
     async fn a_refused_stream_reports_its_code_to_the_writer() {
         let (a, b) = LocalConn::pair(8, 1024);
-        let send = a.open_uni().expect("open");
+        let send = a.open_uni().await.expect("open");
         let mut recv = b.accept_uni().await.expect("accept");
         recv.stop(codes::REJECTED);
         let stopped = send.stopped().await.expect("stopped");
@@ -532,6 +554,9 @@ mod tests {
             a.close_reason(),
             Some(Error::ConnectionLost(LossCause::PeerClosed))
         ));
-        assert!(a.open_uni().is_err(), "a closed connection opens nothing");
+        assert!(
+            a.open_uni().await.is_err(),
+            "a closed connection opens nothing"
+        );
     }
 }

@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use weida_core::{Error, LocalPrincipal, LossCause, PeerIdentity};
 use weida_protocol::codes;
 
@@ -154,24 +154,23 @@ struct Group {
 
 /// The connections one peer parked, and the two bounds they live under.
 ///
-/// `max` is `Limits::max_parked_reverse`, the pool's own ceiling; `live` and
-/// `max_streams` are the connection's `max_local_streams` accounting, which
-/// a parked connection counts against like any other live local connection
-/// [0012 §4.4].
+/// `max` is `Limits::max_parked_reverse`, the pool's own ceiling; `slots` is
+/// the connection's `max_local_streams` accounting, which a parked
+/// connection counts against like any other live local connection
+/// [0012 §4.4]. Both are refusals rather than waits: a pool that cannot grow
+/// is the peer's fan-out budget, not backpressure on a transfer.
 pub(crate) struct ReversePool {
     parked: StdMutex<VecDeque<LocalSend>>,
     max: usize,
-    live: Arc<AtomicUsize>,
-    max_streams: usize,
+    slots: Arc<Semaphore>,
 }
 
 impl ReversePool {
-    fn new(live: Arc<AtomicUsize>, max_streams: usize, max: usize) -> ReversePool {
+    fn new(slots: Arc<Semaphore>, max: usize) -> ReversePool {
         ReversePool {
             parked: StdMutex::new(VecDeque::new()),
             max,
-            live,
-            max_streams,
+            slots,
         }
     }
 
@@ -181,7 +180,7 @@ impl ReversePool {
         if parked.len() >= self.max {
             return false;
         }
-        let Some(slot) = StreamSlot::acquire(&self.live, self.max_streams) else {
+        let Some(slot) = StreamSlot::try_acquire(&self.slots) else {
             return false;
         };
         parked.push_back(LocalSend::new(send, Some(Arc::new(slot))));
@@ -344,11 +343,7 @@ pub(crate) async fn accept_control(
     );
     // The pool is the peer's and the link's at once: the peer fills it over
     // the socket, the link spends it on fan-out [0012 §4.4].
-    let reverse = Arc::new(ReversePool::new(
-        Arc::clone(&link.live),
-        max_streams,
-        max_parked,
-    ));
+    let reverse = Arc::new(ReversePool::new(Arc::clone(&link.slots), max_parked));
     link.reverse = Some(Arc::clone(&reverse));
     link.transfers = tokio::sync::Mutex::new(Some(transfers_rx));
     groups.insert(token, principal, transfers_tx, reverse);
@@ -459,8 +454,10 @@ pub(crate) struct UnixLink {
     /// Parked connections that have been spent and need replacing.
     deficit: Arc<Deficit>,
     peer: Option<LocalPrincipal>,
-    live: Arc<AtomicUsize>,
-    max_streams: usize,
+    /// One permit per live local connection: `max_local_streams` of them, and
+    /// an `open` with none free waits for one rather than failing
+    /// (`docs/GUARANTEES.md` §6). The parked reverse pool shares this budget.
+    slots: Arc<Semaphore>,
     max_parked: usize,
     closed: AtomicU64,
     closed_notify: Notify,
@@ -518,8 +515,7 @@ impl UnixLink {
             parked_rx: tokio::sync::Mutex::new(parked_rx),
             deficit: Arc::new(Deficit::default()),
             peer,
-            live: Arc::new(AtomicUsize::new(0)),
-            max_streams,
+            slots: Arc::new(Semaphore::new(max_streams)),
             max_parked,
             closed: AtomicU64::new(NO_CODE),
             closed_notify: Notify::new(),
@@ -571,8 +567,31 @@ impl UnixLink {
         }
     }
 
-    fn slot(&self) -> Result<StreamSlot, Error> {
-        StreamSlot::acquire(&self.live, self.max_streams).ok_or(Error::LimitExceeded)
+    /// Whether every slot is taken right now.
+    ///
+    /// One atomic load, for the caller that has something to free before it
+    /// parks on a slot (`ConnCtx::open_uni`).
+    pub(crate) fn slots_exhausted(&self) -> bool {
+        self.slots.available_permits() == 0
+    }
+
+    /// A slot for one more local connection, waiting for one where
+    /// `max_local_streams` are already live.
+    ///
+    /// This is the local shape of what `quinn` does with the peer's
+    /// `max_concurrent_uni_streams`: an `open` with no budget left parks until
+    /// a stream ends, and the deadline is the caller's, not the transport's.
+    /// Dropping the future is the cancellation and it releases nothing,
+    /// because a waiter holds no descriptor.
+    async fn slot(&self) -> Result<StreamSlot, Error> {
+        let waiting = Arc::clone(&self.slots).acquire_owned();
+        tokio::select! {
+            permit = waiting => match permit {
+                Ok(permit) => Ok(StreamSlot { _permit: permit }),
+                Err(_) => Err(Error::ConnectionLost(LossCause::LocallyClosed)),
+            },
+            reason = self.closed() => Err(reason),
+        }
     }
 
     /// Opens one stream toward the peer.
@@ -631,7 +650,7 @@ impl UnixLink {
             // is always initiated by the dialling side.
             Side::Accept { .. } => return Err(Error::Unsupported),
         };
-        let slot = self.slot()?;
+        let slot = self.slot().await?;
         let mut stream = UnixStream::connect(socket).await.map_err(Error::Io)?;
         let mut preamble = [0u8; 1 + TOKEN_LEN];
         preamble[0] = KIND_TRANSFER;
@@ -714,7 +733,9 @@ impl UnixLink {
         let Side::Dial { socket, token } = &self.side else {
             return Err(Error::Unsupported);
         };
-        let slot = Arc::new(self.slot()?);
+        // A pool that cannot grow is a refusal, not backpressure: filling it
+        // must never park on a slot a transfer is waiting for.
+        let slot = Arc::new(StreamSlot::try_acquire(&self.slots).ok_or(Error::LimitExceeded)?);
         let mut stream = UnixStream::connect(socket).await.map_err(Error::Io)?;
         let mut preamble = [0u8; 1 + TOKEN_LEN];
         preamble[0] = KIND_REVERSE;
@@ -743,29 +764,24 @@ impl UnixLink {
     }
 }
 
-/// Keeps one live transfer connection counted against `max_local_streams`.
+/// Keeps one live transfer connection counted against `max_local_streams`:
+/// the permit is returned when the last half of that connection is dropped.
 struct StreamSlot {
-    live: Arc<AtomicUsize>,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl StreamSlot {
-    /// Counts one more live local connection, or `None` at the cap: on this
-    /// transport a stream *is* a connection, so `max_local_streams` is a
-    /// file-descriptor count [0010 §4.2].
-    fn acquire(live: &Arc<AtomicUsize>, max_streams: usize) -> Option<StreamSlot> {
-        if live.fetch_add(1, Ordering::Relaxed) >= max_streams {
-            live.fetch_sub(1, Ordering::Relaxed);
-            return None;
-        }
-        Some(StreamSlot {
-            live: Arc::clone(live),
-        })
-    }
-}
-
-impl Drop for StreamSlot {
-    fn drop(&mut self) {
-        self.live.fetch_sub(1, Ordering::Relaxed);
+    /// Counts one more live local connection, or `None` at the cap, without
+    /// waiting: on this transport a stream *is* a connection, so
+    /// `max_local_streams` is a file-descriptor count [0010 §4.2].
+    ///
+    /// Only the callers whose answer to a full budget is a refusal use this;
+    /// a transfer waits, in `UnixLink::slot`.
+    fn try_acquire(slots: &Arc<Semaphore>) -> Option<StreamSlot> {
+        Arc::clone(slots)
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| StreamSlot { _permit: permit })
     }
 }
 
