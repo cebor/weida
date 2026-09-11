@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use quinn::VarInt;
 use tokio::sync::{mpsc, watch};
-use weida_core::{Error, ErrorCode, Fingerprint, Limits};
+use weida_core::{Error, ErrorCode, Fingerprint, Limits, LossCause};
 use weida_protocol::header::GuaranteeSet;
 use weida_protocol::{
     Agreed, DataHeader, ErrorHeader, FrameKind, Hello, MAX_PREAMBLE_LEN, Preamble, PreambleError,
@@ -155,10 +155,12 @@ impl ConnCtx {
                         // The sender is gone because the connection is: the
                         // accept loops and the deadline hold it and end with
                         // it. Report why, not merely that.
-                        return Err(self
-                            .conn
-                            .close_reason()
-                            .map_or(Error::ConnectionLost, conn_error));
+                        return Err(self.conn.close_reason().map_or(
+                            // A closed connection always has a reason; this
+                            // arm exists so the mapping is total.
+                            Error::ConnectionLost(LossCause::LocallyClosed),
+                            conn_error,
+                        ));
                     }
                 }
                 reason = self.conn.closed() => return Err(conn_error(reason)),
@@ -203,13 +205,19 @@ pub(crate) fn conn_error(e: quinn::ConnectionError) -> Error {
                 Error::Protocol("peer closed the connection: protocol violation".into())
             }
             codes::LIMIT_EXCEEDED => Error::LimitExceeded,
-            _ => Error::ConnectionLost,
+            // Any other application close code is the peer saying goodbye in
+            // its own words: a shutdown, or a code this version does not map.
+            _ => Error::ConnectionLost(LossCause::PeerClosed),
         },
-        quinn::ConnectionError::LocallyClosed => Error::ConnectionLost,
+        quinn::ConnectionError::LocallyClosed => Error::ConnectionLost(LossCause::LocallyClosed),
         // An idle timeout or a stateless reset is a lost connection: whatever
         // was in flight will never complete, which is the definite outcome
-        // `ConnectionLost` promises (`docs/FAILURE_MODEL.md`).
-        quinn::ConnectionError::TimedOut | quinn::ConnectionError::Reset => Error::ConnectionLost,
+        // `ConnectionLost` promises (`docs/FAILURE_MODEL.md`). The cause is
+        // kept because the next action differs — an idle timeout invites a
+        // redial, a reset says the peer forgot us, and a deliberate close may
+        // mean it does not want one yet.
+        quinn::ConnectionError::TimedOut => Error::ConnectionLost(LossCause::IdleTimeout),
+        quinn::ConnectionError::Reset => Error::ConnectionLost(LossCause::Reset),
         // Error codes 0x100..0x200 carry a TLS alert: the handshake itself
         // failed, whether we detected it or the peer told us so. That is a
         // TLS outcome, not a transport one.

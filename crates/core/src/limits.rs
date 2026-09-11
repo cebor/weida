@@ -52,6 +52,12 @@ pub struct Limits {
     /// hold as a whole. At the cap the oldest held transfer is released out
     /// of order with its gap reported, never held in a growing buffer.
     pub max_reorder_hold: usize,
+    /// Addresses a dialling endpoint will try for one hostname, in the order
+    /// the resolver returned them. More than one is necessary because the
+    /// first is not necessarily reachable — `localhost` commonly resolves to
+    /// both `::1` and `127.0.0.1` — and a ceiling is necessary because a
+    /// resolver answer is remote input.
+    pub max_resolved_addresses: usize,
     /// Identities a receiver remembers per connection for `Bounded`
     /// deduplication. The window bounds how long an identity is kept, not
     /// how many arrive within it, so the count needs its own ceiling; at the
@@ -86,6 +92,7 @@ impl Default for Limits {
             subscriber_buffer_bytes: 8 * 1024 * 1024,
             max_sequence_scopes: 1024,
             max_reorder_hold: 256,
+            max_resolved_addresses: 8,
             max_dedup_entries: 4096,
         }
     }
@@ -110,6 +117,7 @@ mod tests {
         assert_eq!(l.subscriber_buffer_bytes, 8 << 20);
         assert_eq!(l.max_sequence_scopes, 1024);
         assert_eq!(l.max_reorder_hold, 256);
+        assert_eq!(l.max_resolved_addresses, 8);
         assert_eq!(l.max_dedup_entries, 4096);
     }
 

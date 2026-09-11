@@ -30,16 +30,38 @@ pub struct RuntimeConfig {
     /// library takes from its host process without being asked; `0` is
     /// rejected rather than silently corrected.
     pub worker_threads: usize,
+    /// How long [`crate::Runtime::shutdown`] waits for closed sockets to go
+    /// idle before it returns anyway.
+    ///
+    /// The wait exists so peers see a clean `SHUTDOWN` rather than a timeout,
+    /// and it is bounded because otherwise a peer's behaviour decides when
+    /// this process may exit — the failure ZeroMQ's infinite `ZMQ_LINGER`
+    /// default is known for
+    /// (`docs/decisions/0009-drain.md` §4.4). QUIC's own closing and draining
+    /// periods last about three times the path's probe timeout, so the default
+    /// of one second is generous on any network where a clean close was
+    /// possible at all, and it is not a deadline anything waits for twice:
+    /// every endpoint is closed first, and only the idle wait is capped.
+    pub shutdown_timeout: Duration,
     /// Guarantee set this runtime offers **and** requires of its peers
     /// (`docs/PROTOCOL.md` §6.1, §6.5).
     ///
     /// Offered and required are one setting in v0 on purpose: a set is a
     /// statement of what this side runs, and a peer that cannot match it
     /// fails the handshake rather than quietly giving less
-    /// ([decisions/0006](https://github.com/tuco86/weida/blob/main/docs/decisions/0006-guarantee-sets.md)
-    /// §4.4). The default is `core`, which is what every v0 peer declares by
-    /// declaring nothing.
+    /// (`docs/decisions/0006-guarantee-sets.md` §4.4). The default is `core`,
+    /// which is what every v0 peer declares by declaring nothing.
     pub guarantees: GuaranteeSet,
+    /// How long a dial waits on one resolved address before trying the next.
+    ///
+    /// Only the addresses *before* the last one are bounded by it: a name
+    /// that resolves to one address, and every IP literal, keeps the full
+    /// handshake budget. The default of 250 ms is RFC 8305's Connection
+    /// Attempt Delay, which exists for exactly this case — `localhost`
+    /// resolving to `::1` before `127.0.0.1`, where the first address answers
+    /// nothing at all and QUIC has no refusal to observe, so without a bound
+    /// the second address is reached only after a handshake timeout.
+    pub connect_attempt_timeout: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -49,7 +71,9 @@ impl Default for RuntimeConfig {
             keep_alive: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
             worker_threads: 1,
+            shutdown_timeout: Duration::from_secs(1),
             guarantees: GuaranteeSet::CORE,
+            connect_attempt_timeout: Duration::from_millis(250),
         }
     }
 }

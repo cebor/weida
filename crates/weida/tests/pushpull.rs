@@ -181,6 +181,11 @@ async fn request_to_pull_path_is_unsupported() {
     client.shutdown().await;
 }
 
+/// The 2 MiB payload is what makes this refusal deterministic rather than
+/// racy: past the peer's stream receive window the write cannot finish unless
+/// its application acts, so the stop code is the only way out
+/// (`docs/decisions/0005-refusal-race.md` §4.3). A few bytes would fit in
+/// flight and could be acknowledged before the refusal.
 #[tokio::test]
 async fn push_to_rep_path_is_unsupported() {
     let server = Server::start().await;
@@ -204,6 +209,10 @@ async fn push_to_rep_path_is_unsupported() {
     client.shutdown().await;
 }
 
+/// Deterministic for the same reason as the test above: the 2 MiB payload
+/// exceeds the peer's stream receive window, so the refusal cannot be
+/// overtaken by the transport receipt
+/// (`docs/decisions/0005-refusal-race.md` §4.3).
 #[tokio::test]
 async fn push_to_an_unknown_path_is_reported() {
     let server = Server::start().await;

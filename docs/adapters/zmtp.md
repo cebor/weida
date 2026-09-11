@@ -243,9 +243,12 @@ adapter's configuration must surface them rather than absorb them silently [INVA
   unordered at the far end [PATTERNS §1.7], [SYNTHESIS §7.1].
 - **L9 — Drain.** ZeroMQ's `ZMQ_LINGER` certifies transfer to the network, not receipt, and
   defaults to infinite, so `zmq_ctx_term()` can block forever [zeromq §12/P17]; weida's
-  `Runtime::shutdown` "is the one thing that cuts a finished transfer short" and has no linger
-  and no drain [PATTERNS §1.1], [SYNTHESIS §8.6, still open]. The adapter MUST set a finite
-  linger and MUST NOT present either side's shutdown as a drain acknowledgement.
+  `Runtime::shutdown` "is the one thing that cuts a finished transfer short" [PATTERNS §1.1],
+  and [0009](../decisions/0009-drain.md) answers the other half: a separate `drain(Duration)`
+  waits for already-finished transfers to reach the peer's **transport**, under a deadline that
+  is mandatory and finite. The adapter therefore sets a finite linger on its ZeroMQ sockets and
+  maps its own shutdown onto that drain — and still MUST NOT present either side's shutdown as
+  a drain acknowledgement, because neither protocol has one [SYNTHESIS §2 D12], [0009 §4.6].
 - **L10 — No application acknowledgement in either direction.** ZMTP has none [zeromq §6];
   weida has only the transport receipt [GUARANTEES §3]. Nothing in this adapter can certify
   that a message was processed (§7).

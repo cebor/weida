@@ -19,23 +19,27 @@ implementation source; where this document and an implementation disagree, this 
 authoritative and the implementation is a defect.
 
 **Wire version 0 is unchanged by the decided-but-unbuilt parts of this document.** Sections
-marked *spec ahead of code* — §2.5, HELLO keys `5` and `6` (§6.1), DATA keys `6` and `7`
-(§6.2), the guarantee set of §6.5, the profiles of §10.1 — specify behaviour that the accepted
-decision notes in [decisions/](decisions/) have settled and that no v0 implementation yet
-produces. They are written here rather than left to the implementation for two reasons: a key
-number and an encoding must be fixed once, by the specification, before two implementations
-can disagree about them; and every one of them is already load-bearing for an adapter mapping
-document. They change nothing for a v0 peer, because every one of them is either an optional
-key that an encoder omits and a decoder skips (§5), or a statement about how many connections
-a pair holds. The version stays `0`, and §8 carries a golden vector only for what a v0
-implementation actually writes.
+marked *spec ahead of code* — §2.5, HELLO keys `5` and `6` (§6.1), the guarantee set of §6.5,
+the profiles of §10.1 — specify behaviour that the accepted decision notes in
+[decisions/](decisions/) have settled and that no v0 implementation yet produces. They are
+written here rather than left to the implementation for two reasons: a key number and an
+encoding must be fixed once, by the specification, before two implementations can disagree
+about them; and every one of them is already load-bearing for an adapter mapping document.
+They change nothing for a v0 peer, because every one of them is either an optional key that an
+encoder omits and a decoder skips (§5), or a statement about how many connections a pair
+holds. The version stays `0`.
 
-One change is not merely additive: the topic filter grammar of §6.4 replaces the byte-prefix
+DATA keys `6` and `7` (§6.2) are a narrower case and no longer only on paper: the codec
+encodes and decodes both and §8 pins their vectors, while no v0 *sender* sets either, so they
+are implemented and unused rather than unimplemented.
+
+One change was not merely additive: the topic filter grammar of §6.4 replaced the byte-prefix
 match of earlier drafts, so the same SUBSCRIBE bytes can select a different set of topics than
 they used to ([decisions/0007](decisions/0007-topic-namespace.md) §4.2). The implementation
-still matches by byte prefix and is a defect against this document until the matcher lands;
-`0.x` carries no compatibility promise, which is what makes fixing the grammar before the
-adapters exist cheaper than fixing it after.
+follows it as of B-020 — the matcher is a segment walk and an invalid filter is rejected at
+the codec boundary — so this is history rather than a pending defect. `0.x` carries no
+compatibility promise, which is what made fixing the grammar before the adapters exist
+cheaper than fixing it after.
 
 Related documents: [ARCHITECTURE.md](ARCHITECTURE.md),
 [GUARANTEES.md](GUARANTEES.md), [FAILURE_MODEL.md](FAILURE_MODEL.md),
@@ -59,8 +63,9 @@ marked *spec ahead of code*.
 - "FIN" means the QUIC stream final offset, i.e. clean end of stream.
 - "tstr" and "uint" are the CBOR (RFC 8949) major types 3 (text string) and 0 (unsigned
   integer) respectively.
-- "peer" means the other side of a QUIC connection, regardless of which side is the QUIC
-  client and which the QUIC server.
+- "peer" means the other side of a connection, regardless of which side opened it. On the
+  network transport that is a QUIC connection; on a local transport it is the socket, pipe or
+  channel of §2.1.
 
 ---
 
@@ -68,11 +73,45 @@ marked *spec ahead of code*.
 
 ### 2.1 Transport
 
-The transport is QUIC. The reference implementation uses `quinn`.
+**The network transport is QUIC.** The reference implementation uses `quinn`.
 
 The TLS ALPN token MUST be exactly `weida/0`. A peer MUST offer this token and MUST NOT
 accept a connection that negotiated any other token. An ALPN mismatch MUST fail the TLS
 handshake; it is not signalled at the weida protocol layer.
+
+**A local transport carries the same protocol without TLS**
+([decisions/0010](decisions/0010-local-transport.md)). In-process channels, `AF_UNIX`
+`SOCK_STREAM` sockets and Windows named pipes in message mode carry the same frames (§4), the
+same headers (§6), the same HELLO exchange (§2.2) and the same negotiation (§2.3). Three
+differences, and only three:
+
+- **There is no TLS and therefore no ALPN.** The version fence moves to where the real work
+  was always done: the `versions` intersection of §2.3. A local peer MUST still send HELLO and
+  MUST still fail the connection with `NEGOTIATION_FAILED` on an empty intersection.
+- **The OS connection is the stream.** A local transport has no stream multiplexing, so one
+  transfer is one local connection and a transfer's lifetime is that connection's
+  [0010 §4.2]. Nothing in §3-§9 changes: a preamble and a header still open every stream,
+  because the stream *is* the connection. There is consequently no per-connection window, so
+  the shared-window coupling of §10 does not arise locally.
+
+  One consequence is worth stating rather than deriving. A local connection is bidirectional
+  by nature, so it carries no equivalent of QUIC's stream kind, and the dispatch of §9.4 —
+  today a function of the stream kind *and* the addressed path — is locally a function of the
+  **path alone**: the pattern registered there says whether a reply is expected. A replier path
+  answers on the same connection; a puller or publisher path never writes back, and the
+  initiator MUST NOT wait for a reply on it. The mismatch case is unchanged and already
+  specified: a transfer addressed to a path whose pattern cannot serve it is refused with
+  `UNSUPPORTED` (§9.4).
+- **The peer is proved by the kernel, not by a key.** `SO_PEERCRED` on Linux, `LOCAL_PEERCRED`
+  on macOS — which carries no PID — and the client's token through
+  `ImpersonateNamedPipeClient` on Windows; an in-process peer has no identity at all, because
+  there is nobody else to prove [0010 §4.4]. A PID is an observation and MUST NOT be
+  authorized on.
+
+A local transport is named by its own URL scheme, never by `weida://`
+([ARCHITECTURE.md](ARCHITECTURE.md) §3): the transport is part of the address, and there is no
+automatic fallback from one to another, because that would change who may connect and what
+proves them without saying so [0010 §4.6], [0010 §4.8].
 
 ### 2.2 HELLO exchange
 
@@ -350,8 +389,8 @@ configuration error, not a negotiation position.
 | `3` | `tstr` | `traceparent` | no | 128 B | W3C Trace Context `traceparent` |
 | `4` | `tstr` | `tracestate` | no | 512 B | W3C Trace Context `tracestate`, opaque passthrough |
 | `5` | `tstr` | `topic` | no | 256 B | Pub/Sub topic; opaque bytes, selected by the filter grammar of §6.4 |
-| `6` | `uint` | `sequence` | no | — | per-producer sequence number; **optional, skipped by v0** |
-| `7` | `bstr` | `producer` | no | 32 B | producer identity; **optional, skipped by v0** |
+| `6` | `uint` | `sequence` | no | — | per-producer sequence number; coded, **written by no v0 sender** |
+| `7` | `bstr` | `producer` | no | exactly 32 B | producer identity, the raw digest; coded, **written by no v0 sender** |
 
 **Every key is optional at the decoder, and that is deliberate.** A decoder sees a byte
 slice, not a stream: it cannot tell an initiating half from a reply half, so it cannot
@@ -378,11 +417,12 @@ and MUST NOT size an allocation from it.
 `traceparent` and `tracestate` carry W3C Trace Context. `tracestate` is opaque to weida and
 MUST be forwarded unmodified where trace context is propagated.
 
-**Keys `6` and `7` are specified ahead of code** (§11). They are reserved with exact
-semantics so that nothing else takes the numbers and so that the two capabilities they enable
-have one definition rather than one per implementation. A v0 encoder MUST NOT write them and a
-v0 decoder MUST skip them, which the forward-compatibility rule of §5 already requires of any
-unknown key.
+**Keys `6` and `7` are coded but unused** (§11). They carry exact semantics so that nothing
+else takes the numbers and so that the two capabilities they enable have one definition
+rather than one per implementation. `weida-protocol` encodes and decodes both, and §8 pins
+their bytes; what no v0 *sender* does is set them, because the guarantee levels that give
+them meaning are not negotiated yet (§6.5). A decoder that meets one accepts it — the
+specification defines it — and a decoder that meets an unknown key still skips it under §5.
 
 `sequence` is a monotonically increasing `uint` scoped to (producer, endpoint or topic)
 ([decisions/0001](decisions/0001-sequence-field.md) §7.1). It is not a transfer identifier and
@@ -859,6 +899,8 @@ remote peer can cause to be allocated (master doc §50, §81 rule 17).
 | `max_sequence_scopes` | `1024` | producer scopes — paths and topics — a receiver tracks per connection for gap detection or reassembly under `PerProducer` ordering; the peer names the scopes, so at the cap a new one is simply not tracked |
 | `max_reorder_hold` | `256` | transfers a receiver holds back at once, over all scopes, under `PerProducer(reassemble)`; at the cap the oldest held transfer is released out of order with its gap reported (§6.5, [GUARANTEES.md](GUARANTEES.md) §3). A held transfer is an unread stream, so the bytes it pins are bounded again by `stream_receive_window` and `connection_receive_window` |
 | `max_dedup_entries` | `4096` | identities a receiver remembers per connection under `Bounded` deduplication; the negotiated window bounds how long an identity is kept and this bounds how many, evicting the oldest at the cap (§6.5) |
+| `max_resolved_addresses` | `8` | addresses a dialling endpoint will try for one hostname, in the resolver's order; a resolver answer is remote input, so its length needs a ceiling |
+| `connect_attempt_timeout` | 250 ms | how long a dial waits on one resolved address before trying the next. Every address but the last is bounded by it; an IP literal and a single-address name keep the full handshake budget. The value is RFC 8305's Connection Attempt Delay, and it exists because an address that answers nothing gives QUIC no refusal to observe |
 | `max_connections_per_peer` | *spec ahead of code* | connections one peer may hold across both tiers of §10.1; exceeding it closes the excess connection with `LIMIT_EXCEEDED` |
 
 Worst-case hostile per-connection header memory is bounded by
@@ -940,11 +982,12 @@ versions.
   Push and Sub connect. The reverse directions have no v0 representation.
 - **Streaming fan-out.** A publisher sends whole messages (§9.5). Tee-ing one long stream
   to many subscribers needs its own drop and ordering design and is not specified.
-- **Per-producer ordering on the wire.** Specified ahead of code in §6.2 (DATA key `6`) and
-  §6.5: the sequence key and the `PerProducer` levels are decided
-  ([decisions/0001](decisions/0001-sequence-field.md) §7.1, §7.5) but no v0 implementation
-  writes or reads them, and §8 carries no vector for them yet. `PerKey` ordering has no wire
-  representation at all and is L2 work [0001 §7.4]; `Total` is unspecified.
+- **Per-producer ordering as a behaviour.** The sequence key of §6.2 is coded and its vectors
+  are pinned (§8), but nothing numbers a transfer and nothing detects a gap: the `PerProducer`
+  levels are decided ([decisions/0001](decisions/0001-sequence-field.md) §7.1, §7.5) and
+  unnegotiated (§6.5), so no v0 sender writes the key and no v0 receiver acts on it. `PerKey`
+  ordering has no wire representation at all and is L2 work [0001 §7.4]; `Total` is
+  unspecified.
 - **Session state.** No session identifier, no subscription resumption and no sequence
   resumption. The peer's proved fingerprint identifies it across connections and carries no
   retained state; resumption is L2 work
@@ -958,10 +1001,10 @@ versions.
 - **Multiple replies per exchange.** Exactly one reply or one ERROR per reply half; a second
   is not representable.
 - **Persistence.** No wire concept of durability, storage acknowledgement or recovery.
-- **Deduplication on the wire.** Specified ahead of code in §6.2 (DATA key `7`) and §6.5:
-  `Bounded(window)` and the producer identity that makes it possible are decided
-  [0001 §7.6], [0008 §4.4], and no v0 implementation participates. `Durable` deduplication is
-  L2 work.
+- **Deduplication as a behaviour.** The producer-identity key of §6.2 is coded and pinned in
+  §8; `Bounded(window)` and the receiver-side window that would use it are decided
+  [0001 §7.6], [0008 §4.4] and unbuilt, so no v0 peer suppresses a duplicate. `Durable`
+  deduplication is L2 work.
 - **Capability codes.** The capability negotiation mechanism exists (HELLO keys `3` and
   `4`), but no capability code is assigned and the supported set is empty.
 - **QUIC datagrams.** Only streams are used.

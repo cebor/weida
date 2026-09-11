@@ -18,18 +18,23 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use weida::{Identity, Listener, Puller, Runtime, RuntimeConfig, Trust};
+use weida::{Identity, Limits, Listener, Puller, Runtime, RuntimeConfig, Trust};
 
 /// Connection counts the report covers: one, the second one 0002 adds, and a
 /// per-path fan of 64.
 const COUNTS: [usize; 3] = [1, 2, 64];
 
+/// Path counts for the per-path fan of decision 0002 (B-012).
+const PATHS: [usize; 2] = [16, 256];
+
+/// Connection ceiling used to find the refusal point, small so the run is short.
+const LIMIT: usize = 8;
+
 struct Harness {
     runtime: Runtime,
     trust: Trust,
     addr: SocketAddr,
-    /// Held only so the endpoint namespace outlives the measurements.
-    _listener: Listener,
+    listener: Listener,
     _binding: weida::Binding,
 }
 
@@ -41,10 +46,19 @@ impl Harness {
 
 /// A server with a puller that drains, so a connected client is never stalled.
 async fn harness() -> Harness {
+    harness_with(Limits::default()).await
+}
+
+/// The same server with explicit limits, for the refusal point of B-012.
+async fn harness_with(limits: Limits) -> Harness {
     let identity = Identity::generate().expect("identity");
     let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
 
-    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let runtime = Runtime::new(RuntimeConfig {
+        limits,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
     let listener = runtime.listener();
     let binding = listener
         .bind_quic("127.0.0.1:0".parse().expect("loopback"), identity)
@@ -57,7 +71,7 @@ async fn harness() -> Harness {
         runtime,
         trust,
         addr,
-        _listener: listener,
+        listener,
         _binding: binding,
     }
 }
@@ -97,6 +111,8 @@ fn bench_connect(c: &mut Criterion) {
     let rt = tokio_runtime();
     let harness = rt.block_on(harness());
     report_connection_cost(&rt, &harness);
+    report_path_fan(&rt, &harness);
+    report_connection_limit(&rt);
 
     let url = harness.url("/sink");
     let mut group = c.benchmark_group("connect");
@@ -226,6 +242,134 @@ fn report_connection_cost(rt: &tokio::runtime::Runtime, harness: &Harness) {
              last {last:.2?}, {memory}"
         );
     }
+}
+
+/// One connection per dialled path, and what the same paths cost today (B-012).
+///
+/// Two shapes are measured because they are different systems. Today the pool
+/// keys on `(host, port, ClientTls, address fingerprint)` and **not** on the
+/// path, so one runtime dialling `p` paths holds exactly one connection: the
+/// per-path fan does not exist yet. Decision 0002's bulk tier makes it one
+/// connection per path, which is the second shape here, built with one client
+/// runtime per path because that is the only way to hold `p` connections to one
+/// server from this API.
+fn report_path_fan(rt: &tokio::runtime::Runtime, harness: &Harness) {
+    for p in PATHS {
+        // A path per fan size: dropping a `Puller` leaves its route registered,
+        // so reusing `/p0` for the second fan would be `AlreadyRegistered`.
+        let paths: Vec<String> = (0..p).map(|i| format!("/f{p}p{i}")).collect();
+        let pullers: Vec<Puller> = paths
+            .iter()
+            .map(|path| harness.listener.puller(path).expect("puller"))
+            .collect();
+
+        // Today: one runtime, every path on one pooled connection.
+        let (shared_elapsed, shared_peers) = rt.block_on(async {
+            let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+            let pusher = client.pusher(harness.trust.clone());
+            let start = Instant::now();
+            for path in &paths {
+                pusher.connect(&harness.url(path)).await.expect("connect");
+            }
+            let elapsed = start.elapsed();
+            // `peer_count` counts `(connection, path)` entries; the QUIC
+            // connections behind them are what the pool deduplicated.
+            let peers = pusher.peer_count();
+            client.shutdown().await;
+            (elapsed, peers)
+        });
+
+        // 0002's shape: one connection per path.
+        let baseline = current_rss();
+        let (fan_elapsed, per_path, fan_rss) = rt.block_on(async {
+            let mut clients = Vec::with_capacity(p);
+            for path in &paths {
+                let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+                let pusher = client.pusher(harness.trust.clone());
+                clients.push((client, pusher, path));
+            }
+            let start = Instant::now();
+            for (_, pusher, path) in &clients {
+                pusher.connect(&harness.url(path)).await.expect("connect");
+            }
+            let elapsed = start.elapsed();
+            let rss = current_rss();
+            let per_path = elapsed / u32::try_from(p).expect("path count fits u32");
+            for (client, pusher, _) in clients {
+                drop(pusher);
+                client.shutdown().await;
+            }
+            (elapsed, per_path, rss)
+        });
+
+        let memory = match (baseline, fan_rss) {
+            (Some(before), Some(after)) => format!(
+                "{:.1} KiB per connection",
+                after.saturating_sub(before) as f64 / 1024.0 / p as f64
+            ),
+            _ => "RSS unavailable on this platform".to_owned(),
+        };
+        eprintln!(
+            "paths p={p}: pooled today {shared_elapsed:.2?} for {p} dials over \
+             {shared_peers} peer entries on one connection; one connection per path \
+             {fan_elapsed:.2?} total, {per_path:.2?} each, {memory}"
+        );
+
+        drop(pullers);
+    }
+}
+
+/// Where the server refuses, and with what (B-012).
+///
+/// `max_connections` is checked before the handshake is accepted, but the
+/// refusal is deliberately *not* silent: the server completes the handshake and
+/// then closes with `LIMIT_EXCEEDED`, so the peer can tell overload from a
+/// routing mistake (`crates/weida/src/listener.rs`).
+fn report_connection_limit(rt: &tokio::runtime::Runtime) {
+    let harness = rt.block_on(harness_with(Limits {
+        max_connections: LIMIT,
+        ..Limits::default()
+    }));
+    let url = harness.url("/sink");
+
+    let outcome = rt.block_on(async {
+        let mut held = Vec::new();
+        let mut refused_at = None;
+        let mut message = String::new();
+        // One more than the ceiling: the extra one is the interesting one.
+        for index in 0..=LIMIT {
+            let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+            let pusher = client.pusher(harness.trust.clone());
+            match pusher.connect(&url).await {
+                Ok(()) => held.push((client, pusher)),
+                Err(error) => {
+                    refused_at = Some(index);
+                    message = error.to_string();
+                    client.shutdown().await;
+                    break;
+                }
+            }
+        }
+        for (client, pusher) in held {
+            drop(pusher);
+            client.shutdown().await;
+        }
+        (refused_at, message)
+    });
+
+    match outcome {
+        (Some(index), message) => eprintln!(
+            "connection limit max_connections={LIMIT}: connections 0..{index} accepted, \
+             connection {index} refused with: {message}"
+        ),
+        (None, _) => eprintln!(
+            "connection limit max_connections={LIMIT}: no refusal observed within {} dials \
+             — the ceiling is not enforced where this bench looks",
+            LIMIT + 1
+        ),
+    }
+
+    rt.block_on(async { harness.runtime.clone().shutdown().await });
 }
 
 criterion_group!(benches, bench_connect);

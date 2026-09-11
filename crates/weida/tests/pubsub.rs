@@ -412,20 +412,20 @@ async fn publishing_to_nobody_is_not_an_error() {
     assert_eq!(publisher.publish("px.eur", &b"x"[..]).expect("publish"), 0);
 }
 
+/// A publisher path accepts no inbound stream of either kind.
+///
+/// The 2 MiB payload is what makes the refusal deterministic: a transfer that
+/// fits in flight can be acknowledged by the peer's *transport* before the
+/// peer's *application* refuses it, and the receipt then truthfully says
+/// "delivered", since it says nothing about the application. Past the stream
+/// receive window the write cannot complete until the peer reads or refuses,
+/// so the refusal is the only way out
+/// (`docs/decisions/0005-refusal-race.md` §4.3).
 #[tokio::test]
 async fn a_publisher_path_refuses_inbound_transfers() {
     let server = Server::start().await;
     let _publisher = server.listener.publisher("/md").expect("publisher");
 
-    // A publisher path accepts no inbound stream of either kind.
-    //
-    // The payload is larger than the stream receive window on purpose. A
-    // transfer that fits in flight can be acknowledged by the peer's
-    // *transport* before the peer's *application* refuses it, and then the
-    // receipt truthfully says "delivered" — a transport receipt says nothing
-    // about the application, including that it said no. Past the window the
-    // write cannot complete until the peer reads or refuses, so the refusal
-    // is the only way out.
     let client = server.client_runtime();
     let pusher = client.pusher(server.trust());
     within(pusher.connect(&server.url("/md")))

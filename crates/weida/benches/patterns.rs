@@ -191,6 +191,112 @@ fn bench_fanout(c: &mut Criterion) {
     rt.block_on(async { harness.runtime.clone().shutdown().await });
 }
 
+/// What the segmented matcher costs in the publisher's fan-out path (B-021).
+///
+/// The objection that decision 0007 §4.6 accepted was that a matching language
+/// belongs nowhere near a hot path. This measures the price it actually asked
+/// for.
+///
+/// The trick is a subscriber whose filters all **fail**: one connection holds
+/// `FILTERS` of them, the published topic matches none, so `publish` returns 0
+/// and the measurement is `FILTERS` matcher calls plus the publish frame — no
+/// enqueue, no fan-out, no drain. The shapes then differ only in how much work
+/// one call is:
+///
+/// * `literal` — a mismatch in the first segment, which is the cheapest walk
+///   and the floor a byte prefix would also have to pay;
+/// * `one_segment` — `*` in the middle, so the walk reaches the third segment
+///   before failing;
+/// * `rest` — a trailing `#`, so the walk fails on a literal segment before
+///   the wildcard can accept anything.
+///
+/// `prefix_reference` is the matcher the walk replaced, `topic.starts_with`,
+/// over the same strings. It is a pure function here because it no longer
+/// exists in the library: it is the scale, not a switchable implementation.
+/// The matched, drained fan-out is the `fanout` group above.
+fn bench_filters(c: &mut Criterion) {
+    /// Filters held by one connection; `max_subscriptions` defaults to 256.
+    const FILTERS: usize = 64;
+    /// Matches none of the filters below, in the first segment.
+    const TOPIC: &str = "px.eur.spot";
+
+    let rt = tokio_runtime();
+    let harness = rt.block_on(harness());
+
+    // The last field is how many of that shape one connection holds. The pair
+    // at 1 and at 64 is what isolates the matcher: the difference divided by
+    // 63 is the cost of one more filter, with every fixed cost of `publish`
+    // subtracted out.
+    let shapes: [(&str, usize); 5] = [
+        ("literal_x1", 1),
+        ("literal_x64", FILTERS),
+        ("one_segment_x1", 1),
+        ("one_segment_x64", FILTERS),
+        ("rest_x64", FILTERS),
+    ];
+
+    let mut group = c.benchmark_group("filters");
+
+    for (name, count) in shapes {
+        let filters: Vec<String> = (0..count)
+            .map(|i| {
+                if name.starts_with("literal") {
+                    format!("zz{i}.eur.spot")
+                } else if name.starts_with("one_segment") {
+                    format!("zz{i}.*.spot")
+                } else {
+                    format!("zz{i}.eur.#")
+                }
+            })
+            .collect();
+        let path = format!("/md-{name}");
+        let (publisher, _client, _sub) = rt.block_on(async {
+            let publisher: Publisher = harness.listener.publisher(&path).expect("publisher");
+            let client = harness.client();
+            let sub = client.subscriber(harness.trust());
+            sub.connect(&harness.url(&path)).await.expect("connect");
+            for filter in &filters {
+                sub.subscribe(filter).await.expect("subscribe");
+            }
+            while publisher.filter_count() != count {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            (publisher, client, sub)
+        });
+
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let sent = publisher
+                    .publish(black_box(TOPIC), &b"x"[..])
+                    .expect("publish");
+                // Zero is the point: every filter was walked and every walk
+                // said no, so nothing was enqueued or copied.
+                assert_eq!(sent, 0, "the bench topic must match no filter");
+                sent
+            })
+        });
+    }
+
+    let prefix_filters: Vec<String> = (0..FILTERS).map(|i| format!("zz{i}.eur.spot")).collect();
+
+    // The replaced matcher, for scale: 64 byte-prefix comparisons over the
+    // same strings, with no publish around them.
+    group.bench_function("prefix_reference", |b| {
+        b.iter(|| {
+            let mut matched = 0usize;
+            for filter in &prefix_filters {
+                if black_box(TOPIC).starts_with(filter.as_str()) {
+                    matched += 1;
+                }
+            }
+            matched
+        })
+    });
+    group.finish();
+
+    rt.block_on(async { harness.runtime.clone().shutdown().await });
+}
+
 /// What the two DATA keys of decision 0001 will cost at a high message rate.
 ///
 /// Neither key exists on the wire yet, so each is simulated by the key with its
@@ -293,5 +399,11 @@ fn wire_bytes(endpoint: &str, meta: &TransferMeta, payload: usize) -> usize {
     encode_frame(FrameKind::Data, &header.encode()).len() + payload
 }
 
-criterion_group!(benches, bench_push, bench_fanout, bench_header_cost);
+criterion_group!(
+    benches,
+    bench_push,
+    bench_fanout,
+    bench_filters,
+    bench_header_cost
+);
 criterion_main!(benches);

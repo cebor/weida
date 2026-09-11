@@ -127,7 +127,7 @@ the transfer, so a sender's outcome is whatever `write_all`, `finish()` and the 
 
 | Event | Local state | Result | Rationale |
 | --- | --- | --- | --- |
-| Connection lost | before local FIN | `write_all` fails with `Error::ConnectionLost`; `is_definite_failure()` is true | The receiver discards partial transfers on reset or connection loss ([PROTOCOL.md](PROTOCOL.md) §9), so the payload was definitely not delivered. Definite failure, not indeterminate. |
+| Connection lost | before local FIN | `write_all` fails with `Error::ConnectionLost(cause)`; `is_definite_failure()` is true | The receiver discards partial transfers on reset or connection loss ([PROTOCOL.md](PROTOCOL.md) §9), so the payload was definitely not delivered. Definite failure, not indeterminate. The `cause` says why the connection went, and never changes whether the failure is definite. |
 | Local FIN completes | `Delivery` dropped | nothing is observed at all | `finish()` is synchronous and dropping the receipt is free. Fire-and-forget by choice: the only assertion is that the local side finished writing, which is explicitly not a delivery claim. |
 | Connection lost | after local FIN, before the receipt | `Delivery::delivered()` yields `Error::Indeterminate` | The FIN went out. The peer may hold every byte and may already have acted on them; no local observation distinguishes that from a loss. `is_definite_failure()` is false. |
 | Receipt resolves | after local FIN | `Delivery::delivered()` yields `Ok(())` | The peer's **transport** acknowledged every byte and the FIN. It is not a claim that the peer's application read the payload ([GUARANTEES.md](GUARANTEES.md) §3). |
@@ -135,7 +135,7 @@ the transfer, so a sender's outcome is whatever `write_all`, `finish()` and the 
 | 0-RTT rejected | any | `Error::Transport` | The data was never delivered under the accepted keys. |
 | Handshake refused: the peer is not the one trusted | nothing was sent | `connect` fails with `Error::Untrusted(fp)`; `is_definite_failure()` is true | The dial ended in the verifier, before any transfer existed. The error carries the fingerprint that actually answered rather than the one that was expected, so an operator can check it out of band and pin it. |
 | Handshake fails for any other reason | nothing was sent | `Error::Tls` | Covers a binding that requires a client identity the dialling endpoint does not present or does not trust, and a dial under an empty `Trust` to an address that names no fingerprint — the latter fails before a packet leaves. |
-| Idle timeout or stateless reset | any | `Error::ConnectionLost`; `is_definite_failure()` is true | Both mean the connection is gone, and `conn_error` maps quinn's `TimedOut` and `Reset` there rather than to a bare transport error. The *reason* does not survive: a send over a peer whose connection has closed reports `ConnectionLost` without consulting the transport error, so an idle timeout, a peer SHUTDOWN and a transport failure are indistinguishable at the API ([IMPLEMENTATION.md](IMPLEMENTATION.md) §6). Demonstrated by `idle_timeout_reports_loss_within_the_window` in `crates/weida/tests/streams.rs`, where the server's 500 ms idle timeout is shorter than the dialling side's 10 s keep-alive interval, so silence ends the connection. |
+| Idle timeout or stateless reset | any | `Error::ConnectionLost(LossCause::IdleTimeout)` or `(LossCause::Reset)`; `is_definite_failure()` is true | Both mean the connection is gone, and `conn_error` maps quinn's `TimedOut` and `Reset` there rather than to a bare transport error. **The reason survives.** `ConnectionLost` carries a `LossCause` — `IdleTimeout`, `PeerClosed`, `LocallyClosed`, `Reset` or `TransportError` — and peer selection reports the cause of the peer it rejected instead of flattening every dead connection into one error. The outcome is unchanged and so is `is_definite_failure()`: the cause is not a second outcome vocabulary, it is what an application deciding whether to redial needs. Demonstrated by `idle_timeout_reports_loss_within_the_window` in `crates/weida/tests/streams.rs`, which asserts `LossCause::IdleTimeout`, where the server's 500 ms idle timeout is shorter than the dialling side's 10 s keep-alive interval, so silence ends the connection. |
 
 `Error::is_definite_failure()` is the machine-readable form of the word "definite": true for
 `ConnectionLost`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `Canceled`, `NotConnected`,
@@ -215,15 +215,33 @@ receiving *application's* dispatch, while the peer's transport acknowledges byte
 A one-way transfer small enough to fit in flight may therefore be acknowledged before the
 application refuses it, and `Delivery::delivered()` then resolves `Ok(())` for a transfer that
 was discarded a moment later — truthfully, because a transport receipt says nothing about the
-application, including that it said no ([GUARANTEES.md](GUARANTEES.md) §3). The refusal is
-guaranteed to be observed only where the transfer cannot complete without the application
-acting — a payload beyond the peer's stream receive window, so that flow control makes the
-writer wait for a reader that never comes — or in Req/Rep, where the ERROR frame rides the
-reply half and is therefore ordered after the decision. That is why
-`push_to_rep_path_is_unsupported` and `push_to_an_unknown_path_is_reported` in
+application, including that it said no ([GUARANTEES.md](GUARANTEES.md) §3). This is decided
+behaviour rather than a gap in this document:
+[decisions/0005](decisions/0005-refusal-race.md) closes the race as documented, and no
+application-level signal is added to the L0 wire to order a refusal ahead of the receipt.
+
+**Two constructions make a refusal deterministic, and there is no third** [0005 §4.3]:
+
+- a payload beyond the peer's stream receive window, so that flow control makes the writer
+  wait for a reader that never comes; or
+- an exchange, whose ERROR frame is written by the receiving application on the reply half
+  and takes precedence over the request half's receipt (Precedence, above).
+
+An application that must observe a refusal therefore uses Req/Rep.
+
+**No sender outcome exists for a refusal observed after the receipt resolved, and none is
+added** [0005 §4.4]. The outcome rules above are complete as written: once `delivered()` has
+resolved `Ok(())` the `Delivery` is consumed, so a later `STOP_SENDING` reaches no observer,
+and no counter, metric or late error is invented for it. Nothing in the vocabulary contradicts
+a receipt after the fact, because the receipt was true when it resolved — it asserted what the
+peer's transport held, and never what its application did.
+
+That is why `push_to_rep_path_is_unsupported` and `push_to_an_unknown_path_is_reported` in
 `crates/weida/tests/pushpull.rs` and `a_publisher_path_refuses_inbound_transfers` in
 `crates/weida/tests/pubsub.rs` push 2 MiB instead of a few bytes: at that size the write
-cannot finish unless the peer acts, so the refusal is deterministic rather than racy.
+cannot finish unless the peer acts, so the refusal is deterministic rather than racy. Their
+payload size is load-bearing and must not be reduced — a smaller one would make the tests
+racy rather than make the code wrong [0005 §5].
 
 ### Connection teardown
 

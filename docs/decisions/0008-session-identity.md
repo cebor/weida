@@ -122,6 +122,13 @@ Clean Start 1" [SYNTHESIS §7.2].
    identifier is added to HELLO or to any header for this purpose; Option B is closed, because
    a claimed identifier would be the only unproved identity in the system and brings MQTT's
    authorization rule and takeover ambiguity with it [mqtt5 §10], [mqtt5 §8].
+
+   **Amended by [0010](0010-local-transport.md) §4.4.** On a local transport there is no TLS
+   and therefore no key to present, and the prover is the kernel — a stronger statement about
+   a process on the same machine than a certificate makes. `IncomingMeta::peer` is therefore a
+   key **or** a local principal, and an in-process peer is neither. What this note decided and
+   what survives is the rule, *proved and never claimed*; what gives way is only the word
+   "only". Option B stays closed: a claimed identifier is still refused, on every transport.
 2. **This answers the open follow-up of 0002 §7: the fingerprint alone binds a bulk connection
    to its control connection.** No HELLO field names the control connection. A bulk connection
    is associated with the control connection that proved the same fingerprint under the same

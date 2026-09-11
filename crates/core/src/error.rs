@@ -29,8 +29,9 @@ pub enum Error {
     /// The endpoint has no usable peer connection.
     NotConnected,
     /// The connection was lost before the local transfer reached FIN; the
-    /// payload was definitely not delivered.
-    ConnectionLost,
+    /// payload was definitely not delivered. The [`LossCause`] says why,
+    /// which is what an application deciding whether to redial needs.
+    ConnectionLost(LossCause),
     /// Version/capability negotiation failed.
     Negotiation(String),
     /// The peer violated the wire protocol.
@@ -64,6 +65,43 @@ pub enum Error {
     Transport(String),
 }
 
+/// Why a connection is gone.
+///
+/// The *outcome* is the same whichever it is — nothing that was in flight
+/// completed, which is what [`Error::ConnectionLost`] promises — so this is
+/// not a second outcome vocabulary. It exists because the next action differs:
+/// an idle timeout invites a redial, a peer that closed deliberately may not
+/// want one yet, and a local close means the application already decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LossCause {
+    /// No traffic for the idle period, on whichever side's timeout was
+    /// shorter. Nothing is wrong with either peer.
+    IdleTimeout,
+    /// The peer closed the connection deliberately, with a code this side
+    /// does not map to a more specific outcome — a shutdown, typically.
+    PeerClosed,
+    /// This side closed it: `Runtime::shutdown`, or a dropped runtime.
+    LocallyClosed,
+    /// A stateless reset: the peer has forgotten the connection, usually
+    /// because it restarted.
+    Reset,
+    /// A QUIC transport error ended the connection. Either peer may be at
+    /// fault, and a redial is unlikely to behave differently.
+    TransportError,
+}
+
+impl fmt::Display for LossCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            LossCause::IdleTimeout => "idle timeout",
+            LossCause::PeerClosed => "closed by the peer",
+            LossCause::LocallyClosed => "closed locally",
+            LossCause::Reset => "stateless reset",
+            LossCause::TransportError => "transport error",
+        })
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -77,7 +115,9 @@ impl fmt::Display for Error {
             }
             Error::AlreadyRegistered => f.write_str("endpoint path already registered"),
             Error::NotConnected => f.write_str("endpoint is not connected to any peer"),
-            Error::ConnectionLost => f.write_str("connection lost before the transfer completed"),
+            Error::ConnectionLost(cause) => {
+                write!(f, "connection lost before the transfer completed: {cause}")
+            }
             Error::Negotiation(m) => write!(f, "negotiation failed: {m}"),
             Error::Protocol(m) => write!(f, "protocol violation: {m}"),
             Error::Rejected => f.write_str("peer rejected the transfer"),
@@ -122,7 +162,7 @@ impl Error {
     pub fn is_definite_failure(&self) -> bool {
         matches!(
             self,
-            Error::ConnectionLost
+            Error::ConnectionLost(_)
                 | Error::Rejected
                 | Error::UnknownEndpoint
                 | Error::Unsupported
@@ -231,7 +271,7 @@ mod tests {
             Error::InvalidEndpointPath,
             Error::AlreadyRegistered,
             Error::NotConnected,
-            Error::ConnectionLost,
+            Error::ConnectionLost(LossCause::IdleTimeout),
             Error::Negotiation("x".into()),
             Error::Protocol("x".into()),
             Error::Rejected,
@@ -254,7 +294,7 @@ mod tests {
     fn definite_failures_exclude_the_unknowable_ones() {
         // A typed refusal proves the payload never reached an application.
         for definite in [
-            Error::ConnectionLost,
+            Error::ConnectionLost(LossCause::PeerClosed),
             Error::Rejected,
             Error::UnknownEndpoint,
             Error::Unsupported,

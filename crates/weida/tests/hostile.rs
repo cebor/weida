@@ -517,7 +517,7 @@ async fn a_server_that_disappears_mid_stream_yields_connection_lost() {
     })
     .await;
     assert!(
-        matches!(err, Error::ConnectionLost),
+        matches!(err, Error::ConnectionLost(_)),
         "expected ConnectionLost, got {err:?}"
     );
     assert!(err.is_definite_failure());
@@ -546,7 +546,7 @@ async fn a_server_that_never_sends_hello_is_dropped_after_the_timeout() {
         .await
         .expect_err("connect must not succeed without negotiation");
     assert!(
-        matches!(err, Error::Negotiation(_) | Error::ConnectionLost),
+        matches!(err, Error::Negotiation(_) | Error::ConnectionLost(_)),
         "expected a negotiation failure, got {err:?}"
     );
 }

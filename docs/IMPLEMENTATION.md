@@ -712,6 +712,75 @@ RSS is read from `/proc/self/status` `VmRSS` and the allocator does not return e
 between measurements, so each row's baseline is the previous row's residue; the per-connection
 deltas are the trustworthy part and the absolute totals are not.
 
+### Verified results — connections per dialled path (B-012)
+
+The same bench, extended with the per-path fan of
+[0002](decisions/0002-control-and-bulk-separation.md) and the point at which a server refuses.
+Two shapes are measured because they are two different systems: today the pool keys on
+`(host, port, ClientTls, address fingerprint)` and **not** on the path, so every path a runtime
+dials shares one connection; 0002's bulk tier makes it one connection per path.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| 16 paths, pooled (today) | `cargo bench -p weida --bench connections` | **1.13-1.15 ms** for all 16 dials: one handshake and fifteen pool hits, 16 `(connection, path)` peer entries over **one** QUIC connection |
+| 256 paths, pooled (today) | same | **1.47 ms** for all 256 dials, 256 peer entries over **one** connection. The fan does not exist yet: dialling more paths costs microseconds, not connections |
+| 16 paths, one connection each (0002) | same | **22.6-23.6 ms** total, **1.41-1.47 ms** per path |
+| 256 paths, one connection each (0002) | same | **277.7 ms** total, **1.08 ms** per path — no degradation with the count, and 995 KiB of RSS per connection for both ends together, consistent with B-011's 750-850 KiB at 64 |
+| The refusal point | same | with `max_connections = 8`, connections 0 through 7 are accepted and the ninth dial fails with `Error::LimitExceeded` — "resource limit exceeded". The server completes the handshake first and then closes with `LIMIT_EXCEEDED` on purpose, so a peer can tell overload from a routing mistake (`crates/weida/src/listener.rs`) |
+
+The consequence for B-017's `Limits` profiles: **a per-path bulk connection is affordable in
+time and linear in memory, but it converts a path count into a connection count against
+`max_connections`** — a default of 1024 accepted connections per binding is 1024 paths' worth
+of fan from a *single* client if nothing else bounds it, which is why
+`max_connections_per_peer` is a named bound before the code exists
+([INVARIANTS.md](INVARIANTS.md), [PROTOCOL.md](PROTOCOL.md) §10.1). A client that dials 256
+paths pays 278 ms of handshakes where it pays 1.5 ms today, so the bulk tier wants lazy
+per-path connections — a path dialled is not a path used — while the control connection stays
+eager per B-011.
+
+**One regression found and fixed (B-025).** `connect/cold_handshake` had moved from
+1.02-1.10 ms to **1.18-1.24 ms** (+12 %, p = 0.00) against criterion's stored baseline, which
+predated B-016. The cause was in the code rather than inferred: `Exec::resolve` allocated the
+host string, spawned a task and awaited its join handle on **every** `connect`, including for a
+literal `127.0.0.1` that needs no lookup at all. `Exec::resolve` now parses an IP literal in
+place and keeps the task only for real hostnames, which `lookup_host` needs for its Tokio
+context. Measured after the fix: **1.05-1.09 ms**, `change: −11.6 % (p = 0.00)` — back to the
+pre-B-016 level. Every pinned deployment dials literals, because a pinned address names a key
+rather than a name, so this was the common path and not an edge case.
+
+### Verified results — segment matching in the fan-out path (B-021)
+
+The number [0007](decisions/0007-topic-namespace.md) §6 asked for. The objection the decision
+overrode was that a matching language belongs nowhere near a publisher's hot path
+([0007](decisions/0007-topic-namespace.md) §4.6); this is what it costs.
+
+The `filters` group of `crates/weida/benches/patterns.rs` gives one connection *N* filters that
+the published topic matches **none** of, so `publish` returns 0 and the measurement is *N*
+matcher calls plus the fixed cost of a publish — no enqueue, no copy, no fan-out. Running the
+same shape at `N = 1` and `N = 64` subtracts the fixed cost out: the difference over 63 is what
+one more filter costs.
+
+| Case | Command | Result |
+| --- | --- | --- |
+| Literal mismatch | `cargo bench -p weida --bench patterns -- filters` | 93.3 ns at one filter, **1.020 µs** at 64 → **14.7 ns per filter** |
+| `*` in the middle | same | 97.4 ns at one filter, **999 ns** at 64 → **14.3 ns per filter** |
+| Trailing `#` | same | **1.047 µs** at 64 → **15.1 ns per filter** |
+| The replaced matcher, for scale | same | 64 `topic.starts_with(filter)` comparisons in a tight loop: **29.3 ns**, i.e. **0.46 ns each** |
+| One matched fan-out, for scale | `cargo bench -p weida --bench patterns -- fanout` | `pub_1kib_8_subscribers` **64.5 µs** for publish plus eight receives |
+
+**The shape does not matter.** A walk that fails in the first segment, one that has to cross a
+`*` to reach the third, and one that meets a trailing `#` differ by 5 % — inside the spread of
+this machine. That is the answer to the objection: the per-filter cost is dominated by
+iterating the subscription registry, not by the grammar, and `#` being legal only in the final
+segment is what keeps it that way (no backtracking, so the walk is linear in the filter).
+
+**The scale is what settles it.** Sixty-four non-matching filters cost about **1 µs** of a
+publish, against **64.5 µs** for one matched fan-out to eight subscribers — under 2 % — and a
+publisher hits `max_subscriptions = 256` long before that becomes visible. The byte prefix it
+replaced would have been ~0.5 ns per comparison in isolation, so a hot-path-only argument could
+have preferred it; what it could not do is express a segment boundary at all, which is the
+trade 0007 recorded and these numbers price.
+
 ---
 
 ## 5. Decisions
@@ -790,6 +859,9 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | One runtime surface | `Exec` in `crates/weida/src/runtime.rs`: `spawn`, `sleep`, `resolve`, `enter` | One place to see what the crate asks of tokio, and the thing that makes a non-tokio caller possible at all. `grep -n 'tokio::spawn\|tokio::time\|lookup_host' crates/weida/src` matches `runtime.rs` and one comment. |
 | Client handshake placement | spawned **on** the runtime, awaited by the caller as a join handle | Completing a `quinn::Connecting` spawns the connection driver from inside the poll, so the polling thread would need an ambient reactor. Spawning it keeps `Runtime::connect` pollable from any executor and keeps the future `Send`, which holding an `EnterGuard` across the await would not. |
 | `futures-io` beside `tokio::io` | both trait pairs on `OutgoingTransfer`/`IncomingTransfer`, `futures-io` delegating to the tokio impl | A caller on `futures`, `smol` or `async-std` should not have to wrap a compat shim around a payload stream. Delegating keeps the end-of-payload bookkeeping in one place. |
+| `shutdown_timeout` | `RuntimeConfig::shutdown_timeout`, default 1 s (B-031) | `shutdown` closes every endpoint and then waited for the sockets to go idle **without a bound**, so the length of a process's exit was decided by the path rather than by the caller: measured against a peer that has gone silent, the draining period alone is **96 ms** on loopback and grows with round-trip time and loss. One second is generous on any network where a clean close was possible at all. The bound is one budget for the whole shutdown, not one per endpoint, because what a caller waits for is the call ([decisions/0009](decisions/0009-drain.md) §4.4). |
+| Address selection | try every resolved address in order, capped by `Limits::max_resolved_addresses` (8), each attempt but the last bounded by `RuntimeConfig::connect_attempt_timeout` (250 ms) (B-029) | Taking the first address made `weida://localhost:…` unreachable wherever `localhost` resolves to `::1` before `127.0.0.1`, which is the common Linux ordering and this machine's. Sequential attempts with a per-attempt bound rather than RFC 8305's parallel happy-eyeballs: the failure being fixed is an address that answers *nothing*, where QUIC has no refusal to observe, and 250 ms is RFC 8305's own Connection Attempt Delay for exactly that case. Measured on the regression test: **30 s before, 1.3 s after**. The last address keeps the full handshake budget, so an IP literal and a single-address name behave exactly as before. |
+| Loss cause | `Error::ConnectionLost(LossCause)` — `IdleTimeout`, `PeerClosed`, `LocallyClosed`, `Reset`, `TransportError` (B-028) | `PeerSet::pick` reported a bare `ConnectionLost` for every closed peer, and `conn_error` mapped `TimedOut`, `Reset` and an unrecognized application close to the same value, so the distinction did not exist anywhere in the API. A payload rather than new top-level variants: the *outcome* is identical in all five cases — nothing in flight completed, `is_definite_failure()` stays true — and only the next action differs, so a second outcome vocabulary would have been the wrong shape ([FAILURE_MODEL.md](FAILURE_MODEL.md) §4). Five causes because each one changes what an application should do; `pick` now reports the cause of the peer it rejected. |
 
 ---
 
@@ -841,12 +913,6 @@ Recorded deliberately, not discovered later.
   would be worse.
 - **Publisher direction is fixed.** Pub and Pull bind; Sub and Push connect. The reverse
   directions wait for a use case that demands them.
-- **The cause of a lost connection is erased at peer selection.** `PeerSet::pick` reports
-  `Error::ConnectionLost` for any peer whose connection has closed, without consulting the
-  `quinn::ConnectionError`, so an idle timeout, a peer SHUTDOWN and a transport error are
-  indistinguishable there. `conn_error` has the richer mapping; through the pattern APIs it is
-  unreachable once every peer entry is closed. An application deciding whether to reconnect or
-  to give up cannot tell why it lost the peer.
 - **No automatic reconnect.** A dead peer is never redialled by the library; the application
   calls `connect` again, and dead entries are reaped at that moment (`PeerSet::add`), not
   before.
@@ -854,10 +920,6 @@ Recorded deliberately, not discovered later.
   exist. What ships is authentication plus the identity: applications decide on
   `IncomingMeta::peer`, and the only built-in allow list is a `Trust` pin list on a binding,
   which is connection-wide and all-or-nothing.
-- **The resolver takes the first address.** `pool::resolve` uses the first entry
-  `lookup_host` returns, so `weida://localhost:…` on a host where `localhost` resolves to
-  `::1` only cannot reach a server bound to `127.0.0.1`. Use the IP literal until address
-  selection learns to try more than one.
 - **`stream_receive_window` is not a payload budget.** The DATA header spends the same window
   as the payload, and a receiver announces more window only per eighth of it, so a payload
   sized exactly to the window cannot be written until the application starts reading (§4).
