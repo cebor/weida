@@ -388,20 +388,24 @@ note: on branch `b071-zmq-context` by the parallel worker, straight off ff9131a.
 note: merged `--no-ff` as 67da7bf and gated here: **546 tests**, one ignored. One commit (8c5beb8), `crates/zmq/weida-zmq`, `[dependencies]` = `weida-core`, `weida-runtime`, `tokio` (dev: `futures`) — no `weida`, no `weida-protocol`, which is [0013](decisions/0013-competitor-libraries.md) §4.2 enforced by the manifest rather than by discipline. `Context` with the three reactor constructors, the `inproc` namespace as a `NameRegistry<InprocDial>` under 256 B, `open_socket` handing out a `SocketSlot` that gives `EMFILE` at `ZMQ_MAX_SOCKETS` (1023), and a `shutdown` on a finite `CloseBudget` returning `Terminated::outstanding` — the finite-linger default of 0013 §4.4 arriving with the first object that can hang. `Endpoint` parses the three transports and names the absent ones with `EPROTONOSUPPORT` instead of a generic parse error; `Error` has 16 errno-named variants, each carrying a cause, plus `From<weida_core::Error>` so the mapping happens once at the boundary. The test worth keeping: `113 - "ipc://".len() == weida_core::MAX_SOCKET_PATH_BYTES`, so libzmq's published `ipc` limit and the kernel's `sun_path` budget check *each other* rather than both being asserted from the same reading.
 
 ### B-072 — Message, per-peer queue and the high-water marks
-kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T16:40Z | needs: [B-071]
+kind: code | size: 90 | status: done 8d611c8 | needs: [B-071]
 acceptance: `Message`/`Multipart` sent and received atomically ("all frames or none"), `ZMQ_MAXMSGSIZE` checked from the declared length before any allocation, the per-peer double queue every pattern RFC specifies, `ZMQ_SNDHWM`/`ZMQ_RCVHWM` at 1000, and the mute-state action of `zmq_socket(3)`'s table — block, drop or `EAGAIN` — with one test per action.
 note: from 0013 §5.3.
 note: on branch `b072-zmq-message` by the parallel worker, off 8c5beb8.
+note: merged `--no-ff` as 8d611c8 and gated here: **567 tests**, one ignored. One commit (28d2df0); `weida-zmq` is now 44 unit tests plus the doctest, and its manifest gained `weida-zmtp` — the codec is reused rather than reimplemented and its own `[dependencies]` stays empty ([0013](decisions/0013-competitor-libraries.md) §4.3); still no `weida` and no `weida-protocol`, verified in the manifest. Three shapes worth keeping. **Atomicity is in the type:** `Multipart` is one value, `encode` writes the whole message with MORE on all but the last frame, and `decode` returns `Decoded::Incomplete` **consuming nothing** until the last frame has arrived — a test walks every proper prefix of a three-frame message and asserts nothing is delivered, which is 37/ZMTP's "all frames or none" made unrepresentable rather than merely tested. **The mute action is written once:** `MuteAction::sending(SocketType)` is `zmq_socket(3)`'s column over the codec's `SocketType`, so B-075..B-079 read it instead of each re-deciding; the four rows the manual omits (REP, SUB, DISH, GATHER) return `None` and `QueueConfig::sending` refuses them with `EINVAL` rather than guessing. **No test pins a depth:** hwm 1 or 2 and the behaviour at the bound — block-then-pass-on-drain, drop-and-count, `EAGAIN` — plus `ZMQ_DONTWAIT` giving `EAGAIN` whatever the mute action and hwm 0 as libzmq's "no limit", because libzmq's own number is inexact ("as much as 90% lower", kernel buffers underneath) and what is exact here is the local behaviour.
+note: the `ZMQ_MAXMSGSIZE` test feeds a **nine-octet** buffer — a long header declaring 2^63-1 and no body — and gets `EMSGSIZE` from the declared length, which is the only order in which that declaration is survivable; the check is `weida-zmtp`'s own rather than a second copy of the arithmetic. The exposure this leaves is a product, and it is stated in `DEFAULT_MAX_MESSAGE_SIZE`'s docs: the HWM counts **messages**, so the defaults are 1000 × 1 MiB per direction per peer — the same arithmetic B-051 forced onto the bridge. Filed as B-096.
 
 ### B-073 — The connection engine: bind, connect, reconnect
-kind: code | size: 90 | status: ready | needs: [B-072]
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T16:45Z | needs: [B-072]
 acceptance: one socket binds and connects many endpoints; `ZMQ_RECONNECT_IVL`/`_IVL_MAX` backoff, `ZMQ_HANDSHAKE_IVL`, `ZMQ_CONNECT_TIMEOUT`, `ZMQ_IMMEDIATE`, `ZMQ_BACKLOG`, `ZMQ_LAST_ENDPOINT` after a wildcard bind, `unbind`/`disconnect`; a queue exists for a peer that never connected, per the RFCs' "whether or not the connection is established".
 note: from 0013 §5.3.
+note: on branch `b073-zmq-engine` by the parallel worker, off the B-072 merge 8d611c8.
 
 ### B-074 — The ZMTP session on the existing codec
 kind: adapter | size: 90 | status: ready | needs: [B-073]
 acceptance: greeting with the 3.0 downgrade, NULL handshake, `READY` metadata with `Socket-Type` and `Identity`, MORE/COMMAND framing through `weida-zmtp` unchanged, `PING`/`PONG` gated on the negotiated version, `ERROR` sent and understood; zmtp.md §10.1's vectors still assert byte-for-byte and the codec's `[dependencies]` is still empty.
 note: from 0013 §5.3.
+note: queued after B-073 on `b074-zmq-session`.
 
 ### B-075 — REQ and REP
 kind: code | size: 90 | status: ready | needs: [B-074]
@@ -507,3 +511,8 @@ note: from 0013 §5.3.
 kind: spec | size: 45 | status: ready | needs: [B-071]
 acceptance: `crates/zmq/` holds `weida-zmtp`, `weida-zmq` and `weida-zmq-bridge`; `crates/nng/` holds `weida-sp` and `weida-nng-bridge`; `cross-tests` moves to `crates/interop/`; README's crate table gains the `kind` column of [0013](decisions/0013-competitor-libraries.md) §5.5 and ARCHITECTURE §4's crate map and every stale doc path follow; no crate **name** changes, so nothing published breaks.
 note: from 0013 §5.3.
+
+### B-096 — A byte ceiling for the per-peer queues, or the product stated where it is taken
+kind: code | size: 60 | status: ready | needs: [B-076, B-077, B-078, B-079]
+acceptance: the exposure a socket hands a real peer is bounded in bytes rather than only in messages, or — where libzmq's message-counting HWM must be preserved exactly — the product `hwm × max_message_size` per direction per peer is stated at every place the numbers are taken and a test asserts the ceiling actually holds; the answer is the same shape B-053 and B-054 gave the bridge ([INVARIANTS.md](INVARIANTS.md)), and it says which of the two it chose and why.
+note: found by B-072 rather than by a review pass. `ZMQ_SNDHWM`/`ZMQ_RCVHWM` count **messages**, so at the defaults one peer can hold 1000 × 1 MiB per direction; `DEFAULT_MAX_MESSAGE_SIZE`'s documentation states the product, which is honest but is not a bound. Deliberately after the pattern sockets exist (B-076..B-079): before them nothing hands these numbers to a stranger, and the right answer may differ per socket type — a PUB that drops is not exposed the way a PULL that blocks is.
