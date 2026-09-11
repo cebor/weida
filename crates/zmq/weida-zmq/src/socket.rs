@@ -365,6 +365,16 @@ impl SocketCore {
         }
     }
 
+    /// Waits until a message could be waiting, or the peer set changed.
+    ///
+    /// For a socket type whose `recv` has more to report than messages — an
+    /// XPUB turns a departure into an unsubscribe — so it must wake on both
+    /// and decide for itself.
+    pub async fn wait_for_activity(&mut self) {
+        let peers = self.engine.peers();
+        wait_for_message(&self.engine, &peers).await;
+    }
+
     /// The next peer with room, starting at the cursor, and its index.
     fn next_with_room(&self, peers: &[Peer]) -> Option<(usize, Arc<Queue>)> {
         if peers.is_empty() {

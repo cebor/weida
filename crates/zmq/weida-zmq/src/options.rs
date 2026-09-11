@@ -188,6 +188,27 @@ pub struct SocketOptions {
     /// Which wire form this socket **sends** subscriptions in; both are
     /// accepted on receive. See [`SubscriptionForm`].
     pub subscription_form: SubscriptionForm,
+    /// `ZMQ_XPUB_VERBOSE`: deliver **every** subscription to the
+    /// application, not only the first for a prefix.
+    ///
+    /// libzmq's default deduplicates — 29/PUBSUB's optional normalization
+    /// "so that multiple identical subscriptions result in a single command
+    /// only" — which loses the count a proxy needs to forward upstream
+    /// faithfully (`docs/research/zeromq.md` §4.3).
+    pub xpub_verbose: bool,
+    /// `ZMQ_XPUB_VERBOSER`: deliver every subscription **and** every
+    /// unsubscription, including the ones that changed nothing.
+    pub xpub_verboser: bool,
+    /// `ZMQ_XPUB_MANUAL`: deliver subscriptions without applying them.
+    ///
+    /// The application decides what this socket will match, with
+    /// [`crate::XPubSocket::subscribe`] — which is how a broker
+    /// authorizes subscriptions instead of honouring whatever a peer asks
+    /// for.
+    pub xpub_manual: bool,
+    /// `ZMQ_XPUB_WELCOME_MSG`: a message sent to every subscriber as soon as
+    /// it connects, and again on every reconnect.
+    pub xpub_welcome_msg: Option<Vec<u8>>,
     /// Peers this socket will admit from **accepted** connections.
     ///
     /// **Not a libzmq option**, and the parity table says so in those terms:
@@ -222,6 +243,10 @@ impl Default for SocketOptions {
             max_subscriptions: DEFAULT_MAX_SUBSCRIPTIONS,
             max_subscription_bytes: DEFAULT_MAX_SUBSCRIPTION_BYTES,
             subscription_form: SubscriptionForm::default(),
+            xpub_verbose: false,
+            xpub_verboser: false,
+            xpub_manual: false,
+            xpub_welcome_msg: None,
             heartbeat_ivl: None,
             heartbeat_timeout: None,
             heartbeat_ttl: None,
@@ -349,6 +374,20 @@ impl SocketOptions {
                 format!(
                     "ZMQ_ROUTER_MANDATORY and ZMQ_ROUTER_HANDOVER are ROUTER options; a {} \
                      socket cannot honour them",
+                    socket_type.as_str()
+                )
+                .into(),
+            ));
+        }
+        if (self.xpub_verbose
+            || self.xpub_verboser
+            || self.xpub_manual
+            || self.xpub_welcome_msg.is_some())
+            && socket_type != SocketType::XPub
+        {
+            return Err(Error::EINVAL(
+                format!(
+                    "the ZMQ_XPUB_* options are XPUB's; a {} socket cannot honour them",
                     socket_type.as_str()
                 )
                 .into(),
