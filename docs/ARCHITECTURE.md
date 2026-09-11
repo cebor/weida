@@ -612,12 +612,13 @@ peer measured ~50 MiB of transport state across both ends, against a ~1.1 ms han
 together, because two of them cannot be shown to be one peer; a binding that wants the bound
 requires a client identity.
 
-**The control tier is decided and not built** ([PROTOCOL.md](PROTOCOL.md) §2.5): one connection
-per peer for HELLO, SUBSCRIBE/UNSUBSCRIBE and the reserved credit frame. In v0 it would carry
-none of those — every connection does its own HELLO, the credit frame does not exist, and
-SUBSCRIBE cannot move off the path's connection until the wire says how a publisher addresses a
-subscriber's per-path connection. So `Limits` is already a per-connection profile, and a second
-profile arrives with the tier rather than before it.
+**The control tier is parked** ([decisions/0011](decisions/0011-answered-where-it-arrived.md)
+§4.3, [PROTOCOL.md](PROTOCOL.md) §2.5). The rule that settles it: a side writes traffic it
+originates on the connection the peer's registration arrived on, so a frame naming a path rides
+that path's connection [0011 §4.1-§4.2]. That is every frame weida has or reserves except
+HELLO, which each connection performs for itself — so a per-peer connection would pay a
+handshake and a timer pair to carry nothing. `Limits` is a per-connection profile, ready for a
+second profile, and the second profile arrives with the tier rather than before it.
 
 ### TLS
 

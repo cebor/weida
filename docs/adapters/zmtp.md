@@ -60,13 +60,18 @@ that mapping made concrete for a bridge, with the direction rule of
 maps naturally to one transport stream" [INVARIANTS], P1 and P2 of [ARCHITECTURE §6a]. A
 weida transfer is a DATA header followed by opaque payload bytes until FIN [PROTOCOL §4].
 
-**The ZMTP connection is not one weida connection.** After [0002](../decisions/0002-control-and-bulk-separation.md)
-§6.2-§6.3 the adapter holds one control connection per weida peer and one bulk connection per
-dialled path, bound together by the proved fingerprint
+**The ZMTP connection is not one weida connection.** The adapter holds **one weida connection
+per dialled endpoint path** ([0002](../decisions/0002-control-and-bulk-separation.md) §6.2,
+implemented), and the connections of one peer are bound together by the proved fingerprint
 ([0008](../decisions/0008-session-identity.md) §4.2). A ZeroMQ socket that connects to several
-endpoints [zeromq §2] therefore maps to several weida bulk connections, and the adapter's
+endpoints [zeromq §2] therefore maps to several weida connections, and the adapter's
 round-robin over them is `PeerSet::pick` [ARCHITECTURE §5], which is the same selection rule
-PUSH and REQ use [zeromq §4.1].
+PUSH and REQ use [zeromq §4.1]. There is no separate control connection to hold: 0002 §6.3's
+per-peer tier is parked, because a frame that names a path rides that path's connection
+([0011](../decisions/0011-answered-where-it-arrived.md) §4.2-§4.3). What the adapter gets from
+that is exactly what SYNTHESIS §7.2 asked for — one weida connection per foreign session is one
+connection per path — so it can promise MQTT's no-stall rule for a session without inventing
+anything.
 
 **Multipart does not survive.** ZMTP multipart is "multiple sequential ZMTP messages, where
 all but the last message has the MORE flag set", delivered atomically, "all frames or none"
@@ -127,7 +132,7 @@ MUST NOT pretend otherwise.
 | Block at the bound: PUSH, PULL, REQ, DEALER, PAIR, CLIENT, SCATTER, CHANNEL [zeromq §12/P4] | `Block` [GUARANTEES §6] | Matching. Push/Pull and Req/Rep bridges keep backpressure end to end |
 | Drop at the bound: PUB, XPUB, XSUB, RADIO, ROUTER [zeromq §12/P4] | `Drop`, publisher fan-out only [GUARANTEES §6] | Matching **only** for PUB/XPUB/RADIO onto weida Pub/Sub. ROUTER's drop has no weida counterpart — loss L5 |
 | `EAGAIN` at the bound: SERVER, PEER, STREAM [zeromq §12/P4] | `Reject`: `read_capped` past its cap, `publish` past `subscriber_buffer_bytes` [GUARANTEES §6] | Different trigger, same shape: a visible local error rather than a silent loss |
-| No credit signal anywhere [zeromq §12/P12] | No L0 application credit; L2 credit is per subscription on the control connection [0003 §4.2] | When the L2 broker exists, a ZeroMQ peer still has nothing to grant or consume, so the adapter is the credit endpoint and must bound its own buffer |
+| No credit signal anywhere [zeromq §12/P12] | No L0 application credit; L2 credit is per subscription, on the connection of the path that subscription names [0003 §4.2, [0011](../decisions/0011-answered-where-it-arrived.md) §4.3] | When the L2 broker exists, a ZeroMQ peer still has nothing to grant or consume, so the adapter is the credit endpoint and must bound its own buffer |
 
 The rule SYNTHESIS §7.1 states for this chain is normative here: "a bridge that maps ZeroMQ
 PUB onto weida Pub/Sub gets a matching policy… a bridge that maps ZeroMQ PUSH onto weida

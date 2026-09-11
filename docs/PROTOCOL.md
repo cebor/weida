@@ -192,11 +192,11 @@ per the connection-loss rules in [FAILURE_MODEL.md](FAILURE_MODEL.md).
 A peer pair holds more than one QUIC connection
 ([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.2-§6.3):
 
-- one **bulk** connection per dialled endpoint path, carrying that path's transfers.
-  **Implemented**;
-- one **control** connection per peer, carrying HELLO, SUBSCRIBE, UNSUBSCRIBE and the
-  reserved credit frame of §11 — everything small and latency-sensitive. **Not implemented,
-  and deliberately not**: see the paragraph below.
+- one **connection per dialled endpoint path**, carrying that path's transfers and the control
+  frames that name it. **Implemented**;
+- one **control** connection per peer, for peer-scoped frames.
+  **Not implemented, and parked** ([decisions/0011](decisions/0011-answered-where-it-arrived.md)
+  §4.3): no frame that v0 has or reserves is peer-scoped enough to need it.
 
 The point is head-of-line coupling: a QUIC connection's receive window is shared, so one slow
 reader can stall every writer on that connection ([PATTERNS.md](PATTERNS.md) §1.3). One
@@ -206,16 +206,24 @@ which is asserted end to end by `a_stalled_path_does_not_stall_another_path` in
 its own HELLO (§2.2) and its own negotiation (§2.3), and nothing on the wire distinguishes one
 from another.
 
-**Why the control tier is not built yet.** Every connection already does its own HELLO, so a
-control connection would carry no HELLO that protects anything; the credit frame of §11 does
-not exist at wire version 0; and SUBSCRIBE/UNSUBSCRIBE cannot move there until the wire says
-how a server addresses a subscriber's *bulk* connection. A publisher writes fan-out on the
-connection the SUBSCRIBE arrived on, and no field tells it which of a peer's per-path
-connections to use instead — the question 0002 §7 left open as "a HELLO field, or the
-fingerprint alone". A control connection in v0 would therefore cost one handshake per peer
-and carry nothing. Until that is decided, SUBSCRIBE and UNSUBSCRIBE ride the bulk connection
-of the path they name, and the residual coupling is named rather than hidden: an endpoint that
-publishes *and* subscribes on one path can queue its own SUBSCRIBE behind its own payload.
+**Traffic a side originates for a peer's registration MUST be written on the connection that
+carried the registration** ([decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.1).
+No header field selects a connection. A publisher therefore writes fan-out on the connection
+the SUBSCRIBE arrived on, which is what every protocol in the catalogue does — EMQX sends a
+server-initiated PUBLISH "on the stream where it received that topic's subscription", NATS
+answers a `SUB` on its own connection, a RabbitMQ consumer tag is channel-scoped.
+
+**A frame that names a path is path-scoped and rides that path's connection; a frame that names
+only the peer is peer-scoped** [0011 §4.2]. SUBSCRIBE and UNSUBSCRIBE name an endpoint path
+(§6.4), so they ride that path's connection and are **not** control-tier traffic: moving them
+to a per-peer connection would separate a subscription from the only route to its subscriber.
+The reserved credit frame of §11 is granted per subscription, so it is path-scoped for the same
+reason [0011 §4.3].
+
+What remains coupled is stated rather than hidden: since a path's connection carries both its
+payload and its subscriptions, an endpoint that publishes *and* subscribes on one path can
+queue its own SUBSCRIBE behind its own payload. A pure subscriber writes nothing there and a
+pure publisher sends no SUBSCRIBE, so neither is affected [0011 §4.4].
 
 **What binds a peer's connections is the proved fingerprint, and nothing else**
 ([decisions/0008](decisions/0008-session-identity.md) §4.2). No HELLO field names a peer's
@@ -1038,7 +1046,9 @@ versions.
   ([decisions/0008](decisions/0008-session-identity.md) §4.5, §4.6).
 - **The L2 credit frame.** Frame kind `5` is **reserved** for the broker-layer credit frame of
   [decisions/0003](decisions/0003-credit-unit.md) §4.2-§4.3: an absolute delivery limit per
-  subscription, carried on the control connection, idempotent under loss or duplication. Its
+  subscription, idempotent under loss or duplication. It names a subscription, so it is
+  path-scoped and rides that path's connection rather than a control connection, which amends
+  0003 §4.2 ([decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.3). Its
   fields are fixed with the Phase 6 broker design. A wire-version-0 receiver has no such frame
   and MUST therefore treat kind `5` as unknown and close with `PROTOCOL_VIOLATION` (§3.2); the
   reservation only forbids anyone else from taking the number.

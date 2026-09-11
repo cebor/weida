@@ -298,6 +298,16 @@ combined with Option E, plus three properties no single option carried.
    require a permanent control stream" ([INVARIANTS.md](../INVARIANTS.md)) must be restated so
    that a control *connection* is permitted while a multiplexed control *stream* remains
    forbidden.
+
+   **Amended by [0011](0011-answered-where-it-arrived.md) §4.3: this connection is parked.**
+   0011 decides that server-initiated traffic is written on the connection the registration
+   arrived on, so a frame naming a path rides that path's connection — which takes
+   SUBSCRIBE/UNSUBSCRIBE and the reserved credit frame out of this tier's cargo, and leaves
+   HELLO, which every connection performs for itself anyway. A control connection in v0 would
+   therefore pay a handshake and a timer pair per peer to carry nothing. It revives on a
+   genuinely peer-scoped latency-sensitive frame, or on a measurement showing the residual
+   coupling of 0011 §4.4 hurting a real workload. Decision 2 — one connection per dialled
+   path — is implemented and is what carries the isolation this note was written for.
 4. **Limits are configuration per runtime**, not protocol constants and not negotiated:
    `RuntimeConfig` carries two `Limits` profiles, `control` and `bulk`, with their own
    receive windows, stream budgets, idle timeout and keep-alive. QUIC's windows are the
@@ -335,6 +345,12 @@ combined with Option E, plus three properties no single option carried.
   table splits into control and bulk profiles with their defaults. Whether ALPN distinguishes
   the two connection kinds (Zenoh's `zenoh-ms` shape [prior-art §1]) or a HELLO field does is
   part of the same follow-up.
+- **The follow-up above is closed by [0011](0011-answered-where-it-arrived.md).** The question
+  "how a bulk connection names its control connection" turned out to be two: which connections
+  are one peer — answered by [0008](0008-session-identity.md) §4.2, the proved fingerprint and
+  nothing else — and which connection a side writes *its own* traffic on, which 0008 does not
+  answer and 0011 §4.1 now does: the one the registration arrived on. No HELLO field and no
+  ALPN distinction is added, so nothing on the wire distinguishes the tiers.
 - **[GUARANTEES.md](../GUARANTEES.md) §6 and [PATTERNS.md](../PATTERNS.md) §1.3.** The
   sentence "one slow reader stalls every writer on the connection" is narrowed to "every bulk
   writer on the same path's connection"; control traffic and other paths are isolated by

@@ -69,10 +69,12 @@ Flow control is per stream and per connection, and the two behave differently:
   one connection per dialled path
   ([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.2), "everyone" means
   the writers on that path and nothing else: another path is another connection and another
-  window. What is *not* yet isolated is control traffic on the same path — a SUBSCRIBE still
-  rides its path's connection, so an endpoint that publishes and subscribes on one path can
-  queue its own subscription behind its own payload, which is the residual coupling the
-  control tier will remove ([PROTOCOL.md](PROTOCOL.md) §2.5).
+  window. What is *not* isolated is a path's own control traffic: a SUBSCRIBE rides the
+  connection of the path it names, because that is the only route back to the subscriber
+  ([decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.1-§4.2), so an endpoint
+  that publishes *and* subscribes on one path can queue its own subscription behind its own
+  payload. A pure subscriber writes nothing there and a pure publisher sends no SUBSCRIBE,
+  so neither is affected [0011 §4.4].
 - **The header spends the window too.** The DATA header rides on the transfer's own stream, so
   the payload that fits in one window is `stream_receive_window - header`, and the last eighth
   only clears once the application reads. A payload sized exactly to the window therefore
@@ -103,9 +105,10 @@ L0 or on the wire: QUIC's byte windows are the byte credit and the concurrent-st
 the message credit, both receiver-granted through transport parameters and both absolute and
 idempotent ([decisions/0003](decisions/0003-credit-unit.md) §4.1). A consumer that wants a
 prefetch of *n* messages grants `max_concurrent_uni_streams = n` on the connection it reads
-from — a bulk connection, once the tiers of §1.3 exist — and that is the whole mechanism
+from — one per dialled path, per §1.3 — and that is the whole mechanism
 [0003 §5]. A per-subscription message credit arrives with the L2 broker and travels on the
-control connection, never at L0 [0003 §4.2].
+connection of the path its subscription names, never at L0 [0003 §4.2, as amended by
+[0011](decisions/0011-answered-where-it-arrived.md) §4.3].
 
 ### 1.5 Cancel: never EOF, not a retraction
 

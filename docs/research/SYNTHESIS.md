@@ -1097,6 +1097,14 @@ handshake and under a megabyte of resident state for the pair
 ([IMPLEMENTATION.md](../IMPLEMENTATION.md) §4, B-011), against head-of-line coupling that is
 unbounded.
 
+**Amended by [0011](../decisions/0011-answered-where-it-arrived.md):** the separation that was
+built is the per-path one, and it is what the coupling above needed. The per-peer control
+connection is parked: 0011 §4.1 decides that a side writes traffic it originates on the
+connection the peer's registration arrived on, so a frame naming a path rides that path's
+connection — which leaves the control tier with no cargo in v0, HELLO included, since every
+connection performs its own. What is left coupled is one case, named rather than hidden: an
+endpoint that publishes *and* subscribes on the same path [0011 §4.4].
+
 **8.3 Which acknowledgement states does L2 actually need, and what exactly certifies each?**
 `Accepted`, `Stored`, `Replicated(n)` and `Processed` are reserved with precise definitions and
 no wire representation [GUARANTEES §1]. The sheets show three distinct certification points in

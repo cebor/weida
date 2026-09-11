@@ -780,16 +780,18 @@ number excludes the per-runtime quinn endpoint and UDP socket.
 | Memory per idle runtime | same | **0-4 KiB** RSS: a `Runtime` that has dialled nothing holds nothing worth counting |
 | Memory per live connection | same | **488-596 KiB** at 2 connections, **750-850 KiB** at 64 (46-53 MiB for 64), covering **both** ends. The single-connection figure is 1196-1260 KiB because it also pays the one-off crypto and endpoint state |
 
-What this says for 0002's two tiers: a control connection beside a bulk connection costs about
-**one millisecond of handshake and under a megabyte of resident memory for both ends
-together**, and the handshake is the whole cost — there is no per-connection cost that grows
-with the number of connections held. Against that, the head-of-line coupling 0002 removes is
-unbounded: one slow reader stalls every writer on the connection
-([PATTERNS.md](PATTERNS.md) §1.3). The numbers therefore support 0002's default rather than
-arguing for a lazily created control connection. They also set the scale for the `Limits`
-profiles of B-017: 64 connections to one peer is ~50 MiB of transport state on the pair, so a
-per-peer connection count belongs in the named bounds
-([INVARIANTS.md](INVARIANTS.md)) rather than being left to the path count.
+What this says about a second connection per peer: it costs about **one millisecond of
+handshake and under a megabyte of resident memory for both ends together**, and the handshake
+is the whole cost — there is no per-connection cost that grows with the number of connections
+held. Against that, the head-of-line coupling one connection per path removes is unbounded:
+one slow reader stalls every writer on the connection ([PATTERNS.md](PATTERNS.md) §1.3). That
+is why the per-path split is worth a connection each and was built (B-017). It is also why the
+*control* tier is not: a millisecond is cheap for isolation and expensive for nothing, and
+[decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.3 shows the tier would carry
+nothing in v0. These numbers also set the scale for the per-peer ceiling: 64 connections to
+one peer is ~50 MiB of transport state on the pair, which is why
+`max_connections_per_peer` (64) is a named bound ([INVARIANTS.md](INVARIANTS.md)) rather than
+the path count being the only one.
 
 RSS is read from `/proc/self/status` `VmRSS` and the allocator does not return everything
 between measurements, so each row's baseline is the previous row's residue; the per-connection
@@ -811,15 +813,16 @@ dials shares one connection; 0002's bulk tier makes it one connection per path.
 | 256 paths, one connection each (0002) | same | **277.7 ms** total, **1.08 ms** per path — no degradation with the count, and 995 KiB of RSS per connection for both ends together, consistent with B-011's 750-850 KiB at 64 |
 | The refusal point | same | with `max_connections = 8`, connections 0 through 7 are accepted and the ninth dial fails with `Error::LimitExceeded` — "resource limit exceeded". The server completes the handshake first and then closes with `LIMIT_EXCEEDED` on purpose, so a peer can tell overload from a routing mistake (`crates/weida/src/listener.rs`) |
 
-The consequence for B-017's `Limits` profiles: **a per-path bulk connection is affordable in
-time and linear in memory, but it converts a path count into a connection count against
+The consequence, now implemented (B-017): **a per-path connection is affordable in time and
+linear in memory, but it converts a path count into a connection count against
 `max_connections`** — a default of 1024 accepted connections per binding is 1024 paths' worth
-of fan from a *single* client if nothing else bounds it, which is why
-`max_connections_per_peer` is a named bound before the code exists
-([INVARIANTS.md](INVARIANTS.md), [PROTOCOL.md](PROTOCOL.md) §10.1). A client that dials 256
-paths pays 278 ms of handshakes where it pays 1.5 ms today, so the bulk tier wants lazy
-per-path connections — a path dialled is not a path used — while the control connection stays
-eager per B-011.
+of fan from a *single* client if nothing else bounds it, which is why `max_connections_per_peer`
+(64) exists and counts per proved fingerprint
+([INVARIANTS.md](INVARIANTS.md), [PROTOCOL.md](PROTOCOL.md) §10). A client that dials 256
+paths pays 278 ms of handshakes where it paid 1.5 ms with one pooled connection, so a path
+dialled is not a path used: connections are created on the first dial of a path and never
+pre-created, which is what the pool does. No control connection is added on top
+([decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.3).
 
 **One regression found and fixed (B-025).** `connect/cold_handshake` had moved from
 1.02-1.10 ms to **1.18-1.24 ms** (+12 %, p = 0.00) against criterion's stored baseline, which
@@ -966,7 +969,7 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Decision | Value | Rationale |
 | --- | --- | --- |
 | Pool granularity | one connection per `(authority, terms, expected fingerprint, **path**)` | A QUIC connection's receive window is shared, so the only way two flows cannot stall each other is for them not to share a connection ([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.2). Measured as behaviour, not asserted: `a_stalled_path_does_not_stall_another_path` fills one path's window until a write parks and then sends on another path. Reverting the key to one connection per peer makes that test time out, which is the coupling the decision set out to remove. |
-| The control tier | **not built**, and the reason is recorded rather than the code | In v0 a control connection would carry nothing: every connection performs its own HELLO (§2.2 of [PROTOCOL.md](PROTOCOL.md)), the credit frame of §11 does not exist, and SUBSCRIBE cannot move there because a publisher writes fan-out on the connection the SUBSCRIBE arrived on and no field tells it which per-path connection to use instead — the question 0002 §7 left open. One handshake per peer for nothing is worse than the named residual coupling (a SUBSCRIBE behind payload on the *same* path). Filed as B-044 (the addressing decision) and B-045 (the tier). |
+| The control tier | **not built, and now parked by decision** | In v0 a control connection would carry nothing: every connection performs its own HELLO (§2.2 of [PROTOCOL.md](PROTOCOL.md)), the credit frame of §11 does not exist, and SUBSCRIBE could not move there because a publisher writes fan-out on the connection the SUBSCRIBE arrived on and no field names a peer's other per-path connection. That question is settled by [decisions/0011](decisions/0011-answered-where-it-arrived.md): a frame naming a path rides that path's connection, which takes SUBSCRIBE/UNSUBSCRIBE *and* the reserved credit frame out of the tier's cargo and leaves it empty, so it is parked with a revival condition (0011 §4.3) rather than left blocked. The named residual coupling is a SUBSCRIBE behind payload on the *same* path (0011 §4.4). |
 | `Limits` scope | a **per-connection** profile; runtime-level numbers moved to `RuntimeConfig` | 0002 §6.4 wants one profile per tier. Two profiles are only honest if every field means something in both, so `max_connections`, `endpoint_queue` and `max_resolved_addresses` — per binding, per endpoint, per dial — left `Limits`, and `keep_alive`/`idle_timeout` joined it, because those *are* per connection. The second profile itself waits for the tier: a `Limits::CONTROL` nothing reads would be five numbers nobody has to justify. |
 | Peer binding | compare against the peer's **live** connections, refuse a mismatch with `Error::Untrusted(fp)` | The fingerprint is the only thing that binds a peer's connections ([decisions/0008](decisions/0008-session-identity.md) §4.2), and dialling a second path is dialling the same peer. Live connections rather than a remembered value, because a peer is this peer only while a connection to it lives: once the last one is gone, a replacement server with a new key is a new peer and nothing should still be objecting to it. Proved by swapping a raw server's identity between two handshakes on one socket — the load-balancer case, which two `quinn` endpoints cannot reproduce because they cannot share a port. |
 | `max_connections_per_peer` | 64, counted per proved fingerprint, released on close | One connection per path lets the dialling side choose the count, so `max_connections` alone would let one peer fill a binding. 64 is the number B-011 measured (~50 MiB of transport state across both ends for 64 connections to one peer) and a sixteenth of the default `max_connections`. Anonymous connections are not counted together: two of them cannot be shown to be one peer, so counting them as one would refuse strangers for each other's traffic. |
