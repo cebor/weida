@@ -13,7 +13,7 @@ use weida_zmtp::{Command, SocketType};
 
 use crate::error::BridgeError;
 use crate::subscriptions::{Change, MidSegment, Subscriptions};
-use crate::wire::{DropQueue, Incoming, Session};
+use crate::wire::{DropQueue, Incoming, Session, answer, answer_command, sanitize};
 
 /// Which ZeroMQ socket type the bridge presents to whoever connects.
 ///
@@ -450,41 +450,6 @@ async fn apply_subscription(
         Change::None => {}
     }
     Ok(())
-}
-
-/// Answers a command that is not a subscription: `PING` gets its `PONG`,
-/// everything else is noted and ignored.
-async fn answer_command(session: &mut Session<TcpStream>, body: &[u8]) -> Result<(), BridgeError> {
-    let command = Command::decode(body)?;
-    answer(session, command).await
-}
-
-async fn answer(session: &mut Session<TcpStream>, command: Command<'_>) -> Result<(), BridgeError> {
-    match command {
-        // "When a peer receives a PING command it SHALL respond with a PONG
-        // command that echoes the ping-context."
-        Command::Ping { context, .. } => session.write_command(&Command::Pong { context }).await,
-        Command::Error(reason) => Err(BridgeError::Protocol(format!(
-            "peer sent ERROR, which is fatal: {reason}"
-        ))),
-        other => {
-            tracing::debug!(
-                command = other.name(),
-                "ignoring a command with no use here"
-            );
-            Ok(())
-        }
-    }
-}
-
-/// Makes a reason printable, since `ERROR` carries printable ASCII only.
-fn sanitize(reason: &str) -> String {
-    let mut out: String = reason
-        .chars()
-        .map(|c| if (' '..='~').contains(&c) { c } else { '?' })
-        .collect();
-    out.truncate(255);
-    out
 }
 
 #[cfg(test)]

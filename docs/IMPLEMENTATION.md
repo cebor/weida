@@ -1092,6 +1092,20 @@ refused its own buffer with "a SUB peer sent a message, which its socket type ca
 fix is to read into scratch and append only after the read completes, which is what makes the
 claim "cancel-safe" true; the comment on `fill` now records the version that looks equivalent
 and is not.
+
+---
+
+### ZMTP outbound bridge decisions (Phase 9 slice 3, B-042)
+
+| Decision | Value | Rationale |
+| --- | --- | --- |
+| Which side binds | the **weida** side | The mirror of the inbound slice is not symmetric. Inbound the bridge binds on the ZeroMQ side because that is where the foreign peers dial; outbound it binds a weida endpoint and dials the foreign peer, because the endpoint path is what weida applications address and an endpoint that nobody can name is not reachable. One `Outbound` is therefore one weida path in front of one foreign peer. |
+| Req/Rep dials `DEALER`, not `REQ` | `Dialling::{Dealer, Pull, Sub}` | A weida `Replier` accepts concurrent exchanges ([ARCHITECTURE.md](ARCHITECTURE.md) §6b) and REQ is lockstep — "send and then receive exactly one message at a time" [zeromq §4.2] — so a REQ socket would serialize the very concurrency this side offers. DEALER carries the 28/REQREP envelope instead, and the bridge synthesizes it: an id frame it assigns, an empty delimiter, the body. |
+| What pairs a reply with its exchange | the id frame, in a table keyed by it | Not arrival order: a foreign ROUTER may answer out of order, and even against a REP peer nothing on the wire says the replies come back in the order the requests left. The test drives four exchanges at once and has the peer answer them in reverse; an id-blind bridge fails it. |
+| A reply that never comes | a deadline per exchange, then `ERROR{NO_REPLY}` | `ZMQ_ROUTER_MANDATORY` is an option on the ROUTER socket, and outbound that socket belongs to the peer — the adapter cannot set it and the loss (L5) arrives as silence. A weida requester hanging forever on somebody else's dropped message is the one outcome worth ruling out, so the exchange is refused with a typed error instead. What the deadline should be is measurement the interop bench owes ([adapters/zmtp.md](adapters/zmtp.md) §11). |
+| The refusal needed a public API | `IncomingRequest::refuse(code)` | The runtime already wrote `ERROR` frames for its own routing refusals and on drop (`NO_REPLY`), but an application could only refuse by dropping the handle — which says `NO_REPLY` and nothing else. [decisions/0005](decisions/0005-refusal-race.md) §4.3 says the ERROR frame is written by the application; until this slice needed it, nothing did. |
+| Heartbeats | `ZMQ_HEARTBEAT_IVL` on the adapter's own socket, never translated | 37/ZMTP's PING/PONG is the only liveness the ZeroMQ side has, and TCP's is not a substitute (§3 of the mapping document). It stays local to that hop: weida's `keep_alive`/`idle_timeout` are not derived from it and it is not derived from them, because a timer that crosses the adapter would let one side's idea of "dead" close the other side's healthy connection. |
+
 ---
 
 ### Connection-tier decisions (B-017)

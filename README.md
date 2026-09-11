@@ -17,9 +17,10 @@ within `0.x`). Phases 0-2 implemented: docs, core model, native QUIC transport w
 Phase 3 in progress: Push/Pull, Pub/Sub, the raw L0 stream API, peer identity by public-key
 fingerprint, opt-in per-producer ordering and bounded deduplication, one connection per
 dialled endpoint path, a bounded `drain`, and an in-process transport beside QUIC have
-landed. The ZeroMQ adapter has its first two slices: a standalone ZMTP 3.1 codec
-(`crates/adapters/weida-zmtp`) and an inbound bridge that puts foreign ZeroMQ peers onto
-weida endpoints (`crates/adapters/weida-zmtp-bridge`).
+landed. The ZeroMQ adapter has its first three slices: a standalone ZMTP 3.1 codec
+(`crates/adapters/weida-zmtp`) and a bridge in both directions — foreign ZeroMQ peers onto
+weida endpoints, and weida endpoints onto foreign ZeroMQ peers
+(`crates/adapters/weida-zmtp-bridge`).
 
 ## Documentation
 
@@ -42,7 +43,7 @@ weida endpoints (`crates/adapters/weida-zmtp-bridge`).
 | `crates/protocol` | `weida-protocol` | wire codec, no I/O: varints, framing, CBOR headers, negotiation, error codes |
 | `crates/weida` | `weida` | runtime, the QUIC and in-process transports, the raw stream core, and the Req/Rep, Push/Pull and Pub/Sub patterns |
 | `crates/adapters/weida-zmtp` | `weida-zmtp` | ZMTP 3.1 codec — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |
-| `crates/adapters/weida-zmtp-bridge` | `weida-zmtp-bridge` | bridges foreign ZeroMQ peers onto weida endpoints, terminating both protocols |
+| `crates/adapters/weida-zmtp-bridge` | `weida-zmtp-bridge` | bridges ZeroMQ peers and weida endpoints in both directions, terminating both protocols |
 
 ## Identity in one line
 
@@ -108,7 +109,7 @@ cargo test -p weida --test transports            # one pattern suite over QUIC a
 cargo test -p weida --test identity              # pins, anchors, addresses, client identity
 cargo test -p weida --test large -- --ignored     # 1 GiB echo, asserts bounded peak RSS
 cargo test -p weida-zmtp                         # ZMTP golden vectors and hostile input
-cargo test -p weida-zmtp-bridge                  # ZeroMQ peers against the bridge
+cargo test -p weida-zmtp-bridge                  # ZeroMQ peers and weida endpoints through the bridge
 cargo bench                                      # codec and loopback QUIC throughput
 ```
 

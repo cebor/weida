@@ -199,7 +199,7 @@ an exchange.
 | --- | --- | --- |
 | Compatible peer | `Replier`, `Acceptor` | `Requester`, `Peer::open_bi` |
 | Direction | connects | binds |
-| Send/receive pattern | any number of concurrent exchanges, each `open` → write → `finish` → `recv` | `accept` → read body → `reply` → write → `finish`, or drop for `NO_REPLY` |
+| Send/receive pattern | any number of concurrent exchanges, each `open` → write → `finish` → `recv` | `accept` → read body → `reply` → write → `finish`, or `refuse(code)`, or drop for `NO_REPLY` |
 | Incoming routing | the reply half of the exchange that asked | fair, bounded queue per path (`endpoint_queue`) |
 | Outgoing routing | round-robin over live peers, one exchange per pick | the exchange that asked |
 | Action with no peer | `Error::NotConnected` immediately; `ConnectionLost` if every peer died | `accept` waits |
@@ -216,6 +216,7 @@ Failure modes, from the requester's side:
 | Path unknown at the peer | `Error::UnknownEndpoint` (ERROR frame) |
 | Path serves another pattern | `Error::Unsupported` (ERROR frame) |
 | Replier dropped the request | `Error::NoReply`; the request may have had an effect |
+| Replier refused on purpose | the code it chose: `Error::Rejected`, or `Error::NoReply` where the request was taken and nobody will answer it — an adapter whose far side dropped it silently |
 | Connection lost before the request FIN | `Error::ConnectionLost` from the write: definitely not delivered |
 | Connection lost after the FIN, no reply seen | `Error::Indeterminate`: the replier may have acted |
 | Replier reset the reply mid-stream | `Error::Canceled` from the read |

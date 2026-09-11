@@ -607,9 +607,29 @@ impl IncomingRequest {
         ))
     }
 
-    /// Refuses the exchange: a typed ERROR on the reply half, `STOP_SENDING` on
-    /// the request half so the peer stops writing a payload nobody will read.
-    pub(crate) async fn refuse(mut self, code: ErrorCode, stop: u64) {
+    /// Refuses the exchange: a typed ERROR instead of a reply.
+    ///
+    /// This is the one place where an **application** decides an outcome the
+    /// requester will see, and it exists because Req/Rep is the only pattern
+    /// where a refusal has somewhere to go: the reply half
+    /// (`docs/decisions/0005-refusal-race.md` §4.3). The requester's
+    /// `request()` fails with the matching [`Error`] — `Rejected` for
+    /// [`ErrorCode::Rejected`], `NoReply` for [`ErrorCode::NoReply`] — rather
+    /// than waiting for a reply that is not coming.
+    ///
+    /// The request half is stopped at the same time, so a peer still writing a
+    /// payload stops rather than filling a window nobody will read.
+    ///
+    /// Use [`ErrorCode::NoReply`] where the request was taken and no reply
+    /// will exist — an adapter whose far side dropped it silently, for
+    /// instance — and [`ErrorCode::Rejected`] where this side declined it.
+    pub async fn refuse(self, code: ErrorCode) {
+        self.refuse_coded(code, codes::REJECTED).await;
+    }
+
+    /// Refuses with an explicit `STOP_SENDING` code, for the runtime's own
+    /// routing refusals, which have their own codes (`docs/PROTOCOL.md` §9.3).
+    pub(crate) async fn refuse_coded(mut self, code: ErrorCode, stop: u64) {
         if let Some(body) = self.body.take() {
             body.refuse(stop);
         }

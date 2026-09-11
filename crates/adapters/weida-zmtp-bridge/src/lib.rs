@@ -51,19 +51,33 @@
 //! at message time where the message is, which is the rule at an adapter edge
 //! (`docs/decisions/0006-guarantee-sets.md` §4.7).
 //!
+//! # The other direction
+//!
+//! [`Outbound`] is the mirror: it **binds** on the weida side — Rep, Pull and
+//! Pub bind (`docs/ARCHITECTURE.md` §6c.4) — and dials a foreign ZeroMQ peer,
+//! presenting `DEALER` toward a `REP`/`ROUTER`, `PUSH` toward a `PULL`, or
+//! `SUB` toward a `PUB`. Two things exist only there: a **correlation
+//! envelope**, because a weida `Replier` accepts concurrent exchanges while a
+//! ZeroMQ `REP` answers in order, and a **reply deadline**, because a ROUTER
+//! that cannot route drops the request silently (loss L5) and the absence of a
+//! reply is the only observation available.
+//!
 //! # What is not here
 //!
-//! The outbound direction (weida endpoints reaching foreign peers) is slice 3,
-//! and the interop bench against a real `zeromq` peer is slice 5
-//! (`docs/adapters/zmtp.md` §10).
+//! The interop bench against a real `zeromq` peer is slice 5
+//! (`docs/adapters/zmtp.md` §10 items 3-6). Everything in this crate is tested
+//! against a ZMTP peer built on [`weida_zmtp`] itself: faithful on the wire,
+//! and not an independent implementation.
 
 #![warn(missing_docs)]
 
 mod error;
 mod inbound;
+mod outbound;
 mod subscriptions;
 mod wire;
 
 pub use error::BridgeError;
 pub use inbound::{Inbound, InboundConfig, Presenting};
+pub use outbound::{Dialling, Outbound, OutboundConfig};
 pub use subscriptions::MidSegment;

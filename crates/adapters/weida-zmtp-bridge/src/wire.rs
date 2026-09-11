@@ -256,6 +256,52 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     }
 }
 
+/// Answers a command that needs no pattern knowledge: `PING` gets its `PONG`,
+/// `ERROR` is fatal, everything else is noted and ignored.
+///
+/// Shared by both directions, because the rules are the peer's, not the
+/// bridge's: "when a peer receives a PING command it SHALL respond with a PONG
+/// command that echoes the ping-context", and "the peer SHALL treat an
+/// incoming ERROR command as fatal".
+pub(crate) async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut Session<S>,
+    command: Command<'_>,
+) -> Result<(), BridgeError> {
+    match command {
+        Command::Ping { context, .. } => session.write_command(&Command::Pong { context }).await,
+        Command::Error(reason) => Err(BridgeError::Protocol(format!(
+            "peer sent ERROR, which is fatal: {reason}"
+        ))),
+        other => {
+            tracing::debug!(
+                command = other.name(),
+                "ignoring a command with no use here"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Decodes a command body and answers it.
+pub(crate) async fn answer_command<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut Session<S>,
+    body: &[u8],
+) -> Result<(), BridgeError> {
+    let command = Command::decode(body)?;
+    answer(session, command).await
+}
+
+/// Makes a reason printable, since `ERROR` carries printable ASCII only and at
+/// most 255 octets of it — and the reasons here quote what a peer sent.
+pub(crate) fn sanitize(reason: &str) -> String {
+    let mut out: String = reason
+        .chars()
+        .map(|c| if (' '..='~').contains(&c) { c } else { '?' })
+        .collect();
+    out.truncate(255);
+    out
+}
+
 /// Queue of ZMTP messages waiting for a peer that is not reading.
 ///
 /// Bounded, and the bound is the same one every other queue in this bridge
