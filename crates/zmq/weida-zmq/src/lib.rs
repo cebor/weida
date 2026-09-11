@@ -60,11 +60,16 @@
 //!   sink.
 //! - [`PairSocket`] — the exclusive pair: one peer, no auto-reconnect, and a
 //!   further incoming connection terminated while one is live.
+//! - [`PubSocket`] and [`SubSocket`] — publish-subscribe with
+//!   publisher-side prefix matching, additive non-idempotent
+//!   [`Subscriptions`], drop-not-block at the high-water mark, and both
+//!   subscription wire forms accepted with the sent one chosen by
+//!   [`SubscriptionForm`].
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
 //!
-//! The remaining socket types — `PubSocket`, `SubSocket`, `XPubSocket`,
-//! `XSubSocket` — are the following slices, as are security and
+//! The remaining socket types — `XPubSocket` and `XSubSocket` — are the
+//! next slice, as are security and
 //! authorization and the rest of the option surface [0013 §5.3]. They are
 //! named here so that a reader knows what this crate is for and what it does
 //! not do yet; nothing stands in for them, and in particular there is no
@@ -112,9 +117,11 @@ pub mod options;
 pub mod pair;
 pub mod pipe;
 pub mod pipeline;
+pub mod pubsub;
 pub mod reqrep;
 pub mod session;
 pub mod socket;
+pub mod subscriptions;
 pub mod transport;
 
 pub use context::{
@@ -142,7 +149,9 @@ pub use pipe::{
     DEFAULT_RCVHWM, DEFAULT_SNDHWM, MuteAction, Pipe, PipeConfig, Queue, QueueConfig, Sent,
 };
 pub use pipeline::{PullSocket, PushSocket};
+pub use pubsub::{PubSocket, SubSocket};
 pub use reqrep::{RepSocket, ReqSocket};
 pub use session::{Incoming, Negotiated, Wire, ZmtpSession};
 pub use socket::{Delivered, SocketCore};
+pub use subscriptions::{SubscriptionForm, Subscriptions};
 pub use transport::Stream;

@@ -160,6 +160,30 @@ impl SocketCore {
         })
     }
 
+    /// Creates the engine for a socket of `socket_type` with a session the
+    /// socket type built itself.
+    ///
+    /// A subscribing socket needs this: its session carries the
+    /// subscription set, so that a reconnect re-sends it without the socket
+    /// being told. The session is still a [`ZmtpSession`] — no socket can be
+    /// built without one.
+    pub fn with_session(
+        context: &Context,
+        socket_type: SocketType,
+        options: SocketOptions,
+        session: Arc<ZmtpSession>,
+    ) -> Result<SocketCore> {
+        options.validate_for(socket_type)?;
+        let engine = Engine::new(context, options, session)?;
+        Ok(SocketCore {
+            exec: context.exec().clone(),
+            engine,
+            socket_type,
+            cursor: 0,
+            not_sync: PhantomData,
+        })
+    }
+
     /// The socket type this socket announces in its `READY`.
     pub const fn socket_type(&self) -> SocketType {
         self.socket_type

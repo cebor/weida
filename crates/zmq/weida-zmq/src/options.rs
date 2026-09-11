@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 use crate::identity::RoutingId;
 use crate::message::{DEFAULT_MAX_MESSAGE_FRAMES, DEFAULT_MAX_MESSAGE_SIZE, MessageLimits};
 use crate::pipe::PipeConfig;
+use crate::subscriptions::{DEFAULT_MAX_SUBSCRIPTIONS, SubscriptionForm};
 
 /// `ZMQ_RECONNECT_IVL` default: 100 ms (`docs/research/zeromq.md` §11).
 pub const DEFAULT_RECONNECT_IVL: Duration = Duration::from_millis(100);
@@ -168,6 +169,17 @@ pub struct SocketOptions {
     /// 37/ZMTP has no such limit and an unbounded frame count is unbounded
     /// memory. See [`DEFAULT_MAX_MESSAGE_FRAMES`].
     pub max_message_frames: usize,
+    /// Distinct subscription prefixes one peer may hold on this socket.
+    ///
+    /// **Not a libzmq option**, for the reason
+    /// [`DEFAULT_MAX_SUBSCRIPTIONS`]
+    /// gives: subscriptions are additive and non-idempotent, so a peer can
+    /// buy N table entries with N commands and 37/ZMTP bounds neither the
+    /// count nor the length. The exposure is this times `max_peers`.
+    pub max_subscriptions: usize,
+    /// Which wire form this socket **sends** subscriptions in; both are
+    /// accepted on receive. See [`SubscriptionForm`].
+    pub subscription_form: SubscriptionForm,
     /// Peers this socket will admit from **accepted** connections.
     ///
     /// **Not a libzmq option**, and the parity table says so in those terms:
@@ -199,6 +211,8 @@ impl Default for SocketOptions {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_message_frames: DEFAULT_MAX_MESSAGE_FRAMES,
             max_peers: DEFAULT_MAX_PEERS,
+            max_subscriptions: DEFAULT_MAX_SUBSCRIPTIONS,
+            subscription_form: SubscriptionForm::default(),
             heartbeat_ivl: None,
             heartbeat_timeout: None,
             heartbeat_ttl: None,
@@ -231,6 +245,11 @@ impl SocketOptions {
                  request be reported as the reply to the one that superseded it; libzmq \
                  documents that hazard and this library refuses it"
                     .into(),
+            ));
+        }
+        if self.max_subscriptions == 0 {
+            return Err(Error::EINVAL(
+                "max_subscriptions is zero, so no peer could subscribe to anything".into(),
             ));
         }
         if self.max_peers == 0 {

@@ -29,6 +29,7 @@
 //! ZeroMQ peers. The bridge keeps running on its own copy until B-094 rebuilds
 //! it on this crate; nothing here touches it.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -44,6 +45,7 @@ use crate::identity::RoutingId;
 use crate::message::{Decoded, Message, MessageLimits, Multipart};
 use crate::options::SocketOptions;
 use crate::pipe::{Queue, Sent};
+use crate::subscriptions::{self, SubscriptionForm, Subscriptions};
 
 /// Read buffer growth step. A frame header is at most nine octets and a
 /// command body a few hundred, so the interesting case is a payload, which is
@@ -59,15 +61,35 @@ const PING_CONTEXT: &[u8] = b"weida-zmq";
 /// Constructed with the socket type it announces, because that is the one
 /// thing about the handshake that differs per pattern: `Socket-Type` in our
 /// `READY`, and the compatibility check against the peer's.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ZmtpSession {
     socket_type: SocketType,
+    /// The socket's **own** subscriptions, for a SUB or XSUB: what it asks
+    /// every publisher for, and what it re-sends on every reconnect, since a
+    /// reconnect runs a new session and a new handshake.
+    mine: Option<Arc<Subscriptions>>,
 }
 
 impl ZmtpSession {
     /// A session that announces `socket_type`.
-    pub const fn new(socket_type: SocketType) -> ZmtpSession {
-        ZmtpSession { socket_type }
+    pub fn new(socket_type: SocketType) -> ZmtpSession {
+        ZmtpSession {
+            socket_type,
+            mine: None,
+        }
+    }
+
+    /// A session for a subscribing socket type, carrying the set it must
+    /// ask every publisher for.
+    ///
+    /// This is where "re-sends them on reconnect" comes from: a reconnect is
+    /// a new session, and a new session sends the set it finds — so the
+    /// socket never has to notice that a connection was replaced.
+    pub fn subscribing(socket_type: SocketType, mine: Arc<Subscriptions>) -> ZmtpSession {
+        ZmtpSession {
+            socket_type,
+            mine: Some(mine),
+        }
     }
 
     /// The socket type this session announces.
@@ -79,7 +101,8 @@ impl ZmtpSession {
 impl Session for ZmtpSession {
     fn run(&self, connection: Connection) -> SessionFuture {
         let ours = self.socket_type;
-        Box::pin(async move { drive(ours, connection).await })
+        let mine = self.mine.clone();
+        Box::pin(async move { drive(ours, mine, connection).await })
     }
 }
 
@@ -97,7 +120,11 @@ pub struct Negotiated {
     pub identity: Option<RoutingId>,
 }
 
-async fn drive(ours: SocketType, connection: Connection) -> Result<()> {
+async fn drive(
+    ours: SocketType,
+    mine: Option<Arc<Subscriptions>>,
+    connection: Connection,
+) -> Result<()> {
     let Connection {
         stream,
         pipe,
@@ -107,6 +134,7 @@ async fn drive(ours: SocketType, connection: Connection) -> Result<()> {
         exec,
         mut handshake,
         identity,
+        subscriptions,
         role: _,
     } = connection;
 
@@ -128,6 +156,14 @@ async fn drive(ours: SocketType, connection: Connection) -> Result<()> {
         "ZMTP handshake complete"
     );
 
+    if let Some(mine) = &mine {
+        // A subscribing socket asks for everything it holds, now — which is
+        // also what makes a reconnect re-subscribe, because this runs again.
+        for prefix in mine.prefixes() {
+            write_subscription(&mut wire, options.subscription_form, true, &prefix).await?;
+        }
+    }
+
     if options.probe_router {
         // ZMQ_PROBE_ROUTER: "send an empty message on every new connection",
         // so the peer's ROUTER learns this peer exists before it has
@@ -137,7 +173,16 @@ async fn drive(ours: SocketType, connection: Connection) -> Result<()> {
             .await?;
     }
 
-    pump(&mut wire, &pipe, &options, &exec, negotiated.version).await
+    pump(
+        &mut wire,
+        ours,
+        &subscriptions,
+        &pipe,
+        &options,
+        &exec,
+        negotiated.version,
+    )
+    .await
 }
 
 /// Drives the greeting and the NULL handshake.
@@ -246,6 +291,8 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
 /// is discarded and counted, and reading continues.
 async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
     wire: &mut Wire<S>,
+    ours: SocketType,
+    subscriptions: &Arc<Subscriptions>,
     pipe: &crate::pipe::Pipe,
     options: &SocketOptions,
     exec: &Exec,
@@ -261,15 +308,43 @@ async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
                 liveness.saw_traffic();
                 match arrived? {
                     Incoming::Message(message) => {
-                        if incoming.send(message).await? == Sent::Dropped {
-                            tracing::trace!("dropped an inbound message: the queue is at its high-water mark");
+                        if publishes(ours) {
+                            // A publisher never hands an inbound message to
+                            // its application: "PUB SHALL silently discard
+                            // any messages that subscribers send it". The one
+                            // thing such a message may be is a subscription
+                            // in ZMTP 2.0's form, which is how a 3.0 peer
+                            // asks.
+                            apply_message_form(ours, subscriptions, &incoming, &message).await?;
+                        } else if incoming.send(message).await? == Sent::Dropped {
+                            tracing::trace!(
+                                "dropped an inbound message: the queue is at its high-water mark"
+                            );
                         }
                     }
-                    Incoming::Command(body) => answer(wire, &body).await?,
+                    Incoming::Command(body) => {
+                        answer(wire, ours, subscriptions, &incoming, &body).await?;
+                    }
                 }
             }
             queued = outgoing.recv() => match queued {
-                Ok(message) => wire.write_message(&message).await?,
+                Ok(message) => {
+                    // A subscribing socket's outgoing messages *are* its
+                    // subscriptions, in the `%x01`/`%x00` form the API uses;
+                    // which form goes on the wire is this socket's choice.
+                    match subscribing_form(ours, &message) {
+                        Some((subscribe, prefix)) => {
+                            write_subscription(
+                                wire,
+                                options.subscription_form,
+                                subscribe,
+                                &prefix,
+                            )
+                            .await?;
+                        }
+                        None => wire.write_message(&message).await?,
+                    }
+                }
                 // The pipe was destroyed: the socket closed or disconnected
                 // this endpoint, and this connection has nothing left to do.
                 Err(_) => return Ok(()),
@@ -279,16 +354,28 @@ async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// Answers a command that needs no pattern knowledge.
+/// Answers a command.
 ///
-/// `PING` gets its `PONG` echoing the context, `ERROR` is fatal, and anything
-/// else is noted and ignored — which is what a peer must do with a command it
-/// has no use for. `SUBSCRIBE`/`CANCEL` are such commands *here*: they belong
-/// to SUB, XPUB and XSUB, and the slice that implements those socket types is
-/// where they are applied. Ignoring them in a REQ or a PUSH is not a loss; it
-/// is the only correct answer.
-async fn answer<S: AsyncRead + AsyncWrite + Unpin>(wire: &mut Wire<S>, body: &[u8]) -> Result<()> {
+/// `PING` gets its `PONG` echoing the context and `ERROR` is fatal, for
+/// every socket type. `SUBSCRIBE`/`CANCEL` belong to a publisher, so they
+/// are applied for PUB and XPUB and ignored everywhere else — ignoring a
+/// subscription on a REQ or a PUSH is not a loss, it is the only correct
+/// answer. Anything else is noted and ignored, which is what a peer must do
+/// with a command it has no use for.
+async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    ours: SocketType,
+    subscriptions: &Arc<Subscriptions>,
+    incoming: &Arc<Queue>,
+    body: &[u8],
+) -> Result<()> {
     match Command::decode(body).map_err(command_error)? {
+        Command::Subscribe(prefix) if publishes(ours) => {
+            apply_subscription(ours, subscriptions, incoming, true, prefix).await
+        }
+        Command::Cancel(prefix) if publishes(ours) => {
+            apply_subscription(ours, subscriptions, incoming, false, prefix).await
+        }
         Command::Ping { context, .. } => {
             // "When a peer receives a PING command it SHALL respond with a
             // PONG command that echoes the ping-context."
@@ -305,6 +392,107 @@ async fn answer<S: AsyncRead + AsyncWrite + Unpin>(wire: &mut Wire<S>, body: &[u
             Ok(())
         }
     }
+}
+
+/// Whether this socket type keeps a subscription table for its peers.
+const fn publishes(ours: SocketType) -> bool {
+    matches!(ours, SocketType::Pub | SocketType::XPub)
+}
+
+/// Whether this socket type's outgoing messages are subscriptions.
+///
+/// SUB can send nothing else at all; XSUB can send messages upstream too, and
+/// `zmq_socket(3)` gives it the same `%x01`/`%x00` convention for the
+/// subscriptions among them.
+fn subscribing_form(ours: SocketType, message: &Multipart) -> Option<(bool, Vec<u8>)> {
+    if !matches!(ours, SocketType::Sub | SocketType::XSub) {
+        return None;
+    }
+    if message.len() != 1 {
+        return None;
+    }
+    let (subscribe, prefix) = subscriptions::read_message_form(message.frames()[0].as_slice())?;
+    Some((subscribe, prefix.to_vec()))
+}
+
+/// Writes one subscription in the configured form.
+async fn write_subscription<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    form: SubscriptionForm,
+    subscribe: bool,
+    prefix: &[u8],
+) -> Result<()> {
+    match form {
+        SubscriptionForm::Commands => {
+            let command = if subscribe {
+                Command::Subscribe(prefix)
+            } else {
+                Command::Cancel(prefix)
+            };
+            wire.write_command(&command).await
+        }
+        SubscriptionForm::LegacyMessage => {
+            let frame = subscriptions::write_message_form(subscribe, prefix);
+            wire.write_message(&Multipart::single(frame)).await
+        }
+    }
+}
+
+/// Applies a subscription a peer sent, and — for an XPUB — hands it to the
+/// application.
+async fn apply_subscription(
+    ours: SocketType,
+    subscriptions: &Arc<Subscriptions>,
+    incoming: &Arc<Queue>,
+    subscribe: bool,
+    prefix: &[u8],
+) -> Result<()> {
+    let changed = if subscribe {
+        match subscriptions.subscribe(prefix) {
+            Some(first) => first,
+            None => {
+                tracing::warn!(
+                    held = subscriptions.len(),
+                    "refused a subscription: this peer is at its table ceiling"
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        subscriptions.cancel(prefix).unwrap_or(false)
+    };
+
+    if ours == SocketType::XPub {
+        // XPUB delivers subscriptions to the application. Whether a repeat is
+        // delivered is `ZMQ_XPUB_VERBOSE`'s business, which is the next
+        // slice; deduplicating is libzmq's default and what `changed` is.
+        if changed {
+            let frame = subscriptions::write_message_form(subscribe, prefix);
+            let _ = incoming.try_send(Multipart::single(frame));
+        }
+    }
+    Ok(())
+}
+
+/// Reads a message a publisher received as ZMTP 2.0's subscription form, or
+/// discards it.
+async fn apply_message_form(
+    ours: SocketType,
+    subscriptions: &Arc<Subscriptions>,
+    incoming: &Arc<Queue>,
+    message: &Multipart,
+) -> Result<()> {
+    if message.len() == 1
+        && let Some((subscribe, prefix)) =
+            subscriptions::read_message_form(message.frames()[0].as_slice())
+    {
+        return apply_subscription(ours, subscriptions, incoming, subscribe, prefix).await;
+    }
+    tracing::debug!(
+        frames = message.len(),
+        "a publisher discarded a message a subscriber sent it"
+    );
+    Ok(())
 }
 
 /// The heartbeat: `PING` on a timer, and silence declared fatal.
@@ -659,6 +847,9 @@ mod tests {
             exec: Exec::current().expect("ambient reactor"),
             handshake: HandshakeGate::detached(),
             identity: crate::engine::AnnouncedIdentity::default(),
+            subscriptions: Arc::new(Subscriptions::new(
+                crate::subscriptions::DEFAULT_MAX_SUBSCRIPTIONS,
+            )),
         };
         let session = ZmtpSession::new(ours);
         let task = tokio::spawn(async move { session.run(connection).await });
