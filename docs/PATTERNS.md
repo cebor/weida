@@ -62,15 +62,19 @@ the accept queue).*
 Flow control is per stream and per connection, and the two behave differently:
 
 - **Per stream, transfers are isolated.** A stream nobody reads does not delay its siblings.
-- **Per connection, one slow reader stalls every other writer on that connection.** The
-  connection window is shared by every stream on the connection. Unread streams consume it;
-  when it is spent, every writer on the connection blocks until the slow reader consumes at
-  least an eighth of the window. Once the two connection tiers of
-  [decisions/0002](decisions/0002-control-and-bulk-separation.md) exist, "everyone" means
-  **bulk writers on the same path's connection** and nothing else: a control frame travels on
-  its own connection and cannot be withheld by stalled payload
-  ([PROTOCOL.md](PROTOCOL.md) §2.5). Today there is one connection per peer, so the narrower
-  statement is the one to design against and the wider one is what the tree still does.
+- **Per connection, one slow reader stalls every other writer on that connection** — and
+  "that connection" is now one **endpoint path**. The connection window is shared by every
+  stream on the connection. Unread streams consume it; when it is spent, every writer on the
+  connection blocks until the slow reader consumes at least an eighth of the window. Since
+  one connection per dialled path
+  ([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.2), "everyone" means
+  the writers on that path and nothing else: another path is another connection and another
+  window. What is *not* isolated is a path's own control traffic: a SUBSCRIBE rides the
+  connection of the path it names, because that is the only route back to the subscriber
+  ([decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.1-§4.2), so an endpoint
+  that publishes *and* subscribes on one path can queue its own subscription behind its own
+  payload. A pure subscriber writes nothing there and a pure publisher sends no SUBSCRIBE,
+  so neither is affected [0011 §4.4].
 - **The header spends the window too.** The DATA header rides on the transfer's own stream, so
   the payload that fits in one window is `stream_receive_window - header`, and the last eighth
   only clears once the application reads. A payload sized exactly to the window therefore
@@ -79,6 +83,8 @@ Flow control is per stream and per connection, and the two behave differently:
 *`a_stalled_stream_does_not_block_its_siblings` (64 KiB stream window, 256 KiB connection
 window, 32 KiB per stream: siblings flow past an unread stream; the seventh unread stream
 stalls the connection at 229376 bytes; reading the first one releases it);
+`a_stalled_path_does_not_stall_another_path` (the same numbers on two paths: one path's window
+is filled until a write parks, and a send on the other path arrives anyway);
 `a_payload_the_size_of_the_stream_window_waits_for_the_reader`.*
 
 ### 1.4 The stream budget is backpressure, and it lands on `open`
@@ -99,9 +105,10 @@ L0 or on the wire: QUIC's byte windows are the byte credit and the concurrent-st
 the message credit, both receiver-granted through transport parameters and both absolute and
 idempotent ([decisions/0003](decisions/0003-credit-unit.md) §4.1). A consumer that wants a
 prefetch of *n* messages grants `max_concurrent_uni_streams = n` on the connection it reads
-from — a bulk connection, once the tiers of §1.3 exist — and that is the whole mechanism
+from — one per dialled path, per §1.3 — and that is the whole mechanism
 [0003 §5]. A per-subscription message credit arrives with the L2 broker and travels on the
-control connection, never at L0 [0003 §4.2].
+connection of the path its subscription names, never at L0 [0003 §4.2, as amended by
+[0011](decisions/0011-answered-where-it-arrived.md) §4.3].
 
 ### 1.5 Cancel: never EOF, not a retraction
 

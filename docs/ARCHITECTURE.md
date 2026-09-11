@@ -371,21 +371,29 @@ one that plainly is not [0010 §4.8].
 
 ```text
 crates/
-    core/       →  weida-core       I/O-free model
-    protocol/   →  weida-protocol   wire codec, no I/O
-    weida/      →  weida            runtime + QUIC transport + stream core + patterns
+    core/                  →  weida-core       I/O-free model
+    protocol/              →  weida-protocol   wire codec, no I/O
+    weida/                 →  weida            runtime + QUIC transport + stream core + patterns
+    adapters/weida-zmtp/   →  weida-zmtp       ZMTP 3.1 codec, no I/O and no weida dependency
 ```
+
+`weida-zmtp` is the first slice of the ZeroMQ adapter
+([adapters/zmtp.md](adapters/zmtp.md)) and depends on **nothing at all** — not even
+`weida-core`. That is deliberate and stronger than the rule below: the half of an adapter
+that can be checked byte-for-byte against a foreign specification must not be able to reach
+for weida's types, limits or error vocabulary, or the check quietly becomes a check against
+our reading of the specification. The bridge slices depend on both sides.
 
 Planned, not yet present: `weida-broker` (the L2 semantics of §1 — queues, publisher
 confirms, consumer acknowledgements with redelivery — Phase 6), `weida-web` (the Web
-binding, Phase 8) and the legacy-protocol adapter crates `weida-zeromq`, `weida-mqtt`,
+binding, Phase 8) and the remaining legacy-protocol adapters `weida-mqtt` and
 `weida-amqp091` (Phase 9). The broker is a separate crate because it is a separate layer:
 it depends on the patterns, nothing in the core may depend on it, and a brokerless
 deployment must not link it. The adapters are separate crates because they are separately
 useful: each is a native Rust implementation of a foreign protocol, hosted by this runtime
-or an extension of it, and each must be usable on its own — `weida-zeromq` without a weida
-deployment at all, and later repackaged for other languages. They depend on `weida-core`
-and `weida-protocol`; the core never depends on them.
+or an extension of it, and each must be usable on its own — the ZMTP codec without a weida
+deployment at all, and later repackaged for other languages. They may depend on
+`weida-core` and `weida-protocol`; the core never depends on them.
 
 ### `weida-core`
 
@@ -583,14 +591,22 @@ early DATA stream is never a protocol violation.
 
 The `Runtime` holds one lazily-bound client `quinn::Endpoint` (`[::]:0`, falling back to
 `0.0.0.0:0` where IPv6 is unavailable) and a map keyed by
-`(host, port, ClientTls, Option<Fingerprint> from the address)` (`crates/weida/src/pool.rs`).
-Every part of that key is load-bearing: two endpoints dialling one authority under different
-trust, under different client identities, or expecting different peers must never share a
-connection, or one would be using a peer authenticated on the other's terms. `connect()`
-resolves the host, dials, uses the host string as written for the TLS server name — which
-only an anchor check consults, since a pin ignores names — and waits for the HELLO exchange
-before returning, so a returned connection is always negotiated. A closed entry is evicted
-when the same key is dialled again; a handshake the verifier refused becomes
+`((host, port, ClientTls, Option<Fingerprint> from the address), path)`
+(`crates/weida/src/pool.rs`). Every part of that key is load-bearing: two endpoints dialling
+one authority under different trust, under different client identities, or expecting different
+peers must never share a connection, or one would be using a peer authenticated on the other's
+terms — and the **path** is part of the key because one connection per dialled endpoint path is
+what keeps two paths from stalling each other
+([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.2). A QUIC connection's
+receive window is shared by everything on it, so the only way two flows cannot stall each other
+is for them not to share a connection: `a_stalled_path_does_not_stall_another_path`
+(`crates/weida/tests/streams.rs`) fills one path's connection window until a write parks and
+then sends on another path, which arrives.
+
+`connect()` resolves the host, dials, uses the host string as written for the TLS server name —
+which only an anchor check consults, since a pin ignores names — and waits for the HELLO
+exchange before returning, so a returned connection is always negotiated. A closed entry is
+evicted when the same key is dialled again; a handshake the verifier refused becomes
 `Error::Untrusted(fp)`, carrying the fingerprint that actually answered so an operator can
 decide whether to pin it. The dialled peers themselves live in the `PeerSet` inside a `Peer`
 (module `stream`): each `connect()` appends a `(connection, path)` pair, `pick()` round-robins
@@ -598,27 +614,33 @@ across the live ones, and `peer_count()` counts only peers whose connection is s
 `add()` reaps closed entries as it appends, so the set cannot grow with uptime — at most one
 dead entry per loss survives, until the next `connect()`.
 
-**Two tiers, and what binds them** (decided, not yet built —
-[decisions/0002](decisions/0002-control-and-bulk-separation.md),
-[PROTOCOL.md](PROTOCOL.md) §2.5). The pool becomes two tiers over the same
-`quinn::Endpoint`: one **control** entry per peer, and one **bulk** entry per dialled path.
-The pool key above gains the tier and, for bulk, the path; everything else about it stays,
-because the reason each part is load-bearing does not change. What ties a bulk entry to its
-control entry is the **proved fingerprint and nothing else**
-([decisions/0008](decisions/0008-session-identity.md) §4.2): no field names the control
-connection, a bulk connection whose peer proved a different key is a different peer, and two
-connections that proved no key at all — anonymous clients — are never treated as one peer.
+**What binds a peer's connections.** The **proved fingerprint, and nothing else**
+([decisions/0008](decisions/0008-session-identity.md) §4.2): no field names a peer's other
+connections, so before a freshly dialled connection is pooled the pool compares the identity it
+proved against the identity this peer's *live* connections proved and refuses a mismatch with
+`Error::Untrusted(fp)`. That is the load-balancer case — two dials to one authority reaching two
+different servers — and it is checked against live connections rather than a remembered value,
+because a peer is this peer only while a connection to it lives: once the last one is gone, a
+replacement server with a new key is a new peer and nothing should still be objecting to it.
+Two connections that proved no key at all — anonymous clients — are never treated as one peer.
 `Option<Fingerprint> from the address` remains a *dialling expectation*; the identity is what
 the handshake proved.
 
-Each tier carries its own `Limits` profile ([PROTOCOL.md](PROTOCOL.md) §10.1): `control` sized
-for a few short frames, `bulk` for payload, and the two are separate budgets rather than one
-shared one. A per-peer connection count (`max_connections_per_peer`) bounds the pair, because
-one connection per path otherwise lets a peer choose the number — 64 connections to one peer
-measured ~50 MiB of transport state across both ends, against a ~1.1 ms handshake each
-([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-011). That measurement is also why the control
-connection is not lazy: a millisecond and under a megabyte buys the isolation that no amount of
-window tuning inside one connection can.
+Server side, `max_connections_per_peer` (default 64) bounds what one peer may hold on one
+binding, counted by the fingerprint it proved and released when a connection closes. It exists
+because one connection per path lets the dialling side choose the number: 64 connections to one
+peer measured ~50 MiB of transport state across both ends, against a ~1.1 ms handshake each
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-011). Anonymous connections are not counted
+together, because two of them cannot be shown to be one peer; a binding that wants the bound
+requires a client identity.
+
+**The control tier is parked** ([decisions/0011](decisions/0011-answered-where-it-arrived.md)
+§4.3, [PROTOCOL.md](PROTOCOL.md) §2.5). The rule that settles it: a side writes traffic it
+originates on the connection the peer's registration arrived on, so a frame naming a path rides
+that path's connection [0011 §4.1-§4.2]. That is every frame weida has or reserves except
+HELLO, which each connection performs for itself — so a per-peer connection would pay a
+handshake and a timer pair to carry nothing. `Limits` is a per-connection profile, ready for a
+second profile, and the second profile arrives with the tier rather than before it.
 
 ### TLS
 

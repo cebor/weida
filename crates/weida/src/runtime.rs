@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use quinn::VarInt;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
-use weida_core::{Error, Fingerprint};
+use weida_core::{EndpointAddr, Error};
 use weida_protocol::codes;
 
 use crate::config::{ClientTls, RuntimeConfig};
@@ -183,18 +183,18 @@ impl RuntimeInner {
             .push(endpoint);
     }
 
-    /// Dials, or reuses a pooled connection to, `host:port` on `tls`'s terms,
-    /// accepting only `expected` when the address named a peer.
+    /// Dials, or reuses a pooled connection to, `path` on `host:port` on
+    /// `tls`'s terms, accepting only `expected` when the address named a peer.
+    ///
+    /// The path is part of the pool key: one connection per dialled endpoint
+    /// path, so two paths on one peer cannot stall each other
+    /// ([decisions/0002](../../../docs/decisions/0002-control-and-bulk-separation.md) §6.2).
     pub(crate) async fn connect(
         &self,
-        host: &str,
-        port: u16,
+        addr: &EndpointAddr,
         tls: &Arc<ClientTls>,
-        expected: Option<Fingerprint>,
     ) -> Result<ConnHandle, Error> {
-        self.pool
-            .connect(&self.config, &self.exec, host, port, tls, expected)
-            .await
+        self.pool.connect(&self.config, &self.exec, addr, tls).await
     }
 
     /// Dials an in-process bus, with no pool and no TLS.
@@ -372,7 +372,7 @@ impl Runtime {
         Endpoint::from_state(SubState::new(
             Arc::clone(&self.inner),
             Arc::new(tls.into()),
-            self.inner.config.limits.endpoint_queue,
+            self.inner.config.endpoint_queue,
         ))
     }
 
@@ -499,6 +499,7 @@ impl std::fmt::Debug for Runtime {
 mod tests {
     use super::*;
     use crate::config::{ClientTls, Identity, Trust};
+    use weida_core::Limits;
 
     /// An endpoint that trusts only what an address names; a plain address
     /// under it must fail before any packet is sent.
@@ -726,7 +727,10 @@ mod tests {
         // Short idle timeout: the second dial goes to a port nobody answers
         // on, and QUIC gives up only when the handshake idles out.
         let rt = Runtime::new(RuntimeConfig {
-            idle_timeout: std::time::Duration::from_millis(200),
+            limits: Limits {
+                idle_timeout: std::time::Duration::from_millis(200),
+                ..Limits::default()
+            },
             ..RuntimeConfig::default()
         })
         .unwrap();

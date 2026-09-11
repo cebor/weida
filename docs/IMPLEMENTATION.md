@@ -24,7 +24,7 @@ chaotically across phases.
 | 6 | Standalone broker | not started |
 | 7 | Broker clustering | not started |
 | 8 | Web adapter | not started |
-| 9 | Legacy adapters | not started |
+| 9 | Legacy adapters | in progress |
 | 10 | Language bindings | not started |
 | 11 | CLI and administration | not started |
 | 12 | Documentation/site/stabilization | not started |
@@ -36,6 +36,12 @@ identities and pinned the stream semantics with measured probes. Router/Dealer a
 as emergent rather than implemented, see [ARCHITECTURE.md](ARCHITECTURE.md) §6a. Phases 4
 and later remain out of scope; Phase 6 gained the acknowledgement vocabulary that used to
 sit in the core.
+
+Phase 9 is open out of order, deliberately and narrowly: the ZMTP codec
+(`crates/adapters/weida-zmtp`, [adapters/zmtp.md](adapters/zmtp.md) §10.1) is a self-contained
+foreign-protocol codec with no weida dependency, so it needs nothing from phases 4-8 and
+building it now is what turns the adapter mapping document from a design into a checked
+claim. The bridge slices, which do need the patterns, wait for their place in the order.
 
 ### Phase 0 — Architecture/specification
 
@@ -440,9 +446,25 @@ drift. The expiry test gives the peer its own single-threaded reactor and blocks
 thread outright — socket open, connection up, nothing read or acknowledged — and a
 200 ms drain returns at its deadline with `outstanding = 1`, `delivered = 0` and no error.
 
-Not covered by a test: the admission refusals. Both are three lines in the accept loops and
-neither has an observable that does not need a second frozen peer to hold a drain open long
-enough to race a connect against it.
+**The admission refusals, and what testing them needed (B-046).** Both are three lines in an
+accept loop, and neither has an observable unless a drain is *in flight* — a drain with
+nothing outstanding returns at once, so there is no window to race a connect against. The
+`Draining` harness in `crates/weida/tests/drain.rs` makes one: a runtime that is a server
+**and** a stalled sender, holding a binding plus one finished transfer to a frozen peer whose
+receipt can never settle, so its drain runs for its whole deadline. Inside that window a new
+dial is refused (the control is in the same test: the same client dials one path before the
+drain and another during it, which one connection per dialled path makes a real handshake
+rather than a reuse), and a new stream on the connection that already exists is refused with
+`SHUTDOWN`. Both fail under mutation: disabling either `is_draining()` check makes exactly its
+own test fail.
+
+Writing them exposed a vocabulary gap. `STOP_SENDING(SHUTDOWN)` fell through
+`codes::stop_reason` to `StopReason::Other(6)` and reached the sender as
+`Error::Transport("peer stopped receiving with code 6")` — a refusal the application could only
+recognize by parsing a string. `StopReason::ShuttingDown` now names it and maps to
+`Error::Rejected`: the *outcome* is the same as any other refusal — nothing of the transfer was
+taken and the peer will not take it later — and a second word for one outcome is what B-028's
+`LossCause` exists to avoid.
 
 **Delivered in the tenth increment — the transport boundary and inproc (B-037):**
 
@@ -720,7 +742,7 @@ is noted where the two differ.
 | The connection window is the shared resource | `a_stalled_stream_does_not_block_its_siblings` | 32 KiB payloads, 64 KiB stream window, 256 KiB connection window: siblings of an unread stream arrive and read back correctly, and the stall lands at **7 unread streams = 229376 of 262144 bytes**; reading one stream's 32 KiB releases the stalled writer. The test asserts the bound `1 + blocked_at <= connection_window / payload` and the unblocking, not the index |
 | The stream budget is backpressure, and `open` is where it lands | `the_stream_budget_is_backpressure_not_an_error`, `a_deeper_endpoint_queue_does_not_raise_the_stream_budget` | with `max_concurrent_uni_streams = 2` the third transfer blocks in `Pusher::open` — not in `write_all`, not in the receipt — and never errors; reading one transfer to EOF releases it. `endpoint_queue = 8` changes nothing, because a transfer parked in the queue still owns its stream |
 | Cancellation | `cancel_discards_unread_bytes_and_keeps_read_ones` | the 4 KiB already read still compares equal; after `cancel()` the reader is served the whole 4 KiB buffered remainder and only then fails, as `io::ErrorKind::ConnectionReset` on the `AsyncRead` and as `Error::Canceled` through `read_capped` — never EOF |
-| Idle timeout is connection loss | `idle_timeout_reports_loss_within_the_window` | a 500 ms server idle timeout against the client's default 10 s keep-alive (asserted to be the longer of the two): after 1.5 s of silence the next request fails with `Error::ConnectionLost` |
+| Idle timeout is connection loss | `idle_timeout_reports_loss_within_the_window` | a 500 ms server idle timeout against the client's default 10 s keep-alive (asserted to be the longer of the two): after 1.5 s of silence the next request fails with `Error::ConnectionLost(LossCause::IdleTimeout)` — the cause, not only the outcome, since B-028 |
 | No automatic reconnect | `after_the_server_restarts_the_pusher_must_reconnect` | the **first** send after the server closed fails with `ConnectionLost` and `peer_count()` drops to 0; nothing reconnects, and after `connect` to a replacement server carrying the same identity a send succeeds and `peer_count()` is 1 — the dead entry was reaped |
 | Hot paths unchanged | `cargo bench -p weida` (3 s measurement, both trees on the same idle machine) | `echo_1kib_rtt` 63.5-67.3 µs over four runs of this tree against 62.9 µs for the tree before it; `push_1kib_best_effort` 7.9 µs against 7.9; `pub_1kib_8_subscribers` 71.7 µs against 70.3. All within the run-to-run spread of this machine: the verifier runs once per handshake and the per-stream path gained one `Option<[u8; 32]>` copy |
 
@@ -831,16 +853,18 @@ number excludes the per-runtime quinn endpoint and UDP socket.
 | Memory per idle runtime | same | **0-4 KiB** RSS: a `Runtime` that has dialled nothing holds nothing worth counting |
 | Memory per live connection | same | **488-596 KiB** at 2 connections, **750-850 KiB** at 64 (46-53 MiB for 64), covering **both** ends. The single-connection figure is 1196-1260 KiB because it also pays the one-off crypto and endpoint state |
 
-What this says for 0002's two tiers: a control connection beside a bulk connection costs about
-**one millisecond of handshake and under a megabyte of resident memory for both ends
-together**, and the handshake is the whole cost — there is no per-connection cost that grows
-with the number of connections held. Against that, the head-of-line coupling 0002 removes is
-unbounded: one slow reader stalls every writer on the connection
-([PATTERNS.md](PATTERNS.md) §1.3). The numbers therefore support 0002's default rather than
-arguing for a lazily created control connection. They also set the scale for the `Limits`
-profiles of B-017: 64 connections to one peer is ~50 MiB of transport state on the pair, so a
-per-peer connection count belongs in the named bounds
-([INVARIANTS.md](INVARIANTS.md)) rather than being left to the path count.
+What this says about a second connection per peer: it costs about **one millisecond of
+handshake and under a megabyte of resident memory for both ends together**, and the handshake
+is the whole cost — there is no per-connection cost that grows with the number of connections
+held. Against that, the head-of-line coupling one connection per path removes is unbounded:
+one slow reader stalls every writer on the connection ([PATTERNS.md](PATTERNS.md) §1.3). That
+is why the per-path split is worth a connection each and was built (B-017). It is also why the
+*control* tier is not: a millisecond is cheap for isolation and expensive for nothing, and
+[decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.3 shows the tier would carry
+nothing in v0. These numbers also set the scale for the per-peer ceiling: 64 connections to
+one peer is ~50 MiB of transport state on the pair, which is why
+`max_connections_per_peer` (64) is a named bound ([INVARIANTS.md](INVARIANTS.md)) rather than
+the path count being the only one.
 
 RSS is read from `/proc/self/status` `VmRSS` and the allocator does not return everything
 between measurements, so each row's baseline is the previous row's residue; the per-connection
@@ -862,15 +886,16 @@ dials shares one connection; 0002's bulk tier makes it one connection per path.
 | 256 paths, one connection each (0002) | same | **277.7 ms** total, **1.08 ms** per path — no degradation with the count, and 995 KiB of RSS per connection for both ends together, consistent with B-011's 750-850 KiB at 64 |
 | The refusal point | same | with `max_connections = 8`, connections 0 through 7 are accepted and the ninth dial fails with `Error::LimitExceeded` — "resource limit exceeded". The server completes the handshake first and then closes with `LIMIT_EXCEEDED` on purpose, so a peer can tell overload from a routing mistake (`crates/weida/src/listener.rs`) |
 
-The consequence for B-017's `Limits` profiles: **a per-path bulk connection is affordable in
-time and linear in memory, but it converts a path count into a connection count against
+The consequence, now implemented (B-017): **a per-path connection is affordable in time and
+linear in memory, but it converts a path count into a connection count against
 `max_connections`** — a default of 1024 accepted connections per binding is 1024 paths' worth
-of fan from a *single* client if nothing else bounds it, which is why
-`max_connections_per_peer` is a named bound before the code exists
-([INVARIANTS.md](INVARIANTS.md), [PROTOCOL.md](PROTOCOL.md) §10.1). A client that dials 256
-paths pays 278 ms of handshakes where it pays 1.5 ms today, so the bulk tier wants lazy
-per-path connections — a path dialled is not a path used — while the control connection stays
-eager per B-011.
+of fan from a *single* client if nothing else bounds it, which is why `max_connections_per_peer`
+(64) exists and counts per proved fingerprint
+([INVARIANTS.md](INVARIANTS.md), [PROTOCOL.md](PROTOCOL.md) §10). A client that dials 256
+paths pays 278 ms of handshakes where it paid 1.5 ms with one pooled connection, so a path
+dialled is not a path used: connections are created on the first dial of a path and never
+pre-created, which is what the pool does. No control connection is added on top
+([decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.3).
 
 **One regression found and fixed (B-025).** `connect/cold_handshake` had moved from
 1.02-1.10 ms to **1.18-1.24 ms** (+12 %, p = 0.00) against criterion's stored baseline, which
@@ -914,6 +939,39 @@ publisher hits `max_subscriptions = 256` long before that becomes visible. The b
 replaced would have been ~0.5 ns per comparison in isolation, so a hot-path-only argument could
 have preferred it; what it could not do is express a segment boundary at all, which is the
 trade 0007 recorded and these numbers price.
+
+### Verified results — the dedup key's allocation per call (B-040)
+
+`DedupWindow::is_duplicate` builds its lookup key with `scope: scope.into()`, which allocates
+a `Box<str>` on **every** call — including the two paths that insert nothing: a duplicate that
+is found, and the probe before an insert. The worker who wrote B-034 noticed it and refused to
+restructure the key on suspicion; this is the number that decides it.
+
+It cannot be measured through the public surface. `DedupWindow` is `pub(crate)` and its only
+public path is a negotiated connection receiving DATA, where one loopback message costs
+microseconds and would bury a nanosecond answer — so the `dedup_key` group of
+`crates/weida/benches/patterns.rs` measures the two *shapes* as pure functions, the way B-021
+measured the byte prefix it had replaced. Tables hold `max_dedup_entries = 4096` entries over
+eight scopes, with a 19-byte scope string. Two runs, release, same idle machine.
+
+| Shape | Miss | Hit |
+| --- | --- | --- |
+| **owned** — today: one flat `HashMap<Identity, _>`, key allocates per probe | **41.1-41.3 ns** | **43.8-48.1 ns** |
+| the same table, key built once (the allocation removed, nothing else) | 31.4 ns | 35.1-35.6 ns |
+| **borrowed** — the candidate: `HashMap<Box<str>, HashMap<(producer, sequence), _>>`, outer lookup borrows `&str` | 42.0-42.8 ns | 44.7-46.3 ns |
+
+`cargo bench -p weida --bench patterns -- dedup_key --warm-up-time 1 --measurement-time 3`
+
+**The allocation costs ~10 ns**, which the middle row isolates: 41.2 against 31.4 on a miss,
+and the same gap on a hit.
+
+**And removing it does not pay.** The candidate shape is *slower* on a miss — 42.0-42.8 ns
+against 41.1-41.3 — and the same within noise on a hit, because a two-level table hashes twice
+and the second hash costs what the allocation cost. That is the whole finding: the obvious
+optimization buys nothing, so the flat key stays and `dedup.rs` now says so with the number
+beside it. For scale, 10 ns is **0.13 %** of a 1 KiB push (~7.9 µs), and deduplication is
+opt-in — a connection that negotiated `core` allocates nothing here at all, which the
+capacity assertions in `dedup.rs` already prove.
 
 ---
 
@@ -996,6 +1054,31 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | `shutdown_timeout` | `RuntimeConfig::shutdown_timeout`, default 1 s (B-031) | `shutdown` closes every endpoint and then waited for the sockets to go idle **without a bound**, so the length of a process's exit was decided by the path rather than by the caller: measured against a peer that has gone silent, the draining period alone is **96 ms** on loopback and grows with round-trip time and loss. One second is generous on any network where a clean close was possible at all. The bound is one budget for the whole shutdown, not one per endpoint, because what a caller waits for is the call ([decisions/0009](decisions/0009-drain.md) §4.4). |
 | Address selection | try every resolved address in order, capped by `Limits::max_resolved_addresses` (8), each attempt but the last bounded by `RuntimeConfig::connect_attempt_timeout` (250 ms) (B-029) | Taking the first address made `weida://localhost:…` unreachable wherever `localhost` resolves to `::1` before `127.0.0.1`, which is the common Linux ordering and this machine's. Sequential attempts with a per-attempt bound rather than RFC 8305's parallel happy-eyeballs: the failure being fixed is an address that answers *nothing*, where QUIC has no refusal to observe, and 250 ms is RFC 8305's own Connection Attempt Delay for exactly that case. Measured on the regression test: **30 s before, 1.3 s after**. The last address keeps the full handshake budget, so an IP literal and a single-address name behave exactly as before. |
 | Loss cause | `Error::ConnectionLost(LossCause)` — `IdleTimeout`, `PeerClosed`, `LocallyClosed`, `Reset`, `TransportError` (B-028) | `PeerSet::pick` reported a bare `ConnectionLost` for every closed peer, and `conn_error` mapped `TimedOut`, `Reset` and an unrecognized application close to the same value, so the distinction did not exist anywhere in the API. A payload rather than new top-level variants: the *outcome* is identical in all five cases — nothing in flight completed, `is_definite_failure()` stays true — and only the next action differs, so a second outcome vocabulary would have been the wrong shape ([FAILURE_MODEL.md](FAILURE_MODEL.md) §4). Five causes because each one changes what an application should do; `pick` now reports the cause of the peer it rejected. |
+
+---
+
+### ZMTP codec decisions (Phase 9 slice 1, B-030)
+
+| Decision | Value | Rationale |
+| --- | --- | --- |
+| Dependencies | **none**, not even `weida-core` | The half of an adapter that can be checked against a foreign specification must not be able to reach for weida's types, limits or error vocabulary, or the check becomes a check against our reading of the specification. `Cargo.toml` has an empty `[dependencies]` on purpose, and the crate carries its own error vocabulary rather than borrowing `weida_core::Error`. |
+| Where the cap lives | an argument to every decode entry point, never a constant | ZMTP grants no credit, a long frame may declare 2^63-1 octets, and `ZMQ_MAXMSGSIZE` is unlimited by default, so the local limit is the whole defence. Passing it in means a bridge can use the weida-side number it already has (`subscriber_buffer_bytes`, 8 MiB) instead of a second, unrelated default invented here — which is [adapters/zmtp.md](adapters/zmtp.md) §11's open question, left open rather than answered by accident. The effective cap is `min(argument, 2^63-1)`, so a caller cannot switch the check off. |
+| What a decoder returns | borrowed slices (`Command<'a>`, `Metadata<'a>`) | A decoded frame body is a slice of the caller's buffer and a command points into that body, so the only allocation on the way in is a `READY`'s property list. It is also what lets a bridge hand a payload to a weida transfer without a copy. |
+| Illegal flag combinations | unrepresentable | MORE "SHALL be zero on command frames", so `FrameKind` is `Message { more }` or `Command` — the combination has no value in either direction, rather than a runtime check on the way out. |
+| Incomplete versus violated | separate per layer | A frame header can legitimately be short (read more); a command body arrives whole, so a field running past its end is a violation with nothing to wait for. Three error types, each answering `is_violation()`, rather than one type whose `Incomplete` means different things at different depths. |
+| Where the specification contradicts itself | follow the ABNF and libzmq, and say so | Command names are length-prefixed, not null-separated; an `ERROR` reason may contain spaces although `VCHAR` excludes them. Both are recorded in [adapters/zmtp.md](adapters/zmtp.md) §10.1 and in the crate docs, because an interop bug found later must be traceable to a decision rather than to an accident. |
+
+---
+
+### Connection-tier decisions (B-017)
+
+| Decision | Value | Rationale |
+| --- | --- | --- |
+| Pool granularity | one connection per `(authority, terms, expected fingerprint, **path**)` | A QUIC connection's receive window is shared, so the only way two flows cannot stall each other is for them not to share a connection ([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.2). Measured as behaviour, not asserted: `a_stalled_path_does_not_stall_another_path` fills one path's window until a write parks and then sends on another path. Reverting the key to one connection per peer makes that test time out, which is the coupling the decision set out to remove. |
+| The control tier | **not built, and now parked by decision** | In v0 a control connection would carry nothing: every connection performs its own HELLO (§2.2 of [PROTOCOL.md](PROTOCOL.md)), the credit frame of §11 does not exist, and SUBSCRIBE could not move there because a publisher writes fan-out on the connection the SUBSCRIBE arrived on and no field names a peer's other per-path connection. That question is settled by [decisions/0011](decisions/0011-answered-where-it-arrived.md): a frame naming a path rides that path's connection, which takes SUBSCRIBE/UNSUBSCRIBE *and* the reserved credit frame out of the tier's cargo and leaves it empty, so it is parked with a revival condition (0011 §4.3) rather than left blocked. The named residual coupling is a SUBSCRIBE behind payload on the *same* path (0011 §4.4). |
+| `Limits` scope | a **per-connection** profile; runtime-level numbers moved to `RuntimeConfig` | 0002 §6.4 wants one profile per tier. Two profiles are only honest if every field means something in both, so `max_connections`, `endpoint_queue` and `max_resolved_addresses` — per binding, per endpoint, per dial — left `Limits`, and `keep_alive`/`idle_timeout` joined it, because those *are* per connection. The second profile itself waits for the tier: a `Limits::CONTROL` nothing reads would be five numbers nobody has to justify. |
+| Peer binding | compare against the peer's **live** connections, refuse a mismatch with `Error::Untrusted(fp)` | The fingerprint is the only thing that binds a peer's connections ([decisions/0008](decisions/0008-session-identity.md) §4.2), and dialling a second path is dialling the same peer. Live connections rather than a remembered value, because a peer is this peer only while a connection to it lives: once the last one is gone, a replacement server with a new key is a new peer and nothing should still be objecting to it. Proved by swapping a raw server's identity between two handshakes on one socket — the load-balancer case, which two `quinn` endpoints cannot reproduce because they cannot share a port. |
+| `max_connections_per_peer` | 64, counted per proved fingerprint, released on close | One connection per path lets the dialling side choose the count, so `max_connections` alone would let one peer fill a binding. 64 is the number B-011 measured (~50 MiB of transport state across both ends for 64 connections to one peer) and a sixteenth of the default `max_connections`. Anonymous connections are not counted together: two of them cannot be shown to be one peer, so counting them as one would refuse strangers for each other's traffic. |
 
 ---
 

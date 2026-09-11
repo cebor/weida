@@ -1,0 +1,96 @@
+//! ZMTP 3.1 codec: greeting, framing, commands and connection metadata.
+//!
+//! This crate is the first slice of the ZeroMQ adapter described in
+//! `docs/adapters/zmtp.md`. It is **sans-I/O and weida-free**: no sockets, no
+//! executor, no dependency - not even on `weida-core`. What it exports is a
+//! byte-for-byte encoder and decoder for [37/ZMTP], the protocol libzmq
+//! speaks, so that it can be checked against a foreign specification rather
+//! than against weida's opinion of it. The bridge slices that move messages
+//! between a ZeroMQ socket and a weida endpoint are built on top and depend on
+//! both sides; this one deliberately depends on neither.
+//!
+//! [37/ZMTP]: https://rfc.zeromq.org/spec/37/
+//!
+//! # Shape
+//!
+//! * [`greeting`] - the fixed 64-octet greeting, the 11-octet version sniff,
+//!   the mechanism field, and the accept rules for version and mechanism.
+//! * [`frame`] - the flags octet and one- or eight-octet size field, with the
+//!   cap that a long frame's declared length is checked against **before** the
+//!   body is touched.
+//! * [`command`] - `READY`, `ERROR`, `SUBSCRIBE`, `CANCEL`, `PING`, `PONG`.
+//! * [`metadata`] - the `READY` property dictionary and the `Socket-Type`
+//!   table, including which peer types are legal opposite which.
+//!
+//! Decoders borrow: a decoded frame body is a slice of the caller's buffer and
+//! a decoded [`Command`] points into that body, so the only allocation on the
+//! way in is the property list of a `READY`.
+//!
+//! # Reading a stream
+//!
+//! ```
+//! use weida_zmtp::{Command, FrameKind, Greeting, Mechanism, Metadata, SocketType, frame};
+//!
+//! // 1. Exchange greetings. Ours is 64 octets; the peer's must agree about
+//! //    the mechanism, and speak 3.1 or higher.
+//! let ours = Greeting::null();
+//! let peer = Greeting::decode(&ours.encode()).expect("a greeting");
+//! peer.accept(Mechanism::NULL).expect("agreement");
+//!
+//! // 2. The NULL handshake: one READY each way.
+//! let ready = Command::Ready(Metadata::new().with_socket_type(SocketType::Push))
+//!     .encode()
+//!     .expect("a READY");
+//!
+//! // 3. Then frames, commands and messages intermixed.
+//! let (header, body, used) = frame::decode(&ready, 8 * 1024 * 1024).expect("a frame");
+//! assert_eq!(used, ready.len());
+//! assert_eq!(header.kind, FrameKind::Command);
+//! match Command::decode(body).expect("a command") {
+//!     Command::Ready(md) => assert_eq!(md.socket_type(), Some(SocketType::Push)),
+//!     other => panic!("expected READY, got {}", other.name()),
+//! }
+//! ```
+//!
+//! # Bounds
+//!
+//! ZMTP has no credit on the wire and no size limit in its grammar beyond
+//! 2^63-1 octets per frame; libzmq's `ZMQ_MAXMSGSIZE` defaults to unlimited.
+//! Every decode entry point therefore takes the cap as an argument, and
+//! [`FrameError::BodyTooLarge`] is reported from the declared length alone.
+//! Nothing in this crate reserves memory on behalf of a peer.
+//!
+//! # Where this codec departs from the text
+//!
+//! * **Command names are length-prefixed.** The prose says "a printable
+//!   command name, a null octet separator, and data"; the ABNF says
+//!   `command-name = short-size 1*255command-name-char`, and libzmq sends
+//!   `\x05READY`. The grammar wins - see [`command`].
+//! * **`ERROR` reasons may contain spaces.** `error-reason` is specified as
+//!   `VCHAR`, which excludes the space octet, while libzmq's own reasons read
+//!   "Unknown mechanism". Printable ASCII including space is accepted;
+//!   anything else is refused in both directions.
+//! * **The filler is not validated.** The greeting's last 31 octets are
+//!   specified as zero, but no rule asks a reader to check them and a
+//!   mismatch has no meaning. The eight padding octets are a stronger case:
+//!   validating them is explicitly forbidden.
+//! * **No downgrade.** ZMTP 1.0 and 2.0 detection is optional, and this codec
+//!   declines: a peer below 3.1 is refused with
+//!   [`GreetingError::UnsupportedVersion`].
+//! * **`JOIN`/`LEAVE` are not implemented.** They belong to RADIO/DISH, which
+//!   the adapter's socket-type mapping does not carry; they decode to
+//!   [`CommandError::UnknownName`].
+
+#![warn(missing_docs)]
+
+pub mod command;
+pub mod error;
+pub mod frame;
+pub mod greeting;
+pub mod metadata;
+
+pub use command::{Command, MAX_PING_CONTEXT};
+pub use error::{CommandError, FrameError, GreetingError};
+pub use frame::{FrameHeader, FrameKind};
+pub use greeting::{GREETING_LEN, Greeting, Mechanism, VERSION, Version};
+pub use metadata::{Metadata, SocketType};

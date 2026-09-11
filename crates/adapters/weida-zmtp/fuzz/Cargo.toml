@@ -1,0 +1,54 @@
+[package]
+name = "weida-zmtp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+weida-zmtp = { path = ".." }
+
+# Deliberately its own workspace: the fuzz crate needs nightly and must not
+# affect `cargo build --workspace` or the lockfile of the library crates.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_stream"
+path = "fuzz_targets/frame_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "command"
+path = "fuzz_targets/command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata"
+path = "fuzz_targets/metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "greeting"
+path = "fuzz_targets/greeting.rs"
+test = false
+doc = false
+bench = false

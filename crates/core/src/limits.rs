@@ -3,8 +3,19 @@
 //! Master doc §50: no internal queue may be unbounded, and every allocation
 //! that a remote peer can influence must have a defensive ceiling. Each field
 //! below names the remote-controlled quantity it bounds.
+//!
+//! **`Limits` is a per-connection profile.** Every field applies to one
+//! connection — which is what a runtime holding one profile per connection
+//! tier will need
+//! (`docs/decisions/0002-control-and-bulk-separation.md` §6.4). Numbers that
+//! belong to a runtime rather than to a connection — how many connections a
+//! binding accepts, how many one peer may hold, how deep an endpoint's queue
+//! is, how many resolved addresses a dial tries — live on `RuntimeConfig`
+//! instead, so that no profile can carry a value nothing reads.
 
-/// Local resource limits for one runtime.
+use std::time::Duration;
+
+/// Resource limits applied to one connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Largest frame header this side will accept, in bytes. Checked against
@@ -22,12 +33,11 @@ pub struct Limits {
     pub stream_receive_window: u64,
     /// QUIC per-connection receive window in bytes.
     pub connection_receive_window: u64,
-    /// Concurrently accepted connections per binding. Excess connections are
-    /// closed immediately with `LIMIT_EXCEEDED`.
-    pub max_connections: usize,
-    /// Depth of a replier's accept queue. Senders await a free slot, so QUIC
-    /// flow control carries the backpressure to the peer.
-    pub endpoint_queue: usize,
+    /// QUIC keep-alive interval. Sent by the dialling side only, so a binding's
+    /// value is not used.
+    pub keep_alive: Duration,
+    /// QUIC idle timeout, applied in both directions.
+    pub idle_timeout: Duration,
     /// How long to wait for the peer HELLO before closing the connection with
     /// `NEGOTIATION_FAILED`, in milliseconds.
     pub hello_timeout_ms: u64,
@@ -59,12 +69,7 @@ pub struct Limits {
     /// tightest platform limit and therefore the one the default respects;
     /// opening past the cap fails with `LimitExceeded` rather than queueing.
     pub max_local_streams: usize,
-    /// Addresses a dialling endpoint will try for one hostname, in the order
-    /// the resolver returned them. More than one is necessary because the
-    /// first is not necessarily reachable — `localhost` commonly resolves to
-    /// both `::1` and `127.0.0.1` — and a ceiling is necessary because a
-    /// resolver answer is remote input.
-    pub max_resolved_addresses: usize,
+
     /// Identities a receiver remembers per connection for `Bounded`
     /// deduplication. The window bounds how long an identity is kept, not
     /// how many arrive within it, so the count needs its own ceiling; at the
@@ -92,15 +97,15 @@ impl Default for Limits {
             max_concurrent_bidi_streams: 1024,
             stream_receive_window: 1024 * 1024,
             connection_receive_window: 16 * 1024 * 1024,
-            max_connections: 1024,
-            endpoint_queue: 256,
+            keep_alive: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(30),
             hello_timeout_ms: 10_000,
             max_subscriptions: 256,
             subscriber_buffer_bytes: 8 * 1024 * 1024,
             max_sequence_scopes: 1024,
             max_reorder_hold: 256,
             max_local_streams: 255,
-            max_resolved_addresses: 8,
+
             max_dedup_entries: 4096,
         }
     }
@@ -118,15 +123,15 @@ mod tests {
         assert_eq!(l.max_concurrent_bidi_streams, 1024);
         assert_eq!(l.stream_receive_window, 1 << 20);
         assert_eq!(l.connection_receive_window, 16 << 20);
-        assert_eq!(l.max_connections, 1024);
-        assert_eq!(l.endpoint_queue, 256);
+        assert_eq!(l.keep_alive, Duration::from_secs(10));
+        assert_eq!(l.idle_timeout, Duration::from_secs(30));
         assert_eq!(l.hello_timeout_ms, 10_000);
         assert_eq!(l.max_subscriptions, 256);
         assert_eq!(l.subscriber_buffer_bytes, 8 << 20);
         assert_eq!(l.max_sequence_scopes, 1024);
         assert_eq!(l.max_reorder_hold, 256);
         assert_eq!(l.max_local_streams, 255);
-        assert_eq!(l.max_resolved_addresses, 8);
+
         assert_eq!(l.max_dedup_entries, 4096);
     }
 

@@ -403,6 +403,102 @@ async fn a_stalled_stream_does_not_block_its_siblings() {
     client.shutdown().await;
 }
 
+/// Claim: **two endpoint paths cannot stall each other**, because they are two
+/// connections and therefore two receive windows
+/// ([0002](../../../docs/decisions/0002-control-and-bulk-separation.md) §6.2).
+/// This is the isolation the previous test cannot give: there, siblings share
+/// one connection window and one slow reader exhausts it for everyone.
+///
+/// The setup exhausts `/slow`'s connection window with unread streams until a
+/// write stalls, then sends on `/fast` from the same runtime and the same
+/// endpoint handle. Before one connection per path, that send would have been
+/// behind the very window the filler just spent.
+#[tokio::test]
+async fn a_stalled_path_does_not_stall_another_path() {
+    const STREAM_WINDOW: usize = 64 * 1024;
+    const PAYLOAD: usize = 32 * 1024;
+    const CONN_WINDOW: usize = 256 * 1024;
+    const CAPACITY: usize = CONN_WINDOW / PAYLOAD;
+
+    let server = Server::start_with(Limits {
+        stream_receive_window: STREAM_WINDOW as u64,
+        connection_receive_window: CONN_WINDOW as u64,
+        ..Limits::default()
+    })
+    .await;
+    let slow = server.listener.puller("/slow").expect("slow puller");
+    let fast = server.listener.puller("/fast").expect("fast puller");
+    let client = server.client_runtime();
+
+    // One endpoint handle per path, because a handle round-robins over the
+    // peers it has: a pusher connected to both would alternate, and this probe
+    // needs to fill one path and then send on the other.
+    let slow_only = client.pusher(server.trust());
+    within(slow_only.connect(&server.url("/slow")))
+        .await
+        .expect("connect slow");
+    let fast_only = client.pusher(server.trust());
+    within(fast_only.connect(&server.url("/fast")))
+        .await
+        .expect("connect fast");
+
+    // Spend `/slow`'s connection window with streams nobody reads, until a
+    // write parks.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut writers = Vec::new();
+    let mut blocked_at = None;
+    for i in 0..CAPACITY + 4 {
+        let mut transfer = within(slow_only.open(TransferMeta::default()))
+            .await
+            .expect("open filler");
+        let tx = tx.clone();
+        writers.push(tokio::spawn(async move {
+            transfer
+                .write_all(&vec![0xccu8; PAYLOAD])
+                .await
+                .expect("write filler");
+            let _ = tx.send(i);
+            std::future::pending::<()>().await;
+        }));
+        match timeout(STALL, rx.recv()).await {
+            Ok(Some(done)) => assert_eq!(done, i, "writers report in order"),
+            Ok(None) => unreachable!("a writer holds the sender"),
+            Err(_) => {
+                blocked_at = Some(i);
+                break;
+            }
+        }
+    }
+    let blocked_at = blocked_at.expect("the slow path's connection window must run out");
+    assert!(blocked_at <= CAPACITY, "{blocked_at} unread streams");
+
+    // The other path, right now, while `/slow` is parked mid-write.
+    within(fast_only.send(b"fast"))
+        .await
+        .expect("send on /fast");
+    let arrived = within(fast.recv()).await.expect("recv on /fast");
+    assert_eq!(
+        within(arrived.collect(64)).await.expect("collect"),
+        b"fast",
+        "a path with its own connection is unaffected by another path's stall"
+    );
+
+    // And the stall was real: reading one filler releases credit on the slow
+    // path's own connection and its parked write completes.
+    let mut inbound = within(slow.recv()).await.expect("recv on /slow");
+    let mut drained = vec![0u8; PAYLOAD];
+    within(inbound.read_exact(&mut drained))
+        .await
+        .expect("read the slow path");
+    assert_eq!(
+        within(rx.recv()).await,
+        Some(blocked_at),
+        "the stalled write completes once its own path's reader consumes"
+    );
+
+    client.shutdown().await;
+}
+
 // --- 4. the concurrent-stream budget --------------------------------------
 
 /// Claim: exhausting the peer's `max_concurrent_uni_streams` is backpressure,
@@ -416,10 +512,13 @@ async fn a_stalled_stream_does_not_block_its_siblings() {
 /// transfer to EOF closes its stream and the third proceeds.
 #[tokio::test]
 async fn the_stream_budget_is_backpressure_not_an_error() {
-    let server = Server::start_with(Limits {
-        max_concurrent_uni_streams: 2,
+    let server = Server::start_with_config(RuntimeConfig {
+        limits: Limits {
+            max_concurrent_uni_streams: 2,
+            ..Limits::default()
+        },
         endpoint_queue: 1,
-        ..Limits::default()
+        ..RuntimeConfig::default()
     })
     .await;
     let puller = server.listener.puller("/jobs").expect("puller");
@@ -478,10 +577,13 @@ async fn the_stream_budget_is_backpressure_not_an_error() {
 /// two: the third transfer still cannot open.
 #[tokio::test]
 async fn a_deeper_endpoint_queue_does_not_raise_the_stream_budget() {
-    let server = Server::start_with(Limits {
-        max_concurrent_uni_streams: 2,
+    let server = Server::start_with_config(RuntimeConfig {
+        limits: Limits {
+            max_concurrent_uni_streams: 2,
+            ..Limits::default()
+        },
         endpoint_queue: 8,
-        ..Limits::default()
+        ..RuntimeConfig::default()
     })
     .await;
     let puller = server.listener.puller("/jobs").expect("puller");
@@ -692,7 +794,10 @@ async fn idle_timeout_reports_loss_within_the_window() {
     let server = ManualServer::start(
         &certs,
         RuntimeConfig {
-            idle_timeout: Duration::from_millis(500),
+            limits: Limits {
+                idle_timeout: Duration::from_millis(500),
+                ..Limits::default()
+            },
             ..RuntimeConfig::default()
         },
     )
@@ -710,7 +815,7 @@ async fn idle_timeout_reports_loss_within_the_window() {
 
     let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
     assert!(
-        client.config().keep_alive > Duration::from_millis(500),
+        client.config().limits.keep_alive > Duration::from_millis(500),
         "the client's keep-alive must be too slow to save this connection"
     );
     let requester = client.requester(certs.client_tls());
@@ -753,10 +858,13 @@ async fn idle_timeout_reports_loss_within_the_window() {
 async fn a_replier_that_stops_accepting_stalls_requesters_after_the_queue_fills() {
     const BUDGET: usize = 2;
 
-    let server = Server::start_with(Limits {
-        max_concurrent_bidi_streams: BUDGET as u32,
+    let server = Server::start_with_config(RuntimeConfig {
+        limits: Limits {
+            max_concurrent_bidi_streams: BUDGET as u32,
+            ..Limits::default()
+        },
         endpoint_queue: 1,
-        ..Limits::default()
+        ..RuntimeConfig::default()
     })
     .await;
     let replier = server.listener.replier("/rpc").expect("replier");
@@ -860,9 +968,9 @@ enum Finish {
 /// recorded in `docs/IMPLEMENTATION.md`, because QUIC promises no ordering
 /// across streams and a test that pinned one would pin an accident.
 async fn reorder_probe(n: usize, finish: Finish) -> Reorder {
-    let server = Server::start_with(Limits {
+    let server = Server::start_with_config(RuntimeConfig {
         endpoint_queue: n + 1,
-        ..Limits::default()
+        ..RuntimeConfig::default()
     })
     .await;
     let puller = server.listener.puller("/reorder").expect("puller");

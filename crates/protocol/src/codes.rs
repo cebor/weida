@@ -51,6 +51,7 @@ pub const fn stop_reason(code: u64) -> StopReason {
         CANCELED => StopReason::Canceled,
         UNKNOWN_ENDPOINT => StopReason::UnknownEndpoint,
         UNSUPPORTED => StopReason::Unsupported,
+        SHUTDOWN => StopReason::ShuttingDown,
         other => StopReason::Other(other),
     }
 }
@@ -87,11 +88,15 @@ mod tests {
     }
 
     #[test]
-    fn stop_reasons_map_the_four_refusal_codes() {
+    fn stop_reasons_map_the_refusal_codes() {
         assert_eq!(stop_reason(REJECTED), StopReason::Rejected);
         assert_eq!(stop_reason(CANCELED), StopReason::Canceled);
         assert_eq!(stop_reason(UNKNOWN_ENDPOINT), StopReason::UnknownEndpoint);
         assert_eq!(stop_reason(UNSUPPORTED), StopReason::Unsupported);
+        // A draining peer stops a stream that arrived too late with this
+        // code, so a sender must be able to read it as a refusal rather than
+        // as an unknown number (`docs/decisions/0009-drain.md` §4.5).
+        assert_eq!(stop_reason(SHUTDOWN), StopReason::ShuttingDown);
         assert_eq!(stop_reason(42), StopReason::Other(42));
     }
 }

@@ -1,0 +1,16 @@
+[package]
+name = "weida-zmtp"
+description = "ZMTP 3.1 codec: greeting, framing, NULL handshake and commands, sans-I/O"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# No dependencies, deliberately: not even weida-core. The codec is the half of
+# the adapter that can be tested byte-for-byte against a foreign specification,
+# so it must not be able to reach for weida's types, its limits or its error
+# vocabulary. The bridge slices depend on both sides; this one depends on
+# neither.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"

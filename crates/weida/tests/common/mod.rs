@@ -338,8 +338,13 @@ pub mod raw {
         endpoint
     }
 
-    /// A server endpoint on an ephemeral loopback port.
-    pub fn server_endpoint(certs: &Certs) -> (quinn::Endpoint, std::net::SocketAddr) {
+    /// A server configuration for one identity.
+    ///
+    /// Separate from [`server_endpoint`] so a test can hand the *same* socket
+    /// a different identity between handshakes — the only way to reproduce one
+    /// authority answering with two different peers, since two `quinn`
+    /// endpoints cannot share a port.
+    pub fn server_config(certs: &Certs) -> quinn::ServerConfig {
         let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&certs.cert_pem)
             .expect("read cert")
             .collect::<Result<_, _>>()
@@ -352,12 +357,18 @@ pub mod raw {
             .with_single_cert(chain, key)
             .expect("server cert");
         crypto.alpn_protocols = vec![weida_protocol::ALPN.to_vec()];
-        let config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(crypto).expect("quic crypto"),
-        ));
+        ))
+    }
 
-        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().expect("loopback"))
-            .expect("server endpoint");
+    /// A server endpoint on an ephemeral loopback port.
+    pub fn server_endpoint(certs: &Certs) -> (quinn::Endpoint, std::net::SocketAddr) {
+        let endpoint = quinn::Endpoint::server(
+            server_config(certs),
+            "127.0.0.1:0".parse().expect("loopback"),
+        )
+        .expect("server endpoint");
         let addr = endpoint.local_addr().expect("local addr");
         (endpoint, addr)
     }

@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use weida::{Identity, Limits, Listener, Puller, Runtime, RuntimeConfig, Trust};
+use weida::{Identity, Listener, Puller, Runtime, RuntimeConfig, Trust};
 
 /// Connection counts the report covers: one, the second one 0002 adds, and a
 /// per-path fan of 64.
@@ -46,19 +46,16 @@ impl Harness {
 
 /// A server with a puller that drains, so a connected client is never stalled.
 async fn harness() -> Harness {
-    harness_with(Limits::default()).await
+    harness_with(RuntimeConfig::default()).await
 }
 
-/// The same server with explicit limits, for the refusal point of B-012.
-async fn harness_with(limits: Limits) -> Harness {
+/// The same server with an explicit configuration, for the refusal point of
+/// B-012.
+async fn harness_with(config: RuntimeConfig) -> Harness {
     let identity = Identity::generate().expect("identity");
     let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
 
-    let runtime = Runtime::new(RuntimeConfig {
-        limits,
-        ..RuntimeConfig::default()
-    })
-    .expect("runtime");
+    let runtime = Runtime::new(config).expect("runtime");
     let listener = runtime.listener();
     let binding = listener
         .bind_quic("127.0.0.1:0".parse().expect("loopback"), identity)
@@ -326,9 +323,13 @@ fn report_path_fan(rt: &tokio::runtime::Runtime, harness: &Harness) {
 /// then closes with `LIMIT_EXCEEDED`, so the peer can tell overload from a
 /// routing mistake (`crates/weida/src/listener.rs`).
 fn report_connection_limit(rt: &tokio::runtime::Runtime) {
-    let harness = rt.block_on(harness_with(Limits {
+    let harness = rt.block_on(harness_with(RuntimeConfig {
         max_connections: LIMIT,
-        ..Limits::default()
+        // The per-peer ceiling would otherwise bite first: every dial here
+        // comes from a client that proves no identity, but they all reach one
+        // binding, and this bench is about the binding's own limit.
+        max_connections_per_peer: usize::MAX,
+        ..RuntimeConfig::default()
     }));
     let url = harness.url("/sink");
 

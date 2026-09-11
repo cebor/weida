@@ -79,6 +79,12 @@ regardless of what an application credit says [PATTERNS §1.3].
    subscription (or queue, in L2's vocabulary) on the control connection, independent of which
    bulk connection carries the deliveries, so that credit can be withdrawn without closing
    streams and can be re-stated after a connection change [0002 §6.3].
+
+   **Amended by [0011](0011-answered-where-it-arrived.md) §4.3:** the credit frame names a
+   subscription, and a subscription names a path, so it rides **that path's connection** rather
+   than a control connection. The reason given above — that credit must be withdrawable
+   independent of which connection carries the deliveries — is answered better that way, since
+   the connection carrying the deliveries is the one whose credit is being withdrawn.
 3. **The credit is an absolute delivery limit, not a delta and not an ack-driven window.** The
    frame carries the highest delivery number the sender may reach; the receiver maintains a
    delivery count, and a lost or duplicated credit frame changes nothing — AMQP 1.0's

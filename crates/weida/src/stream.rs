@@ -208,10 +208,9 @@ impl Peer {
     pub(crate) async fn dial(&self, url: &str) -> Result<(ConnHandle, Arc<str>), Error> {
         let (conn, path) = match Address::parse(url)? {
             Address::Quic(addr) => {
-                let conn = self
-                    .runtime
-                    .connect(&addr.host, addr.port, &self.tls, addr.peer)
-                    .await?;
+                // B-017: the pool keys on the dialled path as well as the
+                // authority, and checks the fingerprint it gets back.
+                let conn = self.runtime.connect(&addr, &self.tls).await?;
                 (conn, addr.path)
             }
             Address::Inproc(addr) => {

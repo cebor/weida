@@ -17,7 +17,6 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use quinn::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -354,12 +353,14 @@ impl ClientCertVerifier for ClientVerifier {
 /// Builds the QUIC transport parameters shared by both sides.
 ///
 /// Every value here bounds memory a remote peer can cause us to hold; see
-/// `docs/PROTOCOL.md` §10.
-pub(crate) fn transport_config(
-    limits: &Limits,
-    idle_timeout: Duration,
-    keep_alive: Option<Duration>,
-) -> Result<TransportConfig, Error> {
+/// `docs/PROTOCOL.md` §10. The profile decides all of them, including the
+/// timers, because the control and bulk tiers are two profiles of the same
+/// type (`docs/decisions/0002-control-and-bulk-separation.md` §6.4).
+///
+/// `dialling` is what separates the two uses: keep-alives are sent by the
+/// dialling side only, so a binding passes `false` and its `keep_alive` is
+/// not read.
+pub(crate) fn transport_config(limits: &Limits, dialling: bool) -> Result<TransportConfig, Error> {
     let mut tc = TransportConfig::default();
     tc.max_concurrent_uni_streams(VarInt::from_u32(limits.max_concurrent_uni_streams));
     // Bidirectional streams carry Req/Rep exchanges: one per live request, so
@@ -373,10 +374,10 @@ pub(crate) fn transport_config(
         VarInt::from_u64(limits.connection_receive_window)
             .map_err(|_| Error::Runtime("connection_receive_window exceeds 2^62-1".into()))?,
     );
-    let idle = quinn::IdleTimeout::try_from(idle_timeout)
+    let idle = quinn::IdleTimeout::try_from(limits.idle_timeout)
         .map_err(|e| Error::Runtime(format!("idle_timeout out of range: {e}")))?;
     tc.max_idle_timeout(Some(idle));
-    tc.keep_alive_interval(keep_alive);
+    tc.keep_alive_interval(dialling.then_some(limits.keep_alive));
     Ok(tc)
 }
 
@@ -392,7 +393,6 @@ fn load_identity(
 pub(crate) fn server_config(
     tls: &ServerTls,
     limits: &Limits,
-    idle_timeout: Duration,
 ) -> Result<quinn::ServerConfig, Error> {
     let (chain, key) = load_identity(&tls.identity)?;
     let provider = provider();
@@ -436,7 +436,7 @@ pub(crate) fn server_config(
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .map_err(|e| tls_err("building the QUIC server crypto", e))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-    config.transport_config(Arc::new(transport_config(limits, idle_timeout, None)?));
+    config.transport_config(Arc::new(transport_config(limits, false)?));
     Ok(config)
 }
 
@@ -449,8 +449,6 @@ pub(crate) fn client_config(
     tls: &ClientTls,
     expected: Option<Fingerprint>,
     limits: &Limits,
-    keep_alive: Duration,
-    idle_timeout: Duration,
 ) -> Result<(quinn::ClientConfig, Refused), Error> {
     if expected.is_none() && tls.trust.is_empty() {
         return Err(Error::Tls(
@@ -497,11 +495,7 @@ pub(crate) fn client_config(
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|e| tls_err("building the QUIC client crypto", e))?;
     let mut config = quinn::ClientConfig::new(Arc::new(quic_crypto));
-    config.transport_config(Arc::new(transport_config(
-        limits,
-        idle_timeout,
-        Some(keep_alive),
-    )?));
+    config.transport_config(Arc::new(transport_config(limits, true)?));
     Ok((config, refused))
 }
 
@@ -518,24 +512,25 @@ pub(crate) fn peer_fingerprint(conn: &quinn::Connection) -> Option<Fingerprint> 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
     fn transport_config_accepts_the_defaults() {
         assert!(
-            transport_config(
-                &Limits::default(),
-                Duration::from_secs(30),
-                Some(Duration::from_secs(10))
-            )
-            .is_ok()
+            transport_config(&Limits::default(), true).is_ok()
+                && transport_config(&Limits::default(), false).is_ok()
         );
     }
 
     #[test]
     fn an_absurd_idle_timeout_is_rejected_not_clamped() {
-        let err =
-            transport_config(&Limits::default(), Duration::from_secs(u64::MAX), None).unwrap_err();
+        let limits = Limits {
+            idle_timeout: Duration::from_secs(u64::MAX),
+            ..Limits::default()
+        };
+        let err = transport_config(&limits, false).unwrap_err();
         assert!(matches!(err, Error::Runtime(_)), "{err:?}");
     }
 
@@ -546,7 +541,7 @@ mod tests {
             ..Limits::default()
         };
         assert!(matches!(
-            transport_config(&limits, Duration::from_secs(30), None).unwrap_err(),
+            transport_config(&limits, false).unwrap_err(),
             Error::Runtime(_)
         ));
     }
@@ -559,7 +554,6 @@ mod tests {
                 "/nonexistent/key.pem",
             )),
             &Limits::default(),
-            Duration::from_secs(30),
         )
         .unwrap_err();
         assert!(matches!(err, Error::Tls(_)), "{err:?}");
@@ -568,8 +562,6 @@ mod tests {
             &ClientTls::new(Trust::anchor_file("/nonexistent/ca.pem")),
             None,
             &Limits::default(),
-            Duration::from_secs(10),
-            Duration::from_secs(30),
         )
         .unwrap_err();
         assert!(matches!(err, Error::Tls(_)), "{err:?}");
@@ -581,8 +573,6 @@ mod tests {
             &ClientTls::new(Trust::by_address()),
             None,
             &Limits::default(),
-            Duration::from_secs(10),
-            Duration::from_secs(30),
         )
         .unwrap_err();
         assert!(matches!(err, Error::Tls(_)), "{err:?}");
@@ -592,8 +582,6 @@ mod tests {
                 &ClientTls::new(Trust::by_address()),
                 Some(Fingerprint::from_bytes([0; 32])),
                 &Limits::default(),
-                Duration::from_secs(10),
-                Duration::from_secs(30),
             )
             .is_ok()
         );
@@ -606,7 +594,6 @@ mod tests {
         let err = server_config(
             &ServerTls::new(identity).require_client(Trust::by_address()),
             &Limits::default(),
-            Duration::from_secs(30),
         )
         .unwrap_err();
         assert!(matches!(err, Error::Tls(_)), "{err:?}");

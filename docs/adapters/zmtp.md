@@ -1,7 +1,8 @@
 # ZMTP 3.1 — adapter mapping
 
-Status: mapping document. No adapter crate exists yet; this is the design a
-`crates/adapters/weida-zmtp` must implement, and the contract its documentation owes its user
+Status: mapping document; slice 1 (the codec) implemented as `crates/adapters/weida-zmtp`.
+The rest is the design the bridge slices must implement, and the contract the adapter's
+documentation owes its user
 ([LOOP.md](../LOOP.md) §9 Phase B slice 2, [0006](../decisions/0006-guarantee-sets.md) §4.9).
 Date: 2026-09-11
 Derived from: [docs/research/zeromq.md](../research/zeromq.md) (ZMTP 3.1, libzmq 4.3.x, the
@@ -59,13 +60,18 @@ that mapping made concrete for a bridge, with the direction rule of
 maps naturally to one transport stream" [INVARIANTS], P1 and P2 of [ARCHITECTURE §6a]. A
 weida transfer is a DATA header followed by opaque payload bytes until FIN [PROTOCOL §4].
 
-**The ZMTP connection is not one weida connection.** After [0002](../decisions/0002-control-and-bulk-separation.md)
-§6.2-§6.3 the adapter holds one control connection per weida peer and one bulk connection per
-dialled path, bound together by the proved fingerprint
+**The ZMTP connection is not one weida connection.** The adapter holds **one weida connection
+per dialled endpoint path** ([0002](../decisions/0002-control-and-bulk-separation.md) §6.2,
+implemented), and the connections of one peer are bound together by the proved fingerprint
 ([0008](../decisions/0008-session-identity.md) §4.2). A ZeroMQ socket that connects to several
-endpoints [zeromq §2] therefore maps to several weida bulk connections, and the adapter's
+endpoints [zeromq §2] therefore maps to several weida connections, and the adapter's
 round-robin over them is `PeerSet::pick` [ARCHITECTURE §5], which is the same selection rule
-PUSH and REQ use [zeromq §4.1].
+PUSH and REQ use [zeromq §4.1]. There is no separate control connection to hold: 0002 §6.3's
+per-peer tier is parked, because a frame that names a path rides that path's connection
+([0011](../decisions/0011-answered-where-it-arrived.md) §4.2-§4.3). What the adapter gets from
+that is exactly what SYNTHESIS §7.2 asked for — one weida connection per foreign session is one
+connection per path — so it can promise MQTT's no-stall rule for a session without inventing
+anything.
 
 **Multipart does not survive.** ZMTP multipart is "multiple sequential ZMTP messages, where
 all but the last message has the MORE flag set", delivered atomically, "all frames or none"
@@ -126,7 +132,7 @@ MUST NOT pretend otherwise.
 | Block at the bound: PUSH, PULL, REQ, DEALER, PAIR, CLIENT, SCATTER, CHANNEL [zeromq §12/P4] | `Block` [GUARANTEES §6] | Matching. Push/Pull and Req/Rep bridges keep backpressure end to end |
 | Drop at the bound: PUB, XPUB, XSUB, RADIO, ROUTER [zeromq §12/P4] | `Drop`, publisher fan-out only [GUARANTEES §6] | Matching **only** for PUB/XPUB/RADIO onto weida Pub/Sub. ROUTER's drop has no weida counterpart — loss L5 |
 | `EAGAIN` at the bound: SERVER, PEER, STREAM [zeromq §12/P4] | `Reject`: `read_capped` past its cap, `publish` past `subscriber_buffer_bytes` [GUARANTEES §6] | Different trigger, same shape: a visible local error rather than a silent loss |
-| No credit signal anywhere [zeromq §12/P12] | No L0 application credit; L2 credit is per subscription on the control connection [0003 §4.2] | When the L2 broker exists, a ZeroMQ peer still has nothing to grant or consume, so the adapter is the credit endpoint and must bound its own buffer |
+| No credit signal anywhere [zeromq §12/P12] | No L0 application credit; L2 credit is per subscription, on the connection of the path that subscription names [0003 §4.2, [0011](../decisions/0011-answered-where-it-arrived.md) §4.3] | When the L2 broker exists, a ZeroMQ peer still has nothing to grant or consume, so the adapter is the credit endpoint and must bound its own buffer |
 
 The rule SYNTHESIS §7.1 states for this chain is normative here: "a bridge that maps ZeroMQ
 PUB onto weida Pub/Sub gets a matching policy… a bridge that maps ZeroMQ PUSH onto weida
@@ -302,14 +308,16 @@ the process supervisor with a `ready` condition and is stopped in the same item 
 
 **The bench itself.**
 
-1. **Golden vectors, no I/O.** The 64-octet greeting, a NULL `READY` with `Socket-Type`
-   metadata, short and long frames at the 255/256-octet boundary, a two-frame multipart
-   message, `SUBSCRIBE`/`CANCEL`, `PING` with a TTL and its `PONG` echo [zeromq §1],
-   [zeromq §3]. Byte-exact in both directions, the shape [PROTOCOL §8] already requires of the
-   weida codec.
+1. **Golden vectors, no I/O** — *done, slice 1*: §10.1 below publishes the octets and
+   `crates/adapters/weida-zmtp/tests/golden_vectors.rs` asserts every one of them in both
+   directions [zeromq §1], [zeromq §3]. Byte-exact both ways, the shape [PROTOCOL §8] already
+   requires of the weida codec.
 2. **Fuzz target** over the ZMTP decoder, cap-before-allocate on the declared frame size —
    a frame may declare up to 2^63-1 octets and `ZMQ_MAXMSGSIZE` is the only defence
-   [zeromq §11] — mirroring `max_header_bytes`'s rule [PROTOCOL §3.1].
+   [zeromq §11] — mirroring `max_header_bytes`'s rule [PROTOCOL §3.1]. *Done, slice 1*: five
+   `cargo fuzz` targets under `crates/adapters/weida-zmtp/fuzz` (frame, frame stream, command,
+   metadata, greeting) and a stable-Rust `fuzz_smoke.rs` that runs the same properties in
+   `cargo test`, including a long header with an arbitrary 64-bit length and no body.
 3. **Inbound matrix.** zmq.rs REQ → adapter → weida `Replier`; zmq.rs PUSH → adapter →
    `Puller`; zmq.rs SUB ← adapter ← weida `Publisher`, including a boundary-aligned prefix and
    a rejected mid-segment prefix (L2).
@@ -327,6 +335,46 @@ the process supervisor with a `ready` condition and is stopped in the same item 
 7. **Cross-adapter test** (Phase B slice 6, once a second adapter exists): a message enters
    through ZMTP and leaves through the other protocol, with the guarantees of both mapping
    documents asserted [LOOP §9].
+
+### 10.1 The vectors
+
+Published here so that a reader can check an implementation — this one, libzmq, or a
+reimplementation — rather than trust it. Hex; the frame header and the body are separate
+columns, and a run of equal octets is written `00×8`.
+
+Two places where 37/ZMTP disagrees with itself or with its reference implementation were found
+while writing the codec, and the vectors take a side:
+
+- **Command names are length-prefixed.** The prose says a command contains "a printable
+  command name, a null octet separator, and data"; the ABNF says
+  `command-name = short-size 1*255command-name-char`, and libzmq puts `05 READY` on the wire.
+  The grammar and the reference implementation agree against the prose, so the vectors use the
+  length octet and no separator.
+- **An `ERROR` reason may contain spaces.** `error-reason = short-size 0*255VCHAR` excludes
+  the space octet, while libzmq's own reasons read like "Unknown mechanism". The codec accepts
+  printable ASCII including space and refuses everything else, in both directions.
+
+| Vector | Frame header | Body |
+| --- | --- | --- |
+| Greeting, NULL, as-server 0 | — | `FF 00×8 7F` `03 01` `4E 55 4C 4C 00×16` `00` `00×31`, 64 octets: signature, version, mechanism, as-server, filler |
+| Partial greeting (version sniff) | — | `FF 00×8 7F 03`, 11 octets |
+| `READY`, `Socket-Type=REQ` | `04 19` | `05 READY 0B "Socket-Type" 00 00 00 03 "REQ"` |
+| `READY`, no properties | `04 06` | `05 READY` |
+| `ERROR "bad socket type"` | `04 16` | `05 ERROR 0F "bad socket type"` |
+| `SUBSCRIBE "px.eur"` | `04 10` | `09 SUBSCRIBE "px.eur"` |
+| `CANCEL "px.eur"` | `04 0D` | `06 CANCEL "px.eur"` |
+| `SUBSCRIBE ""` (matches everything) | `04 0A` | `09 SUBSCRIBE` |
+| `PING`, TTL 300 (30.0 s), context `ctx` | `04 0A` | `04 PING 01 2C "ctx"` |
+| `PONG`, context `ctx` | `04 08` | `04 PONG "ctx"` |
+| Message frame, 255-octet body | `00 FF` | 255 octets — the largest short frame |
+| Message frame, 256-octet body | `02 00 00 00 00 00 00 01 00` | 256 octets — the smallest long frame |
+| Multipart `A`, `B` | `01 01` then `00 01` | `41`, then `42` — MORE on all but the last |
+| Long command frame | `06` + eight-octet size | a `READY` beyond 255 octets |
+
+The encoder always picks the shortest size field, which is what the specification recommends;
+the decoder accepts a long size for a short body, because a peer that sends one is odd rather
+than wrong. That asymmetry is itself a vector: `02 00 00 00 00 00 00 00 01 78` decodes to the
+one-octet body `x`.
 
 ## 11. Open questions
 
