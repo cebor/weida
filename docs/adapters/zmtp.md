@@ -441,7 +441,7 @@ Published here so that a reader can check an implementation — this one, libzmq
 reimplementation — rather than trust it. Hex; the frame header and the body are separate
 columns, and a run of equal octets is written `00×8`.
 
-Three places where a ZeroMQ RFC disagrees with itself or with its reference implementation were
+Four places where a ZeroMQ RFC disagrees with itself or with its reference implementation were
 found while writing the codec, and the vectors take a side:
 
 - **Command names are length-prefixed.** The prose says a command contains "a printable
@@ -459,6 +459,16 @@ found while writing the codec, and the vectors take a side:
   its own because refusing it is the behaviour that matters — a reader that accepted it would
   take the signature box two octets out of phase. The arithmetic is in
   [zeromq.md](../research/zeromq.md) §10.
+- **A CURVE `MESSAGE` is framed as a message, not as a command.** 26/CURVEZMQ calls it a
+  command and gives it a command body — `%d7 "MESSAGE"`, the short nonce, the box — but
+  libzmq 4.3.5 puts a **message** frame header in front of it and **closes the connection** on
+  the command-framed form. The reference implementation wins here because it is the only
+  reading two implementations can share: the vectors use the message header, a reader accepts
+  either kind since what matters is whether the box opens, and the four handshake commands stay
+  command frames — so the two forms are mixed inside one connection. Measured rather than read:
+  a CURVE handshake with libzmq completes and the first command-framed `MESSAGE` ends it
+  (`crates/zmq/weida-zmq/tests/interop_libzmq.rs`, [zeromq.md](../research/zeromq.md) §13
+  source [41]).
 
 | Vector | Frame header | Body |
 | --- | --- | --- |
@@ -485,7 +495,7 @@ found while writing the codec, and the vectors take a side:
 | `WELCOME` (CURVE), 168 octets | `04 A8` | `07 WELCOME` `11×16` `B0×144` — long nonce, `Box [S' + cookie](S->C')` |
 | `INITIATE` (CURVE), 257 octets | `06` `00×6 01 01` | `08 INITIATE` `22×16` `CB×80` `00×7 02` `1B×144` — cookie (nonce and box), nonce counter, `Box [C + vouch + metadata](C'->S')`; always a long frame |
 | `READY` (CURVE), 30 octets | `04 1E` | `05 READY` `00×7 03` `BD×16` — the smallest box there is: sealing costs 16 octets |
-| `MESSAGE` (CURVE), 33 octets | `04 21` | `07 MESSAGE` `00×7 04` `E7×17` — the box holds the flags octet, so it is never empty |
+| `MESSAGE` (CURVE), 33 octets | `00 21` | `07 MESSAGE` `00×7 04` `E7×17` — a **message** frame header, not a command one (see above); the box holds the flags octet, so it is never empty |
 | `INITIATE` box plaintext, 128+ octets | — | `C1×32` `33×16 BC×80` `0B "Socket-Type" 00 00 00 06 "DEALER"` — C, vouch, metadata |
 | Z85, the RFC's test vector | — | `86 4F D2 6F B5 59 F7 5B` ↔ `HelloWorld` |
 | Z85, a 40-character key | — | `C1×32` ↔ `.ni$7.ni$7.ni$7.ni$7.ni$7.ni$7.ni$7.ni$7` |

@@ -777,6 +777,15 @@ effectively `inproc`-only because they do not auto-reconnect [17]. Filtering pla
 could not be relicensed, and tagged sources with SPDX identifiers; it also added `ZMQ_BUSY_POLL` and `ZMQ_HICCUP_MSG` [36]. "WebSockets support is disabled by default if DRAFT APIs are disabled" [36], which is the practical
 reason `ws`/`wss` and the whole thread-safe socket family are missing from many distribution builds [inference].
 
+**Measured against libzmq 4.3.5 [41]**, on a build linked against libsodium, each fact observed in one exchange with it over loopback TCP and none of them stated by its documentation: (a) the greeting's `as-server` octet is
+**0 even on a socket configured as the PLAIN or CURVE server** — 24/ZMTP-PLAIN and 25/ZMTP-CURVE both say it "SHALL be 1 for a server, 0 for a client" — and it never reads the peer's octet either, each side taking its role
+from its own `ZMQ_PLAIN_SERVER`/`ZMQ_CURVE_SERVER` option, so the field identifies nothing on the wire and an implementation that refuses a peer on the strength of it refuses libzmq; (b) every REQ, DEALER and ROUTER socket
+with no `ZMQ_ROUTING_ID` set announces an **`Identity` property with an empty value**, which 37/ZMTP's `identity = 0*255OCTET` permits — only a non-empty identity must not begin with a zero octet — so an empty property is
+the absence of an identity and not a malformed one; (c) a CURVE `MESSAGE` travels behind a **message frame header, not a command frame header**, although 26/CURVEZMQ calls it a command and its body is a command body
+(`%d7 "MESSAGE"`, the short nonce, the box), and a command-framed `MESSAGE` closes the connection — the handshake commands `HELLO`, `WELCOME`, `INITIATE` and `READY` are command frames as specified, so the two forms are
+mixed within one connection; (d) its PLAIN and CURVE servers refuse every connection without a ZAP handler bound on `inproc://zeromq.zap.01` in the same context, which 27/ZAP's "The handler SHALL start before any server
+starts" requires but no libzmq page states as a refusal.
+
 **Bindings and higher-level stacks named by the primary sources.** CZMQ, whose `zloop` reactor the guide uses for the Clone server, the Binary Star reactor and the Freelance agent [34][35]. The RFC-side reference
 implementations: `majordomo` for MDP/0.2 [13], `libcurve` for CurveZMQ [10], `spec_27.c` for ZAP [11], and the chapter 5 C99 Clone examples, which "act as the prime reference implementation for CHP" [14]. cppzmq and zmqpp
 (C++), PyZMQ (Python), zeromq.js (Node) and zwssock (CZMQ WebSockets) appear in the project's own documentation index [36].
@@ -784,7 +793,9 @@ implementations: `majordomo` for MDP/0.2 [13], `libcurve` for CurveZMQ [10], `sp
 **Rust crates.**
 - `zmq` (rust-zmq, `erickt/rust-zmq`, Apache-2.0/MIT): "The `zmq` crate provides bindings for the `libzmq` library… The API exposed by `zmq` should be safe (in the usual Rust sense), but it follows the C API closely, so it is
   not very idiomatic." "The aim of this project is to track latest zmq releases as close as possible", CI-tested on current stable Rust. It ships compile-fail tests including `socket-thread-unsafe.rs`, enforcing libzmq's
-  thread-safety rule at the type level, plus a large `examples/zguide/` tree [39].
+  thread-safety rule at the type level, plus a large `examples/zguide/` tree [39]. **Measured across its two current lines [41]:** the 0.10 line's `zmq-sys` 0.12 always builds libzmq from source and that build reports
+  `zmq_has("curve") == false` and `zmq_has("draft") == false`, so CURVE cannot be exercised through it at all; the 0.9 line's `zmq-sys` 0.11 links the system library through `pkg-config`, where both answers follow whatever
+  the distribution built — on a libsodium-linked 4.3.5, both true.
 - `zeromq` (zmq.rs, `zeromq/zmq.rs`, MIT): "A native Rust implementation of ZeroMQ", with "DISCLAIMER: This codebase does not implement all of ZeroMQ's feature set." Status: "Basic ZMTP implementation is working and tested
   against the reference implementation." Transports: TCP and IPC (unix only). Patterns: REQ, REP, DEALER, ROUTER, PUB, SUB, XPUB, XSUB, PUSH, PULL. Runtime selectable between `tokio` (default), `async-std` and
   `async-dispatcher` [38].
@@ -793,7 +804,10 @@ implementations: `majordomo` for MDP/0.2 [13], `libcurve` for CurveZMQ [10], `sp
   error that ends the connection, so 3.1's heartbeat and the specification's own way of reporting a refusal are both unusable toward it; (c) SUB and XSUB send subscriptions in the **ZMTP 2.0 form** — a one-frame message whose
   first octet is `%x01` to subscribe or `%x00` to cancel — rather than as the `SUBSCRIBE`/`CANCEL` commands of 3.x, and its PUB and XPUB read only that form. A PUB implementation that accepts only the command form therefore
   receives no subscriptions from it at all, and one that sends only the command form is not subscribed to by it. (d) Its own client collapses a repeated `subscribe()` for an identical prefix before it reaches the wire, so a
-  peer cannot use it to exercise the additive, non-idempotent counting §11 describes.
+  peer cannot use it to exercise the additive, non-idempotent counting §11 describes. (e) Its **XPUB applies a subscription only as a side effect of the application receiving it** — `XPubSocket::recv` records the
+  subscription and then hands the message on — so a publisher built on it that never calls `recv` has no subscribers and drops everything; libzmq applies the subscription in the socket unless `ZMQ_XPUB_MANUAL` is set, which
+  makes zmq.rs's behaviour that option's rather than the default's. (f) Its **DEALER announces no `Identity`**, so a ROUTER opposite it addresses it by an identity the ROUTER generated, which is what 37/ZMTP prescribes for a
+  peer that announces none.
 
 **Known incompatibilities** (those the sources state, plus one group measured and marked as such).
 - Feature coverage: zmq.rs implements neither PAIR nor the thread-safe draft family, and no transport beyond TCP and IPC [38]; a peer using CLIENT/SERVER, RADIO/DISH, SCATTER/GATHER, PEER/CHANNEL or `ws`/`wss` therefore needs
@@ -898,6 +912,11 @@ All sources were read on 2026-09-08, in full or in the cited ranges.
 40. **`zeromq` crate 0.6.0, read and exercised 2026-09-11.** https://crates.io/crates/zeromq/0.6.0 - source read (`src/codec/greeting.rs`, `src/codec/command.rs`, `src/sub_backend.rs`) and behaviour observed by running it
     against an independent ZMTP implementation over loopback TCP. Everything attributed to [40] is **measured against that version**, not a claim about ZeroMQ or about later releases of the crate: the greeting's announced
     version, the single recognized command name, the subscription wire form in both directions, and the client-side collapsing of a repeated subscription.
+41. **libzmq 4.3.5 and the `zmq` crate, exercised 2026-09-11.** `pkg-config --modversion libzmq` = 4.3.5, linked against libsodium 26 (`ldd`), reached through https://crates.io/crates/zmq/0.9.2 and, for the vendoring note,
+    https://crates.io/crates/zmq/0.10.0. Behaviour observed by running it against an independent ZMTP implementation over loopback TCP, with the greeting octets read off a raw socket: the `as-server` octet on PLAIN and
+    CURVE servers, the empty `Identity` property, the frame header of a CURVE `MESSAGE`, the refusal of a PLAIN or CURVE server without a ZAP handler, and `zmq_has("curve")`/`zmq_has("draft")` on both crate lines. Everything
+    attributed to [41] is **measured against that build of that version**, not a claim about later releases; the source-built libzmq of the 0.10 line reports 4.3.4 and no CURVE, which is why the numbers differ by crate line.
+    Also the zmq.rs facts (e) and (f) of §13, measured against `zeromq` 0.6.0 in the same session (`src/xpub.rs` read for the mechanism behind (e)).
 
 Not read, therefore not cited for content: 23/ZMTP (ZMTP 3.0), 13/ZMTP (2.0), 15/ZMTP (1.0), 49/SCATTERGATHER, 51/P2P, 52/CHANNEL, 6/PPP, 7/MDP 0.1, 8/MMI, 20/ZRE-DISC. Their existence and titles come from 37/ZMTP's
 related-specifications list and chapter 4's references [1][34].
