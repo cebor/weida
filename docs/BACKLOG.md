@@ -65,17 +65,20 @@ acceptance: the same bench with one connection per path for 16 and 256 paths, ag
 note: measures both shapes, because they are two systems: pooled today (256 paths share one connection, 1.47 ms for all 256 dials) and one connection per path as 0002 will have it (277.7 ms for 256, 1.08 ms each, 995 KiB per connection). The refusal point is confirmed at `max_connections`: the ninth dial against a ceiling of 8 fails with `Error::LimitExceeded`. The run also caught a +12 % `cold_handshake` regression that B-016 introduced — filed as B-025, not fixed here.
 
 ### B-013 — Wire: DATA keys 6 and 7 in weida-protocol
-kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T05:25Z | needs: [B-006]
+kind: code | size: 90 | status: done 2a43e70 | needs: [B-006]
 acceptance: `DataHeader` gains `sequence: Option<u64>` and `producer: Option<...>` per 0008's encoding; encoder writes them only when set; decoder accepts, caps and skips per §5; golden vectors for both; fuzz targets extended; no runtime behaviour change yet.
 note: delegated to the parallel worker on branch `b013-data-keys` in the worktree `../weida-b016` with its own `CARGO_TARGET_DIR`. Encoding is fixed by [PROTOCOL §6.2] and 0008 §4.4: `sequence` a `uint`, `producer` a `bstr` capped at 32 B and absent whenever the producer is the connection peer. Merged, gated and finished here on delivery, as B-016 was.
+note: merged `--no-ff` as 2a43e70 and gated here (232 tests). `producer` is `Option<[u8; 32]>` rather than a capped `Vec`, which is the stronger shape: a wrong length cannot be constructed at all, and the decoder rejects a `bstr` of any other length. That sharpened PROTOCOL §6.2 from "cap 32 B" to *exactly* 32 B — a spec change I accepted and carried into the key table, because a truncated digest names nobody. §8 gained a sequenced and a relayed vector; the pinned v0 vectors are byte-identical, which is the "no runtime behaviour change" half of the acceptance.
 
 ### B-014 — Wire: HELLO guarantee declarations and intersection
-kind: code | size: 90 | status: ready | needs: [B-006, B-013]
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T07:00Z | needs: [B-006, B-013]
 acceptance: `Hello` carries ordering mode, dedup on/off plus window, producer naming, control-isolated flag; `negotiate()` computes the intersection and fails on a requested level the peer does not offer; `Agreed` exposes the result; hostile tests for mismatches; golden vector for the extended HELLO.
+note: delegated to the parallel worker on branch `b014-hello-guarantees`, branched from `b020-segment-filter`. The wire is already specified: HELLO keys `5`/`6` and the guarantee-set map of [PROTOCOL §6.5], with the per-dimension intersection and the fail-rather-than-downgrade rule of §2.3 steps 5-7. Absent keys mean `core`, so a v0 HELLO must stay byte-identical — the existing golden vector is the regression guard.
 
 ### B-015 — Runtime: detector-mode ordering and dedup window
-kind: code | size: 90 | status: ready | needs: [B-014]
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T07:00Z | needs: [B-014]
 acceptance: a sending endpoint configured `PerProducer(detect)` numbers its transfers per (connection, path/topic); the receiver reports gaps through `IncomingMeta` (gap count, expected vs seen) without holding anything back; dedup with a time window drops repeats and counts them; both allocate nothing when negotiated off (INVARIANTS); tests for gap detection through a Pub/Sub drop.
+note: delegated to the parallel worker on branch `b015-detect-dedup`, after B-014. Both structures it introduces are named bounds in INVARIANTS before they exist — the dedup identity count in particular, since a time window bounds how long an identity is kept and not how many arrive — and the "allocate nothing when negotiated off" half is the whole point: `core` is the default set, so the hot path must be untouched for every connection that does not ask.
 
 ### B-016 — Runtime ownership and centralized spawn/timer/DNS
 kind: code | size: 90 | status: done 2741dfd | needs: []
@@ -92,9 +95,10 @@ acceptance: `docs/adapters/zmtp.md` derived from `docs/research/zeromq.md`: sock
 note: delivered with `docs/adapters/README.md` as well — the mapping-document template and its own table, so no row was needed in `docs/decisions/README.md`. Exceeds the acceptance line with ten named losses, six refused configurations and a per-loss test in the bench plan.
 
 ### B-020 — Segmented topic filter matching in code
-kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T05:25Z | needs: [B-006]
+kind: code | size: 90 | status: done 6250448 | needs: [B-006]
 acceptance: `matches_filter` in `crates/weida/src/pubsub.rs` becomes the allocation-free, backtracking-free segment walker of 0007 §4.3, and its doc-comment objection is rewritten rather than deleted; filter grammar validation lands in `weida-protocol` beside the other header rules so an invalid filter (`*` not alone in its segment, `#` not final) is rejected at the codec boundary; `Subscriber::subscribe`'s documentation states the grammar; golden vectors for a literal filter, a middle-segment `*`, a trailing `#`, the empty filter and a topic containing a literal `*`; `subscribe_prefix_filters_topics` is renamed and extended, including the boundary case a byte prefix over-matched (`sensors.temp` must not select `sensors.temperature`).
 note: delegated to the parallel worker on branch `b020-segment-filter` in the worktree `../weida-b016`, after B-013. It is the one item that makes the implementation agree with [PROTOCOL §6.4] again, so the §8 golden vectors and the `px.` note in that section are part of it; the existing `subscribe_prefix_filters_topics` must fail before the change and pass after it in its extended form.
+note: merged `--no-ff` as 6250448 (it carried B-013 with it) and gated here: 244 tests. Verified: the walker is one left-to-right pass with no backtracking and no allocation, `weida_protocol::filter::validate` rejects `*` that does not own its segment and `#` that is not final, `SubscriptionHeader::decode` turns that into `HeaderError::InvalidFilter` at the codec boundary, `Subscriber::subscribe` refuses locally before the frame is written, and the renamed `subscribe_filters_topics_by_segment` asserts that `sensors.temp` does not select `sensors.temperature` — the assertion that fails on the old matcher. Three existing tests moved from `px.` to `px.#`: that is the contract changing, not a test being weakened, and the same change is why PROTOCOL's Status section now reads as history rather than as a pending defect (b4f77b3).
 
 ### B-021 — Measure: segment matching in the fan-out path
 kind: measure | size: 45 | status: ready | needs: [B-020]
