@@ -282,8 +282,21 @@ impl Runtime {
         ))
     }
 
-    /// Closes every binding and pooled connection, then waits for the sockets
-    /// to go idle so peers see a clean `SHUTDOWN` rather than a timeout.
+    /// Closes every binding and pooled connection, then waits — for at most
+    /// [`RuntimeConfig::shutdown_timeout`] — for the sockets to go idle, so
+    /// peers see a clean `SHUTDOWN` rather than a timeout.
+    ///
+    /// The close is **abortive**: a transfer still in flight is reset, and one
+    /// whose FIN is queued but unacknowledged may never arrive. That is what
+    /// `Runtime::shutdown` has always meant
+    /// (`docs/decisions/0009-drain.md` §4.1); giving a finished transfer its
+    /// chance is a drain, which is a different operation.
+    ///
+    /// The wait is bounded on purpose. Without a bound its length is decided
+    /// by the path — QUIC's closing and draining periods last about three
+    /// times the current probe timeout, which grows with round-trip time and
+    /// loss — so a process that must exit within a budget of its own could not
+    /// use it [0009 §4.4].
     pub async fn shutdown(self) {
         let endpoints: Vec<quinn::Endpoint> = self
             .inner
@@ -300,8 +313,21 @@ impl Runtime {
                 b"runtime shutting down",
             );
         }
-        for endpoint in endpoints.iter().chain(client.iter()) {
-            endpoint.wait_idle().await;
+
+        // One budget for the whole shutdown, not one per endpoint: what a
+        // caller cares about is when `shutdown` returns.
+        let idle = async {
+            for endpoint in endpoints.iter().chain(client.iter()) {
+                endpoint.wait_idle().await;
+            }
+        };
+        let deadline = self.inner.exec.sleep(self.inner.config.shutdown_timeout);
+        tokio::select! {
+            () = idle => {}
+            () = deadline => tracing::debug!(
+                timeout_ms = self.inner.config.shutdown_timeout.as_millis(),
+                "shutdown timeout reached before the sockets went idle"
+            ),
         }
     }
 
@@ -406,6 +432,65 @@ mod tests {
         assert_eq!(clone.config().limits, rt.config().limits);
         assert_eq!(clone.requester(no_trust()).peer_count(), 0);
         rt.shutdown().await;
+    }
+
+    /// Claim: `shutdown`'s wait for idle sockets is bounded by
+    /// `shutdown_timeout`, so process exit never waits on somebody else's
+    /// network.
+    ///
+    /// The peer is made unreachable the hard way: the server runtime is
+    /// dropped without being shut down, which closes its socket and sends
+    /// nothing, so the client's `CONNECTION_CLOSE` is answered by silence and
+    /// the close runs out its draining period — about three times the path's
+    /// probe timeout, ~96 ms on loopback and longer as round-trip time and
+    /// loss grow.
+    ///
+    /// The assertion is **relative**, and measured in the same run: the same
+    /// shutdown with a 1 ms cap must be at least twice as fast as one with a
+    /// cap far beyond the draining period. An absolute millisecond bound would
+    /// pin this machine; an unbounded wait — the defect this defends against —
+    /// makes the two times equal and fails it.
+    #[tokio::test]
+    async fn the_wait_for_idle_sockets_is_bounded() {
+        async fn shutdown_with(cap: Duration) -> Duration {
+            let identity = Identity::generate().expect("identity");
+            let trust = Trust::pin(identity.fingerprint().expect("fingerprint"));
+
+            let server = Runtime::new(RuntimeConfig::default()).expect("server runtime");
+            let listener = server.listener();
+            let binding = listener
+                .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
+                .await
+                .expect("bind");
+            let url = format!("weida://127.0.0.1:{}/sink", binding.local_addr().port());
+            let puller = listener.puller("/sink").expect("puller");
+
+            let client = Runtime::new(RuntimeConfig {
+                shutdown_timeout: cap,
+                ..RuntimeConfig::default()
+            })
+            .expect("client runtime");
+            let pusher = client.pusher(trust);
+            pusher.connect(&url).await.expect("connect");
+
+            // The peer stops existing without saying so.
+            drop(pusher);
+            drop(puller);
+            drop(binding);
+            drop(listener);
+            drop(server);
+
+            let start = std::time::Instant::now();
+            client.shutdown().await;
+            start.elapsed()
+        }
+
+        let capped = shutdown_with(Duration::from_millis(1)).await;
+        let uncapped = shutdown_with(Duration::from_secs(10)).await;
+        assert!(
+            capped * 2 < uncapped,
+            "the cap must bite: capped {capped:?} against uncapped {uncapped:?}"
+        );
     }
 
     #[tokio::test]

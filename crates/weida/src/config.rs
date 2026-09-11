@@ -29,6 +29,19 @@ pub struct RuntimeConfig {
     /// library takes from its host process without being asked; `0` is
     /// rejected rather than silently corrected.
     pub worker_threads: usize,
+    /// How long [`crate::Runtime::shutdown`] waits for closed sockets to go
+    /// idle before it returns anyway.
+    ///
+    /// The wait exists so peers see a clean `SHUTDOWN` rather than a timeout,
+    /// and it is bounded because otherwise a peer's behaviour decides when
+    /// this process may exit — the failure ZeroMQ's infinite `ZMQ_LINGER`
+    /// default is known for
+    /// (`docs/decisions/0009-drain.md` §4.4). QUIC's own closing and draining
+    /// periods last about three times the path's probe timeout, so the default
+    /// of one second is generous on any network where a clean close was
+    /// possible at all, and it is not a deadline anything waits for twice:
+    /// every endpoint is closed first, and only the idle wait is capped.
+    pub shutdown_timeout: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -38,6 +51,7 @@ impl Default for RuntimeConfig {
             keep_alive: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
             worker_threads: 1,
+            shutdown_timeout: Duration::from_secs(1),
         }
     }
 }
