@@ -523,7 +523,8 @@ transfers there. A local connection carries no TLS, so there is no key and no id
 
 ### Connection driver
 
-There is **one `ConnDriver` actor task per connection**, running identical code on both
+There is **one connection actor task per connection** — `conn::driver`, holding a
+`ConnCtx` — running identical code on both
 sides. Both carry an `Arc<Namespace>`: on a server it is the Listener's, on a client it
 starts empty and a `Subscriber` registers its path there, so fanned-out copies arriving on a
 dialled connection have somewhere to land.

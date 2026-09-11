@@ -306,12 +306,16 @@ drop detection is what the sequence key of [PROTOCOL.md](PROTOCOL.md) §6.2 exis
 ([decisions/0001](decisions/0001-sequence-field.md) §7.2). A subscriber that has negotiated
 the detect level of `PerProducer` sees the gap — how many messages were missed, expected
 against seen — without anything being held back, which is the honest answer to a policy that
-drops on purpose. The reassemble level holds messages instead, at the buffer cost measured in
-[IMPLEMENTATION.md](IMPLEMENTATION.md) §4 (B-010). Neither is on the wire yet
-([PROTOCOL.md](PROTOCOL.md) §11). Streaming fan-out — a publisher that hands out a stream per
+drops on purpose. The reassemble level holds messages instead, bounded by
+`Limits::max_reorder_hold` and releasing the oldest held transfer with its gap reported at
+the cap, at the buffer cost measured in [IMPLEMENTATION.md](IMPLEMENTATION.md) §4 (B-010).
+Both are **on the wire and implemented**: DATA keys 6 and 7 carry the sequence and the
+producer ([PROTOCOL.md](PROTOCOL.md) §6.2), and a fan-out drop reaches a detecting
+subscriber as a `Gap`. Streaming fan-out — a publisher that hands out a stream per
 subscriber instead of a `Bytes` — is a recorded deferral.
-*`slow_subscriber_drops_not_blocks`, `subscribe_prefix_filters_topics` (renamed and extended
-with the grammar when the matcher lands).*
+*`slow_subscriber_drops_not_blocks`, `subscribe_filters_topics_by_segment`,
+`a_dropped_fan_out_copy_shows_up_as_a_gap`,
+`a_full_hold_reports_the_pub_sub_drop_it_was_waiting_for`.*
 
 ---
 
