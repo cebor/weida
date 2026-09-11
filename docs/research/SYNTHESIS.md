@@ -1077,6 +1077,13 @@ quorum), after quorum replication without an explicit `fsync` (RabbitMQ streams)
 record before acknowledgement" [kafka §6]. The decision is which of these `Stored` means, and
 whether `Replicated(n)` counts acceptance or durable flush.
 
+**Closed by [0004](../decisions/0004-durability-levels.md):** `Stored` gains a durability level
+naming the failure domain it survives — `Stored(Written)` the broker process, `Stored(Flushed)`
+power loss on that node — and `Replicated(n, flushed: bool)` counts the replicas that reached at
+least `Stored(Written)`, leader included, with the flag certifying that all of them flushed. The
+two axes are a partial order, `n` is achieved rather than configured, and a level that cannot be
+honoured is refused rather than degraded.
+
 **8.4 Does weida need a sequence field, and at what scope?** Ordering is `None` and
 deduplication is `None` because nothing on the wire names a transfer
 [GUARANTEES §6]; per-producer ordering is recorded as "a deliberate later protocol addition"
@@ -1097,6 +1104,12 @@ construction, because the acknowledgement *is* the application's. The decision i
 leave the race documented (the current position) or to make refusal deterministic for small
 payloads, which requires an application-level signal the v0 wire deliberately lacks
 [GUARANTEES §3].
+
+**Closed by [0005](../decisions/0005-refusal-race.md):** the race stays as documented
+behaviour. No application-level signal is added to the L0 wire; a refusal is guaranteed to be
+observed only where the payload exceeds the peer's stream receive window or where the pattern
+is Req/Rep, and the deterministic counterpart arrives, if ever, as the reserved `Accepted`
+state at an L2 broker hop [GUARANTEES §3].
 
 **8.6 Is a quiescence signal needed at shutdown?** `Runtime::shutdown` is "the one thing that
 cuts a finished transfer short" and there is no linger and no drain [PATTERNS §1.1]. The
