@@ -1361,10 +1361,15 @@ Recorded deliberately, not discovered later.
   never retried by the library ([GUARANTEES.md](GUARANTEES.md) §6). Retry policy arrives in
   Phase 4.
 - **No persistence.** No payload store, no WAL, no recovery. Phase 5.
-- **No deduplication.** No idempotency ids, no dedup window — and since `transfer_id` left
-  the wire there is not even an identifier a receiver could deduplicate on. This is why an
-  `Indeterminate` result may only be retried for idempotent operations
-  ([FAILURE_MODEL.md](FAILURE_MODEL.md) §5).
+- **Deduplication is opt-in and bounded, not absent.** The entry here used to say weida had
+  no dedup at all and no identifier to deduplicate on; both stopped being true with DATA keys
+  6 and 7 ([decisions/0001](decisions/0001-sequence-field.md)). A connection that negotiated
+  `Deduplication::Bounded(window)` suppresses a repeat of `(producer, scope, sequence)`
+  inside `max_dedup_entries` (4096), and a `core` connection allocates nothing for it. What is
+  still absent is an **application-level idempotency id** — the key is the producer's sequence,
+  which only a sender that opted into per-producer ordering writes — so an `Indeterminate`
+  result may still only be retried for idempotent operations, or by a sender that numbers its
+  own transfers ([FAILURE_MODEL.md](FAILURE_MODEL.md) §5).
 - **Single reply per exchange.** The reply half carries one DATA transfer or one ERROR and
   then FIN. Answering one request several times needs either several exchanges or a framing
   convention inside the payload; v0 offers neither.
@@ -1379,17 +1384,21 @@ Recorded deliberately, not discovered later.
 - **No synchronous API wrapper.** The async API is the only surface. A blocking facade is a
   binding-layer concern (Phase 10).
 - **Fuzz runs need a nightly toolchain.** `cargo-fuzz` requires nightly, which is installed
-  and was used: all six targets ran 200 000 iterations each with no findings. On a host
-  without nightly the targets are still committed and the deterministic `fuzz_smoke_*` tests
-  cover the same properties on stable, at lower depth.
+  and was used: the `weida-protocol` targets ran 200 000 iterations each, the `weida-zmtp`
+  targets and the five `weida-sp` targets 20 000 each, with no findings. On a host without
+  nightly the targets are still committed and the deterministic `fuzz_smoke*` tests cover the
+  same properties on stable, at lower depth.
 - **`IncomingTransfer::read_capped` was added beyond the planned API surface.** The planned
   `collect(self, max_bytes)` cannot read a borrowed request body, so the borrowing form is
   the primitive and `collect` delegates to it.
-- **Pub/Sub fan-out drops are invisible to the subscriber.** A subscriber past its byte
-  budget at the publisher simply misses the message; nothing on the wire reports it. Only
-  the publisher counts it (`Publisher::dropped`). Making loss observable to the receiving
-  side would need a sequence field, which is the same prerequisite as per-producer
-  ordering.
+- **A fan-out drop is visible to a subscriber that asked for detection.** This entry used to
+  say the loss was invisible and would need a sequence field; the field arrived
+  ([decisions/0001](decisions/0001-sequence-field.md)) and `PerProducer(detect)` now reports
+  the gap to the subscriber, with `PerProducer(reassemble)` holding instead up to
+  `max_reorder_hold`. What remains true is the **default**: a `core` subscriber past its byte
+  budget at the publisher simply misses the message and only the publisher counts it
+  (`Publisher::dropped`), because nothing on the wire reports a drop to a receiver that
+  negotiated no ordering.
 - **One subscriber per path per connection.** A `Subscriber` claims its path in the dialling
   connection's namespace, so two subscribers on one pooled connection asking for the same
   path collide with `AlreadyRegistered`. Fanning one subscription out to several in-process

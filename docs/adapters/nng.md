@@ -1,7 +1,7 @@
 # NNG / SP v1 — adapter mapping
 
-Status: mapping document only. No adapter crate exists yet; the SP codec is Phase B slice 1
-(`crates/adapters/weida-sp`) and the two bridge directions follow it
+Status: mapping document; slice 1 (the codec) implemented as `crates/adapters/weida-sp` with
+an empty `[dependencies]`. The two bridge directions follow it
 ([LOOP.md](../LOOP.md) §9 Phase B, [0006](../decisions/0006-guarantee-sets.md) §4.9).
 Date: 2026-09-11
 Derived from: [docs/research/nanomsg-nng.md](../research/nanomsg-nng.md) (SP v1 RFCs
