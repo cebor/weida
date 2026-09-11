@@ -116,8 +116,9 @@ removal. Keep the file ordered by priority, ready items first.
 
 Before any commit that touches Rust, all four, in this order, each with `timeout: 900`:
 `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings` (and again
-`-p weida --no-default-features --all-targets`); `cargo test --workspace`;
+`-p weida --no-default-features --all-targets`); `cargo test --workspace --no-fail-fast`;
 `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`. Docs-only commits run none.
+Keep the failures block of the test output; a count without names is not a gate result.
 
 Never weaken a test, widen an `allow`, or add `#[ignore]` to make the gate pass. A test that
 is flaky twice gets a deterministic rewrite or becomes a `blocked` item; it is not retried.
