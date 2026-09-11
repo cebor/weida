@@ -37,16 +37,6 @@ the session stopped first. Merge `--no-ff`, gate, close the item, and write the 
   reading had found; the pipe slice would find its own and nobody would see them. Overrule me
   if you want the code written blind — revival is otherwise mechanical: a Windows CI runner or
   a Windows host the loop can reach.
-- **A stray document at the repository root.** `weida-sample-transport.md` was left untracked
-  by a previous session and committed as-is (81d1df7, `chore: recover uncommitted work`). It
-  is a *zeughaus*-side design note about carrying video frames over weida, with links pointing
-  outside this repository. It is useful input (it names five things weida would need, led by
-  streaming fan-out) but it does not belong at the root of this tree. Decide: move it under
-  `docs/` as an external-requirements note, or drop it and take its five requests into the
-  backlog. One of its claims is already stale: it states that weida "needs an ambient Tokio
-  reactor", which stopped being true with B-016 — `Runtime::owned` exists now. Whoever decides
-  the file's fate should re-read its five requests against the current tree rather than
-  against the commit it was written for.
 - **Decisions 0001-0012 are all `accepted`; nothing is provisional any more.** 0012 was
   provisional for one section — §4.4's parked reverse connections, the one part with no
   precedent in the sheets — and B-048 built it: the shape held, the shared Pub/Sub test body

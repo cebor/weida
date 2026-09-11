@@ -9,7 +9,7 @@ at all is bulk sample data. A screen-capture node holds a 3840x2160 RGBA frame -
 process, on another machine, or several of both.
 
 Frames deliberately do not travel through the store. This document proposes how
-they travel over [weida](../../weida) instead, what weida already supports, and
+they travel over [weida](../../README.md) instead, what weida already supports, and
 what it would have to grow for the later stages.
 
 Everything under "What weida provides today" was read from the weida source at
