@@ -31,9 +31,15 @@
 //!            8 + 17*, eight octets of name                     =  33+ octets
 //! ```
 //!
-//! All five travel as **command** frames: a CURVE message is encrypted, so
-//! even application data arrives with the COMMAND flag set and the name
-//! `MESSAGE`, and [`crate::frame`] is unaware of the difference.
+//! The four handshake commands travel as **command** frames. `MESSAGE` does
+//! not: its body is a command body — the name, the nonce and the box — but
+//! libzmq 4.3.5 puts a **message** frame header in front of it and closes
+//! the connection on the command-framed form. That was measured, not read:
+//! `crates/zmq/weida-zmq/tests/interop_libzmq.rs` completes a CURVE
+//! handshake with libzmq and the first command-framed `MESSAGE` ends it.
+//! This module encodes bodies; which header goes in front is the caller's,
+//! and [`CurveCommand::encode`] is the command-framed form the four
+//! handshake commands use.
 //!
 //! # The 72-versus-70 contradiction in the HELLO padding
 //!

@@ -102,7 +102,7 @@ use crypto_box::aead::rand_core::RngCore;
 use crypto_box::aead::{Aead, OsRng};
 use crypto_box::{PublicKey, SalsaBox, SecretKey};
 use weida_zmtp::curve as layout;
-use weida_zmtp::{CurveCommand, InitiatePlaintext, Metadata, z85};
+use weida_zmtp::{CurveCommand, FrameKind, InitiatePlaintext, Metadata, frame, z85};
 
 use crate::error::{Error, Result};
 use crate::options::{Security, SocketOptions};
@@ -887,11 +887,21 @@ impl fmt::Debug for CurveTransport {
 
 impl CurveTransport {
     /// Seals one frame: the flags octet and the body, as one `MESSAGE`
-    /// command frame ready for the wire.
+    /// ready for the wire.
+    ///
+    /// **In a message frame, not a command frame.** 26/CURVEZMQ calls
+    /// `MESSAGE` a command and the body is a command body — the name, the
+    /// nonce and the box — but libzmq 4.3.5 puts it behind a **message**
+    /// frame header, flags without the COMMAND bit, and refuses the
+    /// command-framed form: measured in `tests/interop_libzmq.rs`, where a
+    /// CURVE handshake with libzmq succeeds and the first command-framed
+    /// `MESSAGE` closes the connection. The outer MORE flag stays zero
+    /// because the real one is the flags octet inside the box. Reading
+    /// accepts either kind ([`Self::open_message`] takes a body).
     ///
     /// # Errors
     ///
-    /// `ENOTCONN` after [`Self::destroy`], `ENOCOMPATPROTO` at the counter
+    /// `ENOTSOCK` after [`Self::destroy`], `ENOCOMPATPROTO` at the counter
     /// ceiling.
     pub fn seal_frame(&mut self, flags: u8, body: &[u8]) -> Result<Vec<u8>> {
         self.check_alive()?;
@@ -904,12 +914,14 @@ impl CurveTransport {
             &layout::short_nonce(self.send_prefix, nonce),
             &plaintext,
         )?;
+        let mut framed = Vec::new();
         CurveCommand::Message {
             nonce,
             message_box: &message_box,
         }
-        .encode()
-        .map_err(curve_error)
+        .encode_body(&mut framed)
+        .map_err(curve_error)?;
+        Ok(frame::encode(FrameKind::Message { more: false }, &framed))
     }
 
     /// Opens one `MESSAGE` command body, returning the flags octet and the
