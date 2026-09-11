@@ -72,13 +72,18 @@
 //!   and messages and subscriptions sent upstream.
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
+//! - [`Inproc`] — the `inproc` transport: a context-scoped namespace on
+//!   `weida-runtime`'s registry with libzmq's 256-character budget, a
+//!   connection that is a pair of memory buffers rather than a socket, and a
+//!   connect that **parks** until the bind arrives, which is what libzmq 4.0
+//!   changed.
 //!
-//! What remains is as are security and
-//! authorization and the rest of the option surface [0013 §5.3]. They are
-//! named here so that a reader knows what this crate is for and what it does
-//! not do yet; nothing stands in for them, and in particular there is no
-//! default [`Session`] beyond [`ZmtpSession`]: a socket that handed its peers
-//! to a no-op would be a ZeroMQ implementation that speaks nothing.
+//! What remains is `ipc`, security and authorization, and the rest of the
+//! option surface [0013 §5.3]. They are named here so that a reader knows
+//! what this crate is for and what it does not do yet; nothing stands in for
+//! them, and in particular there is no default [`Session`] beyond
+//! [`ZmtpSession`]: a socket that handed its peers to a no-op would be a
+//! ZeroMQ implementation that speaks nothing.
 //!
 //! # Rules this crate keeps
 //!
@@ -116,6 +121,7 @@ pub mod endpoint;
 pub mod engine;
 pub mod error;
 pub mod identity;
+pub mod inproc;
 pub mod message;
 pub mod options;
 pub mod pair;
@@ -130,8 +136,8 @@ pub mod transport;
 pub mod xpubxsub;
 
 pub use context::{
-    Context, ContextConfig, DEFAULT_CLOSE_BUDGET, DEFAULT_MAX_SOCKETS, InprocDial, SocketId,
-    SocketSlot, Terminated,
+    Context, ContextConfig, DEFAULT_CLOSE_BUDGET, DEFAULT_MAX_SOCKETS, SocketId, SocketSlot,
+    Terminated,
 };
 pub use dealerrouter::{DealerSocket, RouterSocket};
 pub use endpoint::{Endpoint, MAX_INPROC_NAME_BYTES, MAX_IPC_ENDPOINT_BYTES, TcpHost};
@@ -141,6 +147,7 @@ pub use engine::{
 };
 pub use error::{Cause, Error, Result};
 pub use identity::{MAX_ROUTING_ID_BYTES, RoutingId, RoutingKey};
+pub use inproc::{INPROC_BUFFER_BYTES, Inproc, InprocBinding, InprocDial};
 pub use message::{
     DEFAULT_MAX_MESSAGE_FRAMES, DEFAULT_MAX_MESSAGE_SIZE, Decoded, Message, MessageLimits,
     Multipart,
