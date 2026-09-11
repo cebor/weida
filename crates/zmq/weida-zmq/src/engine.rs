@@ -53,6 +53,7 @@ use crate::error::{Error, Result};
 use crate::identity::RoutingId;
 use crate::options::SocketOptions;
 use crate::pipe::Pipe;
+use crate::subscriptions::Subscriptions;
 use crate::transport::Stream;
 
 /// What a [`Session`] returns: a future that ends when the connection does.
@@ -149,6 +150,9 @@ pub struct Connection {
     /// Where to record the identity the peer announces; see
     /// [`AnnouncedIdentity`].
     pub identity: AnnouncedIdentity,
+    /// This peer's subscription table, which a PUB or XPUB session fills
+    /// from the peer's `SUBSCRIBE`/`CANCEL` in either wire form.
+    pub subscriptions: Arc<Subscriptions>,
 }
 
 /// What drives one connection once its bytes flow: in this library, ZMTP.
@@ -186,6 +190,9 @@ pub struct Peer {
     /// [`Peer::identity`] means anything. A socket type that keys a table by
     /// the identity must wait for this.
     pub announced: bool,
+    /// This peer's subscriptions, which a publisher matches messages
+    /// against; see [`Subscriptions`].
+    pub subscriptions: Arc<Subscriptions>,
 }
 
 /// What destroying a pipe discarded.
@@ -200,6 +207,9 @@ pub struct Discarded {
 struct PeerEntry {
     pipe: Pipe,
     identity: AnnouncedIdentity,
+    /// What this peer has subscribed to, as a publisher keeps it. Empty and
+    /// unused for every socket type that is not PUB or XPUB.
+    subscriptions: Arc<Subscriptions>,
     endpoint: Option<Endpoint>,
     connected: bool,
     attempts: u64,
@@ -462,6 +472,9 @@ impl Engine {
                 PeerEntry {
                     pipe,
                     identity: AnnouncedIdentity::default(),
+                    subscriptions: Arc::new(Subscriptions::new(
+                        self.inner.options.max_subscriptions,
+                    )),
                     endpoint: Some(endpoint.clone()),
                     connected: false,
                     attempts: 0,
@@ -721,6 +734,7 @@ fn snapshot(id: PeerId, entry: &PeerEntry) -> Peer {
         pipe: entry.pipe.clone(),
         identity: entry.identity.get(),
         announced: entry.identity.is_announced(),
+        subscriptions: Arc::clone(&entry.subscriptions),
     }
 }
 
@@ -766,6 +780,7 @@ impl EngineInner {
             PeerEntry {
                 pipe,
                 identity: AnnouncedIdentity::default(),
+                subscriptions: Arc::new(Subscriptions::new(self.options.max_subscriptions)),
                 endpoint,
                 connected: true,
                 attempts: 0,
@@ -818,6 +833,15 @@ impl EngineInner {
         }
     }
 
+    fn subscriptions_of(&self, peer: PeerId) -> Option<Arc<Subscriptions>> {
+        self.state
+            .lock()
+            .expect("engine state poisoned")
+            .peers
+            .get(&peer)
+            .map(|entry| Arc::clone(&entry.subscriptions))
+    }
+
     fn identity_slot(&self, peer: PeerId) -> Option<AnnouncedIdentity> {
         self.state
             .lock()
@@ -867,6 +891,9 @@ async fn accept_loop(ctx: TaskCtx, listener: TcpListener, endpoint: Endpoint) {
             Admitted::SocketClosed => return,
         };
         let identity = engine.identity_slot(peer).unwrap_or_default();
+        let subscriptions = engine
+            .subscriptions_of(peer)
+            .unwrap_or_else(|| Arc::new(Subscriptions::new(ctx.options.max_subscriptions)));
         drop(engine);
 
         let ctx = ctx.clone();
@@ -875,8 +902,19 @@ async fn accept_loop(ctx: TaskCtx, listener: TcpListener, endpoint: Endpoint) {
         exec.spawn(async move {
             let stream = Stream::tcp(stream);
             let _ = stream.set_nodelay(true);
-            let outcome =
-                run_session(&ctx, stream, pipe, peer, endpoint, Role::Binder, identity).await;
+            let outcome = run_session(
+                &ctx,
+                stream,
+                PeerSession {
+                    peer,
+                    pipe,
+                    endpoint,
+                    role: Role::Binder,
+                    identity,
+                    subscriptions,
+                },
+            )
+            .await;
             if let Err(e) = outcome {
                 tracing::debug!(%peer, error = %e, "an accepted connection ended");
             }
@@ -904,6 +942,9 @@ async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
             return;
         };
         let identity = engine.identity_slot(peer).unwrap_or_default();
+        let subscriptions = engine
+            .subscriptions_of(peer)
+            .unwrap_or_else(|| Arc::new(Subscriptions::new(ctx.options.max_subscriptions)));
         drop(engine);
 
         match dial(&ctx, &endpoint).await {
@@ -916,11 +957,14 @@ async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
                 let outcome = run_session(
                     &ctx,
                     stream,
-                    pipe,
-                    peer,
-                    endpoint.clone(),
-                    Role::Connecter,
-                    identity,
+                    PeerSession {
+                        peer,
+                        pipe,
+                        endpoint: endpoint.clone(),
+                        role: Role::Connecter,
+                        identity: identity.clone(),
+                        subscriptions: Arc::clone(&subscriptions),
+                    },
                 )
                 .await;
                 match ctx.engine.upgrade() {
@@ -994,27 +1038,32 @@ async fn dial(ctx: &TaskCtx, endpoint: &Endpoint) -> Result<Stream> {
     Err(last)
 }
 
-/// Hands a connection to the session, enforcing `ZMQ_HANDSHAKE_IVL`.
-async fn run_session(
-    ctx: &TaskCtx,
-    stream: Stream,
-    pipe: Pipe,
+/// Everything one peer contributes to a connection: what the engine holds
+/// for it, gathered so that starting a session is one argument rather than
+/// six that must be kept in the same order at two call sites.
+struct PeerSession {
     peer: PeerId,
+    pipe: Pipe,
     endpoint: Endpoint,
     role: Role,
     identity: AnnouncedIdentity,
-) -> Result<()> {
+    subscriptions: Arc<Subscriptions>,
+}
+
+/// Hands a connection to the session, enforcing `ZMQ_HANDSHAKE_IVL`.
+async fn run_session(ctx: &TaskCtx, stream: Stream, peer: PeerSession) -> Result<()> {
     let (done, handshaken) = oneshot::channel();
     let connection = Connection {
         stream,
-        pipe,
-        peer,
-        role,
-        endpoint,
+        pipe: peer.pipe,
+        peer: peer.peer,
+        role: peer.role,
+        endpoint: peer.endpoint,
         options: ctx.options.clone(),
         exec: ctx.exec.clone(),
         handshake: HandshakeGate { done: Some(done) },
-        identity,
+        identity: peer.identity,
+        subscriptions: peer.subscriptions,
     };
     let mut session = ctx.session.run(connection);
 
