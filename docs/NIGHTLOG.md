@@ -14,15 +14,22 @@ complete but for its two named gaps (A5 parked by 0011, A9's Windows half blocke
 mechanisms** — NULL, PLAIN and CURVE with the ZAP dialog — leaving the option table, monitoring
 and the devices.
 
-**One thing to read before the next item starts: B-104.** The B-084 worker hit a symptom it
-worked around rather than fixed — two of this crate's own sessions driven against each other over
-a TCP pair in one process deliver nothing, under NULL as much as under CURVE — and I have
-narrowed it on merging rather than passing the sentence along: socket-level delivery over TCP in
-one process is tested throughout and unaffected, `tests/plain_zap.rs` running a REQ and a REP of
-this crate over `tcp://127.0.0.1:0` through a full PLAIN handshake. So it is **not** "this library
-cannot talk to itself"; the suspect is a hand-built session pair with no engine around it. It is
-a 30-minute item because a workaround whose reason is unknown is the kind of thing that turns out
-to be a real bug six weeks later.
+**B-104 is diagnosed, and the answer is that nothing is broken.** The B-084 worker hit a symptom
+it worked around rather than explained — two of this crate's own sessions driven against each
+other over a TCP pair in one process deliver nothing, under NULL as much as under CURVE — so I
+chased it read-only rather than passing the sentence along. `Pipe` is oriented from the
+**socket's** perspective: `outgoing()` is the queue headed *for* this peer, `incoming()` what came
+*from* it, and a session pumps against that orientation. Pairing two sessions therefore needs two
+pipes with their halves **crossed**, and `Pipe::new(config)` is the only constructor there is — a
+pipe cannot be assembled from two given queues, so the crossing is not expressible through the
+public API at all. Share one pipe instead, which is the obvious move, and both sessions pop the
+same outgoing queue and push the same incoming one, so a message is raced by both readers and
+never arrives where the test looks. **No library code is implicated**: the engine pairs a session
+with a *socket*, one pipe per peer, which is why every socket-level test over TCP delivers. Two
+hypotheses I had written down before looking are eliminated too — the NULL handshake is symmetric,
+both sides writing and reading `READY`, so neither a shared role nor an uncompleted handshake gate
+can stall it. What is left of the item is 15 minutes of writing that where somebody would try it
+again, which is why the worker's instinct to drive the wire with the codec instead was right.
 
 **Nothing needs your word any more.** The one thing that did — LOOP §6's test command — is
 amended on your approval (`e16867f`): the gate's third step is
