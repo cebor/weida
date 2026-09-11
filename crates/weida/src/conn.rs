@@ -23,6 +23,7 @@ use weida_protocol::{
 };
 
 use crate::dedup::DedupWindow;
+use crate::drain::ConnDrain;
 use crate::listener::{Namespace, Route};
 use crate::ordering::{GapDetector, Reassembler, Sequencer};
 use crate::pubsub::SubRegistry;
@@ -76,9 +77,11 @@ pub(crate) struct ConnCtx {
     pub reorder: Reassembler<Held>,
     /// Suppresses repeated identities; inert unless deduplication is on.
     pub dedup: DedupWindow,
+    /// Receipts of finished transfers on this connection that nobody is
+    /// waiting on, for [`crate::Runtime::drain`].
+    pub parked: ConnDrain,
     /// Counters and flags shared with every other connection of this
-    /// runtime: the duplicate count and the drain's admission flag and
-    /// parked receipts.
+    /// runtime: the duplicate count and the drain's admission flag.
     pub shared: Arc<Shared>,
     agreed: watch::Receiver<Option<Agreed>>,
 }
@@ -121,9 +124,14 @@ impl ConnCtx {
                 guarantees.dedup_window_ms,
                 limits.max_dedup_entries,
             ),
+            parked: ConnDrain::new(&limits),
             shared,
             agreed: agreed_rx,
         });
+
+        // Once per connection, never per message: a drain collects the
+        // parked receipts from here.
+        ctx.shared.drain.register(&ctx);
 
         exec.spawn(driver(conn.clone(), ctl_rx, exec.clone()));
         exec.spawn(hello_deadline(Arc::clone(&ctx), Arc::clone(&agreed_tx)));

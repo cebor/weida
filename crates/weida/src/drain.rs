@@ -10,25 +10,32 @@
 //!
 //! The state below exists because a fire-and-forget sender drops its
 //! `Delivery` and with it the only handle that can observe the
-//! acknowledgement. Such a receipt is parked here instead of being dropped, so
-//! that a later drain has something to wait on. A receipt the application
-//! keeps is never parked: whoever holds it is doing the waiting.
+//! acknowledgement. Such a receipt is parked **on its connection** instead of
+//! being dropped, so that a later drain has something to wait on. A receipt
+//! the application keeps is never parked: whoever holds it is doing the
+//! waiting.
 //!
-//! The parked set holds nothing new in the sense of
+//! Parking is on the send path, so it costs one uncontended lock on the
+//! connection's own deque and a push — no runtime-wide structure, no polling
+//! and no task. The set is walked only when it is full and once more at drain
+//! time.
+//!
+//! It holds nothing new in the sense of
 //! [`docs/INVARIANTS.md`](../../../docs/INVARIANTS.md) — a receipt is a
 //! future over a stream that already exists — but it is a set, so it is
-//! bounded: by the stream budgets already in `Limits`, and by reaping settled
-//! receipts on the way in. Both are local quantities; a peer cannot grow this
-//! by sending.
+//! bounded: per connection, by the stream budgets already in `Limits`.
+//! Both are local quantities; a peer cannot grow this by sending.
 
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
 use weida_core::Limits;
+
+use crate::conn::ConnCtx;
 
 /// One finished transfer's acknowledgement, as quinn reports it.
 pub(crate) type Receipt =
@@ -51,32 +58,33 @@ pub struct Drained {
     pub outstanding: u64,
 }
 
-/// Admission flag plus the parked receipts of one runtime.
+/// The runtime-wide half: the admission flag, the connections a drain must
+/// visit, and the count of receipts that had to be dropped unobserved.
+///
+/// Deliberately *not* the receipts themselves. Parking is on the hot path of
+/// every fire-and-forget send, so it must not touch a structure shared by
+/// every connection and every worker thread; the receipts live on the
+/// connection that produced them ([`ConnDrain`]) and a drain collects them
+/// from there.
 pub(crate) struct DrainState {
     /// Set for good when a drain starts: bindings stop accepting connections
     /// and a new inbound stream is refused with `SHUTDOWN` [0009 §4.5].
     draining: AtomicBool,
-    /// Receipts nobody else is waiting on, oldest first.
-    parked: Mutex<VecDeque<Receipt>>,
-    /// Cap on the parked set, taken from the stream budgets.
-    max_parked: usize,
-    /// Receipts evicted at the cap before they settled. They can no longer be
-    /// observed from here, so the next drain counts them as outstanding
+    /// Every connection this runtime has spawned, weakly: a drain walks them
+    /// to collect their parked receipts. Touched once per connection, never
+    /// per message.
+    connections: Mutex<Vec<Weak<ConnCtx>>>,
+    /// Receipts evicted at a connection's cap before they settled. They can
+    /// no longer be observed, so the next drain counts them as outstanding
     /// rather than assuming they landed.
     evicted: AtomicU64,
 }
 
 impl DrainState {
-    pub(crate) fn new(limits: &Limits) -> DrainState {
-        // The transfers that can plausibly be unacknowledged at once are
-        // bounded by the concurrent streams this side deals in; reusing that
-        // number adds no new knob (0009 §5 asks for none).
-        let max_parked = limits.max_concurrent_uni_streams as usize
-            + limits.max_concurrent_bidi_streams as usize;
+    pub(crate) fn new() -> DrainState {
         DrainState {
             draining: AtomicBool::new(false),
-            parked: Mutex::new(VecDeque::new()),
-            max_parked,
+            connections: Mutex::new(Vec::new()),
             evicted: AtomicU64::new(0),
         }
     }
@@ -91,32 +99,89 @@ impl DrainState {
         self.draining.store(true, Ordering::Relaxed);
     }
 
-    /// Parks the receipt of a finished transfer nobody is waiting on.
+    /// Records a connection so a later drain can find its parked receipts.
     ///
-    /// Settled receipts at the front are reaped on the way in, so a healthy
-    /// connection keeps this set near empty without a task polling it.
-    pub(crate) fn park(&self, receipt: Receipt) {
-        let mut parked = self.parked.lock().expect("drain state poisoned");
-        while let Some(front) = parked.front_mut() {
-            if settled(front).is_none() {
-                break;
-            }
-            parked.pop_front();
+    /// Dead entries are swept when the vector would grow, which bounds the
+    /// list at roughly twice the live connection count without a sweep on
+    /// every registration.
+    pub(crate) fn register(&self, conn: &Arc<ConnCtx>) {
+        let mut connections = self.connections.lock().expect("drain state poisoned");
+        if connections.len() == connections.capacity() {
+            connections.retain(|conn| conn.strong_count() > 0);
         }
-        if parked.len() >= self.max_parked {
-            parked.pop_front();
-            self.evicted.fetch_add(1, Ordering::Relaxed);
-        }
-        parked.push_back(receipt);
+        connections.push(Arc::downgrade(conn));
     }
 
-    /// Takes everything this drain has to wait for.
+    /// Counts one receipt that was dropped before it could settle.
+    pub(crate) fn evict(&self) {
+        self.evicted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Takes everything this drain has to wait for, from every live
+    /// connection.
     pub(crate) fn take(&self) -> (Vec<Receipt>, u64) {
-        let parked = {
-            let mut parked = self.parked.lock().expect("drain state poisoned");
-            std::mem::take(&mut *parked)
+        let live: Vec<Arc<ConnCtx>> = {
+            let mut connections = self.connections.lock().expect("drain state poisoned");
+            connections
+                .drain(..)
+                .filter_map(|conn| conn.upgrade())
+                .collect()
         };
-        (parked.into(), self.evicted.swap(0, Ordering::Relaxed))
+        let mut receipts = Vec::new();
+        for conn in live {
+            receipts.append(&mut conn.parked.take());
+        }
+        (receipts, self.evicted.swap(0, Ordering::Relaxed))
+    }
+}
+
+/// The parked receipts of **one** connection.
+///
+/// One short uncontended lock on the send path, no reaping and no polling:
+/// parking a receipt is a push. The set only has to be walked when it is
+/// full, and then settled receipts are reaped to make room before anything
+/// is thrown away.
+pub(crate) struct ConnDrain {
+    parked: Mutex<VecDeque<Receipt>>,
+    /// Cap on this connection's parked set, taken from the stream budgets:
+    /// what can plausibly be unacknowledged at once is what can be in flight
+    /// at once, so this adds no new knob (0009 §5 asks for none).
+    max_parked: usize,
+}
+
+impl ConnDrain {
+    pub(crate) fn new(limits: &Limits) -> ConnDrain {
+        ConnDrain {
+            parked: Mutex::new(VecDeque::new()),
+            max_parked: limits.max_concurrent_uni_streams as usize
+                + limits.max_concurrent_bidi_streams as usize,
+        }
+    }
+
+    /// Parks the receipt of a finished transfer nobody is waiting on.
+    ///
+    /// Returns `true` when an unsettled receipt had to be dropped to make
+    /// room, which the caller counts as a loss the next drain reports.
+    pub(crate) fn park(&self, receipt: Receipt) -> bool {
+        let mut parked = self.parked.lock().expect("drain state poisoned");
+        let mut lost = false;
+        if parked.len() >= self.max_parked {
+            // Only now is it worth looking: everything settled goes, and the
+            // oldest unsettled one goes too if that was not enough.
+            parked.retain_mut(|receipt| settled(receipt).is_none());
+            if parked.len() >= self.max_parked {
+                parked.pop_front();
+                lost = true;
+            }
+        }
+        parked.push_back(receipt);
+        lost
+    }
+
+    /// Takes this connection's receipts, for a drain.
+    pub(crate) fn take(&self) -> Vec<Receipt> {
+        let mut parked = self.parked.lock().expect("drain state poisoned");
+        std::mem::take(&mut *parked).into()
     }
 }
 

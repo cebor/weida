@@ -270,7 +270,7 @@ impl Runtime {
         // connections it dials, the listener to the connections it accepts.
         let shared = Arc::new(Shared {
             duplicates: AtomicU64::new(0),
-            drain: DrainState::new(&config.limits),
+            drain: DrainState::new(),
         });
         Runtime {
             inner: Arc::new(RuntimeInner {

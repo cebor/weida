@@ -170,11 +170,7 @@ impl Peer {
         header.sequence = conn.sequencer.next(&path);
         let mut stream = conn.open_uni().await?;
         write_data_preamble(&mut stream, &header).await?;
-        Ok(OutgoingTransfer::new(
-            stream,
-            trace,
-            Arc::clone(&conn.shared),
-        ))
+        Ok(OutgoingTransfer::new(stream, trace, conn))
     }
 
     /// Opens a bidirectional stream — an exchange — to the next peer.
@@ -192,7 +188,7 @@ impl Peer {
         // bidirectional stream it cannot classify.
         write_data_preamble(&mut send, &header).await?;
         Ok((
-            OutgoingTransfer::new(send, trace, Arc::clone(&conn.shared)),
+            OutgoingTransfer::new(send, trace, Arc::clone(&conn)),
             ReplyStream::new(recv, conn),
         ))
     }

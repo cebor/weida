@@ -22,7 +22,6 @@ use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes, encode_preamble}
 use crate::conn::{ConnHandle, Ctl, read_error, read_frame, write_error, write_error_frame};
 use crate::drain::Receipt;
 use crate::ordering::Gap;
-use crate::runtime::Shared;
 
 /// Per-transfer metadata supplied by the application.
 #[derive(Clone, Debug, Default)]
@@ -170,22 +169,23 @@ pub struct OutgoingTransfer {
     stream: quinn::SendStream,
     trace: TraceContext,
     settled: bool,
-    /// Where an unawaited receipt goes, so that a drain has something to
-    /// wait on (`docs/decisions/0009-drain.md` §4.2).
-    drain: Arc<Shared>,
+    /// The connection this stream belongs to: where an unawaited receipt is
+    /// parked so a drain can wait on it
+    /// (`docs/decisions/0009-drain.md` §4.2).
+    conn: ConnHandle,
 }
 
 impl OutgoingTransfer {
     pub(crate) fn new(
         stream: quinn::SendStream,
         trace: TraceContext,
-        drain: Arc<Shared>,
+        conn: ConnHandle,
     ) -> OutgoingTransfer {
         OutgoingTransfer {
             stream,
             trace,
             settled: false,
-            drain,
+            conn,
         }
     }
 
@@ -220,7 +220,7 @@ impl OutgoingTransfer {
         // handle it came from.
         Ok(Delivery {
             stopped: Some(Box::pin(self.stream.stopped())),
-            drain: Arc::clone(&self.drain),
+            conn: Arc::clone(&self.conn),
         })
     }
 
@@ -297,14 +297,15 @@ impl std::fmt::Debug for OutgoingTransfer {
 /// processed them. Guarantees of that shape belong to a broker hop and are
 /// deliberately absent from the v0 core (`docs/GUARANTEES.md`).
 ///
-/// Dropping a `Delivery` is free for the caller — that is the
-/// fire-and-forget path — but the receipt itself is not thrown away: it is
-/// parked with the runtime so that [`crate::Runtime::drain`] has something
-/// to wait on (`docs/decisions/0009-drain.md` §4.2). A receipt the caller
-/// *does* await is never parked; whoever holds it is doing the waiting.
+/// Dropping a `Delivery` observes no outcome and waits for nothing, which is
+/// the fire-and-forget path. It is not quite free: the receipt is handed to
+/// the connection's parked set — one uncontended lock and a push — so that
+/// [`crate::Runtime::drain`] has something to wait on
+/// (`docs/decisions/0009-drain.md` §4.2). A receipt the caller *does* await
+/// is never parked; whoever holds it is doing the waiting.
 pub struct Delivery {
     stopped: Option<Receipt>,
-    drain: Arc<Shared>,
+    conn: ConnHandle,
 }
 
 impl Delivery {
@@ -329,8 +330,13 @@ impl Delivery {
 
 impl Drop for Delivery {
     fn drop(&mut self) {
-        if let Some(receipt) = self.stopped.take() {
-            self.drain.drain.park(receipt);
+        if let Some(receipt) = self.stopped.take()
+            && self.conn.parked.park(receipt)
+        {
+            // The connection's parked set was full of receipts that had not
+            // settled, so the oldest was dropped unobserved: the next drain
+            // reports it as outstanding rather than assuming it landed.
+            self.conn.shared.drain.evict();
         }
     }
 }
@@ -615,7 +621,7 @@ impl IncomingRequest {
         Ok(OutgoingTransfer::new(
             send,
             trace,
-            Arc::clone(&self.reply.conn.shared),
+            Arc::clone(&self.reply.conn),
         ))
     }
 
