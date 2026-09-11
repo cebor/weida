@@ -695,6 +695,55 @@ a foreign peer's disagreements interpretable rather than mysterious.
 SP has no topic field, only the leading bytes of a body, so the split is adapter
 configuration and belongs to the bridge slice ([adapters/nng.md](adapters/nng.md) §6).
 
+**Delivered in the fourteenth increment — the SP inbound bridge (B-052):**
+
+`crates/adapters/weida-sp-bridge`, the mirror of B-041 for SP: one `Inbound` terminates the
+SP TCP mapping with `weida-sp` and speaks weida onward. `REP` in front of a weida
+`Replier`, `PULL` in front of a `Puller`, `PUB` fed by a `Subscriber`. Ten integration
+tests against an SP peer built on our own codec — no C library, nothing `#[ignore]`d — plus
+the unit test that pins the endpoint-type table.
+
+**Two things are structurally unlike the ZMTP bridge, and both come from the protocol.**
+
+1. **Requests are concurrent, and the tag stack is what pairs them.** ZMTP's REQ is
+   lockstep, so B-041's REP loop is too. A cooked SP REQ holds one outstanding request per
+   *context* and a socket may own many
+   ([research/nanomsg-nng.md](research/nanomsg-nng.md) §2), so the bridge splits the socket,
+   serves each request in its own task and writes replies through one writer task. Order is
+   not the correlation — the 32-bit tag stack is [rfc-reqrep §5] — and
+   `several_requests_in_flight_are_answered_by_tag_not_by_order` proves it by making the
+   weida replier answer four held requests in reverse: a sequential bridge deadlocks on that
+   test rather than failing it slowly.
+2. **The `PUB` side subscribes to everything.** SP filters at the *subscriber* and a SUB
+   socket has no send operation at all (§4), so no subscription ever reaches the bridge and
+   there is nothing to translate. It takes the empty-subscription row of
+   [adapters/nng.md](adapters/nng.md) §6, and L1 stops being a sentence: the test observes a
+   topic the peer would have filtered out arriving anyway. The topic is written as the
+   leading bytes of the body with no separator, because SP has no topic field.
+
+**Every bound is a factor of one stated product**, which is the B-043 arithmetic applied
+before the review pass could find it rather than after. `max_message_bytes` defaults to
+1 MiB — `stream_receive_window`, the same number and the same reason as the ZMTP bridge —
+and the worst case one bridge holds is
+`max_message_bytes × 2 × max_in_flight × max_connections` = 1 MiB × 2 × 4 × 64 = **512 MiB**,
+twice `max_in_flight` because a request payload is held while its exchange runs and its
+reply while it waits for the writer. `max_connections` exists because the listener would
+otherwise accept without a ceiling; `max_hops` bounds the tag stack a peer can make the
+bridge allocate. All four are configuration, and zero in any of them is refused at
+`bind` — which is also where a guarantee set above `core` is refused (§9.2, §9.3).
+
+**A refusal here carries no reason, and that is now L10 of the mapping document.** SP has
+no error frame: the TCP mapping's only remedy is "the connection MUST be closed
+immediately" [rfc-tcp §2]. A mismatched endpoint type, a malformed protocol header, an
+oversized declaration and a too-deep tag stack are therefore all the same observation from
+the peer's side — the bridge's header, then EOF — which two tests assert and which makes
+the bridge's own log the only place the reason exists. The contrast with the ZMTP bridge,
+where a refusal carries a printable reason, is the sharpest thing this slice learned.
+
+**What is not here:** the outbound direction (slice 3) and the interop bench against a real
+`nng` peer (slice 5), which is what would settle §11's PAIR v1 hop-count disagreement and
+L10's "is a close really all a peer learns".
+
 ---
 
 ## 2. Mandatory development loop per phase

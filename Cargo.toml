@@ -7,6 +7,7 @@ members = [
     "crates/adapters/weida-zmtp",
     "crates/adapters/weida-zmtp-bridge",
     "crates/adapters/weida-sp",
+    "crates/adapters/weida-sp-bridge",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ weida-core = { path = "crates/core", version = "0.1.0" }
 weida-protocol = { path = "crates/protocol", version = "0.1.0" }
 weida = { path = "crates/weida", version = "0.1.0" }
 weida-zmtp = { path = "crates/adapters/weida-zmtp", version = "0.1.0" }
+weida-sp = { path = "crates/adapters/weida-sp", version = "0.1.0" }
 
 quinn = "0.11"
 tokio = { version = "1", features = [

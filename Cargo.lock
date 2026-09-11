@@ -1901,6 +1901,17 @@ name = "weida-sp"
 version = "0.1.0"
 
 [[package]]
+name = "weida-sp-bridge"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "weida",
+ "weida-sp",
+]
+
+[[package]]
 name = "weida-zmtp"
 version = "0.1.0"
 
