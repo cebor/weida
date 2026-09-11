@@ -27,11 +27,28 @@ The next hop has accepted responsibility in memory according to the selected pol
 
 ### Stored
 
-The next hop has persisted sufficient state to survive the documented failure domain.
+The next hop has persisted sufficient state to survive the documented failure domain. The
+domain is named by a level, and `Stored` without a level is not a reportable state
+([decisions/0004](decisions/0004-durability-levels.md) §4.1):
 
-### Replicated(n)
+- **`Stored(Written)`** — the storage layer holds the message and it survives the **broker
+  process** dying: crash, restart or orderly stop. It may still be lost to an operating-system
+  or power failure, because it may still sit in the page cache. This is what a system
+  certifies when it acknowledges after a disk write without an `fsync`.
+- **`Stored(Flushed)`** — the write has been flushed to durable media and returned, so the
+  message survives **loss of power on that node**.
 
-The next hop guarantees that configured replication criteria have been met.
+### Replicated(n, flushed)
+
+The next hop guarantees that configured replication criteria have been met, stated as a count
+and a persistence level ([decisions/0004](decisions/0004-durability-levels.md) §4.2):
+
+- `n` is the number of replicas that hold the message, **the leader included**, and it is the
+  number *achieved* at the commit, never the configured replication factor (§4).
+- Every counted replica has reached at least `Stored(Written)`; `flushed: true` additionally
+  certifies that every counted replica reached `Stored(Flushed)`.
+- `Replicated(1, …)` is not a reportable state: one replica is `Stored`, and calling it
+  replicated invents a redundancy that does not exist.
 
 ### Processed
 
@@ -100,10 +117,18 @@ that is a property of a composed system, not of a transport.
 None
 TransportReceipt          (v0 core)
 Accepted                  (reserved, L2 broker)
-Stored                    (reserved, L2 broker)
-Replicated(...)           (reserved, L2 broker)
+Stored(Written|Flushed)   (reserved, L2 broker)
+Replicated(n, flushed)    (reserved, L2 broker)
 Processed                 (reserved, L2 broker)
 ```
+
+The completion states above `TransportReceipt` are **not a ladder**. Persistence level and
+replica count are independent axes, so `Stored(Flushed)` on one node and
+`Replicated(3, flushed: false)` are incomparable: one survives power loss on a single machine,
+the other survives losing two machines that were all running. Only pairs within one axis are
+ordered — `Accepted` < `Stored(Written)` < `Stored(Flushed)`, and, at equal `n`,
+`flushed: false` < `flushed: true`
+([decisions/0004](decisions/0004-durability-levels.md) §4.4).
 
 The v0 stream core offers exactly one delivery signal, the **transport receipt**.
 `OutgoingTransfer::finish` hands back a `Delivery`, and `Delivery::delivered().await`
@@ -111,7 +136,12 @@ resolves `Ok(())` when the peer's transport holds every byte of the payload and 
 quinn documents the underlying condition as the local side finishing the stream and the peer
 then acknowledging receipt of all stream data *"(although not necessarily the processing of
 it)"*. That parenthesis is the whole distinction: a transport receipt says the bytes
-arrived, never that an application read them, still less that it acted on them.
+arrived, never that an application read them, still less that it acted on them. It is not an
+implementation limit but the transport's: the receiving side's terminal state "Data Read" —
+the state that means the application consumed the bytes — is one the sender cannot observe
+(RFC 9000 §3.1, §3.2), and QUIC provides no way at all to learn the peer's application read
+progress, MAX_STREAM_DATA credit being only a proxy a receiver may advertise on any basis it
+likes (RFC 9000 §4.1).
 
 `Accepted`, `Stored`, `Replicated` and `Processed` are reserved for the L2 broker layer and
 are deliberately absent from the v0 wire ([PROTOCOL.md](PROTOCOL.md) §11). Earlier drafts
@@ -141,26 +171,56 @@ progress; a receipt for a small one is not, and no API distinguishes the two cas
 The same asymmetry cuts the other way for refusals: a one-way transfer that fits in flight may
 be acknowledged by the peer's transport before the peer's application refuses it, so
 `delivered()` may resolve `Ok(())` for a transfer the application then discarded. That is not
-a defect of the receipt but its definition ([PATTERNS.md](PATTERNS.md) §1.6).
+a defect of the receipt but its definition ([PATTERNS.md](PATTERNS.md) §1.6), and it is a
+decided position rather than an open question:
+[decisions/0005](decisions/0005-refusal-race.md) closes the race as documented behaviour. No
+application-level signal is added to the L0 wire to order a refusal ahead of the receipt; a
+refusal is guaranteed to be observed only where the payload exceeds the peer's stream receive
+window or where the pattern is Req/Rep, whose ERROR frame the receiving application writes
+itself [0005 §4.3]. A refusal that arrives after the receipt has resolved reaches no observer,
+and none is invented for it [0005 §4.4]. The deterministic counterpart is the reserved
+`Accepted` of an L2 broker hop, not a future L0 acknowledgement.
 
 ### Ordering
 
 ```text
 None
-PerProducer
-PerKey
+PerProducer(detect|reassemble)
+PerKey                          (L2 only)
 Total
 ```
 
-The performance implications of each level MUST be documented.
+`PerProducer` is scoped to (producer, endpoint or topic), where the producer is by default the
+sending peer's proved fingerprint and the counter therefore restarts with the connection
+([decisions/0008](decisions/0008-session-identity.md) §4.3). It has two modes
+([decisions/0001](decisions/0001-sequence-field.md) §7.5): **detect** reports the gap and
+delivers messages as they arrive, and is the default; **reassemble** holds messages back up to
+a bounded buffer, accepting head-of-line blocking above a transport chosen to avoid it, and
+reads eagerly into an application-owned buffer with a named cap
+([decisions/0002](decisions/0002-control-and-bulk-separation.md) §6.6). `PerKey` is
+unreachable at L0 and reserved for the L2 broker, because key order exists only under a stable
+key-to-partition binding weida does not have [0001 §7.4].
+
+The performance implications of each level MUST be documented. Measured so far: the two DATA
+keys that carry the sequence and the producer identity cost 80 B on a 135 B frame and 9 % of
+the message rate at a 64-byte payload in their worst case, while the default omits the
+producer key entirely and pays the sequence's 6 B
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-009; [decisions/0008](decisions/0008-session-identity.md)
+§4.4). The cost of the reassembly buffer under cross-stream reordering is not yet measured.
 
 ### Deduplication
 
 ```text
 None
-Bounded
-Durable
+Bounded(window)
+Durable                         (L2 only)
 ```
+
+`Bounded(window)` suppresses a repeated identity within a time window; an identifier reused
+after its window is not suppressed, and the window length is configuration rather than a
+constant of the protocol ([decisions/0001](decisions/0001-sequence-field.md) §7.6). Ordering
+and deduplication are separate dimensions: neither implies the other, and one may be enabled
+without the other [0001 §7.1]. `Durable` needs a store and belongs to the L2 broker.
 
 ### Backpressure behavior
 
@@ -172,7 +232,38 @@ Spill
 Coalesce
 ```
 
-These names are provisional; semantics matter more than naming.
+These names are provisional; semantics matter more than naming. Backpressure is also the one
+dimension that is **not** ordered: its levels are behaviours, not strengths, so two peers
+state the same one or fail to agree
+([decisions/0006](decisions/0006-guarantee-sets.md) §4.3).
+
+### Guarantee sets
+
+A **guarantee set** is the unit of configuration: a tuple with one level per dimension above —
+delivery, acknowledgement/completion, ordering, deduplication, backpressure — where an
+acknowledgement level of `Stored` or `Replicated` carries the durability axes of §1. A set is
+never a single enum, and it introduces no new words: it is a way to carry the existing ones as
+one object ([decisions/0006](decisions/0006-guarantee-sets.md) §4.1).
+
+**`core` is the default set, and it is what v0 does**: delivery `BestEffort`, acknowledgement
+`TransportReceipt`, ordering `None`, deduplication `None`, backpressure `Block`, with `Reject`
+at an endpoint's queue bound and `Drop` for fan-out only. §6 is the normative source for
+`core`, so that the default cannot drift away from what the code does. An endpoint configured
+with nothing gets `core`, and every adapter may assume `core` on the weida side without asking
+[0006 §4.2].
+
+**Inside the weida network a configured set may only be a superset of `core`.** Set `B` is at
+least `A` when, for every dimension, `B`'s level is greater than or equal to `A`'s in that
+dimension's own order. Where a dimension is a partial order rather than a ladder — persistence
+level against replica count, §1 — the comparison is per axis and incomparable levels do not
+satisfy each other [0006 §4.3], [0004 §4.4].
+
+**At an adapter edge the chain ends at the foreign protocol's transfer point**, and the
+adapter's mapping document in [`adapters/`](adapters/README.md) names that point, the set it
+carries in each direction, its named losses and the configurations it refuses [0006 §4.6],
+[0006 §4.9]. Where the foreign protocol has no transfer point at all — ZeroMQ beyond
+`zmq_send`, core NATS — the chain ends at the adapter's own local queue and the document says
+so in those words.
 
 ---
 
@@ -211,16 +302,32 @@ durable deduplication
 consumer processed ACK
 ```
 
-Two rules govern configuration:
+Four rules govern configuration:
 
 - Invalid combinations MUST be rejected. Validation is explicit and happens at
-  configuration time, not silently at runtime.
+  configuration time, not silently at runtime. A guarantee set is validated when an endpoint,
+  a connection or a bridge is configured, against what the build and the local configuration
+  can honour, before any connection is attempted
+  ([decisions/0006](decisions/0006-guarantee-sets.md) §4.5).
 - A requested guarantee MUST NEVER be silently weakened (master doc §81 rule 6). If a peer
   or a build cannot honour a requested guarantee, the operation MUST fail visibly. The v0
   core has no acknowledgement knob to weaken — it offers the transport receipt or nothing —
   so the rule shows up in routing instead: a stream addressed to an endpoint whose pattern
   cannot serve it is refused with `UNSUPPORTED` rather than quietly treated as something
-  the endpoint does understand (see [PROTOCOL.md](PROTOCOL.md) §9).
+  the endpoint does understand (see [PROTOCOL.md](PROTOCOL.md) §9). At an adapter edge the
+  same rule permits a degradation only as a **named** configuration entry, which then *is*
+  the configured set, so nothing is weakened at runtime [0006 §4.7].
+- **Validation compares per axis, not per word.** A request for a completion state is
+  honoured only when an offer covers it on the persistence axis *and* on the replica count;
+  incomparable levels do not satisfy each other, and an acknowledgement reports the `n` that
+  was achieved, never the one that was configured
+  ([decisions/0004](decisions/0004-durability-levels.md) §4.3, §4.4).
+- **Both sides declare, and the intersection decides.** Each side declares in HELLO the set
+  it offers and the set it requires; negotiation computes the per-dimension intersection —
+  the weaker level of the two offers — and fails the connection with `NEGOTIATION_FAILED`
+  when the result does not reach what the peer requires. There is no downgrade path
+  [0006 §4.4], [PROTOCOL.md](PROTOCOL.md) §2.3. *Spec ahead of code: the HELLO fields that
+  carry the declarations are not on the wire yet.*
 
 ---
 
@@ -252,15 +359,20 @@ normative in [FAILURE_MODEL.md](FAILURE_MODEL.md).
 Everything below describes the **L0 stream core** and the **L1 patterns** built on it. The
 L2 broker layer, where the completion states of §1 acquire meaning, is Phase 6.
 
+This table is also the normative source for the default guarantee set `core` of §3: `core` is
+what this table says, so the default cannot drift away from what the code does
+([decisions/0006](decisions/0006-guarantee-sets.md) §4.2). Rows marked *spec ahead of code*
+name a level that is decided and specified but not yet implemented.
+
 | Dimension | v0 support | Notes |
 | --- | --- | --- |
 | Acknowledgement | transport receipt only | `Delivery::delivered()` resolves `Ok(())` when the peer's **transport** holds every byte and the FIN — explicitly not "the application read it" (§3). There is no application acknowledgement anywhere in the v0 core: `Accepted`, `Stored`, `Replicated` and `Processed` are reserved for the L2 broker layer and have no wire representation, not even a reserved code point ([PROTOCOL.md](PROTOCOL.md) §11). |
 | Delivery | `BestEffort` only | v0 performs no retries. A failed or indeterminate transfer is reported to the application, which decides. `AtMostOnce` and `AtLeastOnce` require retry and dedup machinery that does not exist yet. |
-| Ordering | `None` | QUIC guarantees byte order **within** one stream. A one-way transfer is one stream, and each half of an exchange is one stream, so a single payload is ordered end to end. Across streams there is no ordering guarantee of any kind. `PerProducer`, `PerKey` and `Total` are not implemented. |
-| Deduplication | `None` | No idempotency ids, no dedup window. Nothing on the wire names a transfer — correlation is the stream itself — so a receiver could not deduplicate even if it wanted to. |
-| Backpressure | `Block`, `Reject`, `Drop` | `Block`: QUIC stream and connection flow control, the concurrent-stream budgets (`max_concurrent_uni_streams`, `max_concurrent_bidi_streams`) and bounded internal channels (`endpoint_queue`, the actor control channel) make senders await capacity; this is what Req/Rep and Push/Pull use. The budget lands on `open`, and a transfer parked in an accept queue still holds its stream, so a deeper queue does not raise it ([PATTERNS.md](PATTERNS.md) §1.4). `Reject`: `IncomingTransfer::read_capped` refuses a payload past its cap with `STOP_SENDING(REJECTED)` and `LimitExceeded` before buffering it, and `Publisher::publish` rejects a payload larger than `subscriber_buffer_bytes` locally. `Drop`: publisher fan-out only — a subscriber past `subscriber_buffer_bytes` loses the message rather than stalling the publisher. `Spill` and `Coalesce` are not implemented. |
+| Ordering | `None` | QUIC guarantees byte order **within** one stream. A one-way transfer is one stream, and each half of an exchange is one stream, so a single payload is ordered end to end. Across streams there is no ordering guarantee of any kind. *Spec ahead of code:* `PerProducer(detect\|reassemble)` is decided ([decisions/0001](decisions/0001-sequence-field.md) §7.5) and needs the DATA sequence key, which is not on the wire yet; `PerKey` is L2-only by decision [0001 §7.4]; `Total` is not specified. |
+| Deduplication | `None` | No idempotency ids, no dedup window. Nothing on the wire names a transfer — correlation is the stream itself — so a receiver could not deduplicate even if it wanted to. *Spec ahead of code:* `Bounded(window)` is decided [0001 §7.6] and needs the same wire work. |
+| Backpressure | `Block`, `Reject`, `Drop` | **The two credit units at L0 are bytes and streams, and there is no application credit.** Bytes: `stream_receive_window` and `connection_receive_window`. Streams: `max_concurrent_uni_streams` and `max_concurrent_bidi_streams`, which *are* weida's message credit — a consumer sizes its prefetch by granting them ([decisions/0003](decisions/0003-credit-unit.md) §4.1, §5). Both are receiver-granted through QUIC transport parameters and both are absolute and idempotent; nothing on the L0 wire grants credit at the application level, and the per-subscription message credit of [0003 §4.2] is L2 work with no v0 representation. `Block`: those two windows, those two budgets and bounded internal channels (`endpoint_queue`, the actor control channel) make senders await capacity; this is what Req/Rep and Push/Pull use. The budget lands on `open`, and a transfer parked in an accept queue still holds its stream, so a deeper queue does not raise it ([PATTERNS.md](PATTERNS.md) §1.4). `Reject`: `IncomingTransfer::read_capped` refuses a payload past its cap with `STOP_SENDING(REJECTED)` and `LimitExceeded` before buffering it, and `Publisher::publish` rejects a payload larger than `subscriber_buffer_bytes` locally. `Drop`: publisher fan-out only — a subscriber past `subscriber_buffer_bytes` loses the message rather than stalling the publisher. `Spill` and `Coalesce` are not implemented. |
 | Indeterminate outcomes | implemented | First-class: `Error::Indeterminate` is deliberately excluded from `Error::is_definite_failure()`. See [FAILURE_MODEL.md](FAILURE_MODEL.md). |
-| Peer identity | implemented | Every inbound transfer carries the sending peer's proved public-key fingerprint in `IncomingMeta::peer` (`None` for an anonymous client). It comes from the TLS handshake, never from a header, so it can be authorized on but not claimed (master doc §47). Trust is stated per dialling endpoint (`Trust`: pins, anchors, or only what the address names) and optionally required of clients per binding (`ServerTls::require_client`). Authorization beyond "is this key trusted at all" is the application's decision on the fingerprint. |
+| Peer identity | implemented | Every inbound transfer carries the sending peer's proved public-key fingerprint in `IncomingMeta::peer` (`None` for an anonymous client). It comes from the TLS handshake, never from a header, so it can be authorized on but not claimed (master doc §47). Trust is stated per dialling endpoint (`Trust`: pins, anchors, or only what the address names) and optionally required of clients per binding (`ServerTls::require_client`). Authorization beyond "is this key trusted at all" is the application's decision on the fingerprint. The fingerprint is also the peer's name **across** connections — two connections that proved the same key are one peer, which is what binds a control connection to its bulk connections — and it carries no session: recognizing a peer restores nothing from a previous connection ([decisions/0008](decisions/0008-session-identity.md) §4.1, §4.2, §4.4). |
 | Hop-locality | implemented, trivially | Exactly one hop exists in v0 (direct connection). No composition of hops is possible yet. |
 
 ### Per pattern
@@ -282,9 +394,12 @@ Three points deserve emphasis, because each is easy to assume otherwise:
   publisher is exhausted simply does not receive that message; nothing on the wire tells it
   so. The publisher counts the drop locally (`Publisher::dropped`). This is the one place
   where weida answers overload by discarding, and it is confined to fan-out (master doc
-  §17).
+  §17). With the detect mode of `PerProducer` a subscriber will be able to observe the gap
+  instead of missing it silently; that is decided
+  ([decisions/0001](decisions/0001-sequence-field.md) §7.2) and not yet on the wire.
 - **Ordering is `None` for the new patterns, not "usually ordered".** Each message is its
   own stream and QUIC does not order streams relative to each other. A publisher's
   per-subscriber writer enqueues copies in publication order, but that is an implementation
   property of one hop, not a guarantee an application may rely on. Per-producer ordering
-  requires a sequence field that v0 does not have.
+  requires a sequence field that v0 does not have, and §3 states the level it will carry
+  when it does.
