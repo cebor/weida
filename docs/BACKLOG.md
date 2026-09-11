@@ -35,8 +35,9 @@ kind: spec | size: 45 | status: done 30b8942 | needs: [B-001, B-003]
 acceptance: §3 ordering `PerProducer(detect|reassemble)`, dedup `Bounded(window)`, `PerKey` L2-only; `Stored`/`Replicated` with durability levels; §6 rows for backpressure name the two L0 credit units and the absence of application credit; a new subsection on guarantee sets per 0006; §3 receipt paragraph cites RFC 9000 §3.2 per 0005.
 
 ### B-008 — Spec sync: PATTERNS.md, INVARIANTS.md, ARCHITECTURE.md
-kind: spec | size: 45 | status: in_progress 2026-09-11T04:47Z | needs: [B-006, B-007]
+kind: spec | size: 45 | status: done 64ba40b | needs: [B-006, B-007]
 acceptance: PATTERNS §1.3 narrowed to "bulk writers on the same path's connection", §1.4 states the stream budget is the L0 message credit, §1.6 cites 0005, §4 gains subscriber-side drop detection and segmented filters; INVARIANTS permits a control connection while forbidding a multiplexed control stream, adds the reassembly cap and per-peer connection count to the named bounds; ARCHITECTURE §5 describes the two pool tiers and two Limits profiles; SYNTHESIS §8 entries carry their decision numbers.
+note: INVARIANTS gained a third named-but-unimplemented bound beside the reassembly hold and the per-peer connection count — the dedup window's identity count, which a time window does not bound — plus a paragraph naming the adapter mapping document as the home of the adapter-honesty invariant per 0006 §4.9. SYNTHESIS §8 also gained a preamble stating which seven entries are closed and that §8.6 and §8.8 remain open; the question text above each closing paragraph is left untouched, because a decision is only legible against its question.
 
 ### B-019 — Spec sync: FAILURE_MODEL.md per 0005
 kind: spec | size: 30 | status: in_progress (delegated) 2026-09-11T04:30Z | needs: []
