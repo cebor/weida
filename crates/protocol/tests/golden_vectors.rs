@@ -102,6 +102,49 @@ fn golden_fanout_data_frame() {
     assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
 }
 
+/// The digest the §8 vectors use: SHA-256 of `"test"`, the same value the
+/// address examples in `docs/PROTOCOL.md` carry.
+const VECTOR_PRODUCER: [u8; 32] = [
+    0x9F, 0x86, 0xD0, 0x81, 0x88, 0x4C, 0x7D, 0x65, 0x9A, 0x2F, 0xEA, 0xA0, 0xC5, 0x5A, 0xD0, 0x15,
+    0xA3, 0xBF, 0x4F, 0x1B, 0x2B, 0x0B, 0x82, 0x2C, 0xD1, 0x5D, 0x6C, 0x15, 0xB0, 0xF0, 0x0A, 0x08,
+];
+
+#[test]
+fn golden_sequenced_data_frame() {
+    // DATA key 6. Specified ahead of code: the codec writes it when set, and
+    // no v0 sender sets it.
+    let mut h = DataHeader::addressed("/t");
+    h.sequence = Some(1);
+    assert_frame(
+        "DATA with a sequence",
+        FrameKind::Data,
+        h.encode(),
+        &[0x57, 0x01, 0x07, 0xA2, 0x00, 0x62, 0x2F, 0x74, 0x06, 0x01],
+    );
+    assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
+}
+
+#[test]
+fn golden_relayed_data_frame() {
+    // DATA keys 6 and 7 together: the shape a relay or an L2 hop writes when
+    // the producer is not the connection peer. The producer is the raw
+    // 32-byte digest as a CBOR `bstr` (0x58 0x20 …), never the hex spelling.
+    let mut h = DataHeader::addressed("/t");
+    h.sequence = Some(1);
+    h.producer = Some(VECTOR_PRODUCER);
+    let mut expected = vec![
+        0x57, 0x01, 0x2A, 0xA3, 0x00, 0x62, 0x2F, 0x74, 0x06, 0x01, 0x07, 0x58, 0x20,
+    ];
+    expected.extend_from_slice(&VECTOR_PRODUCER);
+    assert_frame(
+        "DATA with a sequence and a producer",
+        FrameKind::Data,
+        h.encode(),
+        &expected,
+    );
+    assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
+}
+
 #[test]
 fn golden_subscribe_and_unsubscribe_frames() {
     let h = SubscriptionHeader::new("/md", "px.");

@@ -22,6 +22,11 @@ fn full_request() -> DataHeader {
         traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
         tracestate: Some("vendor=value,other=thing".into()),
         topic: Some("px.eur".into()),
+        // Keys 6 and 7 stay absent so this bench keeps measuring the same
+        // header as the numbers recorded in IMPLEMENTATION.md §4; their cost
+        // is B-009's separate measurement.
+        sequence: None,
+        producer: None,
     }
 }
 

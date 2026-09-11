@@ -131,6 +131,8 @@ fn fuzz_smoke_data_header_from_valid_bytes() {
             traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
             tracestate: Some("a=1,b=2".into()),
             topic: Some("px.eur".into()),
+            sequence: Some(u64::MAX),
+            producer: Some([0xA5; 32]),
         },
     ];
     let mut accepted = 0usize;
@@ -350,5 +352,19 @@ fn arbitrary_data_header(rng: &mut Rng) -> DataHeader {
         traceparent: text(rng, limits::MAX_TRACEPARENT_BYTES),
         tracestate: text(rng, limits::MAX_TRACESTATE_BYTES),
         topic: text(rng, limits::MAX_TOPIC_BYTES),
+        sequence: if rng.below(2) == 0 {
+            Some(rng.next_u64())
+        } else {
+            None
+        },
+        producer: if rng.below(2) == 0 {
+            let mut digest = [0u8; limits::PRODUCER_BYTES];
+            for chunk in digest.chunks_mut(8) {
+                chunk.copy_from_slice(&rng.next_u64().to_le_bytes()[..chunk.len()]);
+            }
+            Some(digest)
+        } else {
+            None
+        },
     }
 }
