@@ -1169,6 +1169,44 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 
 ---
 
+### ZMTP inbound bridge decisions (Phase 9 slice 2, B-041)
+
+| Decision | Value | Rationale |
+| --- | --- | --- |
+| Where it lives | its own crate, `crates/adapters/weida-zmtp-bridge` | A feature on the codec crate would put a weida dependency in the codec's manifest, and that manifest being empty is what keeps the codec checkable against 37/ZMTP rather than against our reading of it ([ARCHITECTURE.md](ARCHITECTURE.md) §4). |
+| The handshake state machine | in the bridge, not the codec | The codec deliberately shipped without one (B-030), so this slice decided its shape: `Session::handshake` sends the full greeting, reads the peer's, exchanges `READY`, and refuses with `ERROR` before closing on two things — a socket type §2's table forbids, and a `READY` naming no socket type at all. The second is a `SHOULD` in the specification and a MUST here: a bridge that does not know which pattern it is translating cannot translate it. |
+| One socket type per listener | `Presenting::{Rep, Pull, Pub}` | The three whose ZeroMQ counterparts bind rather than connect ([ARCHITECTURE.md](ARCHITECTURE.md) §6c.4). It also makes §9.1's refusal — a dropping policy bridged onto a blocking one — unrepresentable rather than checked: the pattern pair follows from the presented type, so there is nothing to misconfigure. |
+| Envelope versus multipart | consume `[empty, body]`, refuse everything else | REQ puts an empty delimiter on the wire and REP strips it, so that frame is envelope and is consumed and mirrored onto the reply; a bare `[body]` is accepted too, because a DEALER peer leaves the envelope to its application. Any other frame count is a genuine multipart message, refused: concatenating it would invent an application protocol weida does not have (loss L1, §9.2). |
+| The topic on the PUB side | its own frame, ahead of the payload | A SUB peer matches a byte prefix against the start of the message, so the topic has to be where that match lands. The zguide's envelope convention says the same thing and gives the reason: "the match won't cross a frame boundary" (§6). |
+| Subscriptions | reference-counted per raw prefix **and** per translated filter | ZeroMQ's SUBSCRIBE is not idempotent and weida's is (L3), so the weida side is told only when a count crosses zero. Two counts rather than one, because under the §9.3 opt-in two different prefixes can translate to the same filter, and cancelling one must not unsubscribe the other. |
+| A refused subscription | `ERROR` to the peer, connection stays up | The only non-fatal error in the bridge. A SUB peer with one untranslatable prefix and three good ones must keep the three, and a silently ignored subscription is a subscriber that waits forever for messages nobody will send. |
+| The weida-side reconnect | three attempts, then let the ZMTP connection fail | A bridge that retried forever would hide a weida outage from the ZeroMQ side, whose own reconnect loop is better at it: a ZMTP peer reconnects automatically, and a fresh connection rebuilds everything from that peer's own subscriptions — which is what `Subscriber::connect` re-sending its filters gives us, and why reconnection is not re-registration ([decisions/0008](decisions/0008-session-identity.md) §4.5). |
+| A slow SUB peer | bounded queue, drop the **oldest**, count and log it | Both sides already agree that fan-out drops rather than blocks. Oldest rather than newest because a subscriber that has fallen behind wants the freshest data it can still be given, and counted because ZeroMQ's PUB drops silently and the zguide names that as a debugging problem. |
+
+**What writing the tests found.** The PUB loop selects over the socket and the weida
+subscriber, so the framed reader's `fill` is dropped routinely — and the first version grew the
+buffer with `resize` before the await and truncated after it. A cancelled read left the
+zero-filled slack behind, which decodes as a stream of empty message frames: the bridge then
+refused its own buffer with "a SUB peer sent a message, which its socket type cannot do". The
+fix is to read into scratch and append only after the read completes, which is what makes the
+claim "cancel-safe" true; the comment on `fill` now records the version that looks equivalent
+and is not.
+
+---
+
+### ZMTP outbound bridge decisions (Phase 9 slice 3, B-042)
+
+| Decision | Value | Rationale |
+| --- | --- | --- |
+| Which side binds | the **weida** side | The mirror of the inbound slice is not symmetric. Inbound the bridge binds on the ZeroMQ side because that is where the foreign peers dial; outbound it binds a weida endpoint and dials the foreign peer, because the endpoint path is what weida applications address and an endpoint that nobody can name is not reachable. One `Outbound` is therefore one weida path in front of one foreign peer. |
+| Req/Rep dials `DEALER`, not `REQ` | `Dialling::{Dealer, Pull, Sub}` | A weida `Replier` accepts concurrent exchanges ([ARCHITECTURE.md](ARCHITECTURE.md) §6b) and REQ is lockstep — "send and then receive exactly one message at a time" [zeromq §4.2] — so a REQ socket would serialize the very concurrency this side offers. DEALER carries the 28/REQREP envelope instead, and the bridge synthesizes it: an id frame it assigns, an empty delimiter, the body. |
+| What pairs a reply with its exchange | the id frame, in a table keyed by it | Not arrival order: a foreign ROUTER may answer out of order, and even against a REP peer nothing on the wire says the replies come back in the order the requests left. The test drives four exchanges at once and has the peer answer them in reverse; an id-blind bridge fails it. |
+| A reply that never comes | a deadline per exchange, then `ERROR{NO_REPLY}` | `ZMQ_ROUTER_MANDATORY` is an option on the ROUTER socket, and outbound that socket belongs to the peer — the adapter cannot set it and the loss (L5) arrives as silence. A weida requester hanging forever on somebody else's dropped message is the one outcome worth ruling out, so the exchange is refused with a typed error instead. What the deadline should be is measurement the interop bench owes ([adapters/zmtp.md](adapters/zmtp.md) §11). |
+| The refusal needed a public API | `IncomingRequest::refuse(code)` | The runtime already wrote `ERROR` frames for its own routing refusals and on drop (`NO_REPLY`), but an application could only refuse by dropping the handle — which says `NO_REPLY` and nothing else. [decisions/0005](decisions/0005-refusal-race.md) §4.3 says the ERROR frame is written by the application; until this slice needed it, nothing did. |
+| Heartbeats | `ZMQ_HEARTBEAT_IVL` on the adapter's own socket, never translated | 37/ZMTP's PING/PONG is the only liveness the ZeroMQ side has, and TCP's is not a substitute (§3 of the mapping document). It stays local to that hop: weida's `keep_alive`/`idle_timeout` are not derived from it and it is not derived from them, because a timer that crosses the adapter would let one side's idea of "dead" close the other side's healthy connection. |
+
+---
+
 ### Connection-tier decisions (B-017)
 
 | Decision | Value | Rationale |

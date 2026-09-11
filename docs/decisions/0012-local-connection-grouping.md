@@ -159,7 +159,8 @@ direction that does not.
   hygiene of 0010 §4.5 (explicit mode, unlink-then-bind, the decoded path budget), and
   `IncomingMeta::peer` carrying the local principal. Req/Rep and Push/Pull work over
   `weida+unix://`; Pub/Sub does not.
-- **Follow-up item, filed with this note:**
+- **Follow-up item, filed with this note** (as B-048: B-047 is the id this note itself was
+  written under, and ids are never reused):
 
   > ### B-048 — AF_UNIX: parked reverse connections for fan-out
   > kind: code | size: 90 | status: ready | needs: [B-038]

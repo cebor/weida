@@ -1,9 +1,9 @@
 # ZMTP 3.1 — adapter mapping
 
-Status: mapping document; slice 1 (the codec) implemented as `crates/adapters/weida-zmtp`.
-The rest is the design the bridge slices must implement, and the contract the adapter's
-documentation owes its user
-([LOOP.md](../LOOP.md) §9 Phase B slice 2, [0006](../decisions/0006-guarantee-sets.md) §4.9).
+Status: mapping document; slice 1 (the codec) implemented as `crates/adapters/weida-zmtp` and
+slices 2 and 3 (both bridge directions) as `crates/adapters/weida-zmtp-bridge`. What is left
+is the interop bench (slice 5) and the contract the adapter's documentation owes its user
+([LOOP.md](../LOOP.md) §9 Phase B, [0006](../decisions/0006-guarantee-sets.md) §4.9).
 Date: 2026-09-11
 Derived from: [docs/research/zeromq.md](../research/zeromq.md) (ZMTP 3.1, libzmq 4.3.x, the
 zguide, CURVE/ZAP). Every ZeroMQ claim below carries that sheet's section; every weida claim
@@ -23,6 +23,31 @@ subscriptions — and it terminates weida; nothing is forwarded opaquely. That i
 "all guarantees are defined against the immediate next hop"
 ([INVARIANTS.md](../INVARIANTS.md)) checkable at this edge, and it is why §7 can name exactly
 where the chain ends.
+
+**What the inbound slice built** (`crates/adapters/weida-zmtp-bridge`): one `Inbound` listens
+on a TCP address, presents one ZeroMQ socket type, and speaks to one weida endpoint —
+`REP` for a `REQ`/`DEALER` peer, `PULL` for a `PUSH` peer, `PUB` for a `SUB`/`XSUB` peer. It
+drives the greeting and the NULL handshake, checks the peer's socket type against §2's table
+and answers a mismatch with `ERROR` before the close, consumes the envelope frames a pattern
+defines and refuses the multipart messages it does not (L1), translates subscriptions per §6
+with the refusals of §9.3 and ZeroMQ's reference counting (L3), and bounds what it buffers
+with its own `max_message_bytes` (§3). The tests drive it with a ZMTP peer built on the
+codec, which is faithful on the wire and is *not* an independent implementation — that is
+what slice 5's bench against the pure-Rust `zeromq` crate is still owed for (§10 items 3-6).
+
+**What the outbound slice built** (the same crate): one `Outbound` binds a weida endpoint and
+dials one foreign ZeroMQ peer — a weida `Replier` in front of a foreign `REP`/`ROUTER`, a
+`Puller` in front of a foreign `PULL`, and a weida `Publisher` fed by a foreign `PUB`. The
+mirror is deliberately not symmetric: inbound the bridge binds on the ZeroMQ side, outbound
+it binds on the weida side, because the side that owns the endpoint path is the side weida
+applications address. Req/Rep dials as `DEALER` rather than `REQ`, since a weida `Replier`
+accepts concurrent exchanges ([ARCHITECTURE.md](../ARCHITECTURE.md) §6b) and `REQ` is a
+lockstep socket [zeromq §4.2]: the 28/REQREP envelope (identity frame, empty delimiter) is
+what pairs a reply with its exchange, and it is consumed rather than forwarded. A peer that
+drops a request silently — `ZMQ_ROUTER_MANDATORY` off, the L5 loss — reaches the weida
+requester as `ERROR{NO_REPLY}` after a deadline rather than as a hang, which is what
+`IncomingRequest::refuse` exists for. `ZMQ_HEARTBEAT_IVL` runs on the adapter's own sockets
+(§3) and neither side's liveness timer is translated into the other's.
 
 Out of scope for the first slices: the draft thread-safe socket family, `pgm`/`epgm`, `udp`,
 `vmci`, `tipc`, `vsock` and `ws`/`wss` [zeromq §12/P18]; `ZMQ_STREAM` (a raw-TCP shim, not a
@@ -236,8 +261,12 @@ adapter's configuration must surface them rather than absorb them silently [INVA
 - **L5 — ROUTER's silent drop.** ROUTER drops an unroutable or over-HWM message silently by
   default — "remarkably easy to lose messages by accident" [zeromq §8], [zeromq §12/P4] —
   while weida refuses an unknown path explicitly with `STOP_SENDING(UNKNOWN_ENDPOINT)`
-  [PROTOCOL §9.4]. The adapter MUST set `ZMQ_ROUTER_MANDATORY` so the loss becomes
-  `EHOSTUNREACH` and can be reported; it MUST NOT map a weida refusal onto a silent drop.
+  [PROTOCOL §9.4]. `ZMQ_ROUTER_MANDATORY` lives on the ROUTER socket, so the adapter can set
+  it only where the ROUTER is **its own**; a weida endpoint dialling somebody else's ROUTER
+  cannot set an option on a socket it does not own, and the loss reaches it as a reply that
+  never comes. The outbound bridge therefore holds each exchange against a deadline and
+  refuses it with `ERROR{NO_REPLY}` when the deadline passes, so the loss surfaces as a typed
+  error rather than as a hang; it MUST NOT map a weida refusal onto a silent drop.
 - **L6 — Key identity is not transferable.** CURVE keys and weida fingerprints are different
   key material [zeromq §10], [PATTERNS §1.9]; the adapter is the trust boundary and cannot
   extend either side's authentication across itself (§5).
@@ -320,14 +349,24 @@ the process supervisor with a `ready` condition and is stopped in the same item 
    `cargo test`, including a long header with an arbitrary 64-bit length and no body.
 3. **Inbound matrix.** zmq.rs REQ → adapter → weida `Replier`; zmq.rs PUSH → adapter →
    `Puller`; zmq.rs SUB ← adapter ← weida `Publisher`, including a boundary-aligned prefix and
-   a rejected mid-segment prefix (L2).
+   a rejected mid-segment prefix (L2). *Slice 2 has all three, and the losses, against a peer
+   built on this repository's own codec* (`crates/adapters/weida-zmtp-bridge/tests/inbound.rs`).
+   What is left for this item is the only thing that peer cannot be: **independent**. A codec
+   that is byte-exact against the golden vectors is a faithful ZMTP peer and still shares every
+   assumption with the code under test, so the zmq.rs run is what turns "we agree with
+   ourselves" into interoperability.
 4. **Outbound matrix.** The same four with the directions reversed, plus DEALER/ROUTER against
-   weida's concurrent exchanges [ARCHITECTURE §6b].
+   weida's concurrent exchanges [ARCHITECTURE §6b]. *Slice 3 has all of them, against the same
+   non-independent peer* (`crates/adapters/weida-zmtp-bridge/tests/outbound.rs`): a weida
+   `Requester` through a foreign REP with four concurrent exchanges answered in reverse, a
+   `Pusher` through a foreign PULL, a `Subscriber` fed by a foreign PUB, and the envelope
+   frames consumed rather than forwarded. The zmq.rs run is owed here for the same reason as
+   item 3.
 5. **Loss assertions, not just happy paths.** Each named loss of §8 that is observable gets a
    test: a multipart message is refused rather than flattened (L1); a duplicate SUBSCRIBE is
-   reference-counted, and one CANCEL does not unsubscribe (L3); `ZMQ_ROUTER_MANDATORY` yields
-   `EHOSTUNREACH` rather than a silent drop (L5); a weida payload beyond `max_message_bytes`
-   is refused rather than truncated (§3).
+   reference-counted, and one CANCEL does not unsubscribe (L3); a ROUTER that drops a request
+   silently reaches the requester as `ERROR{NO_REPLY}` rather than as a hang (L5); a weida
+   payload beyond `max_message_bytes` is refused rather than truncated (§3).
 6. **Numbers.** Round-trip latency and messages per second for REQ/REP and PUSH/PULL through
    the adapter against a direct zmq.rs pair on loopback, recorded in
    [IMPLEMENTATION.md](../IMPLEMENTATION.md) verified results with the command that produced
@@ -382,6 +421,12 @@ one-octet body `x`.
   weida-side neighbours are `subscriber_buffer_bytes` 8 MiB and `stream_receive_window` 1 MiB
   [PROTOCOL §10], and the ZeroMQ side has no default at all (`ZMQ_MAXMSGSIZE` is -1)
   [zeromq §11].
+- **What the outbound reply deadline should be.** A foreign ROUTER that drops a request
+  silently (L5) is indistinguishable from one that is merely slow, so the outbound bridge has
+  to choose a duration after which it calls the exchange lost. The default is currently the
+  one number in this crate that is neither measured nor derived from a weida limit, and the
+  slice-5 bench is where a request's real round trip through the adapter becomes known
+  (§10 item 6).
 - **Whether a weida-native ZMTP codec should implement CURVE at all**, given that the weida
   side is already authenticated and encrypted by TLS and the adapter is the trust boundary
   (§5, L6). CURVE is documented "when using TCP transport" only [zeromq §10].

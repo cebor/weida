@@ -182,6 +182,7 @@ No frame cancels anything; cancellation is entirely QUIC stream state.
 | Receiver refuses an inbound payload | `STOP_SENDING(REJECTED)` — `IncomingTransfer` dropped mid-payload, or a payload past `read_capped`'s cap | `Error::Rejected` from `write_all` or from `delivered()` |
 | Requester abandons the reply | drop `ReplyStream` before `recv()`, which stops the reply half with `CANCELED` | `IncomingRequest::canceled()` resolves; subsequent reply writes fail with `Error::Canceled` |
 | Replier will not answer | ERROR `{NO_REPLY}` + FIN on the reply half — `IncomingRequest` dropped without `reply()` | `ReplyStream::recv()` yields `Error::NoReply` |
+| Replier declines on purpose | the same ERROR frame, said deliberately: `IncomingRequest::refuse(code)` | `ReplyStream::recv()` yields the code's `Error` — `Rejected` where this side declined, `NoReply` where the request was taken and no reply will exist ([decisions/0005](decisions/0005-refusal-race.md) §4.3) |
 
 `IncomingRequest::canceled()` is the reply half's `stopped()` future, and it is `'static`:
 a handler takes it before `reply()` consumes the request, then selects on it beside its own

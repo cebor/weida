@@ -846,13 +846,13 @@ async fn handle_bi(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Resu
         Some(Route::Transfer(_) | Route::Pub) => {
             tracing::debug!(path, "endpoint does not serve exchanges");
             request
-                .refuse(ErrorCode::Unsupported, codes::UNSUPPORTED)
+                .refuse_coded(ErrorCode::Unsupported, codes::UNSUPPORTED)
                 .await;
         }
         None => {
             tracing::debug!(path, "no endpoint registered");
             request
-                .refuse(ErrorCode::UnknownEndpoint, codes::UNKNOWN_ENDPOINT)
+                .refuse_coded(ErrorCode::UnknownEndpoint, codes::UNKNOWN_ENDPOINT)
                 .await;
         }
     }
