@@ -97,6 +97,43 @@ that mapping made concrete for a bridge, with the direction rule of
 
 ## 3. Stream mapping
 
+**The protocol below this document is `weida-zmq`'s, not the bridge's** (B-094,
+[0013](../decisions/0013-competitor-libraries.md) §5.2). Everything §3 states about framing and
+everything §6 states about the two subscription wire forms is now the behaviour of a
+`weida-zmq` socket, which the bridge **inherits rather than implements**: the greeting and its
+3.0 downgrade, the socket-type table checked at the handshake, the frame headers and the
+`ZMQ_MAXMSGSIZE` refusal from a declared length, the envelope a pattern defines, `PING`/`PONG`
+with its version gate, and both subscription forms with 37/ZMTP's non-idempotent counting. This
+document still maps the **forwarder** — what a weida guarantee becomes on the other side, and
+what is lost — and the rules it states are now checkable in two places: here, and in the
+library's own tests. Six differences the rebuild made, each because a socket is not a
+connection driver:
+
+1. **A message the bridge cannot carry ends the socket, not one connection.** Refusing loss
+   L1's multipart used to close that peer's connection; a ZeroMQ socket has no API to drop one
+   peer — libzmq has none either — so the refusal ends the bridge's socket and every connection
+   on it. The refusal is unchanged; its blast radius is larger, and a supervisor that restarts
+   the bridge is what a ZeroMQ application already does.
+2. **A `REP` peer's request must carry the delimiter.** A `DEALER` peer that sent a bare
+   `[body]` used to be accepted; the socket now discards a message with no envelope delimiter,
+   which is what libzmq's REP does and what 28/REQREP specifies.
+3. **The outbound direction reconnects.** Dialling is the socket's, so a foreign peer that goes
+   away is re-dialled with `ZMQ_RECONNECT_IVL` backoff and the queued messages wait for it,
+   where the run used to end.
+4. **A refused subscription still reaches the peer as an `ERROR`**, through the one capability
+   `weida-zmq` has and libzmq's API does not — `XPubSocket::refuse`, recorded in
+   [libraries/zmq.md](../libraries/zmq.md) §9. Without it §9.3's refusal would have become a
+   silent drop, which is the one thing that section forbids.
+5. **`queue_bytes` is a byte budget over a message-counting high-water mark.** `ZMQ_SNDHWM`
+   counts messages, so the configuration's byte budget becomes `queue_bytes /
+   max_message_bytes` messages per peer, at least one, and the product is what a slow
+   subscriber pins.
+6. **`max_message_bytes` is a payload budget and `ZMQ_MAXMSGSIZE` counts frame headers**, so
+   the socket is configured with 32 octets more — three frames' worth of header, more than any
+   message this bridge maps carries. Without it a payload of exactly the configured cap would
+   be refused by its own header, which is not what a caller who set that number meant; the
+   interop bench, which sends exactly 1 MiB against the 1 MiB default, is what found it.
+
 **One ZMTP message is one weida transfer, and therefore one QUIC stream** — "one data flow
 maps naturally to one transport stream" [INVARIANTS], P1 and P2 of [ARCHITECTURE §6a]. A
 weida transfer is a DATA header followed by opaque payload bytes until FIN [PROTOCOL §4].

@@ -754,6 +754,15 @@ async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
                 // this endpoint, and this connection has nothing left to do.
                 Err(_) => return Ok(()),
             },
+            // An `ERROR` the application asked this connection to carry:
+            // 37/ZMTP's only per-connection error channel, and the one thing
+            // an adapter can say to a peer whose request it refuses. The
+            // connection is not ended here — "the peer SHALL treat an
+            // incoming ERROR command as fatal" is the *peer's* rule, and
+            // whether it closes is its choice.
+            reason = pipe.refusal() => {
+                wire.write_command(&Command::Error(&reason)).await?;
+            }
             () = liveness.tick(exec) => liveness.beat(wire).await?,
         }
     }

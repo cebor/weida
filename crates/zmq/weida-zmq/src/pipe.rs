@@ -465,6 +465,7 @@ impl Default for PipeConfig {
 pub struct Pipe {
     outgoing: Arc<Queue>,
     incoming: Arc<Queue>,
+    refusals: Arc<Refusals>,
 }
 
 impl Pipe {
@@ -473,6 +474,7 @@ impl Pipe {
         Pipe {
             outgoing: Arc::new(Queue::new(config.outgoing)),
             incoming: Arc::new(Queue::new(config.incoming)),
+            refusals: Arc::new(Refusals::default()),
         }
     }
 
@@ -486,11 +488,87 @@ impl Pipe {
         Arc::clone(&self.incoming)
     }
 
+    /// Asks this connection to carry one ZMTP `ERROR` naming `reason`.
+    ///
+    /// **No libzmq counterpart**, and the parity table says so
+    /// (`docs/libraries/zmq.md` §9). 37/ZMTP's only per-connection error
+    /// channel is the `ERROR` command — "the peer SHALL treat an incoming
+    /// ERROR command as fatal" — and libzmq's API has no way to send one: an
+    /// XPUB application can decline to *apply* a subscription
+    /// (`ZMQ_XPUB_MANUAL`) and cannot tell the subscriber why. An adapter
+    /// that must refuse what a peer asked for has nothing else to say it
+    /// with, and a silently ignored subscription is a subscriber waiting
+    /// forever for messages nobody will send.
+    ///
+    /// The reason is sanitized to what the command may carry: printable
+    /// ASCII, at most 255 octets. What the peer does about it is the peer's
+    /// choice; this side keeps the connection.
+    pub fn refuse(&self, reason: &str) {
+        self.refusals.push(reason);
+    }
+
+    /// The next `ERROR` this connection has been asked to carry.
+    ///
+    /// Cancel-safe: a dropped wait leaves the reason queued, which is what
+    /// lets the session hold this in a `select!`.
+    pub async fn refusal(&self) -> String {
+        self.refusals.next().await
+    }
+
     /// Destroys both queues, discarding what they hold: the peer
     /// disconnected. Returns the counts discarded, outgoing first.
     pub fn close(&self) -> (usize, usize) {
         (self.outgoing.close(), self.incoming.close())
     }
+}
+
+/// `ERROR` commands an application asked one connection to carry.
+#[derive(Debug, Default)]
+struct Refusals {
+    reasons: Mutex<VecDeque<String>>,
+    ready: Notify,
+}
+
+impl Refusals {
+    fn push(&self, reason: &str) {
+        self.reasons
+            .lock()
+            .expect("refusals poisoned")
+            .push_back(sanitize(reason));
+        self.ready.notify_waiters();
+    }
+
+    async fn next(&self) -> String {
+        loop {
+            let mut ready = std::pin::pin!(self.ready.notified());
+            // Registered before the check, so a reason queued between the two
+            // wakes this rather than being missed.
+            ready.as_mut().enable();
+            if let Some(reason) = self.reasons.lock().expect("refusals poisoned").pop_front() {
+                return reason;
+            }
+            ready.await;
+        }
+    }
+}
+
+/// What an `ERROR` reason may be: `error-reason = short-size 0*255VCHAR`,
+/// plus the space libzmq's own reasons contain.
+///
+/// Anything else becomes `?`, because a reason is for a log and a reason
+/// carrying control octets is a log injection rather than a diagnosis.
+fn sanitize(reason: &str) -> String {
+    reason
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .take(255)
+        .collect()
 }
 
 #[cfg(test)]

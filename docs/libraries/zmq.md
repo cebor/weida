@@ -351,6 +351,16 @@ nothing else; every number below exists because no remote input may cause unboun
 `INPROC_BUFFER_BYTES` (64 KiB) and `DEFAULT_MAX_RESOLVED_ADDRESSES` (8) are the same kind of
 number for the `inproc` transport and the resolver.
 
+**One capability libzmq's API does not have.** `XPubSocket::refuse` sends 37/ZMTP's `ERROR`
+command to the subscriber whose subscription arrived last, and
+`Pipe::refuse` is the channel underneath it. The protocol has always had the command — "the
+peer SHALL treat an incoming ERROR command as fatal" — and libzmq's API exposes no way to send
+one: an XPUB application can decline to *apply* a subscription (`ZMQ_XPUB_MANUAL`) and cannot
+say why. That silence is unusable for an adapter, because a subscription silently ignored is a
+subscriber waiting forever for messages nobody will send, so this library has the command and
+the row is here rather than hidden. It is additive: nothing sends an `ERROR` unless an
+application asks, and the connection is left to the peer's own rule.
+
 **What replaces an option rather than refusing it.** Nine rows of §5 are
 `RuntimeInstead`: libzmq's I/O-thread pool, thread affinity, priority, scheduling policy and
 name prefix are a Tokio runtime here, sized by `ContextConfig::worker_threads`, and

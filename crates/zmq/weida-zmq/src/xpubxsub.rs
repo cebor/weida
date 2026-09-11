@@ -176,6 +176,30 @@ impl XPubSocket {
         }
     }
 
+    /// Sends one ZMTP `ERROR` to the subscriber whose subscription arrived
+    /// last, naming `reason`.
+    ///
+    /// The counterpart of [`XPubSocket::subscribe`] and
+    /// [`XPubSocket::unsubscribe`], which also act on that subscriber: those
+    /// decide what this socket will match, and this says *why* something was
+    /// not matched. **libzmq has no equivalent** — its XPUB application can
+    /// decline to apply a subscription under `ZMQ_XPUB_MANUAL` and cannot
+    /// tell the subscriber anything — so `docs/libraries/zmq.md` §9 carries
+    /// it as a row. See [`crate::pipe::Pipe::refuse`] for why 37/ZMTP's
+    /// `ERROR` is the only channel there is.
+    ///
+    /// The connection stays: what a peer does with an `ERROR` is the peer's
+    /// own rule.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` when no subscription has been delivered yet, so there is no
+    /// subscriber to answer.
+    pub fn refuse(&self, reason: &str) -> Result<()> {
+        self.subscriber()?.pipe.refuse(reason);
+        Ok(())
+    }
+
     /// Subscribers this socket has.
     pub fn subscriber_count(&self) -> usize {
         self.core.peers().len()
@@ -469,6 +493,40 @@ mod tests {
         subscriber.unsubscribe("news").expect("one");
         subscriber.unsubscribe("news").expect("two");
         assert_eq!(next(&mut broker).await, b"\x00news".to_vec());
+    }
+
+    /// Claim: an XPUB can tell one subscriber **why** a subscription was not
+    /// honoured, with 37/ZMTP's `ERROR` — the channel libzmq's API does not
+    /// expose and an adapter cannot do without, since a silently ignored
+    /// subscription is a subscriber waiting forever.
+    ///
+    /// The receiving side's own rule is what ends the connection: "the peer
+    /// SHALL treat an incoming ERROR command as fatal", so the SUB socket
+    /// drops the connection and the publisher sees its subscriber leave.
+    #[tokio::test]
+    async fn a_refused_subscription_reaches_the_subscriber_as_an_error() {
+        let ctx = context();
+        let mut broker = XPubSocket::new(&ctx).expect("xpub");
+        let endpoint = broker.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut subscriber = SubSocket::new(&ctx).expect("sub");
+        subscriber.connect(&endpoint.to_string()).expect("connect");
+        wait_for(|| broker.subscriber_count() == 1).await;
+        subscriber.subscribe("news").expect("subscribe");
+        assert_eq!(next(&mut broker).await, b"\x01news".to_vec());
+
+        // Answered to the subscriber whose subscription arrived last, which
+        // is the same rule `subscribe` and `unsubscribe` keep.
+        broker
+            .refuse("that prefix names no weida filter")
+            .expect("a subscriber to answer");
+        wait_for(|| broker.subscriber_count() == 0).await;
+        assert!(
+            subscriber
+                .recv_timeout(Duration::from_millis(200))
+                .await
+                .is_err(),
+            "the subscriber's connection ended on the ERROR"
+        );
     }
 
     /// Claim: `ZMQ_XPUB_VERBOSE` delivers every subscription and

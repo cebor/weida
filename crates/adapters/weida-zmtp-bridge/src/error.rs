@@ -2,17 +2,23 @@
 //! vocabularies.
 //!
 //! A bridge is a hop, not a tunnel: it terminates ZMTP and it terminates
-//! weida, so it has its own failures — a configuration it refuses, a peer
-//! whose socket type may not talk to it, a message shape neither protocol can
-//! carry across. Mapping those onto `weida::Error` would claim they happened
-//! on the weida side, and mapping them onto a ZMTP code would claim ZeroMQ has
-//! a word for them. Most of these are **named losses** of
-//! `docs/adapters/zmtp.md` §8 and refused configurations of §9, and this enum
-//! is where they become values.
+//! weida, so it has its own failures — a configuration it refuses, a message
+//! shape neither protocol can carry across. Mapping those onto `weida::Error`
+//! would claim they happened on the weida side, and mapping them onto a ZMTP
+//! code would claim ZeroMQ has a word for them. Most of these are **named
+//! losses** of `docs/adapters/zmtp.md` §8 and refused configurations of §9,
+//! and this enum is where they become values.
+//!
+//! **Narrowed when the protocol moved out.** The ZMTP-shaped variants —
+//! `Handshake`, `SocketType` and the `From` conversions for the codec's
+//! `GreetingError`, `FrameError` and `CommandError` — are gone with
+//! `wire.rs`: the greeting, the socket-type table and the framing are
+//! `weida-zmq`'s, so what they produce is a [`weida_zmq::Error`] carrying
+//! libzmq's own errno name ([0013](https://github.com/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! §5.2). A bridge that kept its own names for them would be reporting a
+//! protocol it no longer speaks.
 
 use std::fmt;
-
-use weida_zmtp::{CommandError, FrameError, GreetingError, SocketType};
 
 /// Why a bridged connection or configuration failed.
 #[derive(Debug)]
@@ -28,22 +34,9 @@ pub enum BridgeError {
     /// ([0006](https://github.com/tuco86/weida/blob/main/docs/decisions/0006-guarantee-sets.md)
     /// §4.7).
     Configuration(String),
-    /// The greeting or the NULL handshake failed.
-    Handshake(String),
-    /// The peer's socket type may not talk to the one this bridge presents.
-    /// The specification's table decides, and `ERROR` was sent before the
-    /// close ([`docs/adapters/zmtp.md`] §2).
-    ///
-    /// [`docs/adapters/zmtp.md`]: https://github.com/tuco86/weida/blob/main/docs/adapters/zmtp.md
-    SocketType {
-        /// What this bridge presents to the peer.
-        ours: SocketType,
-        /// What the peer announced in its `READY`.
-        theirs: SocketType,
-    },
-    /// The peer violated ZMTP, or sent a shape this bridge refuses: a
-    /// multipart message where the pattern defines none (loss L1), a command
-    /// inside a message.
+    /// A message shape this bridge refuses: a multipart message where the
+    /// pattern defines none (loss L1), or a published message without its
+    /// topic frame.
     Protocol(String),
     /// A subscription that cannot be translated into a weida filter without
     /// changing what it selects: a byte prefix ending mid-segment (loss L2) or
@@ -52,7 +45,9 @@ pub enum BridgeError {
     /// The weida side failed. Carried as-is, because a weida error is exactly
     /// what happened.
     Weida(weida::Error),
-    /// Socket I/O.
+    /// The ZeroMQ side failed, under libzmq's own errno name.
+    Zmq(weida_zmq::Error),
+    /// Socket I/O the bridge itself did — parsing an address, mostly.
     Io(std::io::Error),
 }
 
@@ -72,16 +67,10 @@ impl fmt::Display for BridgeError {
             BridgeError::Configuration(reason) => {
                 write!(f, "this bridge configuration is refused: {reason}")
             }
-            BridgeError::Handshake(reason) => write!(f, "ZMTP handshake failed: {reason}"),
-            BridgeError::SocketType { ours, theirs } => write!(
-                f,
-                "a {} socket may not talk to this bridge's {}",
-                theirs.as_str(),
-                ours.as_str()
-            ),
             BridgeError::Protocol(reason) => write!(f, "ZMTP protocol error: {reason}"),
             BridgeError::Subscription(reason) => write!(f, "subscription refused: {reason}"),
             BridgeError::Weida(e) => write!(f, "weida side: {e}"),
+            BridgeError::Zmq(e) => write!(f, "ZeroMQ side: {e}"),
             BridgeError::Io(e) => write!(f, "socket error: {e}"),
         }
     }
@@ -101,20 +90,8 @@ impl From<weida::Error> for BridgeError {
     }
 }
 
-impl From<GreetingError> for BridgeError {
-    fn from(e: GreetingError) -> BridgeError {
-        BridgeError::Handshake(e.to_string())
-    }
-}
-
-impl From<FrameError> for BridgeError {
-    fn from(e: FrameError) -> BridgeError {
-        BridgeError::Protocol(e.to_string())
-    }
-}
-
-impl From<CommandError> for BridgeError {
-    fn from(e: CommandError) -> BridgeError {
-        BridgeError::Protocol(e.to_string())
+impl From<weida_zmq::Error> for BridgeError {
+    fn from(e: weida_zmq::Error) -> BridgeError {
+        BridgeError::Zmq(e)
     }
 }
