@@ -223,6 +223,25 @@ survives a restart and `--cert-out PATH` for publishing its certificate, while
 `transform_client` and `large_stream` take an optional `--ca PATH` and otherwise trust what
 the address names.
 
+**Delivered in the fourth increment — DATA keys 6 and 7 in the codec (B-013):**
+
+`DataHeader` gained `sequence: Option<u64>` (key `6`) and
+`producer: Option<[u8; 32]>` (key `7`), encoded per
+[decision 0008](decisions/0008-session-identity.md) §4.4: a minimal CBOR `uint` and a raw
+32-byte `bstr`, both written only when set and both skipped by a peer that does not know
+them. `limits::PRODUCER_BYTES` is an exact length rather than a cap — a `bstr` of any other
+length is a framing violation, because a truncated digest names nobody
+([PROTOCOL.md](PROTOCOL.md) §6.2) — and `MapReader::byte_array` is the strict reader behind
+it. Two golden vectors pin the encoding in `docs/PROTOCOL.md` §8, in
+`crates/protocol/tests/golden_vectors.rs` and in the header unit tests; the `roundtrip` and
+`data_header` fuzz targets and the deterministic `fuzz_smoke` mirrors generate both fields.
+
+**Nothing in `crates/weida` reads or writes either key.** The runtime's `data_header` sets
+both to `None` and says why, so the wire is byte-identical to the previous increment and the
+B-009 header-cost numbers below still describe what the tree sends. The keys exist so that
+the ordering work of [0001](decisions/0001-sequence-field.md) has a wire to land on, not
+because anything uses them yet.
+
 **Deliberately deferred** (recorded now, not discovered later):
 
 - Connecting publishers and binding pushers; v0 fixes Pub/Pull as binders and Sub/Push as
@@ -454,7 +473,7 @@ assert the race-free part instead, and no stream probe is `#[ignore]`d.
 ### Verified results — DATA header cost at a high message rate (B-009)
 
 What the two DATA keys of [decision 0001](decisions/0001-sequence-field.md) cost per message.
-Neither key is on the wire yet, so each is simulated by the existing key with its exact wire
+No sender writes either key, so each was simulated by the existing key with its exact wire
 shape: `content_len` for the `uint` sequence, and a `sha256:<64 hex>` `content_type` for the
 producer identity. Both endpoint paths are six bytes, so the two keys are the only difference.
 Same machine as the runs above, release profile, loopback, debug assertions off.
@@ -472,7 +491,8 @@ numbers: the receiver already knows the sending peer's fingerprint from the hand
 producer key is omitted entirely in the default case and the default pays only the sequence's
 6 B; where the producer is not the connection peer the key is a CBOR `bstr` holding the raw
 32-byte digest, 35 B instead of 74 B, and the hex string stays presentation only. B-013
-implements both cases and their golden vectors.
+landed exactly that codec and its golden vectors; the measured frame above is unchanged,
+because the runtime still sets both fields to `None` (§1, fourth increment).
 
 ### Verified results — reassembly buffer under cross-stream reordering (B-010)
 
