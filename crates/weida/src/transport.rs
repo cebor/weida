@@ -105,6 +105,22 @@ impl Link {
         }
     }
 
+    /// True where every local stream slot is in use, so the next `open` will
+    /// wait for one.
+    ///
+    /// The caller that has parked receipts holding slots frees them first
+    /// (`ConnCtx::open_uni`). One atomic load; on QUIC there is no such
+    /// budget to read, because the peer's stream limit is `quinn`'s to
+    /// account for.
+    pub(crate) fn local_slots_exhausted(&self) -> bool {
+        match self {
+            Link::Quic(_) => false,
+            Link::Local(conn) => conn.slots_exhausted(),
+            #[cfg(unix)]
+            Link::Unix(conn) => conn.slots_exhausted(),
+        }
+    }
+
     /// An identifier stable for the life of this connection, for the
     /// subscription registry.
     pub(crate) fn stable_id(&self) -> usize {
@@ -155,7 +171,7 @@ impl Link {
                 .await
                 .map(SendHalf::Quic)
                 .map_err(conn_error),
-            Link::Local(conn) => conn.open_uni().map(SendHalf::Local),
+            Link::Local(conn) => conn.open_uni().await.map(SendHalf::Local),
             #[cfg(unix)]
             Link::Unix(conn) => conn.open_uni().await.map(SendHalf::Unix),
         }
@@ -220,6 +236,7 @@ impl Link {
                 .map_err(conn_error),
             Link::Local(conn) => conn
                 .open_bi()
+                .await
                 .map(|(s, r)| (SendHalf::Local(s), RecvHalf::Local(r))),
             #[cfg(unix)]
             Link::Unix(conn) => conn

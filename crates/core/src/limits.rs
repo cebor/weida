@@ -67,7 +67,10 @@ pub struct Limits {
     /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
     /// §4.2). Windows caps named-pipe instances at 1-255, which is the
     /// tightest platform limit and therefore the one the default respects;
-    /// opening past the cap fails with `LimitExceeded` rather than queueing.
+    /// an `open` at the cap waits for a live transfer to end, exactly as a
+    /// QUIC `open` waits on the peer's stream budget, rather than refusing.
+    /// A peer configured with zero can therefore open nothing and waits
+    /// until its caller's deadline, exactly as one granted no QUIC streams.
     pub max_local_streams: usize,
     /// Connections a subscriber parks toward a peer it dialled, so that peer
     /// can open a stream back
