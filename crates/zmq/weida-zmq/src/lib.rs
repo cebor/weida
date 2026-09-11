@@ -158,6 +158,7 @@ pub mod inproc;
 #[cfg(unix)]
 pub mod ipc;
 pub mod message;
+pub mod monitor;
 pub mod options;
 pub mod optiontable;
 pub mod pair;
@@ -194,6 +195,9 @@ pub use ipc::IpcBinding;
 pub use message::{
     DEFAULT_MAX_MESSAGE_FRAMES, DEFAULT_MAX_MESSAGE_SIZE, Decoded, Message, MessageLimits,
     Multipart,
+};
+pub use monitor::{
+    MONITOR_CAPACITY, Monitor, MonitorEvent, MonitorEvents, MonitorSink, serve_pair,
 };
 pub use options::{
     DEFAULT_BACKLOG, DEFAULT_HANDSHAKE_IVL, DEFAULT_MAX_RESOLVED_ADDRESSES, DEFAULT_RECONNECT_IVL,

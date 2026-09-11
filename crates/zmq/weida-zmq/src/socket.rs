@@ -179,6 +179,19 @@ macro_rules! socket_endpoints {
                 self.core.socket_type()
             }
 
+            /// `zmq_socket_monitor`: this socket's connection lifecycle as a
+            /// typed stream, replacing any monitor installed before.
+            ///
+            /// [`crate::monitor::serve_pair`] renders the same stream onto a
+            /// PAIR socket in libzmq's two-frame `inproc://` form, which is
+            /// what the zguide's Espresso recipe reads.
+            pub fn monitor(
+                &self,
+                events: $crate::monitor::MonitorEvents,
+            ) -> $crate::monitor::Monitor {
+                self.core.engine().monitor(events)
+            }
+
             /// `zmq_close`: stops accepting and dialling, and destroys every
             /// queue.
             pub fn close(&self) {
