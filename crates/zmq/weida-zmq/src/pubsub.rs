@@ -298,6 +298,38 @@ mod tests {
         }
     }
 
+    /// Claim: a subscription made in the gap between `connect` and the
+    /// handshake reaches the publisher **once**, so one `unsubscribe`
+    /// undoes it.
+    ///
+    /// Subscriptions count rather than set — "subscribing to 'A' and 'A'
+    /// counts as two subscriptions, and would require two CANCEL commands to
+    /// undo" — so a socket that both queued the subscription and replayed it
+    /// from its table at the handshake would leave the publisher needing two
+    /// cancellations for something the application asked for once, and the
+    /// application's `unsubscribe` would change nothing at all. Found by
+    /// B-092's Espresso trace, where the unsubscriptions never appeared.
+    #[tokio::test]
+    async fn a_subscription_made_before_the_handshake_needs_one_cancel() {
+        let ctx = context();
+        let mut publisher = PubSocket::new(&ctx).expect("pub");
+        let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+        let mut subscriber = SubSocket::new(&ctx).expect("sub");
+        subscriber.connect(&endpoint.to_string()).expect("connect");
+        // In the gap: the pipe exists, the handshake has not finished.
+        subscriber.subscribe("A").expect("subscribe");
+        wait_for(|| publisher.anybody_wants(b"A")).await;
+
+        subscriber.unsubscribe("A").expect("unsubscribe");
+        wait_for(|| !publisher.anybody_wants(b"A")).await;
+        assert_eq!(
+            publisher.publish("A one").delivered,
+            0,
+            "one unsubscribe stopped the publisher"
+        );
+    }
+
     /// Claim: the filter is a binary prefix on the first frame, applied by
     /// the publisher — and a fresh subscriber gets nothing until it asks.
     #[tokio::test]

@@ -121,11 +121,23 @@
 //!   and PAUSE/RESUME/TERMINATE/STATISTICS on a control socket with
 //!   libzmq's eight counters.
 //!
-//! What remains is the blocking facade [0013 §5.3]. It is named here so that
-//! a reader knows what this crate is for and what it does not do yet;
-//! nothing stands in for it, and in particular there is no default
-//! [`Session`] beyond [`ZmtpSession`]: a socket that handed its peers to a
-//! no-op would be a ZeroMQ implementation that speaks nothing.
+//! - `blocking` — the synchronous facade behind the non-default `blocking`
+//!   feature: one wrapper per socket type over a context that owns its
+//!   reactor, `ZMQ_SNDTIMEO`/`ZMQ_RCVTIMEO`/`ZMQ_DONTWAIT` where libzmq puts
+//!   them, and no second implementation of any protocol behaviour.
+//!
+//! The zguide's canonical recipes run against this crate as examples, each
+//! asserting the guarantee its original claims [0013 §4.7 clause 5]:
+//! `lazy_pirate`, `simple_pirate` and `paranoid_pirate` (chapter 4's
+//! pirates), `majordomo` (18/MDP 0.2 with `mmi.service`), `freelance`
+//! (10/FLP models one and two), `clone` (12/CHP's three-port wire),
+//! `binary_star`, `espresso` and `last_value_cache`. The `tests/zguide_*.rs`
+//! files include those example files as modules, so what is asserted is the
+//! code a reader runs rather than a second copy of it.
+//!
+//! There is no default [`Session`] beyond [`ZmtpSession`]: a socket that
+//! handed its peers to a no-op would be a ZeroMQ implementation that speaks
+//! nothing.
 //!
 //! # Rules this crate keeps
 //!

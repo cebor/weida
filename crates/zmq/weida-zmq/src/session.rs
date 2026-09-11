@@ -184,9 +184,33 @@ async fn drive(
 
     if let Some(mine) = &mine {
         // A subscribing socket asks for everything it holds, now — which is
-        // also what makes a reconnect re-subscribe, because this runs again.
-        for prefix in mine.prefixes() {
-            write_subscription(&mut wire, options.subscription_form, true, &prefix).await?;
+        // also what makes a reconnect re-subscribe, because this runs again,
+        // and it asks for each subscription as many times as it holds it,
+        // because 29/PUBSUB counts rather than sets.
+        //
+        // What the pipe already holds is *also* in that table: a socket
+        // updates its own table before it queues the announcement, so a
+        // subscription made between `connect` and this handshake would
+        // otherwise reach the publisher twice. Counting makes that a
+        // divergence and not a nuisance — the publisher would need two
+        // `CANCEL`s for a subscription the application holds once, so the
+        // first `unsubscribe` would change nothing and an XPUB would report
+        // nothing. The queued copies go; the table is the truth. Anything
+        // else an XSUB queued is upstream data and is kept, in order.
+        let queued = pipe.outgoing();
+        let mut carried = Vec::new();
+        while let Ok(message) = queued.try_recv() {
+            if subscribing_form(ours, &message).is_none() {
+                carried.push(message);
+            }
+        }
+        for (prefix, count) in mine.counted() {
+            for _ in 0..count {
+                write_subscription(&mut wire, options.subscription_form, true, &prefix).await?;
+            }
+        }
+        for message in carried {
+            wire.write_message(&message).await?;
         }
     }
 
