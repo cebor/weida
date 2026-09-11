@@ -172,6 +172,16 @@ pub trait Session: Send + Sync + 'static {
 /// A snapshot of one peer.
 #[derive(Clone, Debug)]
 pub struct Peer {
+    /// The credentials the kernel attributes to this peer, for a local
+    /// transport that has them.
+    ///
+    /// `Some` only for `ipc://`: TCP has an address and no process, and
+    /// `inproc://` has no kernel between the halves. This is the input an
+    /// authorization handler is given for a local peer — the kernel fact it
+    /// is, and not an identity the peer asserted
+    /// ([0013](../../../docs/decisions/0013-competitor-libraries.md) §4.4
+    /// item 6).
+    pub credentials: Option<weida_core::LocalPrincipal>,
     /// Which peer of this socket.
     pub id: PeerId,
     /// The endpoint this peer belongs to: `Some` for one this socket dialled,
@@ -206,6 +216,9 @@ pub struct Discarded {
 }
 
 struct PeerEntry {
+    /// The kernel's statement about this peer, for an `ipc://` connection:
+    /// captured when the connection was made and never re-read.
+    credentials: Option<weida_core::LocalPrincipal>,
     pipe: Pipe,
     identity: AnnouncedIdentity,
     /// What this peer has subscribed to, as a publisher keeps it. Empty and
@@ -430,6 +443,19 @@ impl Engine {
                     .spawn(async move { inproc_accept_loop(ctx, binding, accepting).await });
                 (endpoint.clone(), task)
             }
+            #[cfg(unix)]
+            Endpoint::Ipc(path) => {
+                let binding = crate::ipc::IpcBinding::bind(&self.inner.exec, path)?;
+                let ctx = self.task_ctx();
+                let accepting = endpoint.clone();
+                // The binding moves into the task, so aborting the task —
+                // what `unbind` and `close` do — unlinks the socket file.
+                let task = self
+                    .inner
+                    .exec
+                    .spawn(async move { ipc_accept_loop(ctx, binding, accepting).await });
+                (endpoint.clone(), task)
+            }
             _ => {
                 let addr = self.resolve_one(endpoint).await?;
                 let listener = {
@@ -496,6 +522,7 @@ impl Engine {
             state.peers.insert(
                 peer,
                 PeerEntry {
+                    credentials: None,
                     pipe,
                     identity: AnnouncedIdentity::default(),
                     subscriptions: Arc::new(Subscriptions::new(
@@ -756,6 +783,7 @@ impl std::fmt::Debug for Engine {
 fn snapshot(id: PeerId, entry: &PeerEntry) -> Peer {
     Peer {
         id,
+        credentials: entry.credentials,
         endpoint: entry.endpoint.clone(),
         connected: entry.connected,
         attempts: entry.attempts,
@@ -766,16 +794,20 @@ fn snapshot(id: PeerId, entry: &PeerEntry) -> Peer {
     }
 }
 
-/// The engine carries `tcp` and `inproc`. `ipc` parses — it is a legal
-/// ZeroMQ endpoint — and is refused here until the slice that implements it
-/// lands, because a socket that accepted it and did nothing would be worse
-/// than one that says so.
+/// The engine carries ZeroMQ's whole working set — `tcp`, `ipc` and
+/// `inproc` — except that `ipc` needs `AF_UNIX`, which is a property of the
+/// platform rather than of this library. Where there is none, the endpoint is
+/// refused by name instead of accepted and ignored.
 fn check_transport(endpoint: &Endpoint) -> Result<()> {
     match endpoint {
         Endpoint::Tcp { .. } | Endpoint::Inproc(_) => Ok(()),
+        #[cfg(unix)]
+        Endpoint::Ipc(_) => Ok(()),
+        #[cfg(not(unix))]
         other => Err(Error::EPROTONOSUPPORT(
             format!(
-                "the {} transport is not carried by this socket yet; tcp and inproc are",
+                "the {} transport needs AF_UNIX, which this platform has not; tcp and inproc are \
+                 carried everywhere",
                 other.transport()
             )
             .into(),
@@ -806,6 +838,7 @@ impl EngineInner {
         state.peers.insert(
             peer,
             PeerEntry {
+                credentials: None,
                 pipe,
                 identity: AnnouncedIdentity::default(),
                 subscriptions: Arc::new(Subscriptions::new(
@@ -850,6 +883,23 @@ impl EngineInner {
             entry.connected = connected;
         }
         self.peers_changed.notify_waiters();
+    }
+
+    /// Records the kernel's statement about a peer, once, when its
+    /// connection was made.
+    fn set_credentials(&self, peer: PeerId, credentials: Option<weida_core::LocalPrincipal>) {
+        if credentials.is_none() {
+            return;
+        }
+        if let Some(entry) = self
+            .state
+            .lock()
+            .expect("engine state poisoned")
+            .peers
+            .get_mut(&peer)
+        {
+            entry.credentials = credentials;
+        }
     }
 
     fn count_attempt(&self, peer: PeerId) {
@@ -1027,6 +1077,76 @@ async fn inproc_accept_loop(ctx: TaskCtx, mut binding: InprocBinding, endpoint: 
     }
 }
 
+/// Accepts connections on one bound `ipc://` endpoint.
+///
+/// The same shape as [`accept_loop`] and [`inproc_accept_loop`]. What is
+/// specific to `AF_UNIX` happens twice: the socket file lives as long as the
+/// [`IpcBinding`][crate::ipc::IpcBinding] this task holds, and every accepted
+/// connection carries the kernel's statement about its peer, which is
+/// recorded on the peer for an authorization handler to read.
+#[cfg(unix)]
+async fn ipc_accept_loop(ctx: TaskCtx, binding: crate::ipc::IpcBinding, endpoint: Endpoint) {
+    loop {
+        let stream = match binding.accept().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::debug!(endpoint = %endpoint, error = %e, "an ipc accept failed");
+                continue;
+            }
+        };
+        let Some(engine) = ctx.engine.upgrade() else {
+            return;
+        };
+        let pipe = Pipe::new(ctx.options.pipe);
+        let peer = match engine.admit(None, pipe.clone()) {
+            Admitted::Peer(peer) => peer,
+            Admitted::AtCeiling => {
+                tracing::warn!(
+                    ceiling = ctx.options.max_peers,
+                    "refused an ipc connection: this socket already holds its max_peers"
+                );
+                drop(stream);
+                continue;
+            }
+            Admitted::SocketClosed => return,
+        };
+        engine.set_credentials(peer, stream.peer_credentials());
+        let identity = engine.identity_slot(peer).unwrap_or_default();
+        let subscriptions = engine.subscriptions_of(peer).unwrap_or_else(|| {
+            Arc::new(Subscriptions::new(
+                ctx.options.max_subscriptions,
+                ctx.options.max_subscription_bytes,
+            ))
+        });
+        drop(engine);
+
+        let ctx = ctx.clone();
+        let endpoint = endpoint.clone();
+        let exec = ctx.exec.clone();
+        exec.spawn(async move {
+            let outcome = run_session(
+                &ctx,
+                stream,
+                PeerSession {
+                    peer,
+                    pipe,
+                    endpoint,
+                    role: Role::Binder,
+                    identity,
+                    subscriptions,
+                },
+            )
+            .await;
+            if let Err(e) = outcome {
+                tracing::debug!(%peer, error = %e, "an ipc connection ended");
+            }
+            if let Some(engine) = ctx.engine.upgrade() {
+                engine.forget(peer);
+            }
+        });
+    }
+}
+
 /// Dials one endpoint, forever, with `ZMQ_RECONNECT_IVL` backoff.
 async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
     let mut delay: Option<Duration> = None;
@@ -1055,6 +1175,7 @@ async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
         match dial(&ctx, &endpoint).await {
             Ok(stream) => {
                 if let Some(engine) = ctx.engine.upgrade() {
+                    engine.set_credentials(peer, stream.peer_credentials());
                     engine.set_connected(peer, true);
                 } else {
                     return;
@@ -1117,8 +1238,25 @@ async fn dial(ctx: &TaskCtx, endpoint: &Endpoint) -> Result<Stream> {
             ctx.inproc.wait_until_bound(name).await;
         }
     }
+    #[cfg(unix)]
+    if let Endpoint::Ipc(path) = endpoint {
+        let attempt = crate::ipc::dial(path);
+        return match ctx.options.connect_timeout {
+            None => attempt.await,
+            Some(limit) => match ctx.exec.within(limit, attempt).await {
+                Some(result) => result,
+                None => Err(Error::ETIMEDOUT(
+                    format!(
+                        "connect to {} gave up after {limit:?} (ZMQ_CONNECT_TIMEOUT)",
+                        path.display()
+                    )
+                    .into(),
+                )),
+            },
+        };
+    }
     let Endpoint::Tcp { host, port } = endpoint else {
-        return check_transport(endpoint).map(|()| unreachable!("tcp and inproc only"));
+        return check_transport(endpoint).map(|()| unreachable!("every carried transport dialled"));
     };
     let addrs: Vec<SocketAddr> = match host {
         TcpHost::Ip(ip) => vec![SocketAddr::new(*ip, *port)],
@@ -1650,28 +1788,105 @@ mod tests {
         assert_eq!(err.errno(), "ENOENT", "{err}");
     }
 
-    /// Claim: the transport this engine does not carry is refused where it
-    /// is asked for, naming itself, rather than accepted and ignored — and
-    /// `inproc`, which it now carries, is not refused.
+    /// Claim: every transport this engine carries is accepted where it is
+    /// asked for, and the wildcard address — which binds — is refused as a
+    /// dial. A transport the library does not implement at all is refused by
+    /// the endpoint parser, where it is named; there is no half-accepted
+    /// endpoint anywhere in between.
     #[tokio::test]
-    async fn a_transport_the_engine_does_not_carry_is_refused() {
+    async fn every_carried_transport_is_accepted_and_the_wildcard_is_not_dialled() {
         let ctx = context();
         let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
-        let ipc = Endpoint::parse("ipc:///tmp/weida-zmq-test.sock").expect("endpoint");
-        let err = engine.bind(&ipc).await.unwrap_err();
-        assert_eq!(err.errno(), "EPROTONOSUPPORT", "{err}");
-        let err = engine.connect(&ipc).unwrap_err();
-        assert_eq!(err.errno(), "EPROTONOSUPPORT", "{err}");
 
         let inproc = Endpoint::parse("inproc://orders").expect("endpoint");
         engine.bind(&inproc).await.expect("inproc is carried");
         engine.connect(&inproc).expect("inproc is carried");
+
+        #[cfg(unix)]
+        {
+            let path = std::env::temp_dir().join(format!("weida-zmq-{}-eng.sock", nonce()));
+            let ipc = Endpoint::parse(&format!("ipc://{}", path.display())).expect("endpoint");
+            engine.bind(&ipc).await.expect("ipc is carried");
+            engine.connect(&ipc).expect("ipc is carried");
+        }
+
+        let err = Endpoint::parse("epgm://239.0.0.1:5555").unwrap_err();
+        assert_eq!(err.errno(), "EPROTONOSUPPORT", "{err}");
 
         // The wildcard binds; it does not dial.
         let err = engine
             .connect(&Endpoint::parse("tcp://*:5555").expect("endpoint"))
             .unwrap_err();
         assert_eq!(err.errno(), "EINVAL", "{err}");
+    }
+
+    /// A number no other test in this process uses, for a socket path.
+    #[cfg(unix)]
+    fn nonce() -> u64 {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst) as u64;
+        u64::from(std::process::id()) * 1000 + n
+    }
+
+    /// Claim: an `ipc://` bind and connect meet over `AF_UNIX`, both sides
+    /// are recorded with the kernel's statement about the other, and the
+    /// socket file is gone once the bind is undone — the node belongs to the
+    /// binding.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ipc_bind_and_connect_meet_with_credentials() {
+        let ctx = context();
+        let binder = Recorder::new();
+        let server = Engine::new(&ctx, options(), as_session(&binder)).expect("engine");
+        let dialler = Recorder::new();
+        let client = Engine::new(&ctx, options(), as_session(&dialler)).expect("engine");
+
+        let path = std::env::temp_dir().join(format!("weida-zmq-{}-meet.sock", nonce()));
+        let endpoint = Endpoint::parse(&format!("ipc://{}", path.display())).expect("endpoint");
+        let bound = server.bind(&endpoint).await.expect("bind");
+        assert_eq!(bound, endpoint, "an ipc bind has nothing to resolve");
+        assert!(path.exists(), "the socket file is the endpoint");
+
+        let peer = client.connect(&endpoint).expect("connect");
+        wait_for(|| binder.count() == 1 && dialler.count() == 1).await;
+        assert_eq!(binder.roles(), vec![Role::Binder]);
+        assert_eq!(dialler.roles(), vec![Role::Connecter]);
+
+        // Both ends hold the kernel's answer, which for two ends of one
+        // connection in one process is this process.
+        let dialled = client.peer(peer).expect("the dialled peer");
+        let credentials = dialled.credentials.expect("credentials at connect");
+        if let Some(pid) = credentials.pid {
+            assert_eq!(pid, std::process::id());
+        }
+        wait_for(|| {
+            server
+                .peers()
+                .first()
+                .is_some_and(|peer| peer.credentials.is_some())
+        })
+        .await;
+
+        server.unbind(&endpoint).expect("unbind");
+        wait_for(|| !path.exists()).await;
+    }
+
+    /// Claim: a TCP peer has no credentials to report — there is no kernel
+    /// fact about a process behind an address, and `None` says so rather
+    /// than a zero that would read as root.
+    #[tokio::test]
+    async fn a_tcp_peer_has_no_credentials() {
+        let ctx = context();
+        let binder = Recorder::new();
+        let server = Engine::new(&ctx, options(), as_session(&binder)).expect("engine");
+        let bound = server
+            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+            .await
+            .expect("bind");
+        let client = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
+        let peer = client.connect(&bound).expect("connect");
+        wait_for(|| client.peer(peer).is_some_and(|peer| peer.connected)).await;
+        assert!(client.peer(peer).expect("peer").credentials.is_none());
     }
 
     /// Claim: closing the socket stops everything and destroys the pipes, and

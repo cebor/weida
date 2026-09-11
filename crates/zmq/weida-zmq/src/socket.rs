@@ -160,6 +160,20 @@ macro_rules! socket_endpoints {
                 self.core.peers().len()
             }
 
+            /// Every connection this socket has, connected or not, as a
+            /// snapshot.
+            ///
+            /// Named for what it is rather than `peers`, which on a ROUTER is
+            /// the routing table. A snapshot and not a handle: "application
+            /// code cannot manipulate individual underlying connections"
+            /// (`docs/research/zeromq.md` §2) — but it can read what the
+            /// library knows about one, which for a local peer includes the
+            /// credentials the kernel attributed to it
+            /// ([`Peer::credentials`][$crate::engine::Peer::credentials]).
+            pub fn connections(&self) -> Vec<$crate::engine::Peer> {
+                self.core.engine().peers()
+            }
+
             /// The socket type this socket announces in its `READY`.
             pub fn socket_type(&self) -> ::weida_zmtp::SocketType {
                 self.core.socket_type()

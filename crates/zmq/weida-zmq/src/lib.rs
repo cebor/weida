@@ -72,14 +72,20 @@
 //!   and messages and subscriptions sent upstream.
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
+//! - [`IpcBinding`] — the `ipc` transport on `AF_UNIX`, with
+//!   `weida-runtime`'s bind hygiene (socket-type check, unlink-then-bind,
+//!   explicit `0600`, the node removed on drop), the kernel's path budget
+//!   beside libzmq's published 113, the peer's credentials captured at
+//!   connect time and kept on the [`Peer`], and the endpoint-stealing hazard
+//!   documented where it lives rather than papered over.
 //! - [`Inproc`] — the `inproc` transport: a context-scoped namespace on
 //!   `weida-runtime`'s registry with libzmq's 256-character budget, a
 //!   connection that is a pair of memory buffers rather than a socket, and a
 //!   connect that **parks** until the bind arrives, which is what libzmq 4.0
 //!   changed.
 //!
-//! What remains is `ipc`, security and authorization, and the rest of the
-//! option surface [0013 §5.3]. They are named here so that a reader knows
+//! What remains is security and authorization, and the rest of the option
+//! surface [0013 §5.3]. They are named here so that a reader knows
 //! what this crate is for and what it does not do yet; nothing stands in for
 //! them, and in particular there is no default [`Session`] beyond
 //! [`ZmtpSession`]: a socket that handed its peers to a no-op would be a
@@ -122,6 +128,8 @@ pub mod engine;
 pub mod error;
 pub mod identity;
 pub mod inproc;
+#[cfg(unix)]
+pub mod ipc;
 pub mod message;
 pub mod options;
 pub mod pair;
@@ -148,6 +156,8 @@ pub use engine::{
 pub use error::{Cause, Error, Result};
 pub use identity::{MAX_ROUTING_ID_BYTES, RoutingId, RoutingKey};
 pub use inproc::{INPROC_BUFFER_BYTES, Inproc, InprocBinding, InprocDial};
+#[cfg(unix)]
+pub use ipc::IpcBinding;
 pub use message::{
     DEFAULT_MAX_MESSAGE_FRAMES, DEFAULT_MAX_MESSAGE_SIZE, Decoded, Message, MessageLimits,
     Multipart,
