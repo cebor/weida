@@ -21,6 +21,10 @@ tokio = { version = "1", features = [
     "net",
 ] }
 bytes = "1"
+# The caller's executor need not be tokio: transfers implement both trait
+# families, and the `futures` dev-dependency drives the no-tokio test.
+futures-io = "0.3"
+futures = "0.3"
 tracing = "0.1"
 rand = "0.9"
 minicbor = { version = "2", features = ["alloc"] }

@@ -15,6 +15,7 @@ use weida_core::{Error, Fingerprint};
 use crate::config::{ClientTls, RuntimeConfig};
 use crate::conn::{ConnCtx, ConnHandle, conn_error};
 use crate::listener::Namespace;
+use crate::runtime::Exec;
 use crate::tls;
 
 pub(crate) struct ClientPool {
@@ -56,6 +57,7 @@ impl ClientPool {
     pub(crate) async fn connect(
         &self,
         config: &RuntimeConfig,
+        exec: &Exec,
         host: &str,
         port: u16,
         tls: &Arc<ClientTls>,
@@ -74,7 +76,7 @@ impl ClientPool {
         let endpoint = match &state.endpoint {
             Some(endpoint) => endpoint.clone(),
             None => {
-                let endpoint = bind_client_endpoint()?;
+                let endpoint = bind_client_endpoint(exec)?;
                 state.endpoint = Some(endpoint.clone());
                 endpoint
             }
@@ -88,12 +90,25 @@ impl ClientPool {
             config.idle_timeout,
         )?;
 
-        let addr = resolve(host, port).await?;
+        let addr = exec.resolve(host, port).await?;
         tracing::debug!(%addr, host, "dialling");
-        let connecting = endpoint
-            .connect_with(client_config, addr, host)
-            .map_err(|e| Error::Transport(format!("connect to {addr} failed: {e}")))?;
-        let conn = match connecting.await {
+        let connecting = {
+            // Inside the runtime context: `quinn` reads its own runtime out
+            // of the ambient reactor while it builds the attempt.
+            let _guard = exec.enter();
+            endpoint
+                .connect_with(client_config, addr, host)
+                .map_err(|e| Error::Transport(format!("connect to {addr} failed: {e}")))?
+        };
+        // The handshake is driven *on* the runtime rather than by whoever
+        // awaits `connect`: completing it spawns the connection driver, and
+        // the caller's executor need not be tokio. Awaiting the join handle
+        // needs nothing.
+        let handshake = exec
+            .spawn(connecting)
+            .await
+            .map_err(|e| Error::Runtime(format!("dial task failed: {e}")))?;
+        let conn = match handshake {
             Ok(conn) => conn,
             Err(e) => {
                 // The verifier saw the peer before the handshake died: report
@@ -109,7 +124,13 @@ impl ClientPool {
         // A fresh namespace per client connection: a subscriber registers its
         // path here so fanned-out copies have somewhere to go. It is not the
         // listener's namespace — a client serves nothing on its own account.
-        let handle = ConnCtx::spawn(conn, config.limits, Arc::new(Namespace::new()), None);
+        let handle = ConnCtx::spawn(
+            conn,
+            config.limits,
+            Arc::new(Namespace::new()),
+            None,
+            exec.clone(),
+        );
         // Negotiation must complete before the caller can send anything: a
         // DATA frame ahead of our own HELLO would be parked by the peer, and a
         // version mismatch must fail `connect`, not the first request.
@@ -121,7 +142,11 @@ impl ClientPool {
 }
 
 /// Binds the shared client socket, preferring dual-stack IPv6.
-fn bind_client_endpoint() -> Result<quinn::Endpoint, Error> {
+///
+/// Inside the runtime context: `quinn` registers the socket with the reactor
+/// as it is constructed, and the caller's thread may have none.
+fn bind_client_endpoint(exec: &Exec) -> Result<quinn::Endpoint, Error> {
+    let _guard = exec.enter();
     let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
     match quinn::Endpoint::client(v6) {
         Ok(endpoint) => Ok(endpoint),
@@ -132,41 +157,14 @@ fn bind_client_endpoint() -> Result<quinn::Endpoint, Error> {
     }
 }
 
-/// Resolves `host:port`, preferring an address family the client socket can
-/// reach.
-async fn resolve(host: &str, port: u16) -> Result<SocketAddr, Error> {
-    let mut addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| Error::InvalidAddress(format!("cannot resolve {host}:{port}: {e}")))?;
-    addrs
-        .next()
-        .ok_or_else(|| Error::InvalidAddress(format!("{host}:{port} resolved to no addresses")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn resolves_ip_literals_without_dns() {
-        assert_eq!(
-            resolve("127.0.0.1", 7443).await.unwrap(),
-            SocketAddr::from(([127, 0, 0, 1], 7443))
-        );
-        let v6 = resolve("::1", 7443).await.unwrap();
-        assert_eq!(v6.port(), 7443);
-        assert!(v6.is_ipv6());
-    }
-
-    #[tokio::test]
-    async fn an_unresolvable_host_is_an_address_error() {
-        let err = resolve("host.invalid.", 7443).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
-    }
-
-    #[tokio::test]
     async fn the_client_socket_binds() {
-        let endpoint = bind_client_endpoint().unwrap();
+        let exec = Exec::current().expect("ambient runtime");
+        let endpoint = bind_client_endpoint(&exec).unwrap();
         assert_ne!(endpoint.local_addr().unwrap().port(), 0);
     }
 }

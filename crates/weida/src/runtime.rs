@@ -1,10 +1,20 @@
-//! The process-level runtime: configuration, the client connection pool and
-//! shutdown.
+//! The process-level runtime: configuration, the client connection pool,
+//! shutdown, and the one place this crate touches the async runtime.
+//!
+//! Every task, timer and name lookup in `weida` goes through [`Exec`]. That
+//! is what lets a caller drive weida from an executor that is not Tokio:
+//! `quinn` needs a Tokio reactor for its sockets and timers, nothing else
+//! here does, so the reactor is an implementation detail the runtime owns
+//! rather than an ambient requirement on every caller.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use quinn::VarInt;
+use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 use weida_core::{Error, Fingerprint};
 use weida_protocol::codes;
 
@@ -15,9 +25,96 @@ use crate::listener::Listener;
 use crate::pool::ClientPool;
 use crate::stream::Peer;
 
+/// The crate's whole surface onto the async runtime: tasks, timers and DNS.
+///
+/// An `Exec` is a Tokio handle and nothing more. It never owns the runtime,
+/// so a task holding one can neither keep the runtime alive nor drop it from
+/// inside itself. Cloning is a handle clone.
+#[derive(Clone)]
+pub(crate) struct Exec {
+    handle: Handle,
+}
+
+impl Exec {
+    pub(crate) fn from_handle(handle: Handle) -> Exec {
+        Exec { handle }
+    }
+
+    /// The ambient handle, for [`Runtime::new`].
+    pub(crate) fn current() -> Result<Exec, Error> {
+        Handle::try_current()
+            .map(Exec::from_handle)
+            .map_err(|_| Error::Runtime("Runtime::new requires an ambient tokio runtime".into()))
+    }
+
+    /// Enters the runtime context, for the two `quinn` constructors that
+    /// register a socket with the reactor. Held around the constructor only,
+    /// never across an await.
+    pub(crate) fn enter(&self) -> tokio::runtime::EnterGuard<'_> {
+        self.handle.enter()
+    }
+
+    /// Spawns a task on the runtime. Works from any thread, with or without
+    /// an ambient reactor — which is why nothing in this crate calls
+    /// `tokio::spawn`.
+    pub(crate) fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.handle.spawn(future)
+    }
+
+    /// A timer on this runtime's wheel. The `Sleep` is created inside the
+    /// runtime context, so the returned future may be awaited anywhere.
+    pub(crate) fn sleep(&self, duration: Duration) -> tokio::time::Sleep {
+        let _guard = self.handle.enter();
+        tokio::time::sleep(duration)
+    }
+
+    /// Resolves `host:port`. The lookup runs as a task on the runtime because
+    /// `lookup_host` needs a Tokio context; awaiting the join handle does not.
+    pub(crate) async fn resolve(&self, host: &str, port: u16) -> Result<SocketAddr, Error> {
+        let query = (host.to_owned(), port);
+        let looked_up = self
+            .spawn(async move {
+                tokio::net::lookup_host(query)
+                    .await
+                    .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
+            })
+            .await
+            .map_err(|e| Error::Runtime(format!("name resolution task failed: {e}")))?;
+        let addrs = looked_up
+            .map_err(|e| Error::InvalidAddress(format!("cannot resolve {host}:{port}: {e}")))?;
+        addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::InvalidAddress(format!("{host}:{port} resolved to no addresses")))
+    }
+}
+
+/// Keeps a Tokio runtime created by [`Runtime::owned`] alive for as long as
+/// the weida runtime that created it.
+struct OwnedRuntime(Option<tokio::runtime::Runtime>);
+
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            // The last `Runtime` clone may go out of scope on one of this
+            // runtime's own worker threads. Dropping a Tokio runtime there
+            // panics; shutting it down in the background does not.
+            runtime.shutdown_background();
+        }
+    }
+}
+
 pub(crate) struct RuntimeInner {
     pub(crate) config: RuntimeConfig,
     pub(crate) pool: ClientPool,
+    pub(crate) exec: Exec,
+    /// Present only for a runtime created by [`Runtime::owned`]; dropped with
+    /// the last handle.
+    _owned: Option<OwnedRuntime>,
     /// Every QUIC endpoint this runtime owns, for shutdown.
     endpoints: Mutex<Vec<quinn::Endpoint>>,
 }
@@ -40,16 +137,21 @@ impl RuntimeInner {
         expected: Option<Fingerprint>,
     ) -> Result<ConnHandle, Error> {
         self.pool
-            .connect(&self.config, host, port, tls, expected)
+            .connect(&self.config, &self.exec, host, port, tls, expected)
             .await
     }
 }
 
 /// A process-level execution and resource container.
 ///
-/// Cloning shares the same pool, limits and bindings. A `Runtime` needs an
-/// ambient Tokio reactor: `quinn` drives its sockets on it, and creating one
-/// without a reactor would fail later, at an unrelated call site.
+/// Cloning shares the same pool, limits and bindings. Every task, timer and
+/// name lookup the runtime needs goes through the Tokio handle it holds, so
+/// only the runtime needs a reactor: a caller may drive weida futures on any
+/// executor, including `futures::executor::block_on`.
+///
+/// Three ways to get one, differing only in where the reactor comes from:
+/// [`Runtime::new`] borrows the ambient one, [`Runtime::with_handle`] takes a
+/// handle to somebody else's, and [`Runtime::owned`] creates and owns one.
 #[derive(Clone)]
 pub struct Runtime {
     inner: Arc<RuntimeInner>,
@@ -57,16 +159,62 @@ pub struct Runtime {
 
 impl Runtime {
     /// Creates a runtime on the current Tokio reactor.
+    ///
+    /// Fails when there is none: `quinn` needs one, and failing here beats
+    /// failing later at an unrelated call site.
     pub fn new(config: RuntimeConfig) -> Result<Runtime, Error> {
-        tokio::runtime::Handle::try_current()
-            .map_err(|_| Error::Runtime("Runtime::new requires an ambient tokio runtime".into()))?;
-        Ok(Runtime {
+        Ok(Runtime::from_parts(config, Exec::current()?, None))
+    }
+
+    /// Creates a runtime on the Tokio runtime `handle` names.
+    ///
+    /// For a process that already runs a reactor somewhere other than the
+    /// calling thread: nothing has to be ambient, and the caller's own
+    /// executor is never consulted.
+    pub fn with_handle(handle: tokio::runtime::Handle, config: RuntimeConfig) -> Runtime {
+        Runtime::from_parts(config, Exec::from_handle(handle), None)
+    }
+
+    /// Creates a runtime that **owns** a multi-thread Tokio runtime with
+    /// [`RuntimeConfig::worker_threads`] workers.
+    ///
+    /// The caller needs no reactor of its own, now or later: weida's tasks,
+    /// timers and name lookups run on the owned runtime while the caller
+    /// drives the futures it awaits on whatever executor it likes. The owned
+    /// runtime is shut down when the last clone of this `Runtime` — and every
+    /// endpoint made from it — is dropped.
+    ///
+    /// Fails when `worker_threads` is `0`, or when the OS refuses the threads.
+    pub fn owned(config: RuntimeConfig) -> Result<Runtime, Error> {
+        if config.worker_threads == 0 {
+            return Err(Error::Runtime(
+                "RuntimeConfig::worker_threads must be at least 1".into(),
+            ));
+        }
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(config.worker_threads)
+            .thread_name("weida")
+            .build()
+            .map_err(Error::Io)?;
+        let exec = Exec::from_handle(tokio_runtime.handle().clone());
+        Ok(Runtime::from_parts(
+            config,
+            exec,
+            Some(OwnedRuntime(Some(tokio_runtime))),
+        ))
+    }
+
+    fn from_parts(config: RuntimeConfig, exec: Exec, owned: Option<OwnedRuntime>) -> Runtime {
+        Runtime {
             inner: Arc::new(RuntimeInner {
                 config,
                 pool: ClientPool::new(),
+                exec,
+                _owned: owned,
                 endpoints: Mutex::new(Vec::new()),
             }),
-        })
+        }
     }
 
     /// Creates an empty messaging namespace.
@@ -174,6 +322,69 @@ mod tests {
     fn creating_a_runtime_without_a_reactor_fails() {
         let err = Runtime::new(RuntimeConfig::default()).unwrap_err();
         assert!(matches!(err, Error::Runtime(_)), "{err:?}");
+    }
+
+    #[test]
+    fn zero_worker_threads_is_rejected() {
+        let err = Runtime::owned(RuntimeConfig {
+            worker_threads: 0,
+            ..RuntimeConfig::default()
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Runtime(_)), "{err:?}");
+    }
+
+    /// The whole point of `owned`: no ambient reactor, on this thread or any
+    /// other, and weida still binds a socket and shuts it down.
+    #[test]
+    fn an_owned_runtime_needs_no_ambient_reactor() {
+        assert!(Handle::try_current().is_err());
+        let rt = Runtime::owned(RuntimeConfig::default()).expect("owned runtime");
+        let listener = rt.listener();
+        futures::executor::block_on(async {
+            let binding = listener
+                .bind_quic(
+                    "127.0.0.1:0".parse().unwrap(),
+                    Identity::generate().expect("identity"),
+                )
+                .await
+                .expect("bind");
+            assert_ne!(binding.local_addr().port(), 0);
+            rt.shutdown().await;
+        });
+    }
+
+    /// `with_handle` takes somebody else's reactor; the calling thread still
+    /// has none.
+    #[test]
+    fn with_handle_uses_the_handed_runtime() {
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let rt = Runtime::with_handle(tokio_rt.handle().clone(), RuntimeConfig::default());
+        assert!(Handle::try_current().is_err());
+        assert_eq!(rt.config().worker_threads, 1);
+        assert_eq!(rt.requester(no_trust()).peer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn resolves_ip_literals_without_dns() {
+        let exec = Exec::current().expect("ambient runtime");
+        assert_eq!(
+            exec.resolve("127.0.0.1", 7443).await.unwrap(),
+            SocketAddr::from(([127, 0, 0, 1], 7443))
+        );
+        let v6 = exec.resolve("::1", 7443).await.unwrap();
+        assert_eq!(v6.port(), 7443);
+        assert!(v6.is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_host_is_an_address_error() {
+        let exec = Exec::current().expect("ambient runtime");
+        let err = exec.resolve("host.invalid.", 7443).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
     }
 
     #[tokio::test]

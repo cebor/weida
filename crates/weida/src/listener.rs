@@ -18,7 +18,7 @@ use crate::config::ServerTls;
 use crate::conn::ConnCtx;
 use crate::endpoint::{Endpoint, PubState, Publisher, PullState, Puller, RepState, Replier};
 use crate::pubsub::SubRegistry;
-use crate::runtime::RuntimeInner;
+use crate::runtime::{Exec, RuntimeInner};
 use crate::stream::{Acceptor, Incoming};
 use crate::tls;
 use crate::transfer::{IncomingRequest, IncomingTransfer};
@@ -153,16 +153,23 @@ impl Listener {
         let limits = self.inner.runtime.config.limits;
         let server_config =
             tls::server_config(&tls, &limits, self.inner.runtime.config.idle_timeout)?;
+        let exec = self.inner.runtime.exec.clone();
 
-        let endpoint = quinn::Endpoint::server(server_config, addr).map_err(Error::Io)?;
+        // Inside the runtime context: `quinn` registers the socket with the
+        // reactor as it is constructed, and the calling thread may have none.
+        let endpoint = {
+            let _guard = exec.enter();
+            quinn::Endpoint::server(server_config, addr).map_err(Error::Io)?
+        };
         let local_addr = endpoint.local_addr().map_err(Error::Io)?;
         self.inner.runtime.track_endpoint(endpoint.clone());
 
-        tokio::spawn(accept_connections(
+        exec.spawn(accept_connections(
             endpoint.clone(),
             Arc::clone(&self.inner.namespace),
             Arc::clone(&self.inner.subs),
             limits,
+            exec.clone(),
         ));
 
         tracing::info!(%local_addr, "quic binding listening");
@@ -261,6 +268,7 @@ async fn accept_connections(
     namespace: Arc<Namespace>,
     subs: Arc<SubRegistry>,
     limits: Limits,
+    exec: Exec,
 ) {
     let live = Arc::new(AtomicUsize::new(0));
     while let Some(incoming) = endpoint.accept().await {
@@ -271,7 +279,7 @@ async fn accept_connections(
                 max = limits.max_connections,
                 "connection limit reached; refusing"
             );
-            tokio::spawn(async move {
+            exec.spawn(async move {
                 if let Ok(conn) = incoming.await {
                     conn.close(
                         VarInt::from_u32(codes::LIMIT_EXCEEDED as u32),
@@ -286,7 +294,8 @@ async fn accept_connections(
         let subs = Arc::clone(&subs);
         let live = Arc::clone(&live);
         live.fetch_add(1, Ordering::Relaxed);
-        tokio::spawn(async move {
+        let exec_for_conn = exec.clone();
+        exec.spawn(async move {
             match incoming.await {
                 Ok(conn) => {
                     let remote = conn.remote_address();
@@ -294,8 +303,13 @@ async fn accept_connections(
                     tracing::debug!(%remote, "connection accepted");
                     // The handle must outlive the connection: it owns the
                     // actor's control channel.
-                    let _ctx =
-                        ConnCtx::spawn(conn.clone(), limits, namespace, Some(Arc::clone(&subs)));
+                    let _ctx = ConnCtx::spawn(
+                        conn.clone(),
+                        limits,
+                        namespace,
+                        Some(Arc::clone(&subs)),
+                        exec_for_conn,
+                    );
                     let reason = conn.closed().await;
                     // A peer that goes away takes its subscriptions with it;
                     // otherwise connection churn would grow the registry.

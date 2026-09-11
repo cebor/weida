@@ -224,6 +224,27 @@ impl AsyncWrite for OutgoingTransfer {
     }
 }
 
+/// Beside the Tokio traits, because a caller's executor need not be Tokio:
+/// the two families differ only in shape, not in behaviour.
+impl futures_io::AsyncWrite for OutgoingTransfer {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        <Self as AsyncWrite>::poll_write(self, cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        <Self as AsyncWrite>::poll_flush(self, cx)
+    }
+
+    /// `futures-io`'s close is Tokio's shutdown: both end the write half.
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        <Self as AsyncWrite>::poll_shutdown(self, cx)
+    }
+}
+
 impl std::fmt::Debug for OutgoingTransfer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutgoingTransfer")
@@ -395,6 +416,24 @@ impl AsyncRead for IncomingTransfer {
                 Poll::Ready(Err(e))
             }
             pending => pending,
+        }
+    }
+}
+
+/// The `futures-io` counterpart. It goes through the Tokio implementation
+/// above rather than the stream directly, so the end-of-payload bookkeeping
+/// happens exactly once and in one place.
+impl futures_io::AsyncRead for IncomingTransfer {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut read_buf = ReadBuf::new(buf);
+        match <Self as AsyncRead>::poll_read(self, cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

@@ -22,6 +22,7 @@ use weida_protocol::{
 
 use crate::listener::{Namespace, Route};
 use crate::pubsub::SubRegistry;
+use crate::runtime::Exec;
 use crate::stream::Incoming;
 use crate::transfer::{IncomingMeta, IncomingRequest, IncomingTransfer};
 
@@ -58,6 +59,8 @@ pub(crate) struct ConnCtx {
     /// The identity the peer proved in the handshake, `None` for an anonymous
     /// client. Fixed for the life of the connection.
     pub peer: Option<Fingerprint>,
+    /// The runtime this connection's tasks and timers run on.
+    pub exec: Exec,
     agreed: watch::Receiver<Option<Agreed>>,
 }
 
@@ -70,6 +73,7 @@ impl ConnCtx {
         limits: Limits,
         namespace: Arc<Namespace>,
         subs: Option<Arc<SubRegistry>>,
+        exec: Exec,
     ) -> ConnHandle {
         let (ctl_tx, ctl_rx) = mpsc::channel(CTL_QUEUE);
         let (agreed_tx, agreed_rx) = watch::channel(None);
@@ -82,14 +86,15 @@ impl ConnCtx {
             limits,
             namespace,
             subs,
+            exec: exec.clone(),
             agreed: agreed_rx,
         });
 
-        tokio::spawn(driver(conn.clone(), ctl_rx));
-        tokio::spawn(hello_deadline(Arc::clone(&ctx), Arc::clone(&agreed_tx)));
-        tokio::spawn(accept_uni_loop(Arc::clone(&ctx), agreed_tx));
-        tokio::spawn(accept_bi_loop(Arc::clone(&ctx)));
-        tokio::spawn(send_hello(conn, limits));
+        exec.spawn(driver(conn.clone(), ctl_rx, exec.clone()));
+        exec.spawn(hello_deadline(Arc::clone(&ctx), Arc::clone(&agreed_tx)));
+        exec.spawn(accept_uni_loop(Arc::clone(&ctx), agreed_tx));
+        exec.spawn(accept_bi_loop(Arc::clone(&ctx)));
+        exec.spawn(send_hello(conn, limits));
         ctx
     }
 
@@ -222,11 +227,11 @@ pub(crate) fn read_error(e: quinn::ReadError) -> Error {
 }
 
 /// The connection actor: serializes the frames destructors ask for.
-async fn driver(conn: quinn::Connection, mut rx: mpsc::Receiver<Ctl>) {
+async fn driver(conn: quinn::Connection, mut rx: mpsc::Receiver<Ctl>, exec: Exec) {
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
-                Some(ctl) => handle_ctl(&conn, ctl),
+                Some(ctl) => handle_ctl(&conn, ctl, &exec),
                 None => break,
             },
             _ = conn.closed() => break,
@@ -234,19 +239,19 @@ async fn driver(conn: quinn::Connection, mut rx: mpsc::Receiver<Ctl>) {
     }
 }
 
-fn handle_ctl(conn: &quinn::Connection, ctl: Ctl) {
+fn handle_ctl(conn: &quinn::Connection, ctl: Ctl, exec: &Exec) {
     match ctl {
         Ctl::SendUnsubscribe { path, filter } => {
             let conn = conn.clone();
             let header = SubscriptionHeader::new(&*path, filter).encode();
-            tokio::spawn(async move {
+            exec.spawn(async move {
                 if let Err(e) = write_control(&conn, FrameKind::Unsubscribe, &header).await {
                     tracing::debug!(error = %e, "failed to send an UNSUBSCRIBE frame");
                 }
             });
         }
         Ctl::ReplyError { mut send, code } => {
-            tokio::spawn(async move {
+            exec.spawn(async move {
                 if let Err(e) = write_error_frame(&mut send, code).await {
                     tracing::debug!(error = %e, "failed to report a reply failure");
                 }
@@ -300,7 +305,7 @@ async fn send_hello(conn: quinn::Connection, limits: Limits) {
 /// Closes the connection if the peer's HELLO never arrives.
 async fn hello_deadline(ctx: ConnHandle, agreed_tx: Arc<watch::Sender<Option<Agreed>>>) {
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_millis(ctx.limits.hello_timeout_ms)) => {}
+        () = ctx.exec.sleep(Duration::from_millis(ctx.limits.hello_timeout_ms)) => {}
         // A connection that is already gone needs no deadline, and holding
         // one would keep its state alive for the whole timeout.
         _ = ctx.conn.closed() => return,
@@ -322,7 +327,7 @@ async fn accept_uni_loop(ctx: ConnHandle, agreed_tx: Arc<watch::Sender<Option<Ag
             Ok(stream) => {
                 let ctx = Arc::clone(&ctx);
                 let agreed_tx = Arc::clone(&agreed_tx);
-                tokio::spawn(async move {
+                ctx.exec.clone().spawn(async move {
                     if let Err(e) = handle_stream(&ctx, &agreed_tx, stream).await {
                         tracing::debug!(error = %e, "inbound stream failed");
                     }
@@ -344,7 +349,7 @@ async fn accept_bi_loop(ctx: ConnHandle) {
         match ctx.conn.accept_bi().await {
             Ok((send, recv)) => {
                 let ctx = Arc::clone(&ctx);
-                tokio::spawn(async move {
+                ctx.exec.clone().spawn(async move {
                     if let Err(e) = handle_bi(&ctx, send, recv).await {
                         tracing::debug!(error = %e, "inbound exchange failed");
                     }
