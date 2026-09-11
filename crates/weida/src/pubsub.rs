@@ -136,7 +136,8 @@ impl SubRegistry {
         // One writer task per (connection, path): it serializes this
         // subscriber's messages, which is what makes delivery FIFO per
         // subscriber even though each message rides its own QUIC stream.
-        tokio::spawn(writer(Arc::clone(ctx), Arc::from(path), rx, budget));
+        ctx.exec
+            .spawn(writer(Arc::clone(ctx), Arc::from(path), rx, budget));
         Ok(())
     }
 

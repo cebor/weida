@@ -30,6 +30,14 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! The example above runs on the caller's ambient Tokio reactor. A caller
+//! that has none — or whose executor is not Tokio at all — uses
+//! [`Runtime::owned`] instead: the runtime then owns the reactor `quinn`
+//! needs, and every task, timer and name lookup weida performs runs there,
+//! while the futures it hands back may be driven by any executor. Transfer
+//! payloads implement both the `tokio::io` and the `futures-io` traits for
+//! the same reason.
 
 mod config;
 mod conn;

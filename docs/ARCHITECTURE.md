@@ -401,6 +401,39 @@ the earliest.
 
 ## 5. Runtime internals, v0
 
+### Runtime ownership: one surface onto tokio
+
+`quinn` needs a Tokio reactor. Nothing else in the crate does, so the reactor is something
+the `Runtime` holds rather than something every caller must already be standing in. Three
+constructors, differing only in where it comes from:
+
+| Constructor | Reactor | Fails when |
+| --- | --- | --- |
+| `Runtime::new(config)` | the ambient one | there is none: `Error::Runtime` |
+| `Runtime::with_handle(handle, config)` | the one `handle` names | never |
+| `Runtime::owned(config)` | a multi-thread runtime it creates and owns, `config.worker_threads` workers (default 1) | `worker_threads == 0`, or the OS refuses the threads |
+
+An owned runtime lives as long as the last `Runtime` clone and every endpoint made from it.
+It is shut down in the background rather than dropped, because the last handle may go out of
+scope on one of that runtime's own worker threads, where dropping a Tokio runtime panics.
+
+`Exec` in `runtime.rs` is the crate's **whole** surface onto the async runtime: `spawn`,
+`sleep`, `resolve` (DNS) and `enter`. Nothing outside that file calls `tokio::spawn`,
+`tokio::time` or `lookup_host` — a grep over `crates/weida/src` is the check, and the two
+accept loops, the connection actor, the HELLO deadline and the per-subscriber writer all
+take their `Exec` from the `ConnCtx` they already hold. Three consequences worth stating:
+
+- **A caller's executor need not be Tokio.** `futures::executor::block_on` drives a full
+  Req/Rep round trip against an owned runtime (`crates/weida/tests/foreign_executor.rs`),
+  and both transfer handles implement the `futures-io` traits beside the `tokio::io` ones.
+- **Two places enter the runtime context**, both synchronous and neither across an await:
+  the `quinn::Endpoint` constructors, which register a socket with the reactor. A third
+  place hands work to the runtime instead of entering it — the client handshake, because
+  completing it spawns `quinn`'s connection driver from inside the poll.
+- **The payload path is untouched.** `Exec` appears in connection setup, never between
+  `write_all` and the socket: no task hop and no allocation was added to the hot path
+  ([INVARIANTS.md](INVARIANTS.md)).
+
 ### Connection driver
 
 There is **one `ConnDriver` actor task per connection**, running identical code on both
@@ -723,7 +756,8 @@ The surface of crate `weida`, grouped by layer.
 //     EndpointAddr (with .peer: Option<Fingerprint>), Fingerprint
 // new error variants: Error::InvalidFingerprint(String), Error::Untrusted(Fingerprint)
 pub struct RuntimeConfig { pub limits: Limits,
-    pub keep_alive: Duration /*10s*/, pub idle_timeout: Duration /*30s*/ }   // Default impl
+    pub keep_alive: Duration /*10s*/, pub idle_timeout: Duration /*30s*/,
+    pub worker_threads: usize /*1; Runtime::owned only*/ }                   // Default impl
 pub enum Pem { Bytes(Vec<u8>), File(PathBuf) }              // TLS material need not be a file
 pub struct Identity { pub cert_chain: Pem, pub key: Pem }   // who I am; Debug never prints the key
 impl Identity {
@@ -755,9 +789,11 @@ pub struct ServerTls { pub identity: Identity, pub client_trust: Option<Trust> }
 impl ServerTls { pub fn new(identity: Identity) -> Self;      // accepts anonymous peers
     pub fn require_client(self, trust: Trust) -> Self; }       // From<Identity> for ServerTls
 
-pub struct Runtime;                                          // Clone (Arc inner); needs ambient tokio
+pub struct Runtime;                                          // Clone (Arc inner); owns or borrows a tokio reactor
 impl Runtime {
-    pub fn new(config: RuntimeConfig) -> Result<Runtime, Error>;   // Error::Runtime if no tokio handle
+    pub fn new(config: RuntimeConfig) -> Result<Runtime, Error>;   // Error::Runtime if no ambient tokio handle
+    pub fn with_handle(handle: tokio::runtime::Handle, config: RuntimeConfig) -> Runtime; // somebody else's reactor
+    pub fn owned(config: RuntimeConfig) -> Result<Runtime, Error>; // owns one: worker_threads, default 1
     pub fn listener(&self) -> Listener;                      // a namespace; credentials belong to bindings
     pub fn peer(&self, tls: impl Into<ClientTls>) -> Peer;   // L0: streams, no pattern vocabulary
     // Trust is per dialling endpoint, mirroring per-binding server identity: one
@@ -846,7 +882,7 @@ impl Subscriber {
     pub content_len: Option<u64>, pub trace: Option<TraceContext> }  // None trace → generate ids
                                        // builders: with_content_type / with_content_len / with_trace
 
-pub struct OutgoingTransfer;                                 // impl tokio::io::AsyncWrite
+pub struct OutgoingTransfer;                                 // impl tokio::io::AsyncWrite + futures_io::AsyncWrite
 impl OutgoingTransfer {
     pub fn trace(&self) -> TraceContext;
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), Error>;
@@ -856,7 +892,7 @@ impl OutgoingTransfer {
 pub struct Delivery;                                         // dropping it is the fire-and-forget path
 impl Delivery { pub async fn delivered(self) -> Result<(), Error>; }  // QUIC's fin-ack, not an app ack
 
-pub struct IncomingTransfer;                                 // impl tokio::io::AsyncRead
+pub struct IncomingTransfer;                                 // impl tokio::io::AsyncRead + futures_io::AsyncRead
 impl IncomingTransfer { pub fn meta(&self) -> &IncomingMeta; // endpoint, content_*, trace, topic, peer
     pub async fn read_capped(&mut self, max_bytes: usize) -> Result<Vec<u8>, Error>;
     pub async fn collect(self, max_bytes: usize) -> Result<Vec<u8>, Error>; } // LimitExceeded over cap
@@ -872,8 +908,8 @@ impl ReplyStream { pub async fn recv(self) -> Result<IncomingTransfer, Error>; }
 
 Type by type:
 
-- **`RuntimeConfig`** — everything a `Runtime` needs: resource limits and the two timers. Has
-  a `Default`.
+- **`RuntimeConfig`** — everything a `Runtime` needs: resource limits, the two timers and the
+  worker count of a runtime it owns itself. Has a `Default`.
 - **`Identity`** — who a binding or a dialling endpoint is: a certificate chain and the key
   behind it, from files or from memory. `generate()` (default feature `generate`) produces a
   self-signed identity carrying no names, made for pinning; `fingerprint()` is the value
@@ -912,7 +948,8 @@ Type by type:
   queue.
 - **`TransferMeta`** — per-transfer outbound metadata: content type, advisory length, trace
   context. A `None` trace means the runtime generates fresh trace and span ids.
-- **`OutgoingTransfer`** — the write half of a transfer, an `AsyncWrite`. `finish()` is
+- **`OutgoingTransfer`** — the write half of a transfer, an `AsyncWrite` in both the
+  `tokio::io` and the `futures-io` sense. `finish()` is
   synchronous: it marks the FIN and hands back the receipt without waiting for it. `cancel()`
   resets the stream with `CANCELED`, and so does dropping the handle unfinished.
 - **`Delivery`** — the transport receipt. `delivered()` resolves `Ok(())` once the peer's

@@ -21,6 +21,14 @@ pub struct RuntimeConfig {
     pub keep_alive: Duration,
     /// QUIC idle timeout, applied in both directions.
     pub idle_timeout: Duration,
+    /// Worker threads of the Tokio runtime [`crate::Runtime::owned`] creates.
+    ///
+    /// Ignored by [`crate::Runtime::new`] and [`crate::Runtime::with_handle`],
+    /// which run on a reactor somebody else sized. One is the default because
+    /// a messaging runtime is I/O bound and every extra worker is a thread a
+    /// library takes from its host process without being asked; `0` is
+    /// rejected rather than silently corrected.
+    pub worker_threads: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -29,6 +37,7 @@ impl Default for RuntimeConfig {
             limits: Limits::default(),
             keep_alive: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
+            worker_threads: 1,
         }
     }
 }
