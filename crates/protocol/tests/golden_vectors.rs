@@ -173,3 +173,75 @@ fn golden_subscribe_and_unsubscribe_frames() {
     assert_eq!(differing, vec![1], "only the kind byte may differ");
     assert_eq!(SubscriptionHeader::decode(&header).unwrap(), h);
 }
+
+/// The filter grammar of §6.4 on the wire: one vector per construct.
+///
+/// These fix the *encoding* of a filter string; what each selects is the
+/// matcher's business (`weida::pubsub`), and the comments name it so the two
+/// cannot drift apart silently.
+#[test]
+fn golden_filter_grammar_frames() {
+    // A literal filter: whole segments, nothing special.
+    assert_frame(
+        "SUBSCRIBE literal",
+        FrameKind::Subscribe,
+        SubscriptionHeader::new("/md", "px.eur").encode(),
+        &[
+            0x57, 0x03, 0x0E, 0xA2, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x01, 0x66, 0x70, 0x78, 0x2E,
+            0x65, 0x75, 0x72,
+        ],
+    );
+    // `*` in the middle: exactly one segment there, literal on both sides.
+    assert_frame(
+        "SUBSCRIBE one-segment wildcard",
+        FrameKind::Subscribe,
+        SubscriptionHeader::new("/md", "sensors.*.temp").encode(),
+        &[
+            0x57, 0x03, 0x16, 0xA2, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x01, 0x6E, 0x73, 0x65, 0x6E,
+            0x73, 0x6F, 0x72, 0x73, 0x2E, 0x2A, 0x2E, 0x74, 0x65, 0x6D, 0x70,
+        ],
+    );
+    // Trailing `#`: the parent and everything under it.
+    assert_frame(
+        "SUBSCRIBE rest wildcard",
+        FrameKind::Subscribe,
+        SubscriptionHeader::new("/md", "ctl.#").encode(),
+        &[
+            0x57, 0x03, 0x0D, 0xA2, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x01, 0x65, 0x63, 0x74, 0x6C,
+            0x2E, 0x23,
+        ],
+    );
+    // The empty filter: every topic. The key is present and the value is the
+    // empty text string `0x60`, because absent and empty must stay distinct.
+    assert_frame(
+        "SUBSCRIBE empty filter",
+        FrameKind::Subscribe,
+        SubscriptionHeader::new("/md", "").encode(),
+        &[
+            0x57, 0x03, 0x08, 0xA2, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x01, 0x60,
+        ],
+    );
+
+    for filter in ["px.eur", "sensors.*.temp", "ctl.#", ""] {
+        let h = SubscriptionHeader::new("/md", filter);
+        assert_eq!(SubscriptionHeader::decode(&h.encode()).unwrap(), h);
+    }
+}
+
+/// A published topic is data, not a pattern: `*` in a topic is a byte like
+/// any other, and the encoder treats it as such.
+#[test]
+fn golden_literal_wildcard_topic_frame() {
+    let mut h = DataHeader::addressed("/md");
+    h.topic = Some("px.*".into());
+    assert_frame(
+        "DATA topic containing a literal `*`",
+        FrameKind::Data,
+        h.encode(),
+        &[
+            0x57, 0x01, 0x0C, 0xA2, 0x00, 0x63, 0x2F, 0x6D, 0x64, 0x05, 0x64, 0x70, 0x78, 0x2E,
+            0x2A,
+        ],
+    );
+    assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
+}

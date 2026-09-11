@@ -21,7 +21,8 @@ pub use frame::{
     parse_preamble,
 };
 pub use header::{
-    DataHeader, ErrorHeader, HeaderError, Hello, SubscriptionHeader, limits as header_limits,
+    DataHeader, ErrorHeader, HeaderError, Hello, SubscriptionHeader, filter,
+    limits as header_limits,
 };
 pub use negotiate::{Agreed, NegotiateError, negotiate};
 pub use varint::{VarintError, decode_varint, encode_varint, varint_len};
