@@ -468,9 +468,8 @@ asserting `BestEffort` end to end across a chain whose weakest link has no trans
 
 ### 5.3 The ZeroMQ library as backlog items
 
-Ids are `B-0xx` placeholders; the backlog owner assigns them, and `needs` names the
-prerequisite item by title because the ids do not exist yet. In dependency order, every item
-inside LOOP §5's 90-minute cap.
+Filed as B-070..B-095 on acceptance, in the order below. `needs` names the prerequisite item
+by title here and by id in the backlog. Every item is inside LOOP §5's 90-minute cap.
 
 ```
 ### B-0xx — Extract weida-runtime

@@ -372,3 +372,134 @@ kind: research | size: 45 | status: done 2035786 | needs: [B-057]
 acceptance: the mirror of B-055 for SP — [research/nanomsg-nng.md](research/nanomsg-nng.md) updated with what building the codec, both bridges and the cross-adapter run established, in the sheet's own protocol-native vocabulary and with no sentence mentioning weida ([research/README.md](research/README.md) rule 1), every addition attributed to a new numbered source that names the `nng` crate version, the C library under it and what was observed; the byte-level layouts the RFCs leave in prose (protocol header octets, the endpoint type ids from NNG's registry, PAIR v1's initial hop count) written out; and the entries [adapters/nng.md](adapters/nng.md) §11 lists as *sheet* gaps closed where the sheet now answers them.
 note: the research item LOOP §9 requires after every Phase B slice, and the material is the same shape B-055 found for ZMTP: the things that cost time were properties of the ecosystem, not of our reading of the RFCs.
 note: done as **source [30]** — `nng` 1.0.1 over `nng-sys` 1.4.0-rc.0, which vendors the NNG C library, so the version cited is the library's and nothing measured against it can later be mistaken for a claim about the specification. Six additions: §1 gains the dial observation (`nng_dial` returns only after the peer's protocol header arrives, so calling it from the thread that must answer a greeting deadlocks — the finding that cost the cross-adapter worker two timed-out tests); §3 gains **Wire layouts, octet by octet** — the 8-octet header, all eleven endpoint type ids with their full headers, the 64-bit framing, the tag stacks, the PAIR v1 word — and its PAIR bullet now states the prose and the implementation side by side instead of only the prose; §4 gains what receiver-side filtering costs on the link (a publisher's egress is size × subscribers no matter what anyone subscribed to) and the observation that a REP does not mind a requester that never retransmits; §6 and §8 gain the one that composes worst, **there is no refusal frame at all** — a close or silence is the entire vocabulary, so every sending-side diagnosis is an inference; §11 gains the second hop ceiling (`NNI_MAX_MAX_TTL` is 15 against the manual's 255); §13 gains what the crate is (a thin binding, blocking calls, timeouts as the only defence against a hang) and why three Rust crates are not three opinions. nng.md §11 closes two entries and narrows the PAIR one to "recorded, not observed", because no chain uses PAIR.
+
+### B-070 — Extract weida-runtime
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T15:55Z | needs: []
+acceptance: `crates/runtime` holds `Exec` (spawn, sleep, within, enter, resolve with its address cap and IP-literal fast path), the three reactor-ownership constructors with the background-shutdown discipline, the `AF_UNIX` bind hygiene and `peer_credentials` of 0010 §4.5, a generic named-endpoint registry with a byte budget, and the bounded close budget; `crates/weida` uses it and **no `pub` item in `weida` changes** — the existing suite compiles untouched.
+note: from 0013 §5.3.
+note: on branch `b070-weida-runtime` in `../weida-b016` by the parallel worker.
+
+### B-071 — weida-zmq: context, endpoints, error vocabulary
+kind: code | size: 90 | status: ready | needs: [B-070]
+acceptance: `crates/zmq/weida-zmq` with a `Context` created three ways on `weida-runtime`'s `Exec`, `ZMQ_MAX_SOCKETS` honoured, `tcp://`/`ipc://`/`inproc://` parsed under libzmq's own length rules (113 B ipc on Linux, 256 inproc), and an error enum carrying libzmq's errno names; no dependency on `weida` or `weida-protocol`.
+note: from 0013 §5.3.
+
+### B-072 — Message, per-peer queue and the high-water marks
+kind: code | size: 90 | status: ready | needs: [B-071]
+acceptance: `Message`/`Multipart` sent and received atomically ("all frames or none"), `ZMQ_MAXMSGSIZE` checked from the declared length before any allocation, the per-peer double queue every pattern RFC specifies, `ZMQ_SNDHWM`/`ZMQ_RCVHWM` at 1000, and the mute-state action of `zmq_socket(3)`'s table — block, drop or `EAGAIN` — with one test per action.
+note: from 0013 §5.3.
+
+### B-073 — The connection engine: bind, connect, reconnect
+kind: code | size: 90 | status: ready | needs: [B-072]
+acceptance: one socket binds and connects many endpoints; `ZMQ_RECONNECT_IVL`/`_IVL_MAX` backoff, `ZMQ_HANDSHAKE_IVL`, `ZMQ_CONNECT_TIMEOUT`, `ZMQ_IMMEDIATE`, `ZMQ_BACKLOG`, `ZMQ_LAST_ENDPOINT` after a wildcard bind, `unbind`/`disconnect`; a queue exists for a peer that never connected, per the RFCs' "whether or not the connection is established".
+note: from 0013 §5.3.
+
+### B-074 — The ZMTP session on the existing codec
+kind: adapter | size: 90 | status: ready | needs: [B-073]
+acceptance: greeting with the 3.0 downgrade, NULL handshake, `READY` metadata with `Socket-Type` and `Identity`, MORE/COMMAND framing through `weida-zmtp` unchanged, `PING`/`PONG` gated on the negotiated version, `ERROR` sent and understood; zmtp.md §10.1's vectors still assert byte-for-byte and the codec's `[dependencies]` is still empty.
+note: from 0013 §5.3.
+
+### B-075 — REQ and REP
+kind: code | size: 90 | status: ready | needs: [B-074]
+acceptance: REQ's strict alternation with `EFSM` on any other order, the empty delimiter prepended and stripped, round-robin out and last-peer in, REP discarding a reply whose originator vanished, `ZMQ_REQ_CORRELATE` and `ZMQ_REQ_RELAXED`; close-and-reopen after `EFSM` works, which is what Lazy Pirate needs.
+note: from 0013 §5.3.
+
+### B-076 — DEALER and ROUTER
+kind: code | size: 90 | status: ready | needs: [B-075]
+acceptance: unrestricted send and receive both ways; ROUTER's routing-id frame prepended and stripped with a peer-chosen `Identity` honoured; `ZMQ_ROUTER_MANDATORY` turning an unroutable message into `EHOSTUNREACH` instead of a silent drop; `ZMQ_ROUTER_HANDOVER` evicting an incumbent where the default rejects the collision; `ZMQ_PROBE_ROUTER`.
+note: from 0013 §5.3.
+
+### B-077 — PUSH, PULL and PAIR
+kind: code | size: 90 | status: ready | needs: [B-074]
+acceptance: PUSH round-robins only to peers whose queue is not full and blocks rather than discarding, PULL fair-queues its peers, and PAIR accepts at most one peer, does not auto-reconnect, and terminates further incoming connections while one is live.
+note: from 0013 §5.3.
+
+### B-078 — PUB and SUB
+kind: code | size: 90 | status: ready | needs: [B-074]
+acceptance: publisher-side binary prefix match against the start of the first frame; subscriptions additive and non-idempotent, so two SUBSCRIBEs need two CANCELs; an empty subscription matches everything and a fresh SUB nothing; drop-not-block at the HWM; both wire forms accepted — the 3.x commands and ZMTP 2.0's one-frame `%x01`/`%x00` — with the sent form configurable.
+note: from 0013 §5.3.
+
+### B-079 — XPUB and XSUB
+kind: code | size: 90 | status: ready | needs: [B-078]
+acceptance: XPUB delivers subscription messages to the application in the `1`/`0` form and synthesizes an unsubscribe when a subscriber disconnects; `ZMQ_XPUB_VERBOSE`, `_VERBOSER`, `_MANUAL`, `_WELCOME_MSG`; XSUB forwards subscriptions upstream and re-sends them on reconnect.
+note: from 0013 §5.3.
+
+### B-080 — The inproc transport
+kind: code | size: 60 | status: ready | needs: [B-072]
+acceptance: a context-scoped namespace on `weida-runtime`'s registry with libzmq's 256-character budget, connect-before-bind working as libzmq 4.0 fixed it, and two contexts in one process never meeting.
+note: from 0013 §5.3.
+
+### B-081 — The ipc transport
+kind: code | size: 90 | status: ready | needs: [B-073]
+acceptance: `AF_UNIX` with the hygiene of 0010 §4.5 — unlink-then-bind, explicit mode, socket-type check before unlinking, the 113-byte Linux path budget — peer credentials available to authorization, and the endpoint-stealing hazard documented rather than papered over.
+note: from 0013 §5.3.
+
+### B-082 — PLAIN and the ZAP dialog
+kind: code | size: 90 | status: ready | needs: [B-074, B-080]
+acceptance: PLAIN's handshake with username and password; RFC 27's request and reply framing over `inproc://zeromq.zap.01` with status 200/300/400/500 and the user-id field, one handler per context, `ZMQ_ZAP_DOMAIN` and `ZMQ_ZAP_ENFORCE_DOMAIN`; a 400 refuses the connection before any message flows, and the user id never becomes a weida identity.
+note: from 0013 §5.3.
+
+### B-083 — CURVE command layouts in weida-zmtp
+kind: adapter | size: 90 | status: ready | needs: [B-074]
+acceptance: `HELLO` (200), `WELCOME` (168), `INITIATE` (257+), `READY` (30+) and `MESSAGE` encoded and decoded as byte layouts with the boxes as opaque ranges, the ABNF's 72-octet HELLO padding rather than the prose's 70, Z85 both ways, vectors published in zmtp.md and asserted both directions — and `weida-zmtp`'s `[dependencies]` still empty, because no crypto happens here.
+note: from 0013 §5.3.
+
+### B-084 — CURVE in weida-zmq
+kind: code | size: 90 | status: ready | needs: [B-083, B-082]
+acceptance: the four keys; the cookie discarded on a valid INITIATE or after a short interval; session keys destroyed on close; the three security models selectable; `ZMQ_CURVE_SERVER`/`_PUBLICKEY`/`_SECRETKEY`/`_SERVERKEY` taking 32 bytes or 40-character Z85; the peer's long-term key reaching the ZAP handler as the CURVE credential; one named RustCrypto dependency and `unsafe_code` still forbidden.
+note: from 0013 §5.3.
+
+### B-085 — The option table, honoured or refused
+kind: code | size: 60 | status: ready | needs: [B-076, B-079, B-081]
+acceptance: every `zmq_setsockopt` and `zmq_ctx_set` option is honoured or refused **at configuration time** with a message naming the reason — no transport, draft only, deprecated in favour of ZAP, or replaced by a `weida-runtime` construct — and never silently ignored; a test walks the whole table, and the two deliberate default changes (finite `ZMQ_LINGER`, bounded `ZMQ_MAXMSGSIZE`) are asserted as such.
+note: from 0013 §5.3.
+
+### B-086 — Monitor events and the devices
+kind: code | size: 90 | status: ready | needs: [B-079, B-077]
+acceptance: the `zmq_socket_monitor` event set delivered as a typed stream **and** over the `inproc://` PAIR form the Espresso recipe reads; `zmq_proxy(frontend, backend, capture)` and `zmq_proxy_steerable` with PAUSE/RESUME/TERMINATE/STATISTICS.
+note: from 0013 §5.3.
+
+### B-087 — The blocking facade
+kind: code | size: 60 | status: ready | needs: [B-075, B-077, B-078]
+acceptance: a non-default `blocking` feature giving one wrapper per socket over a `Context::owned` reactor, with `ZMQ_SNDTIMEO`/`ZMQ_RCVTIMEO` and `ZMQ_DONTWAIT`; no second implementation of any protocol behaviour, and one zguide example that reads like its C original.
+note: from 0013 §5.3.
+
+### B-088 — Interop against zmq.rs, both roles
+kind: adapter | size: 90 | status: ready | needs: [B-076, B-079, B-077]
+acceptance: every pairing both implement, with our socket as the connecting side **and** as the bound side, against `zeromq` 0.6 as a dev-dependency with no supervised process; the three skews the sheet records — a 3.0 greeting, `READY`-only command decoding, the legacy subscription form — exercised rather than assumed.
+note: from 0013 §5.3.
+
+### B-089 — Interop against libzmq, both roles
+kind: adapter | size: 90 | status: ready | needs: [B-088, B-084]
+acceptance: the same matrix plus PAIR, PLAIN, CURVE and ZAP against libzmq through the `zmq` crate as an optional dev-dependency, `#[ignore]` with the install command in the doc comment where libzmq is absent (LOOP §2); every disagreement recorded in the sheet as measured, not inferred.
+note: from 0013 §5.3.
+
+### B-090 — zguide I: the pirates and the load-balancing broker
+kind: adapter | size: 90 | status: ready | needs: [B-088]
+acceptance: lazy pirate, simple pirate over the chapter 3 load-balancing broker, and paranoid pirate with heartbeats, as examples that run in `cargo test`, each asserting the guide's own claim — an in-order reply or abandonment; a worker may crash and restart while the queue runs; the queue evicts a lost worker instead of discovering it through a failed request.
+note: from 0013 §5.3.
+
+### B-091 — zguide II: Majordomo and Freelance
+kind: adapter | size: 90 | status: ready | needs: [B-090]
+acceptance: MDP/0.2 client, worker and broker with the six-byte header, per-service queues, heartbeats and `DISCONNECT`, plus `mmi.service` answering 200/404; Freelance models one and two with request numbering so a stale reply is ignored; each asserting the RFC's stated guarantee.
+note: from 0013 §5.3.
+
+### B-092 — zguide III: Clone, Binary Star and the pub-sub recipes
+kind: adapter | size: 90 | status: ready | needs: [B-091, B-086]
+acceptance: CHP's ROUTER/PUB/SUB port triple with `ICANHAZ?`/`KVSYNC`/`KTHXBAI`/`KVPUB`/`HUGZ`/`KVSET` and the strict-increment discard rule; the Binary Star state machine with its three events and the split-brain warning in the doc comment; the last-value cache and Espresso on the proxy capture socket.
+note: from 0013 §5.3.
+
+### B-093 — The parity table against libzmq 4.3.5
+kind: spec | size: 60 | status: ready | needs: [B-085, B-089]
+acceptance: `docs/libraries/zmq.md` with `docs/libraries/README.md` as its index in the shape `docs/adapters/README.md` set, stating row by row every socket type, transport, mechanism, option, monitor event and device as present, refused-with-reason or absent-with-reason; no row says "partial" without naming what is missing.
+note: from 0013 §5.3.
+
+### B-094 — The bridge rebuilt on the library
+kind: adapter | size: 90 | status: ready | needs: [B-088]
+acceptance: `weida-zmq-bridge` keeps `Inbound`/`Outbound` and their configuration, drops `wire.rs`, the handshake driving, `Liveness` and the subscription reference counting in favour of `weida-zmq` sockets, still refuses zmtp.md §9's six configurations at configuration time, still states `core` on the weida side, and every existing bridge test and the interop bench pass with unchanged observable behaviour.
+note: from 0013 §5.3.
+
+### B-095 — The crate move and the two-product README
+kind: spec | size: 45 | status: ready | needs: [B-071]
+acceptance: `crates/zmq/` holds `weida-zmtp`, `weida-zmq` and `weida-zmq-bridge`; `crates/nng/` holds `weida-sp` and `weida-nng-bridge`; `cross-tests` moves to `crates/interop/`; README's crate table gains the `kind` column of [0013](decisions/0013-competitor-libraries.md) §5.5 and ARCHITECTURE §4's crate map and every stale doc path follow; no crate **name** changes, so nothing published breaks.
+note: from 0013 §5.3.

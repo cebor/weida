@@ -5,10 +5,13 @@ first, then the numbers, then the chronology.
 
 ## Review needed
 
-**Nothing is waiting on disk and nothing is in flight.** `b057-cross-adapter` and
+**Nothing is waiting on disk.** `b057-cross-adapter` and
 `b059-local-block` are both merged (`525db84`, `6ca89ad`), the gate is green at **505 tests**,
-and the tree is clean. Phase A is complete but for its two named gaps (A5 parked by 0011,
-A9's Windows half blocked on a runner) and Phase B2 is six slices of six.
+and the tree is clean. One item is in flight: B-070, the `weida-runtime` extraction, delegated
+to the parallel worker on `b070-weida-runtime`. Phase A is complete but for its two named gaps
+(A5 parked by 0011, A9's Windows half blocked on a runner); Phase B is the shape
+[decision 0013](decisions/0013-competitor-libraries.md) gave it, so B1 and B2 are complete as
+bridges and reopen as libraries.
 
 **Then read these three, in this order.**
 
@@ -32,7 +35,7 @@ A9's Windows half blocked on a runner) and Phase B2 is six slices of six.
   reading had found; the pipe slice would find its own and nobody would see them. Overrule me
   if you want the code written blind — revival is otherwise mechanical: a Windows CI runner or
   a Windows host the loop can reach.
-- **Decisions 0001-0012 are all `accepted`; nothing is provisional any more.** 0012 was
+- **Decisions 0001-0013 are all `accepted`; nothing is provisional any more.** 0012 was
   provisional for one section — §4.4's parked reverse connections, the one part with no
   precedent in the sheets — and B-048 built it: the shape held, the shared Pub/Sub test body
   now runs over `AF_UNIX` exactly as over QUIC and inproc, an exhausted pool is a counted drop
@@ -41,14 +44,14 @@ A9's Windows half blocked on a runner) and Phase B2 is six slices of six.
   it: 0011 §4.3 parks 0002 §6.3's per-peer control connection, because the rule 0011 settles
   leaves that tier with no frame to carry. 0002 and 0003 carry amendment markers; neither was
   rewritten.
-- **No stashes, nothing delegated.** Blocked: B-039 only, on the runner above. Parked: B-045,
-  the control connection, with a written revival condition, and B-058, the Python binding, at
-  your decision that Phase C waits for B3. Eight items are `ready`: B-060 (the CLI),
-  B-061 (CI), B-062 (the MQTT mapping document, which is what Phase B does next) and the five
-  filed from the zeughaus requirements note now at
+- **No stashes; one delegation, B-070.** Blocked: B-039 only, on the runner above. Parked:
+  B-045, the control connection, with a written revival condition, and B-058, the Python
+  binding, at your decision that Phase C waits for B3. Thirty-three items are `ready`:
+  B-060 (the CLI), B-061 (CI), B-062 (the MQTT mapping document), the five filed from the
+  zeughaus requirements note now at
   [requirements/zeughaus-video.md](requirements/zeughaus-video.md) — B-064 streaming fan-out,
   B-065 conflation, B-066 peer authorization, B-067 per-topic drop counters, B-068 a pinnable
-  release.
+  release — and B-071..B-095, the ZeroMQ library of 0013 §5.3.
 - **One process mistake of mine, for the record.** `docs/adapters/nng.md` reached main through
   my own `git add docs` rather than through the worker's branch: a directory-wide stage swept
   an item that was still being written. Nothing was lost and the document was complete, but
@@ -220,3 +223,4 @@ IMPLEMENTATION.md §4.
 2026-09-11T12:17Z | B-057 | done 525db84 | the **cross-adapter test is on main**: `b057-cross-adapter` merged `--no-ff` and the gate run here — fmt, clippy in both configurations, **503 tests** with one ignored, rustdoc — no conflicts, main had moved only by backlog commits since the branch took `e357a4e`. (The clock: the timestamps above this line were ahead of the machine's UTC; this one is the real time.) The two "cross-adapter" lines the mapping documents owed are written — zmtp.md §10 item 7 and nng.md §10 item 7, each naming the three pattern chains in both directions, the composed losses and `BestEffort` asserted rather than described — and IMPLEMENTATION.md §1 gained the sixteenth increment with the reasoning from the test file's own module documentation. One thing the merge settles that the acceptance line did not ask for: the `nng` C library builds on this machine, so the SP end of the chain is the **real implementation and not `#[ignore]`d**, which makes this the independent run nng.md §10 items 3 and 4 were owed and answers §11's first question (a real `Rep0` replies to a raw requester that never retransmits). PAIR is in no chain, so the v1 hop-count disagreement is still open on the wire | next B-069, the SP research item that mirrors B-055
 2026-09-11T12:40Z | B-069 | done 2035786 | the SP sheet now says what the implementation taught it, which is the mirror of B-055 and the item LOOP §9 owes after every Phase B slice. Everything new is **source [30]** — `nng` 1.0.1 over `nng-sys` 1.4.0-rc.0, the vendored C library — so a reader can tell an observation of NNG 1.4.0-rc.0 from a claim about SP, and no sentence in the sheet mentions weida (research/README rule 1). The addition that would have saved the most time if it had been there: **`nng_dial` returns only once the peer's protocol header has arrived**, so calling it on the thread that must answer a greeting deadlocks — two cross-adapter tests timed out on exactly that before the dial moved to a blocking thread. The one that matters most for any future SP work: **SP has no refusal frame at all**, so a close and silence are the whole vocabulary and every sending-side diagnosis is an inference — which is also why a hop ceiling reached at the second hop reaches the first peer as nothing. §3 now carries the octets the RFCs leave in prose (the 8-octet header, eleven endpoint type ids from NNG's registry, the 64-bit framing, the tag stacks, PAIR v1's word, with the prose's "hop count starts at one" against the implementation's `0` side by side), §4 what receiver-side filtering costs on the link, §11 the second hop ceiling (`NNI_MAX_MAX_TTL` = 15 against the manual's 255), §13 what the crate actually is. nng.md §11 loses two entries and narrows the PAIR one to "recorded, not observed", because no chain uses PAIR | next: nothing — the instructed items are done; the backlog's first `ready` item is B-060
 2026-09-11T13:05Z | B-059 | done 6ca89ad | `b059-local-block` merged `--no-ff` and gated here: **505 tests**, one ignored; IMPLEMENTATION.md auto-merged and nothing needed resolving. Your decision built: **a local `open` waits for a free slot**, so `Block` means the same thing on every transport. `StreamSlot` is a tokio `Semaphore` permit and the local links await it in `select!` against `closed()` — a waiter holds nothing, and dropping the future cancels the wait, so the caller's own deadline is the bound. `LimitExceeded` survives in exactly one place, the reverse-pool park, which takes its permit with `try_acquire` because a pool that waited for itself would deadlock. `push_pull_waits_for_a_slot_over_{inproc,unix}` push 600 concurrent sends through 255 slots and fail on the old code with "send 255 of 600 failed: LimitExceeded". The numbers this item existed for are in the Numbers section above and in IMPLEMENTATION.md §4; the one worth your attention is that **a 1 KiB Push over `AF_UNIX` costs 3× the same Push over loopback QUIC** — one connection per transfer is free at 1 MiB and is the whole cost at 1 KiB, which is the honest boundary of 0010 §4.2's structural argument. A pre-existing hang in the bench's memory report was fixed on the way. With this, **Phase A is complete but for the two named gaps (A5 parked, A9's Windows half blocked) and Phase B2 is six slices of six** | next: nothing scheduled — the backlog's first `ready` item is B-060, the CLI
+2026-09-11T15:55Z | 0013 | accepted 4bb2074 0507f7d | **the repository has two products now.** [Decision 0013](decisions/0013-competitor-libraries.md) is accepted on your word: weida on one side, and **standalone implementations of the protocols it competes with** on the other — `weida-zmq` first, `weida-nng` after it — sharing a new `weida-runtime` crate (`Exec`, the three reactor-ownership constructors, the capped resolver, the `AF_UNIX` hygiene of 0010 §4.5, a named-endpoint registry, the bounded close budget) and sharing **none** of weida's frames, HELLO or `Link`. No zmq backend behind `Requester` and no `zmq://` scheme: that was option B and it puts two pattern semantics behind one API. What applied where: LOOP §9's Phase B is replaced by the note's §5.1 text (six slices, of which slice 3 *is* the library and slice 4 is the forwarder), ARCHITECTURE §4 gains the crate map, the dependency direction and the sentence that §73's own split trigger has fired — the cut is the reactor and the OS, **not** QUIC, which keeps exactly one dependent — INVARIANTS records that the libraries are inside the unbounded-allocation rule under libzmq's own bound names, and the roadmap boxes put B1 and B2 back to `partial`: complete as bridges, reopening as libraries. The existing bridge code is not thrown away — 0013 §5.2 names line by line what becomes the library's socket layer (`wire.rs`, `Liveness`, both subscription wire forms, the non-idempotent reference counting) and what stays the forwarder's (the prefix-to-filter translation, the multipart refusal, the DEALER correlation and its deadline). **Filed as B-070..B-095, 2175 minutes ≈ 36 hours**, which is eight times the three ZMTP bridge slices it replaces and the number this decision actually costs; B-070, the runtime extraction, is delegated on `b070-weida-runtime` and is the only thing in flight | next B-071 after B-070 lands
