@@ -290,19 +290,6 @@ impl SocketOptions {
 mod tests {
     use super::*;
 
-    /// Claim: every default is the number libzmq's manual publishes.
-    #[test]
-    fn the_defaults_are_libzmqs() {
-        let options = SocketOptions::default();
-        assert_eq!(options.reconnect_ivl, Some(Duration::from_millis(100)));
-        assert_eq!(options.reconnect_ivl_max, None, "libzmq's 0: no backoff");
-        assert_eq!(options.handshake_ivl, Some(Duration::from_secs(30)));
-        assert_eq!(options.connect_timeout, None, "libzmq's 0: the OS default");
-        assert!(!options.immediate, "libzmq's 0");
-        assert_eq!(options.backlog, 100);
-        options.validate().expect("the defaults are usable");
-    }
-
     /// Claim: with no `_IVL_MAX` the interval never changes, and with one it
     /// doubles up to that ceiling and stops there.
     #[test]
@@ -351,6 +338,13 @@ mod tests {
     /// set, with the value named.
     #[test]
     fn unusable_options_are_refused() {
+        // The defaults are a configuration this library can deliver, which
+        // is the only claim about them worth a test: the numbers themselves
+        // are libzmq's and are stated where they are defined.
+        SocketOptions::default()
+            .validate()
+            .expect("the defaults are usable");
+
         for broken in [
             SocketOptions {
                 max_message_size: 0,

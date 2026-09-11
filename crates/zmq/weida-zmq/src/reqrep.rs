@@ -703,7 +703,9 @@ mod tests {
             ])
             .expect("frames");
             wire.write_message(&right).await.expect("right reply");
-            // Hold the connection until the test is done with it.
+            // Hold the connection while the client reads its reply.
+            // Margin: 200 ms against a reply the client awaits rather than
+            // samples for, so this only has to outlast the await.
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
 

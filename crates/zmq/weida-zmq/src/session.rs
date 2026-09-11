@@ -760,9 +760,11 @@ mod tests {
         assert_eq!(kind, FrameKind::Command, "READY is still a command");
         peer.ready(SocketType::Pull).await;
 
-        // Many heartbeat intervals pass. Nothing may arrive but the message
-        // we ask for, which proves the silence is the version's doing rather
-        // than a stalled session.
+        // Margin: fifteen heartbeat intervals (150 ms over a 10 ms
+        // ZMQ_HEARTBEAT_IVL). The phenomenon is a PING that must never come,
+        // so the interval count is the margin: a session that sent one would
+        // have sent fifteen. The message afterwards proves the silence is the
+        // version's doing rather than a stalled session.
         tokio::time::sleep(Duration::from_millis(150)).await;
         pipe.outgoing()
             .send(Multipart::single("still alive"))
@@ -782,6 +784,11 @@ mod tests {
 
     /// Claim: a 3.1 peer does get `PING`s on `ZMQ_HEARTBEAT_IVL`, carrying
     /// the `ZMQ_HEARTBEAT_TTL` hint in deciseconds.
+    ///
+    /// Margin: none is needed in the assertion — the read below waits for
+    /// the PING rather than sampling for it, so a 10 ms interval only sets
+    /// how soon the test finishes, and a heartbeat that never came would
+    /// hang the read until the harness kills it rather than pass.
     #[tokio::test]
     async fn a_three_one_peer_is_pinged_on_the_interval() {
         let (ours, theirs) = pair().await;

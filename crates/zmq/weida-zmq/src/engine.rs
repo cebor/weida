@@ -1202,7 +1202,9 @@ mod tests {
             .expect("rebind");
         let served = tokio::spawn(async move {
             let (stream, _) = again.accept().await.expect("accept");
-            // Hold it, so the connection stays up while we assert.
+            // Hold it while the assertions below run. Margin: 200 ms
+            // against `wait_for`'s 5 ms polling, and the assertions are
+            // waits rather than samples, so this only has to outlast them.
             tokio::time::sleep(Duration::from_millis(200)).await;
             drop(stream);
         });
@@ -1251,6 +1253,10 @@ mod tests {
         let engine = Engine::new(
             &ctx,
             SocketOptions {
+                // Margin: a 30 ms handshake interval against a peer that is
+                // held open for 5 s, so the interval is two orders of
+                // magnitude inside the window in which it must fire; the
+                // assertions wait for the drop rather than sampling for it.
                 handshake_ivl: Some(Duration::from_millis(30)),
                 // One attempt, so the assertion counts one connection.
                 reconnect_ivl: None,

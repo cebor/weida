@@ -496,16 +496,6 @@ mod tests {
         Multipart::single(body)
     }
 
-    /// Claim: the defaults are libzmq's, and the unit is messages.
-    #[test]
-    fn the_defaults_are_libzmqs() {
-        assert_eq!(DEFAULT_SNDHWM, 1000);
-        assert_eq!(DEFAULT_RCVHWM, 1000);
-        let config = PipeConfig::default();
-        assert_eq!(config.outgoing.hwm, 1000);
-        assert_eq!(config.incoming.hwm, 1000);
-    }
-
     /// Claim: the mute-state column of `zmq_socket(3)`'s table, row for row,
     /// including the four rows the manual omits.
     #[test]
@@ -583,6 +573,10 @@ mod tests {
             let q = Arc::clone(&q);
             tokio::spawn(async move { q.send(message("second")).await })
         };
+        // Margin: 50 ms for a send that must *not* complete. The
+        // phenomenon is the absence of an event, so the interval only has to
+        // exceed the time the send would take if the bound did not hold,
+        // which is a queue push on the same thread — microseconds.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!sender.is_finished(), "the bound must hold the sender");
         assert_eq!(q.dropped(), 0, "a blocking queue discards nothing");
@@ -659,6 +653,8 @@ mod tests {
             let q = Arc::clone(&q);
             tokio::spawn(async move { q.recv().await })
         };
+        // Margin: 20 ms for a receive that must not complete yet; a
+        // receive that wrongly returned would have done so in microseconds.
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!receiver.is_finished());
         q.send(message("late")).await.expect("send");
@@ -700,6 +696,8 @@ mod tests {
             let q = Arc::clone(&q);
             tokio::spawn(async move { q.send(message("three")).await })
         };
+        // Margin: as above — 20 ms against a would-be completion measured
+        // in microseconds.
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!blocked.is_finished());
 
