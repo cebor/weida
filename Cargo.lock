@@ -1647,6 +1647,17 @@ name = "weida-zmtp"
 version = "0.1.0"
 
 [[package]]
+name = "weida-zmtp-bridge"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "weida",
+ "weida-zmtp",
+]
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
