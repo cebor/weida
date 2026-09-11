@@ -451,6 +451,29 @@ delivered after `cancel()` is a genuine race between the reset frame and the rea
 and the exact stall index in the connection-window probe depends on header sizes. Both tests
 assert the race-free part instead, and no stream probe is `#[ignore]`d.
 
+### Verified results — DATA header cost at a high message rate (B-009)
+
+What the two DATA keys of [decision 0001](decisions/0001-sequence-field.md) cost per message.
+Neither key is on the wire yet, so each is simulated by the existing key with its exact wire
+shape: `content_len` for the `uint` sequence, and a `sha256:<64 hex>` `content_type` for the
+producer identity. Both endpoint paths are six bytes, so the two keys are the only difference.
+Same machine as the runs above, release profile, loopback, debug assertions off.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Bytes per message | `cargo bench -p weida --bench patterns -- header` (printed by the bench) | minimal DATA frame **135 B** for a 64-byte payload; with the two keys **215 B**, i.e. **+80 B**, +59.3 % of the whole frame. The split is `content_len` 6 B (1 B key + 5 B `uint`) and the 71-byte producer string 74 B (1 B key + 2 B `tstr` prefix + 71 B) |
+| Messages per second | `cargo bench -p weida --bench patterns -- header --warm-up-time 1 --measurement-time 3`, two runs | minimal `push_64b_keys0` 5.57 µs → **179.4 Kmsg/s** (5.43-5.71 µs); with two keys `push_64b_keys2` 6.14 µs → **162.9 Kmsg/s** (6.01-6.27 µs). Run-to-run change on the same tree was within ±3 % (p = 0.38-0.41), so the **−9 % throughput** between the two variants is larger than this machine's spread |
+
+Two conclusions carried into the wire work. First, the cost is the bytes, not the encoding:
+80 B more header for a 64-byte payload costs 9 % of the message rate, and the same two keys on
+a 64 KiB payload are noise. Second, the 215 B figure is the **worst case**, an explicitly named
+producer spelled as `sha256:<64 hex>`. Decision 0008 §4.4 settled the encoding from these
+numbers: the receiver already knows the sending peer's fingerprint from the handshake, so the
+producer key is omitted entirely in the default case and the default pays only the sequence's
+6 B; where the producer is not the connection peer the key is a CBOR `bstr` holding the raw
+32-byte digest, 35 B instead of 74 B, and the hex string stays presentation only. B-013
+implements both cases and their golden vectors.
+
 ---
 
 ## 5. Decisions
