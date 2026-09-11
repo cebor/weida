@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="560" viewBox="0 0 960 560" font-family="Helvetica, Arial, sans-serif" font-size="12">
+  <defs>
+    <style>
+      .box     { fill:#ffffff; stroke:#455a64; stroke-width:1.2; }
+      .built   { fill:#c8e6c9; stroke:#2e7d32; stroke-width:1.2; }
+      .partial { fill:#fff3cd; stroke:#b28704; stroke-width:1.2; }
+      .missing { fill:#ffffff; stroke:#90a4ae; stroke-width:1.2; stroke-dasharray:4 3; }
+      .band    { fill:#f5f7f8; stroke:none; }
+      .lbl     { fill:#263238; }
+      .sub     { fill:#546e7a; font-size:10px; }
+      .title   { fill:#263238; font-size:14px; font-weight:bold; }
+      .side    { fill:#37474f; font-size:11px; font-weight:bold; }
+      .arrow   { stroke:#455a64; stroke-width:1.2; fill:none; marker-end:url(#a); }
+    </style>
+    <marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#455a64"/></marker>
+  </defs>
+  <text x="20" y="28" class="title">What exists, layer by layer (green = built and tested, amber = partial, dashed = not yet)</text>
+
+  <!-- band: foreign peers -->
+  <rect x="20" y="44" width="920" height="70" class="band"/>
+  <text x="28" y="60" class="side">FOREIGN PEERS</text>
+  <rect x="140" y="56" width="150" height="46" rx="4" class="built"/><text x="148" y="74" class="lbl">ZeroMQ (zeromq crate)</text><text x="148" y="90" class="sub">REQ/DEALER, PUSH, SUB, PUB</text>
+  <rect x="300" y="56" width="150" height="46" rx="4" class="built"/><text x="308" y="74" class="lbl">NNG (nng crate)</text><text x="308" y="90" class="sub">REQ/REP, PUSH/PULL, PUB/SUB</text>
+  <rect x="460" y="56" width="150" height="46" rx="4" class="missing"/><text x="468" y="74" class="lbl">MQTT 5 clients</text><text x="468" y="90" class="sub">B3, document first</text>
+  <rect x="620" y="56" width="150" height="46" rx="4" class="missing"/><text x="628" y="74" class="lbl">AMQP 1.0 / NATS</text><text x="628" y="90" class="sub">B4</text>
+  <rect x="780" y="56" width="150" height="46" rx="4" class="missing"/><text x="788" y="74" class="lbl">Python / Java / Node</text><text x="788" y="90" class="sub">Phase C bindings</text>
+
+  <!-- band: adapters -->
+  <rect x="20" y="126" width="920" height="80" class="band"/>
+  <text x="28" y="142" class="side">ADAPTERS</text>
+  <text x="28" y="156" class="sub">crates/adapters/*</text>
+  <rect x="140" y="138" width="150" height="56" rx="4" class="built"/><text x="148" y="156" class="lbl">weida-zmtp</text><text x="148" y="170" class="sub">codec, no deps, fuzzed</text><text x="148" y="184" class="sub">weida-zmtp-bridge in/out</text>
+  <rect x="300" y="138" width="150" height="56" rx="4" class="built"/><text x="308" y="156" class="lbl">weida-sp</text><text x="308" y="170" class="sub">codec, no deps, fuzzed</text><text x="308" y="184" class="sub">weida-sp-bridge in/out</text>
+  <rect x="460" y="138" width="150" height="56" rx="4" class="missing"/><text x="468" y="156" class="lbl">weida-mqtt</text>
+  <rect x="620" y="138" width="150" height="56" rx="4" class="missing"/><text x="628" y="156" class="lbl">weida-amqp, weida-nats</text>
+  <rect x="780" y="138" width="150" height="56" rx="4" class="missing"/><text x="788" y="156" class="lbl">weida-py (PyO3)</text><text x="788" y="170" class="sub">B-058 ready to start</text>
+  <rect x="140" y="196" width="310" height="8" rx="2" class="partial"/><text x="455" y="203" class="sub">cross-tests: ZMTP ↔ SP, 9 chains, on branch</text>
+
+  <!-- arrows adapters -> runtime -->
+  <path d="M215,206 L215,232" class="arrow"/>
+  <path d="M375,206 L375,232" class="arrow"/>
+
+  <!-- band: runtime -->
+  <rect x="20" y="232" width="920" height="120" class="band"/>
+  <text x="28" y="248" class="side">RUNTIME</text>
+  <text x="28" y="262" class="sub">crates/weida</text>
+  <rect x="140" y="244" width="120" height="40" rx="4" class="built"/><text x="148" y="260" class="lbl">Patterns</text><text x="148" y="274" class="sub">Req/Rep, Push/Pull, Pub/Sub</text>
+  <rect x="270" y="244" width="120" height="40" rx="4" class="built"/><text x="278" y="260" class="lbl">Ordering</text><text x="278" y="274" class="sub">detect + reassemble</text>
+  <rect x="400" y="244" width="120" height="40" rx="4" class="built"/><text x="408" y="260" class="lbl">Dedup</text><text x="408" y="274" class="sub">Bounded(window)</text>
+  <rect x="530" y="244" width="120" height="40" rx="4" class="built"/><text x="538" y="260" class="lbl">Drain / shutdown</text><text x="538" y="274" class="sub">bounded, counted</text>
+  <rect x="660" y="244" width="120" height="40" rx="4" class="built"/><text x="668" y="260" class="lbl">Pool</text><text x="668" y="274" class="sub">one conn per path</text>
+  <rect x="790" y="244" width="140" height="40" rx="4" class="built"/><text x="798" y="260" class="lbl">Runtime::owned</text><text x="798" y="274" class="sub">no ambient reactor needed</text>
+  <rect x="140" y="292" width="250" height="40" rx="4" class="built"/><text x="148" y="308" class="lbl">weida-protocol</text><text x="148" y="322" class="sub">DATA keys 0–7, HELLO guarantee sets, filter grammar, fuzz</text>
+  <rect x="400" y="292" width="250" height="40" rx="4" class="built"/><text x="408" y="308" class="lbl">weida-core</text><text x="408" y="322" class="sub">Address (3 schemes), Limits (every bound named), errors</text>
+  <rect x="660" y="292" width="270" height="40" rx="4" class="partial"/><text x="668" y="308" class="lbl">Guarantee sets</text><text x="668" y="322" class="sub">core + supersets negotiated; Stored/Replicated reserved for L2</text>
+
+  <!-- arrow runtime -> boundary -->
+  <path d="M480,352 L480,372" class="arrow"/>
+
+  <!-- transport boundary -->
+  <rect x="140" y="372" width="790" height="34" rx="4" class="built"/>
+  <text x="148" y="393" class="lbl">Transport boundary — transport.rs: Link / SendHalf / RecvHalf as enums (no vtable on the payload path)</text>
+
+  <!-- band: transports -->
+  <rect x="20" y="420" width="920" height="80" class="band"/>
+  <text x="28" y="436" class="side">TRANSPORTS</text>
+  <rect x="140" y="432" width="180" height="56" rx="4" class="built"/><text x="148" y="450" class="lbl">QUIC (quinn)</text><text x="148" y="464" class="sub">TLS identity = fingerprint</text><text x="148" y="478" class="sub">one connection per dialled path</text>
+  <rect x="330" y="432" width="180" height="56" rx="4" class="built"/><text x="338" y="450" class="lbl">inproc</text><text x="338" y="464" class="sub">duplex channel pair per stream</text><text x="338" y="478" class="sub">peer = None</text>
+  <rect x="520" y="432" width="200" height="56" rx="4" class="built"/><text x="528" y="450" class="lbl">AF_UNIX (Linux, macOS)</text><text x="528" y="464" class="sub">control conn + token + SO_PEERCRED</text><text x="528" y="478" class="sub">reverse pool for fan-out (0012)</text>
+  <rect x="730" y="432" width="200" height="56" rx="4" class="missing"/><text x="738" y="450" class="lbl">Named pipes (Windows)</text><text x="738" y="464" class="sub">B-039 blocked: no Windows runner</text>
+
+  <text x="20" y="530" class="sub">Broker (Phase D) is absent by design: every guarantee is against the immediate next hop, and Accepted/Stored/Replicated/Processed are reserved until a broker hop exists.</text>
+  <text x="20" y="546" class="sub">Sources: docs/ARCHITECTURE.md §5–§7, docs/IMPLEMENTATION.md §1 (increments 1–15).</text>
+</svg>

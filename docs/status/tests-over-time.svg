@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="320" viewBox="0 0 960 320" font-family="Helvetica, Arial, sans-serif" font-size="12">
+  <defs>
+    <style>
+      .axis { stroke:#90a4ae; stroke-width:1; }
+      .grid { stroke:#eceff1; stroke-width:1; }
+      .line { stroke:#2e7d32; stroke-width:2.2; fill:none; }
+      .dot  { fill:#2e7d32; }
+      .lbl  { fill:#263238; }
+      .sub  { fill:#546e7a; font-size:10px; }
+      .title{ fill:#263238; font-size:14px; font-weight:bold; }
+      .ev   { fill:#37474f; font-size:9px; }
+    </style>
+  </defs>
+  <text x="20" y="28" class="title">Test count over the session (2026-09-11, UTC) — 218 → 494, one merge or item per point</text>
+
+  <!-- plot area: x 70..920 maps 00:00..20:00 ; y 270..60 maps 200..500 -->
+  <line x1="70" y1="270" x2="920" y2="270" class="axis"/>
+  <line x1="70" y1="60"  x2="70"  y2="270" class="axis"/>
+  <g class="grid">
+    <line x1="70" y1="200" x2="920" y2="200"/><line x1="70" y1="130" x2="920" y2="130"/><line x1="70" y1="60" x2="920" y2="60"/>
+  </g>
+  <text x="40" y="274" class="sub">200</text><text x="40" y="204" class="sub">300</text><text x="40" y="134" class="sub">400</text><text x="40" y="64" class="sub">500</text>
+  <g class="sub">
+    <text x="66"  y="288">00:00</text><text x="236" y="288">04:00</text><text x="406" y="288">08:00</text><text x="576" y="288">12:00</text><text x="746" y="288">16:00</text><text x="906" y="288">20:00</text>
+  </g>
+
+  <!-- points: x = 70 + minutes*42.5/60 ; y = 270 - (n-200)*0.7 -->
+  <polyline class="line" points="
+    70,257.4
+    229,257.4
+    277,254.6
+    368,239.2
+    432,227.3
+    540,211.2
+    615,162.2
+    763,124.4
+    780,115.3
+    837,84.5
+    864,80.3
+    920,64.2"/>
+  <g class="dot">
+    <circle cx="70"  cy="257.4" r="3"/>
+    <circle cx="229" cy="257.4" r="3"/>
+    <circle cx="277" cy="254.6" r="3"/>
+    <circle cx="368" cy="239.2" r="3"/>
+    <circle cx="432" cy="227.3" r="3"/>
+    <circle cx="540" cy="211.2" r="3"/>
+    <circle cx="615" cy="162.2" r="3"/>
+    <circle cx="763" cy="124.4" r="3"/>
+    <circle cx="780" cy="115.3" r="3"/>
+    <circle cx="837" cy="84.5" r="3"/>
+    <circle cx="864" cy="80.3" r="3"/>
+    <circle cx="920" cy="64.2" r="3"/>
+  </g>
+  <g class="ev">
+    <text x="74"  y="250">218 seed</text>
+    <text x="200" y="250">03:40 B-010 probe</text>
+    <text x="281" y="248">244 filters</text>
+    <text x="330" y="232">261 HELLO+detect</text>
+    <text x="436" y="220">284 reassembly</text>
+    <text x="500" y="204">354 drain+B-017</text>
+    <text x="560" y="155">408 AF_UNIX+0012</text>
+    <text x="700" y="118">421 reverse pool</text>
+    <text x="700" y="140">465 review pass</text>
+    <text x="800" y="70">494 stop</text>
+  </g>
+
+  <text x="70" y="310" class="sub">Every point is a merge into main after the four-step gate (fmt, clippy ×2, test, doc). No test was weakened or ignored to pass; counts come from docs/NIGHTLOG.md.</text>
+</svg>

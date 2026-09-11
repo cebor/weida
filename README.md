@@ -26,6 +26,7 @@ weida endpoints, and weida endpoints onto foreign ZeroMQ peers
 
 | Document | Contents |
 | --- | --- |
+| [docs/STATUS.md](docs/STATUS.md) | one-page status: roadmap, layers, the cross-adapter chain, tests over time, the measurements that decided something |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layer model, terminology, addressing, crate map, runtime internals, public API v0 |
 | [docs/PATTERNS.md](docs/PATTERNS.md) | the pattern reference: per-pattern tables in the shape of `zmq_socket(3)`, and what QUIC streams do underneath, measured |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | normative wire protocol v0: framing, frame headers, golden vectors, limits |

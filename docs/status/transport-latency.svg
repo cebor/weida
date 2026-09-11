@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="300" viewBox="0 0 960 300" font-family="Helvetica, Arial, sans-serif" font-size="12">
+  <defs>
+    <style>
+      .inproc { fill:#81c784; }
+      .unix   { fill:#64b5f6; }
+      .quic   { fill:#ffb74d; }
+      .lbl    { fill:#263238; }
+      .sub    { fill:#546e7a; font-size:10px; }
+      .title  { fill:#263238; font-size:14px; font-weight:bold; }
+      .axis   { stroke:#90a4ae; }
+    </style>
+  </defs>
+  <text x="20" y="28" class="title">Req/Rep round trip by transport (B-059, loopback, release; Push rows pending a decision)</text>
+
+  <!-- group 1: 1 KiB, scale 4 px per µs -->
+  <text x="20" y="66" class="lbl">1 KiB payload</text>
+  <g transform="translate(140,50)">
+    <rect x="0" y="0"  width="58"  height="16" class="inproc"/><text x="64"  y="12" class="sub">inproc 14.4 µs</text>
+    <rect x="0" y="22" width="224" height="16" class="unix"/>  <text x="230" y="34" class="sub">AF_UNIX 55.9 µs</text>
+    <rect x="0" y="44" width="268" height="16" class="quic"/>  <text x="274" y="56" class="sub">QUIC 67.1 µs</text>
+  </g>
+
+  <!-- group 2: 1 MiB, scale 0.28 px per µs -->
+  <text x="20" y="150" class="lbl">1 MiB payload</text>
+  <g transform="translate(140,134)">
+    <rect x="0" y="0"  width="45"  height="16" class="inproc"/><text x="51"  y="12" class="sub">inproc 162 µs</text>
+    <rect x="0" y="22" width="97"  height="16" class="unix"/>  <text x="103" y="34" class="sub">AF_UNIX 348 µs</text>
+    <rect x="0" y="44" width="756" height="16" class="quic"/>  <text x="762" y="56" class="sub">QUIC 2.70 ms</text>
+  </g>
+  <line x1="140" y1="45" x2="140" y2="200" class="axis"/>
+  <text x="140" y="214" class="sub">bars are scaled per group; read the numbers, not the ratios across groups</text>
+
+  <rect x="20" y="228" width="920" height="58" rx="6" fill="#fff3cd" stroke="#b28704"/>
+  <text x="30" y="246" class="lbl">Open decision found by this measurement (docs/NIGHTLOG.md, bottom)</text>
+  <text x="30" y="262" class="sub">Locally a queued inbound transfer holds an OS descriptor, so a fire-and-forget Push fills max_local_streams (255) and the 384th message is refused with LimitExceeded.</text>
+  <text x="30" y="277" class="sub">Either local open waits for a free slot (Block, same as QUIC) or the refusal stands and PATTERNS §1.10 documents Push/Pull as Reject locally. A patch was tried and measured inconclusive.</text>
+</svg>
