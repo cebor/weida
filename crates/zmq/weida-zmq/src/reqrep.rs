@@ -457,7 +457,7 @@ socket_endpoints!(RepSocket);
 mod tests {
     use super::*;
     use crate::context::ContextConfig;
-    use crate::message::DEFAULT_MAX_MESSAGE_SIZE;
+    use crate::message::MessageLimits;
     use crate::session::{Incoming, Wire};
     use tokio::net::TcpListener;
     use weida_zmtp::{Command, Greeting, Metadata, greeting};
@@ -665,7 +665,7 @@ mod tests {
 
         let peer = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            let mut wire = Wire::new(stream, DEFAULT_MAX_MESSAGE_SIZE);
+            let mut wire = Wire::new(stream, MessageLimits::default());
             // The handshake, from the peer's side.
             let mut greeting = [0u8; greeting::GREETING_LEN];
             wire.read_exactly_for_test(&mut greeting).await;
@@ -703,7 +703,9 @@ mod tests {
             ])
             .expect("frames");
             wire.write_message(&right).await.expect("right reply");
-            // Hold the connection until the test is done with it.
+            // Hold the connection while the client reads its reply.
+            // Margin: 200 ms against a reply the client awaits rather than
+            // samples for, so this only has to outlast the await.
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
 
@@ -733,7 +735,7 @@ mod tests {
 
         let peer = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
-            let mut wire = Wire::new(stream, DEFAULT_MAX_MESSAGE_SIZE);
+            let mut wire = Wire::new(stream, MessageLimits::default());
             let mut greeting = [0u8; greeting::GREETING_LEN];
             wire.read_exactly_for_test(&mut greeting).await;
             wire.write_raw_for_test(&Greeting::null().encode()).await;

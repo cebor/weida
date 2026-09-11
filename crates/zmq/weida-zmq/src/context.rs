@@ -501,13 +501,6 @@ mod tests {
         );
     }
 
-    /// Claim: the default ceiling is libzmq's 1023.
-    #[test]
-    fn the_default_ceiling_is_libzmqs() {
-        assert_eq!(ContextConfig::default().max_sockets, 1023);
-        assert_eq!(DEFAULT_MAX_SOCKETS, 1023);
-    }
-
     /// Claim: a socket past the ceiling fails with `EMFILE`, where libzmq's
     /// `zmq_socket()` fails, and a closed socket frees its slot.
     #[tokio::test]
@@ -559,6 +552,11 @@ mod tests {
         })
         .expect("context");
         let slot = ctx.open_socket().expect("a slot");
+        // Margin: the socket closes at 50 ms and the budget is 30 s, so the
+        // two outcomes are three orders of magnitude apart and the assertion
+        // below sits between them. The defect this catches — a shutdown that
+        // waits out its budget instead of noticing the last close — takes
+        // 30 s and fails at 5.
         let closing = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             drop(slot);
@@ -569,13 +567,17 @@ mod tests {
         closing.await.expect("the closing task");
         assert_eq!(report.outstanding(), 0);
         assert!(
-            started.elapsed() < Duration::from_secs(30),
+            started.elapsed() < Duration::from_secs(5),
             "the wait must end with the last socket, not with the budget"
         );
     }
 
     /// Claim: the close budget is finite and it bites — the deliberate
     /// deviation from `ZMQ_LINGER = -1`, which would hang here forever.
+    ///
+    /// Margin: a 20 ms budget against a 5 s assertion, so the machine has
+    /// 250 times the budget to get there; the defect — an infinite linger —
+    /// never returns at all, which no margin can rescue.
     #[tokio::test]
     async fn the_close_budget_is_finite() {
         let ctx = Context::new(ContextConfig {

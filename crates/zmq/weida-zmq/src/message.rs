@@ -46,6 +46,56 @@ use crate::error::{Error, Result};
 /// these numbers to real peers say so where they take them.
 pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1024 * 1024;
 
+/// Default ceiling on the frames of one message.
+///
+/// **37/ZMTP sets none** — "the total number of message parts is unlimited
+/// except by available memory" (`docs/research/zeromq.md` §3) — so this
+/// number is ours, in the same way the finite close budget and the real
+/// `ZMQ_MAXMSGSIZE` default are
+/// ([0013](../../../docs/decisions/0013-competitor-libraries.md) §4.4
+/// item 5).
+///
+/// It is chosen against two products. A frame costs at least two octets on
+/// the wire and a `Message` costs a `Vec` header plus its bytes, so 1024
+/// frames of nothing are kilobytes rather than the eight megabytes an
+/// unbounded count allowed. And the count bounds *work*, not only memory:
+/// an incomplete message is re-parsed from the front on every read, so the
+/// re-parse is 1024 headers at worst instead of the whole buffer. Every
+/// envelope any ZeroMQ pattern defines is a handful of frames — the reply
+/// envelope is one delimiter plus addresses, a RADIO message is two — so a
+/// legitimate message is orders of magnitude below this, and an application
+/// whose own framing is not may raise it.
+pub const DEFAULT_MAX_MESSAGE_FRAMES: usize = 1024;
+
+/// What bounds one inbound message.
+///
+/// Two numbers, because one of them alone bounds nothing: bytes without a
+/// frame count lets empty frames accumulate for free, and a frame count
+/// without bytes lets one frame declare 2^63-1 octets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageLimits {
+    /// `ZMQ_MAXMSGSIZE`, counting frame headers as well as declared bodies.
+    pub max_bytes: u64,
+    /// Frames one message may have. See [`DEFAULT_MAX_MESSAGE_FRAMES`].
+    pub max_frames: usize,
+}
+
+impl MessageLimits {
+    /// Limits of `max_bytes` and `max_frames`.
+    pub const fn new(max_bytes: u64, max_frames: usize) -> MessageLimits {
+        MessageLimits {
+            max_bytes,
+            max_frames,
+        }
+    }
+}
+
+impl Default for MessageLimits {
+    fn default() -> MessageLimits {
+        MessageLimits::new(DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_MESSAGE_FRAMES)
+    }
+}
+
 /// One frame: an opaque byte string.
 ///
 /// ZeroMQ has no payload typing — "ZeroMQ strings are length-specified and
@@ -236,8 +286,7 @@ impl Multipart {
         out
     }
 
-    /// Decodes whatever is at the front of `input`, under a total message
-    /// budget of `max_message_bytes`.
+    /// Decodes whatever is at the front of `input`, under `limits`.
     ///
     /// Nothing is delivered until it is whole: a buffer holding the first two
     /// frames of a three-frame message yields [`Decoded::Incomplete`] and
@@ -247,21 +296,44 @@ impl Multipart {
     /// multipart sequence is a protocol violation, because MORE "SHALL be
     /// zero on command frames".
     ///
-    /// Fails with `EMSGSIZE` when the frames declare more than
-    /// `max_message_bytes` in total. The check is on the declared length, so
-    /// it fires on a header alone, before the body has arrived and before
+    /// Fails with `EMSGSIZE` when the message exceeds either bound of
+    /// [`MessageLimits`], and does so from the **declared** sizes: a header
+    /// alone is enough to refuse it, before the body has arrived and before
     /// anything is reserved for it.
-    pub fn decode(input: &[u8], max_message_bytes: u64) -> Result<Decoded<'_>> {
+    ///
+    /// **Both bounds are load-bearing, and the second one was a hole.**
+    /// Counting declared bodies alone bounds nothing: an empty frame declares
+    /// no body, so a peer sending `01 00` — one empty frame, MORE set —
+    /// forever grew a reader's buffer by two octets per frame with
+    /// `ZMQ_MAXMSGSIZE` untouched (measured: four million of them are eight
+    /// megabytes held against a one-mebibyte ceiling, and still
+    /// `Incomplete`). So a frame costs its **header plus its declared body**
+    /// against [`MessageLimits::max_bytes`], and the frame count has a
+    /// ceiling of its own.
+    pub fn decode(input: &[u8], limits: MessageLimits) -> Result<Decoded<'_>> {
         let mut frames: Vec<Message> = Vec::new();
         let mut held: u64 = 0;
         let mut at = 0usize;
         loop {
-            let remaining = max_message_bytes.saturating_sub(held);
+            let remaining = limits.max_bytes.saturating_sub(held);
             let (header, used) = match frame::decode_header(&input[at..], remaining) {
                 Ok(decoded) => decoded,
                 Err(FrameError::Incomplete) => return Ok(Decoded::Incomplete),
-                Err(e) => return Err(frame_error(e, max_message_bytes)),
+                Err(e) => return Err(frame_error(e, limits.max_bytes)),
             };
+            // The header's own octets count too: this is the check that makes
+            // a stream of empty frames finite.
+            let cost = used as u64 + header.len;
+            if cost > remaining {
+                return Err(Error::EMSGSIZE(
+                    format!(
+                        "this message has reached its {}-byte budget (ZMQ_MAXMSGSIZE), \
+                         counting frame headers; the next frame needs {cost} more",
+                        limits.max_bytes
+                    )
+                    .into(),
+                ));
+            }
             let body_at = at + used;
             let Some(end) = body_at.checked_add(header.len as usize) else {
                 return Err(Error::EMSGSIZE(
@@ -288,7 +360,17 @@ impl Multipart {
                     });
                 }
                 FrameKind::Message { more } => {
-                    held += header.len;
+                    if frames.len() >= limits.max_frames {
+                        return Err(Error::EMSGSIZE(
+                            format!(
+                                "this message already has its ceiling of {} frames; \
+                                 37/ZMTP sets no limit, so this one is ours",
+                                limits.max_frames
+                            )
+                            .into(),
+                        ));
+                    }
+                    held += cost;
                     frames.push(Message::from(&input[body_at..end]));
                     at = end;
                     if !more {
@@ -454,7 +536,7 @@ mod tests {
         let long = vec![7u8; 300];
         let message = parts(&[b"", b"header", &long]);
         let encoded = message.encode();
-        match Multipart::decode(&encoded, DEFAULT_MAX_MESSAGE_SIZE).expect("decode") {
+        match Multipart::decode(&encoded, MessageLimits::default()).expect("decode") {
             Decoded::Message {
                 message: back,
                 consumed,
@@ -476,13 +558,13 @@ mod tests {
         let encoded = message.encode();
         for cut in 0..encoded.len() {
             assert_eq!(
-                Multipart::decode(&encoded[..cut], DEFAULT_MAX_MESSAGE_SIZE).expect("decode"),
+                Multipart::decode(&encoded[..cut], MessageLimits::default()).expect("decode"),
                 Decoded::Incomplete,
                 "a {cut}-byte prefix must deliver nothing"
             );
         }
         assert!(matches!(
-            Multipart::decode(&encoded, DEFAULT_MAX_MESSAGE_SIZE).expect("decode"),
+            Multipart::decode(&encoded, MessageLimits::default()).expect("decode"),
             Decoded::Message { .. }
         ));
     }
@@ -497,7 +579,7 @@ mod tests {
         header.extend_from_slice(&(i64::MAX as u64).to_be_bytes());
         assert_eq!(header.len(), 9);
 
-        let err = Multipart::decode(&header, DEFAULT_MAX_MESSAGE_SIZE).unwrap_err();
+        let err = Multipart::decode(&header, MessageLimits::default()).unwrap_err();
         assert_eq!(err.errno(), "EMSGSIZE", "{err}");
         assert!(err.cause().contains("nothing was allocated"), "{err}");
     }
@@ -513,11 +595,19 @@ mod tests {
         let encoded = message.encode();
 
         assert!(matches!(
-            Multipart::decode(&encoded, 300).expect("at the budget"),
+            Multipart::decode(
+                &encoded,
+                MessageLimits::new(400, DEFAULT_MAX_MESSAGE_FRAMES)
+            )
+            .expect("at the budget"),
             Decoded::Message { .. }
         ));
 
-        let err = Multipart::decode(&encoded, 250).unwrap_err();
+        let err = Multipart::decode(
+            &encoded,
+            MessageLimits::new(250, DEFAULT_MAX_MESSAGE_FRAMES),
+        )
+        .unwrap_err();
         assert_eq!(err.errno(), "EMSGSIZE", "{err}");
     }
 
@@ -527,7 +617,7 @@ mod tests {
     #[test]
     fn a_command_frame_is_not_part_of_a_message() {
         let command = frame::encode(FrameKind::Command, b"\x05READY");
-        match Multipart::decode(&command, DEFAULT_MAX_MESSAGE_SIZE).expect("decode") {
+        match Multipart::decode(&command, MessageLimits::default()).expect("decode") {
             Decoded::Command { body, consumed } => {
                 assert_eq!(body, b"\x05READY");
                 assert_eq!(consumed, command.len());
@@ -537,7 +627,7 @@ mod tests {
 
         let mut mixed = frame::encode(FrameKind::Message { more: true }, b"first");
         mixed.extend_from_slice(&command);
-        let err = Multipart::decode(&mixed, DEFAULT_MAX_MESSAGE_SIZE).unwrap_err();
+        let err = Multipart::decode(&mixed, MessageLimits::default()).unwrap_err();
         assert_eq!(err.errno(), "EINVAL", "{err}");
         assert!(err.cause().contains("command"), "{err}");
     }
@@ -552,7 +642,7 @@ mod tests {
         buffer.extend_from_slice(&second.encode());
 
         let Decoded::Message { message, consumed } =
-            Multipart::decode(&buffer, DEFAULT_MAX_MESSAGE_SIZE).expect("first")
+            Multipart::decode(&buffer, MessageLimits::default()).expect("first")
         else {
             panic!("expected the first message");
         };
@@ -561,7 +651,7 @@ mod tests {
         let Decoded::Message {
             message,
             consumed: rest,
-        } = Multipart::decode(&buffer[consumed..], DEFAULT_MAX_MESSAGE_SIZE).expect("second")
+        } = Multipart::decode(&buffer[consumed..], MessageLimits::default()).expect("second")
         else {
             panic!("expected the second message");
         };
@@ -573,15 +663,62 @@ mod tests {
     /// codec's rule, surfaced in this crate's vocabulary.
     #[test]
     fn a_malformed_frame_is_einval() {
-        let err = Multipart::decode(&[0xF8, 0x00], DEFAULT_MAX_MESSAGE_SIZE).unwrap_err();
+        let err = Multipart::decode(&[0xF8, 0x00], MessageLimits::default()).unwrap_err();
         assert_eq!(err.errno(), "EINVAL", "{err}");
     }
 
-    /// Claim: the default message bound is a real number rather than libzmq's
-    /// "no limit", and it is the one the bridge arrived at for the same
-    /// quantity.
+    /// Claim: **a peer cannot hold a reader's memory with frames that
+    /// declare nothing.** This is the review's reproduction: `01 00` — one
+    /// empty frame with MORE set — repeated. Before the header octets
+    /// counted, four million of them were eight megabytes of buffer against
+    /// a one-mebibyte ceiling and still `Incomplete`; now the decode refuses
+    /// long before that, from the accumulated declared size, and says which
+    /// bound it hit.
     #[test]
-    fn the_default_message_bound_is_finite() {
-        assert_eq!(DEFAULT_MAX_MESSAGE_SIZE, 1024 * 1024);
+    fn a_stream_of_empty_frames_is_refused_rather_than_accumulated() {
+        // Enough frames to blow a small budget many times over, and far more
+        // than the frame ceiling.
+        let mut hostile = Vec::new();
+        for _ in 0..8_192 {
+            hostile.extend_from_slice(&[0x01, 0x00]);
+        }
+
+        // Against the byte budget: two octets a frame, so a 512-byte budget
+        // is spent after 256 of them.
+        let err = Multipart::decode(&hostile, MessageLimits::new(512, 100_000)).unwrap_err();
+        assert_eq!(err.errno(), "EMSGSIZE", "{err}");
+        assert!(err.cause().contains("512"), "{err}");
+
+        // And against the frame ceiling, which is what bounds the re-parse
+        // as well as the memory.
+        let err = Multipart::decode(&hostile, MessageLimits::new(1 << 30, 64)).unwrap_err();
+        assert_eq!(err.errno(), "EMSGSIZE", "{err}");
+        assert!(err.cause().contains("64"), "{err}");
+
+        // The default limits refuse it too, which is the case a socket runs
+        // under: 8192 empty frames is under the default byte budget and over
+        // the default frame ceiling, so the frame ceiling is what catches it.
+        let err = Multipart::decode(&hostile, MessageLimits::default()).unwrap_err();
+        assert_eq!(err.errno(), "EMSGSIZE", "{err}");
+    }
+
+    /// Claim: a legitimate many-frame message just under the ceiling still
+    /// decodes — the bound refuses the excess, not the pattern.
+    #[test]
+    fn a_many_frame_message_under_the_ceiling_still_decodes() {
+        let limits = MessageLimits::new(DEFAULT_MAX_MESSAGE_SIZE, 64);
+        let frames: Vec<Message> = (0..64).map(|n| Message::from(format!("{n}"))).collect();
+        let message = Multipart::new(frames).expect("frames");
+        let encoded = message.encode();
+        match Multipart::decode(&encoded, limits).expect("decode") {
+            Decoded::Message { message: back, .. } => assert_eq!(back.len(), 64),
+            other => panic!("expected a message, got {other:?}"),
+        }
+
+        // One more frame than the ceiling is one too many.
+        let frames: Vec<Message> = (0..65).map(|n| Message::from(format!("{n}"))).collect();
+        let over = Multipart::new(frames).expect("frames").encode();
+        let err = Multipart::decode(&over, limits).unwrap_err();
+        assert_eq!(err.errno(), "EMSGSIZE", "{err}");
     }
 }

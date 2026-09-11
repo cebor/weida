@@ -208,11 +208,26 @@ struct Connecter {
 
 struct EngineState {
     peers: HashMap<PeerId, PeerEntry>,
+    /// Peers admitted from *accepted* connections, which is the count a
+    /// stranger chooses and `max_peers` bounds. The connected ones are not
+    /// counted here: their number is how many times the local application
+    /// called `connect`.
+    accepted: usize,
     binds: Vec<Bound>,
     connects: Vec<Connecter>,
     last_endpoint: Option<Endpoint>,
     next_peer: u64,
     closed: bool,
+}
+
+/// What [`EngineInner::admit`] decided about an accepted connection.
+enum Admitted {
+    /// Admitted, as this peer.
+    Peer(PeerId),
+    /// Refused: this socket already holds `max_peers` accepted connections.
+    AtCeiling,
+    /// Refused: the socket is closed, so there is nothing to accept onto.
+    SocketClosed,
 }
 
 struct EngineInner {
@@ -285,6 +300,7 @@ impl Engine {
                 slot,
                 state: Mutex::new(EngineState {
                     peers: HashMap::new(),
+                    accepted: 0,
                     binds: Vec::new(),
                     connects: Vec::new(),
                     last_endpoint: None,
@@ -550,6 +566,7 @@ impl Engine {
         for (_, entry) in state.peers.drain() {
             entry.pipe.close();
         }
+        state.accepted = 0;
         drop(state);
         self.inner.peers_changed.notify_waiters();
     }
@@ -640,13 +657,25 @@ fn check_transport(endpoint: &Endpoint) -> Result<()> {
 }
 
 impl EngineInner {
-    fn admit(&self, endpoint: Option<Endpoint>, pipe: Pipe) -> Option<PeerId> {
+    /// Admits an accepted connection, or says why it cannot be.
+    ///
+    /// This is where `max_peers` is enforced, because this is where the entry
+    /// is inserted: `ZMQ_MAX_SOCKETS` bounds sockets per *context* and
+    /// `ZMQ_BACKLOG` the kernel's accept queue, and neither bounds how many
+    /// established connections one socket holds. Every admitted peer carries
+    /// a `Pipe` of `ZMQ_SNDHWM`/`ZMQ_RCVHWM` messages per direction, so an
+    /// unbounded count multiplies that product by a number a stranger picks.
+    fn admit(&self, endpoint: Option<Endpoint>, pipe: Pipe) -> Admitted {
         let mut state = self.state.lock().expect("engine state poisoned");
         if state.closed {
-            return None;
+            return Admitted::SocketClosed;
+        }
+        if state.accepted >= self.options.max_peers {
+            return Admitted::AtCeiling;
         }
         let peer = PeerId(state.next_peer);
         state.next_peer += 1;
+        state.accepted += 1;
         state.peers.insert(
             peer,
             PeerEntry {
@@ -658,16 +687,18 @@ impl EngineInner {
         );
         drop(state);
         self.peers_changed.notify_waiters();
-        Some(peer)
+        Admitted::Peer(peer)
     }
 
     fn forget(&self, peer: PeerId) {
-        let entry = self
-            .state
-            .lock()
-            .expect("engine state poisoned")
-            .peers
-            .remove(&peer);
+        let entry = {
+            let mut state = self.state.lock().expect("engine state poisoned");
+            let entry = state.peers.remove(&peer);
+            if entry.as_ref().is_some_and(|entry| entry.endpoint.is_none()) {
+                state.accepted -= 1;
+            }
+            entry
+        };
         if let Some(entry) = entry {
             // An accepted peer's queue is destroyed with its connection,
             // "discarding any messages it contains".
@@ -724,8 +755,21 @@ async fn accept_loop(ctx: TaskCtx, listener: TcpListener, endpoint: Endpoint) {
             return;
         };
         let pipe = Pipe::new(ctx.options.pipe);
-        let Some(peer) = engine.admit(None, pipe.clone()) else {
-            return;
+        let peer = match engine.admit(None, pipe.clone()) {
+            Admitted::Peer(peer) => peer,
+            // Past the ceiling: the connection is closed by dropping the
+            // stream, which a foreign peer observes as an immediate EOF, and
+            // no entry is left behind. Accepting continues, because the
+            // ceiling is a bound on live peers rather than on the listener.
+            Admitted::AtCeiling => {
+                tracing::warn!(
+                    ceiling = ctx.options.max_peers,
+                    "refused an accepted connection: this socket already holds its max_peers"
+                );
+                drop(stream);
+                continue;
+            }
+            Admitted::SocketClosed => return,
         };
         drop(engine);
 
@@ -1158,7 +1202,9 @@ mod tests {
             .expect("rebind");
         let served = tokio::spawn(async move {
             let (stream, _) = again.accept().await.expect("accept");
-            // Hold it, so the connection stays up while we assert.
+            // Hold it while the assertions below run. Margin: 200 ms
+            // against `wait_for`'s 5 ms polling, and the assertions are
+            // waits rather than samples, so this only has to outlast them.
             tokio::time::sleep(Duration::from_millis(200)).await;
             drop(stream);
         });
@@ -1207,6 +1253,10 @@ mod tests {
         let engine = Engine::new(
             &ctx,
             SocketOptions {
+                // Margin: a 30 ms handshake interval against a peer that is
+                // held open for 5 s, so the interval is two orders of
+                // magnitude inside the window in which it must fire; the
+                // assertions wait for the drop rather than sampling for it.
                 handshake_ivl: Some(Duration::from_millis(30)),
                 // One attempt, so the assertion counts one connection.
                 reconnect_ivl: None,
@@ -1313,5 +1363,62 @@ mod tests {
         assert_eq!(report.outstanding(), 1, "the socket slot is still held");
         let err = engine.bind(&bound).await.unwrap_err();
         assert_eq!(err.errno(), "ETERM", "{err}");
+    }
+
+    /// Claim: **a stranger cannot make one socket hold unboundedly many
+    /// peers.** `max_peers` bounds the accepted connections; the excess is
+    /// closed rather than admitted, leaves no entry behind, and the admitted
+    /// one keeps working. Neither `ZMQ_MAX_SOCKETS` nor `ZMQ_BACKLOG` is
+    /// this bound, which is why the option exists.
+    #[tokio::test]
+    async fn accepted_peers_stop_at_max_peers() {
+        use tokio::io::AsyncReadExt;
+
+        let ctx = context();
+        let session = Recorder::new();
+        let engine = Engine::new(
+            &ctx,
+            SocketOptions {
+                max_peers: 1,
+                ..options()
+            },
+            as_session(&session),
+        )
+        .expect("engine");
+        let bound = engine
+            .bind(&Endpoint::parse("tcp://127.0.0.1:0").expect("endpoint"))
+            .await
+            .expect("bind");
+        let addr: std::net::SocketAddr = bound.to_string()["tcp://".len()..].parse().expect("addr");
+
+        let admitted = TcpStream::connect(addr).await.expect("first connection");
+        wait_for(|| engine.peers().len() == 1).await;
+
+        // Three more, all past the ceiling: each is accepted by the kernel
+        // and then closed, which a foreign peer observes as an immediate EOF.
+        for _ in 0..3 {
+            let mut refused = TcpStream::connect(addr)
+                .await
+                .expect("a further connection");
+            let mut byte = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(5), refused.read(&mut byte))
+                .await
+                .expect("the refusal was not left hanging")
+                .expect("read");
+            assert_eq!(read, 0, "a refused connection must be closed, not served");
+        }
+
+        // No entry is left behind, and the admitted peer is untouched.
+        assert_eq!(engine.peers().len(), 1, "the ceiling held");
+        assert_eq!(session.count(), 1, "only the admitted one got a session");
+        assert!(engine.peers()[0].connected);
+
+        // And a slot freed by a peer going away is usable again.
+        drop(admitted);
+        wait_for(|| engine.peers().is_empty()).await;
+        let _next = TcpStream::connect(addr)
+            .await
+            .expect("after the slot freed");
+        wait_for(|| engine.peers().len() == 1).await;
     }
 }

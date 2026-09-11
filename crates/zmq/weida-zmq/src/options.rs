@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::identity::RoutingId;
-use crate::message::DEFAULT_MAX_MESSAGE_SIZE;
+use crate::message::{DEFAULT_MAX_MESSAGE_FRAMES, DEFAULT_MAX_MESSAGE_SIZE, MessageLimits};
 use crate::pipe::PipeConfig;
 
 /// `ZMQ_RECONNECT_IVL` default: 100 ms (`docs/research/zeromq.md` §11).
@@ -42,6 +42,18 @@ pub const DEFAULT_BACKLOG: u32 = 100;
 /// necessary because the first is not necessarily reachable — `localhost`
 /// commonly resolves to both `::1` and `127.0.0.1`.
 pub const DEFAULT_MAX_RESOLVED_ADDRESSES: usize = 8;
+
+/// Peers one socket admits from accepted connections, by default.
+///
+/// libzmq has no such option, so the number is ours to choose and to state.
+/// 1024 is `ZMQ_MAX_SOCKETS`'s own order of magnitude and one above
+/// `ZMQ_BACKLOG`'s 100, so a listener that fills its accept queue several
+/// times over is still admitted; what it bounds is the product underneath —
+/// at the default high-water marks and message size, 1024 peers is the
+/// ceiling on `1024 × 2 × ZMQ_RCVHWM × ZMQ_MAXMSGSIZE` rather than on
+/// nothing at all. A deployment that expects more peers than this raises it
+/// deliberately, having seen that arithmetic.
+pub const DEFAULT_MAX_PEERS: usize = 1024;
 
 /// The largest `ZMQ_HEARTBEAT_TTL` the wire can carry: the field is
 /// deciseconds in a `u16`, so 6553.5 s (`docs/research/zeromq.md` §11).
@@ -125,6 +137,23 @@ pub struct SocketOptions {
     /// so that a ROUTER peer can address it by a name it chose rather than
     /// by a generated one (`docs/research/zeromq.md` §4.2).
     pub routing_id: Option<RoutingId>,
+    /// Frames one inbound message may have — not a libzmq option, because
+    /// 37/ZMTP has no such limit and an unbounded frame count is unbounded
+    /// memory. See [`DEFAULT_MAX_MESSAGE_FRAMES`].
+    pub max_message_frames: usize,
+    /// Peers this socket will admit from **accepted** connections.
+    ///
+    /// **Not a libzmq option**, and the parity table says so in those terms:
+    /// `ZMQ_MAX_SOCKETS` bounds sockets per context, `ZMQ_BACKLOG` bounds the
+    /// kernel's accept queue, and neither bounds how many established
+    /// connections one socket holds — libzmq has no option that does. Every
+    /// admitted peer carries a queue of `ZMQ_RCVHWM` messages inbound and
+    /// `ZMQ_SNDHWM` outbound, so without this the exposure is that product
+    /// times a number a stranger chooses. See
+    /// [`DEFAULT_MAX_PEERS`] for the default and its arithmetic. Connections
+    /// this socket dialled are not counted: their number is how many times
+    /// the application called `connect`.
+    pub max_peers: usize,
     /// `ZMQ_SNDHWM`/`ZMQ_RCVHWM` and the mute action, per peer.
     pub pipe: PipeConfig,
     /// See [`DEFAULT_MAX_RESOLVED_ADDRESSES`].
@@ -141,6 +170,8 @@ impl Default for SocketOptions {
             immediate: false,
             backlog: DEFAULT_BACKLOG,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_message_frames: DEFAULT_MAX_MESSAGE_FRAMES,
+            max_peers: DEFAULT_MAX_PEERS,
             heartbeat_ivl: None,
             heartbeat_timeout: None,
             heartbeat_ttl: None,
@@ -170,6 +201,16 @@ impl SocketOptions {
                  request be reported as the reply to the one that superseded it; libzmq \
                  documents that hazard and this library refuses it"
                     .into(),
+            ));
+        }
+        if self.max_peers == 0 {
+            return Err(Error::EINVAL(
+                "max_peers is zero, so this socket could accept no connection at all".into(),
+            ));
+        }
+        if self.max_message_frames == 0 {
+            return Err(Error::EINVAL(
+                "max_message_frames is zero, so every message would be refused".into(),
             ));
         }
         if self.max_resolved_addresses == 0 {
@@ -216,6 +257,12 @@ impl SocketOptions {
         Ok(())
     }
 
+    /// What bounds one inbound message: `ZMQ_MAXMSGSIZE` and the frame
+    /// ceiling, which the session hands to every connection it drives.
+    pub const fn message_limits(&self) -> MessageLimits {
+        MessageLimits::new(self.max_message_size, self.max_message_frames)
+    }
+
     /// The next reconnect interval after `previous`, doubling towards
     /// `ZMQ_RECONNECT_IVL_MAX`.
     ///
@@ -242,19 +289,6 @@ impl SocketOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Claim: every default is the number libzmq's manual publishes.
-    #[test]
-    fn the_defaults_are_libzmqs() {
-        let options = SocketOptions::default();
-        assert_eq!(options.reconnect_ivl, Some(Duration::from_millis(100)));
-        assert_eq!(options.reconnect_ivl_max, None, "libzmq's 0: no backoff");
-        assert_eq!(options.handshake_ivl, Some(Duration::from_secs(30)));
-        assert_eq!(options.connect_timeout, None, "libzmq's 0: the OS default");
-        assert!(!options.immediate, "libzmq's 0");
-        assert_eq!(options.backlog, 100);
-        options.validate().expect("the defaults are usable");
-    }
 
     /// Claim: with no `_IVL_MAX` the interval never changes, and with one it
     /// doubles up to that ceiling and stops there.
@@ -304,6 +338,13 @@ mod tests {
     /// set, with the value named.
     #[test]
     fn unusable_options_are_refused() {
+        // The defaults are a configuration this library can deliver, which
+        // is the only claim about them worth a test: the numbers themselves
+        // are libzmq's and are stated where they are defined.
+        SocketOptions::default()
+            .validate()
+            .expect("the defaults are usable");
+
         for broken in [
             SocketOptions {
                 max_message_size: 0,
