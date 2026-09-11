@@ -130,7 +130,7 @@ acceptance: `docs/decisions/0009-drain.md`, accepted, closing SYNTHESIS §8.6: w
 note: the evidence turned up a defect while it was being gathered: `Runtime::shutdown` already waits on `wait_idle()` with **no bound**, so today's tree has ZeroMQ's failure mode in a place where it buys nothing. The note names it and B-031 fixes it separately, ahead of the drain feature itself (B-032) and its spec sync (B-033). The ZMTP mapping's loss L9 was updated in place, since "SYNTHESIS §8.6, still open" had become false.
 
 ### B-027 — Decision 0010: the local transport, per platform
-kind: research | size: 60 | status: ready | needs: []
+kind: research | size: 60 | status: in_progress 2026-09-11T08:08Z | needs: []
 acceptance: `docs/decisions/0010-local-transport.md`, accepted, closing SYNTHESIS §8.8 and unblocking roadmap A9: the Linux default (`AF_UNIX` `SOCK_STREAM` against `SOCK_SEQPACKET` and the abstract namespace), the macOS default, the Windows default (named pipes against Windows `AF_UNIX`), the fallback chain, and whether a bulk payload ever travels by handle passing rather than by bytes — each with the cost `docs/research/ipc.md` §11 already records; inproc binding is named as the first slice because it needs no platform decision at all; SYNTHESIS §8.8 closed and README row added.
 
 ### B-028 — Preserve why a connection was lost
