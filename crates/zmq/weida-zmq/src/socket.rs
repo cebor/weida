@@ -54,6 +54,41 @@ pub struct Delivered {
     pub sent: Sent,
 }
 
+/// Every public socket type, once, in the order the patterns were built.
+///
+/// `$apply` is a macro invoked with the whole list, which is how a caller
+/// says something about all of them without naming them again — the
+/// compile-fail harness of `tests/thread_rule.rs` makes its two assertions
+/// per socket type this way.
+///
+/// **The list is load-bearing, not documentation.** Every socket type takes
+/// its endpoint surface from the crate's `socket_endpoints!`, and that macro
+/// refuses to expand for a type this list does not name, so a new socket
+/// type cannot arrive without the thread rule being asserted for it.
+#[macro_export]
+macro_rules! for_each_socket_type {
+    ($apply:ident) => {
+        $apply! {
+            ReqSocket, RepSocket, DealerSocket, RouterSocket, PubSocket, SubSocket, XPubSocket,
+            XSubSocket, PushSocket, PullSocket, PairSocket
+        }
+    };
+}
+
+/// Implemented for exactly the types [`for_each_socket_type`] names.
+///
+/// Nothing is ever called through it: it exists so that the list and the
+/// socket types cannot drift apart silently.
+pub trait Enumerated {}
+
+macro_rules! mark_enumerated {
+    ($($socket:ident),+ $(,)?) => {
+        $(impl $crate::socket::Enumerated for $crate::$socket {})+
+    };
+}
+
+crate::for_each_socket_type!(mark_enumerated);
+
 /// Gives a socket type the endpoint surface every socket type has.
 ///
 /// `bind`, `connect`, `unbind`, `disconnect`, `ZMQ_LAST_ENDPOINT` and
@@ -61,8 +96,33 @@ pub struct Delivered {
 /// many endpoints and bind many at once" is a property of sockets, not of
 /// REQ. Written once here so that five socket-type modules do not write it
 /// five times, and so that adding one cannot forget a method.
+///
+/// It also refuses to expand for a socket type [`for_each_socket_type`] does
+/// not name: a socket without endpoints is not a socket anybody can use, so
+/// this is where a new one is made to join the list the thread-rule harness
+/// reads.
 macro_rules! socket_endpoints {
     ($socket:ty) => {
+        socket_endpoints!($socket, no_connect);
+
+        impl $socket {
+            /// Connects an endpoint. Returns as soon as the peer exists, like
+            /// `zmq_connect`: the queue is there and the dialling happens
+            /// behind it.
+            pub fn connect(&self, endpoint: &str) -> $crate::error::Result<()> {
+                self.core.connect(endpoint)
+            }
+        }
+    };
+    // For the one socket type whose `connect` is its own — PAIR takes at
+    // most one peer, so its second call is `EINVAL` — while everything else
+    // about its endpoints is every socket's.
+    ($socket:ty, no_connect) => {
+        const _: () = {
+            const fn enumerated<T: $crate::socket::Enumerated>() {}
+            enumerated::<$socket>()
+        };
+
         impl $socket {
             /// Binds an endpoint and returns the one actually bound, which is
             /// what `ZMQ_LAST_ENDPOINT` reports and the only way to learn a
@@ -72,13 +132,6 @@ macro_rules! socket_endpoints {
                 endpoint: &str,
             ) -> $crate::error::Result<$crate::endpoint::Endpoint> {
                 self.core.bind(endpoint).await
-            }
-
-            /// Connects an endpoint. Returns as soon as the peer exists, like
-            /// `zmq_connect`: the queue is there and the dialling happens
-            /// behind it.
-            pub fn connect(&self, endpoint: &str) -> $crate::error::Result<()> {
-                self.core.connect(endpoint)
             }
 
             /// Stops accepting on an endpoint. Peers already accepted there
@@ -512,11 +565,11 @@ mod tests {
     /// `Send` means and what a caller handing a socket to a task needs.
     ///
     /// The other half of libzmq's rule — a socket may not be *shared* — is
-    /// `!Sync`, which cannot be asserted by a bound: there is no negative
-    /// bound to write, and a test that "does not compile" needs a
-    /// compile-fail harness the crate does not have. It is carried by
-    /// `PhantomData<Cell<()>>` in [`SocketCore`], and the honest statement is
-    /// that this test does not check it rather than a line that pretends to.
+    /// `!Sync`, carried by `PhantomData<Cell<()>>` in [`SocketCore`]. There
+    /// is no negative bound to write here, so it is asserted where a
+    /// negative can be: `tests/thread_rule.rs` compiles a file that asks for
+    /// `Sync` on every socket type and requires it to fail, with the
+    /// expected error committed beside it.
     #[tokio::test]
     async fn a_socket_core_can_be_moved_between_threads() {
         fn assert_send<T: Send>(_: &T) {}

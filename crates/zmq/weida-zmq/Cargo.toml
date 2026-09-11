@@ -26,6 +26,9 @@ tracing.workspace = true
 # Drives the owned-context doctest and tests from an executor that is not
 # tokio, which is what `Context::owned` exists for.
 futures.workspace = true
+# The compile-fail harness for libzmq's thread rule: a socket is `Send` and
+# **not** `Sync`, and the second half only a compiler can assert.
+trybuild.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
