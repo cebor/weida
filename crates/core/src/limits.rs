@@ -44,6 +44,12 @@ pub struct Limits {
     /// peer chooses the scope names, so the table needs a ceiling; at the cap
     /// a new scope is simply not tracked and no gap is reported for it.
     pub max_sequence_scopes: usize,
+    /// Identities a receiver remembers per connection for `Bounded`
+    /// deduplication. The window bounds how long an identity is kept, not
+    /// how many arrive within it, so the count needs its own ceiling; at the
+    /// cap the oldest entry is evicted, which costs suppression rather than
+    /// memory.
+    pub max_dedup_entries: usize,
 }
 
 impl Limits {
@@ -71,6 +77,7 @@ impl Default for Limits {
             max_subscriptions: 256,
             subscriber_buffer_bytes: 8 * 1024 * 1024,
             max_sequence_scopes: 1024,
+            max_dedup_entries: 4096,
         }
     }
 }
@@ -93,6 +100,7 @@ mod tests {
         assert_eq!(l.max_subscriptions, 256);
         assert_eq!(l.subscriber_buffer_bytes, 8 << 20);
         assert_eq!(l.max_sequence_scopes, 1024);
+        assert_eq!(l.max_dedup_entries, 4096);
     }
 
     #[test]
