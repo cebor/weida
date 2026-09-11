@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 use weida_runtime::Exec;
 
@@ -223,6 +223,11 @@ struct EngineInner {
     /// `zmq_close()`'s accounting.
     slot: SocketSlot,
     state: Mutex<EngineState>,
+    /// Signalled whenever the peer set changes: one arrived, one connected,
+    /// one went away. A socket type that must wait for *a* peer — every
+    /// blocking mute action with nothing to send to — waits on this instead
+    /// of polling.
+    peers_changed: Notify,
 }
 
 impl Drop for EngineInner {
@@ -286,6 +291,7 @@ impl Engine {
                     next_peer: 1,
                     closed: false,
                 }),
+                peers_changed: Notify::new(),
             }),
         })
     }
@@ -400,7 +406,18 @@ impl Engine {
             peer,
             task,
         });
+        self.inner.peers_changed.notify_waiters();
         Ok(peer)
+    }
+
+    /// Waits until the peer set changes: one arrived, one connected, one went
+    /// away.
+    ///
+    /// What a socket type blocking with nowhere to send waits on. "SHALL
+    /// block on sending… when it has no connected peers" is a wait for a
+    /// peer, and this is that wait rather than a poll.
+    pub async fn wait_for_peer_change(&self) {
+        self.inner.peers_changed.notified().await;
     }
 
     /// Stops accepting on `endpoint`, which may be the endpoint as requested
@@ -455,6 +472,8 @@ impl Engine {
                 incoming: 0,
             },
         };
+        drop(state);
+        self.inner.peers_changed.notify_waiters();
         Ok(discarded)
     }
 
@@ -531,6 +550,8 @@ impl Engine {
         for (_, entry) in state.peers.drain() {
             entry.pipe.close();
         }
+        drop(state);
+        self.inner.peers_changed.notify_waiters();
     }
 
     /// Refuses an operation on a closed socket or a terminated context.
@@ -635,6 +656,8 @@ impl EngineInner {
                 attempts: 0,
             },
         );
+        drop(state);
+        self.peers_changed.notify_waiters();
         Some(peer)
     }
 
@@ -650,6 +673,7 @@ impl EngineInner {
             // "discarding any messages it contains".
             entry.pipe.close();
         }
+        self.peers_changed.notify_waiters();
     }
 
     fn set_connected(&self, peer: PeerId, connected: bool) {
@@ -662,6 +686,7 @@ impl EngineInner {
         {
             entry.connected = connected;
         }
+        self.peers_changed.notify_waiters();
     }
 
     fn count_attempt(&self, peer: PeerId) {

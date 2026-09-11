@@ -458,6 +458,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         self.write_all(&bytes).await
     }
 
+    /// Reads exactly `out.len()` octets — a peer's greeting, in a test that
+    /// drives the other side of a connection.
+    #[cfg(test)]
+    pub(crate) async fn read_exactly_for_test(&mut self, out: &mut [u8]) {
+        self.read_exactly(out).await.expect("the peer's greeting");
+    }
+
+    /// Writes bytes with no framing — a greeting, in the same tests.
+    #[cfg(test)]
+    pub(crate) async fn write_raw_for_test(&mut self, bytes: &[u8]) {
+        self.write_all(bytes).await.expect("write");
+    }
+
     /// Writes an `ERROR` and gives up on the connection.
     ///
     /// Best effort by construction: the peer is being closed on, so a write

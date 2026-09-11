@@ -212,6 +212,50 @@ impl Queue {
         self.lock().closed
     }
 
+    /// Whether one more message fits right now.
+    ///
+    /// For a socket type that round-robins, this is how "a peer is available
+    /// only when it has an outgoing queue that is not full" is checked
+    /// (28/REQREP's DEALER rule, `docs/research/zeromq.md` §4.2). A socket
+    /// owns the producing end of its outgoing queues and is `!Sync`, so a
+    /// `true` here cannot become false under it before it sends.
+    pub fn has_room(&self) -> bool {
+        let state = self.lock();
+        !state.closed && !self.at_bound(&state)
+    }
+
+    /// Waits until [`Queue::has_room`] would be true, or the pipe is
+    /// destroyed.
+    ///
+    /// For a sender choosing between peers: it waits on *this* queue, and a
+    /// socket races one of these per peer so that whichever frees first wins.
+    pub async fn wait_for_room(&self) {
+        loop {
+            let room = self.room.notified();
+            if self.has_room() || self.is_closed() {
+                return;
+            }
+            room.await;
+        }
+    }
+
+    /// Waits until a message is queued, or the pipe is destroyed.
+    ///
+    /// The fair-queueing counterpart of [`Queue::wait_for_room`]: a receiver
+    /// races one per peer and then takes from whichever answered.
+    pub async fn wait_for_message(&self) {
+        loop {
+            let ready = self.ready.notified();
+            {
+                let state = self.lock();
+                if !state.messages.is_empty() || state.closed {
+                    return;
+                }
+            }
+            ready.await;
+        }
+    }
+
     /// Queues `message`, applying this queue's mute action at the bound.
     ///
     /// - [`MuteAction::Block`] waits for room — the backpressure a PUSH or a

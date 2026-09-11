@@ -101,6 +101,26 @@ pub struct SocketOptions {
     /// hint. The wire field is deciseconds in a `u16`, so the maximum is
     /// 6553.5 s and finer granularity is rounded down.
     pub heartbeat_ttl: Option<Duration>,
+    /// `ZMQ_SNDTIMEO`: how long a blocking send may wait before reporting
+    /// `EAGAIN`. `None` is libzmq's `-1`: wait forever.
+    pub send_timeout: Option<Duration>,
+    /// `ZMQ_RCVTIMEO`: the same bound on a blocking receive.
+    pub recv_timeout: Option<Duration>,
+    /// `ZMQ_REQ_CORRELATE`: prefix every REQ request with a request-id frame
+    /// and discard replies that do not start with it
+    /// (`docs/research/zeromq.md` §3).
+    pub req_correlate: bool,
+    /// `ZMQ_REQ_RELAXED`: let a REQ socket send a new request without having
+    /// received the previous reply, abandoning that exchange rather than
+    /// reporting `EFSM`.
+    ///
+    /// **Requires `req_correlate`, and this library refuses the pair rather
+    /// than warning about it.** libzmq's own note: without correlation "a
+    /// late reply to an aborted request can be reported as the reply to the
+    /// superseding request", which is a wrong answer rather than a slow one.
+    /// Refusing at configuration time is 0013 §4.4 item 4's rule; libzmq
+    /// documents the hazard and allows it, and that difference is named here.
+    pub req_relaxed: bool,
     /// `ZMQ_ROUTING_ID`: the identity this socket announces in its `READY`,
     /// so that a ROUTER peer can address it by a name it chose rather than
     /// by a generated one (`docs/research/zeromq.md` §4.2).
@@ -124,6 +144,10 @@ impl Default for SocketOptions {
             heartbeat_ivl: None,
             heartbeat_timeout: None,
             heartbeat_ttl: None,
+            send_timeout: None,
+            recv_timeout: None,
+            req_correlate: false,
+            req_relaxed: false,
             routing_id: None,
             pipe: PipeConfig::default(),
             max_resolved_addresses: DEFAULT_MAX_RESOLVED_ADDRESSES,
@@ -138,6 +162,14 @@ impl SocketOptions {
         if self.max_message_size == 0 {
             return Err(Error::EINVAL(
                 "ZMQ_MAXMSGSIZE is zero, so every message would be refused".into(),
+            ));
+        }
+        if self.req_relaxed && !self.req_correlate {
+            return Err(Error::EINVAL(
+                "ZMQ_REQ_RELAXED without ZMQ_REQ_CORRELATE lets a late reply to an abandoned \
+                 request be reported as the reply to the one that superseded it; libzmq \
+                 documents that hazard and this library refuses it"
+                    .into(),
             ));
         }
         if self.max_resolved_addresses == 0 {

@@ -43,18 +43,25 @@
 //!   byte-exact in it is `weida-zmtp`'s.
 //! - [`RoutingId`] — 1-255 self-asserted bytes with a nonzero first octet,
 //!   and the type-level distance from weida's proved identities.
+//! - [`SocketCore`] — what every socket type shares: the engine, the
+//!   round-robin and fair-queue decisions, the `ZMQ_SNDTIMEO`/`ZMQ_RCVTIMEO`
+//!   bound, and libzmq's thread rule as a type (`Send + !Sync`).
+//! - [`ReqSocket`] and [`RepSocket`] — request-reply with its state machine:
+//!   strict alternation reported as `EFSM`, the envelope prepended and
+//!   stripped, round-robin out and last-peer in, a reply to a vanished
+//!   requester discarded rather than blocking, `ZMQ_REQ_CORRELATE` and
+//!   `ZMQ_REQ_RELAXED`.
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
 //!
-//! The socket types — `ReqSocket`, `RepSocket`, `DealerSocket`,
-//! `RouterSocket`, `PubSocket`, `SubSocket`, `XPubSocket`, `XSubSocket`,
-//! `PushSocket`, `PullSocket`, `PairSocket` — are the following slices, as
-//! are security and authorization and the rest of the option surface
-//! [0013 §5.3]. They are named here so that a reader knows what this crate
-//! is for and what it does not do yet; nothing stands in for them, and in
-//! particular there is no default [`Session`] beyond [`ZmtpSession`]: a
-//! socket that handed its peers to a no-op would be a ZeroMQ implementation
-//! that speaks nothing.
+//! The remaining socket types — `DealerSocket`, `RouterSocket`, `PubSocket`,
+//! `SubSocket`, `XPubSocket`, `XSubSocket`, `PushSocket`, `PullSocket`,
+//! `PairSocket` — are the following slices, as are security and
+//! authorization and the rest of the option surface [0013 §5.3]. They are
+//! named here so that a reader knows what this crate is for and what it does
+//! not do yet; nothing stands in for them, and in particular there is no
+//! default [`Session`] beyond [`ZmtpSession`]: a socket that handed its peers
+//! to a no-op would be a ZeroMQ implementation that speaks nothing.
 //!
 //! # Rules this crate keeps
 //!
@@ -94,7 +101,9 @@ pub mod identity;
 pub mod message;
 pub mod options;
 pub mod pipe;
+pub mod reqrep;
 pub mod session;
+pub mod socket;
 pub mod transport;
 
 pub use context::{
@@ -115,5 +124,7 @@ pub use options::{
 pub use pipe::{
     DEFAULT_RCVHWM, DEFAULT_SNDHWM, MuteAction, Pipe, PipeConfig, Queue, QueueConfig, Sent,
 };
+pub use reqrep::{RepSocket, ReqSocket};
 pub use session::{Incoming, Negotiated, Wire, ZmtpSession};
+pub use socket::{Delivered, SocketCore};
 pub use transport::Stream;
