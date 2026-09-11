@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/core",
     "crates/protocol",
+    "crates/runtime",
     "crates/weida",
     "crates/adapters/weida-zmtp",
     "crates/adapters/weida-zmtp-bridge",
@@ -19,6 +20,7 @@ version = "0.1.0"
 [workspace.dependencies]
 weida-core = { path = "crates/core", version = "0.1.0" }
 weida-protocol = { path = "crates/protocol", version = "0.1.0" }
+weida-runtime = { path = "crates/runtime", version = "0.1.0" }
 weida = { path = "crates/weida", version = "0.1.0" }
 weida-zmtp = { path = "crates/adapters/weida-zmtp", version = "0.1.0" }
 weida-sp = { path = "crates/adapters/weida-sp", version = "0.1.0" }

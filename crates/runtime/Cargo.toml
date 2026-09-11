@@ -1,0 +1,23 @@
+[package]
+name = "weida-runtime"
+description = "Reactor ownership, the task/timer/DNS surface and the local-transport OS hygiene shared by weida and the standalone protocol libraries"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+# The shared vocabulary: `Error` for every failure this crate reports and
+# `LocalPrincipal` for what the kernel says about a unix-socket peer. Nothing
+# else, and in particular no wire codec: a consumer of this crate implements
+# its own protocol
+# (`docs/decisions/0013-competitor-libraries.md` §4.2).
+weida-core.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# Drives the owned-reactor test from an executor that is not tokio, which is
+# the capability `Exec::owned` exists for.
+futures.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
