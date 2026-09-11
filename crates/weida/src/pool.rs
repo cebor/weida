@@ -90,34 +90,85 @@ impl ClientPool {
             config.idle_timeout,
         )?;
 
-        let addr = exec.resolve(host, port).await?;
-        tracing::debug!(%addr, host, "dialling");
-        let connecting = {
-            // Inside the runtime context: `quinn` reads its own runtime out
-            // of the ambient reactor while it builds the attempt.
-            let _guard = exec.enter();
-            endpoint
-                .connect_with(client_config, addr, host)
-                .map_err(|e| Error::Transport(format!("connect to {addr} failed: {e}")))?
-        };
-        // The handshake is driven *on* the runtime rather than by whoever
-        // awaits `connect`: completing it spawns the connection driver, and
-        // the caller's executor need not be tokio. Awaiting the join handle
-        // needs nothing.
-        let handshake = exec
-            .spawn(connecting)
-            .await
-            .map_err(|e| Error::Runtime(format!("dial task failed: {e}")))?;
-        let conn = match handshake {
-            Ok(conn) => conn,
-            Err(e) => {
-                // The verifier saw the peer before the handshake died: report
-                // who answered, so the operator can decide whether to pin it.
-                let refused = refused.lock().expect("refusal record poisoned").take();
-                return Err(match refused {
-                    Some(presented) => Error::Untrusted(presented),
-                    None => conn_error(e),
-                });
+        let addrs = exec
+            .resolve(host, port, config.limits.max_resolved_addresses)
+            .await?;
+        // Every address, in the resolver's order, until one answers. The first
+        // is not necessarily reachable: `localhost` commonly resolves to `::1`
+        // and `127.0.0.1`, and a server bound to one of them refuses the
+        // other. The last error is what the caller sees when none answer,
+        // because it is the one that describes the last thing tried.
+        let mut last: Option<Error> = None;
+        let mut established = None;
+        for (index, addr) in addrs.iter().enumerate() {
+            let is_last = index + 1 == addrs.len();
+            tracing::debug!(%addr, host, is_last, "dialling");
+            let connecting = {
+                // Inside the runtime context: `quinn` reads its own runtime
+                // out of the ambient reactor while it builds the attempt.
+                let _guard = exec.enter();
+                match endpoint.connect_with(client_config.clone(), *addr, host) {
+                    Ok(connecting) => connecting,
+                    Err(e) => {
+                        last = Some(Error::Transport(format!("connect to {addr} failed: {e}")));
+                        continue;
+                    }
+                }
+            };
+            // The handshake is driven *on* the runtime rather than by whoever
+            // awaits `connect`: completing it spawns the connection driver,
+            // and the caller's executor need not be tokio. Awaiting the join
+            // handle needs nothing.
+            let attempt = exec.spawn(connecting);
+            // Every address but the last is bounded: an address that answers
+            // nothing gives QUIC no refusal to observe, so an unbounded
+            // attempt on an unreachable `::1` would reach `127.0.0.1` only
+            // after a full handshake timeout. The last one keeps the whole
+            // budget, which is also what an IP literal and a single-address
+            // name get — exactly today's behaviour
+            // (`RuntimeConfig::connect_attempt_timeout`, RFC 8305's
+            // Connection Attempt Delay).
+            let joined = if is_last {
+                Some(attempt.await)
+            } else {
+                exec.within(config.connect_attempt_timeout, attempt).await
+            };
+            let handshake = match joined {
+                Some(joined) => {
+                    joined.map_err(|e| Error::Runtime(format!("dial task failed: {e}")))?
+                }
+                None => {
+                    last = Some(Error::Transport(format!(
+                        "connect to {addr} did not answer within {:?}",
+                        config.connect_attempt_timeout
+                    )));
+                    continue;
+                }
+            };
+            match handshake {
+                Ok(conn) => {
+                    established = Some(conn);
+                    break;
+                }
+                Err(e) => {
+                    // The verifier saw the peer before the handshake died:
+                    // report who answered, so the operator can decide whether
+                    // to pin it. A refusal is about *this* peer's key and is
+                    // not retried against another address.
+                    let refused = refused.lock().expect("refusal record poisoned").take();
+                    if let Some(presented) = refused {
+                        return Err(Error::Untrusted(presented));
+                    }
+                    last = Some(conn_error(e));
+                }
+            }
+        }
+        let conn = match established {
+            Some(conn) => conn,
+            None => {
+                return Err(last.unwrap_or_else(|| {
+                    Error::InvalidAddress(format!("{host}:{port} resolved to no addresses"))
+                }));
             }
         };
 

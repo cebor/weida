@@ -52,6 +52,16 @@ pub struct RuntimeConfig {
     /// (`docs/decisions/0006-guarantee-sets.md` §4.4). The default is `core`,
     /// which is what every v0 peer declares by declaring nothing.
     pub guarantees: GuaranteeSet,
+    /// How long a dial waits on one resolved address before trying the next.
+    ///
+    /// Only the addresses *before* the last one are bounded by it: a name
+    /// that resolves to one address, and every IP literal, keeps the full
+    /// handshake budget. The default of 250 ms is RFC 8305's Connection
+    /// Attempt Delay, which exists for exactly this case — `localhost`
+    /// resolving to `::1` before `127.0.0.1`, where the first address answers
+    /// nothing at all and QUIC has no refusal to observe, so without a bound
+    /// the second address is reached only after a handshake timeout.
+    pub connect_attempt_timeout: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -63,6 +73,7 @@ impl Default for RuntimeConfig {
             worker_threads: 1,
             shutdown_timeout: Duration::from_secs(1),
             guarantees: GuaranteeSet::CORE,
+            connect_attempt_timeout: Duration::from_millis(250),
         }
     }
 }

@@ -762,6 +762,7 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Client handshake placement | spawned **on** the runtime, awaited by the caller as a join handle | Completing a `quinn::Connecting` spawns the connection driver from inside the poll, so the polling thread would need an ambient reactor. Spawning it keeps `Runtime::connect` pollable from any executor and keeps the future `Send`, which holding an `EnterGuard` across the await would not. |
 | `futures-io` beside `tokio::io` | both trait pairs on `OutgoingTransfer`/`IncomingTransfer`, `futures-io` delegating to the tokio impl | A caller on `futures`, `smol` or `async-std` should not have to wrap a compat shim around a payload stream. Delegating keeps the end-of-payload bookkeeping in one place. |
 | `shutdown_timeout` | `RuntimeConfig::shutdown_timeout`, default 1 s (B-031) | `shutdown` closes every endpoint and then waited for the sockets to go idle **without a bound**, so the length of a process's exit was decided by the path rather than by the caller: measured against a peer that has gone silent, the draining period alone is **96 ms** on loopback and grows with round-trip time and loss. One second is generous on any network where a clean close was possible at all. The bound is one budget for the whole shutdown, not one per endpoint, because what a caller waits for is the call ([decisions/0009](decisions/0009-drain.md) §4.4). |
+| Address selection | try every resolved address in order, capped by `Limits::max_resolved_addresses` (8), each attempt but the last bounded by `RuntimeConfig::connect_attempt_timeout` (250 ms) (B-029) | Taking the first address made `weida://localhost:…` unreachable wherever `localhost` resolves to `::1` before `127.0.0.1`, which is the common Linux ordering and this machine's. Sequential attempts with a per-attempt bound rather than RFC 8305's parallel happy-eyeballs: the failure being fixed is an address that answers *nothing*, where QUIC has no refusal to observe, and 250 ms is RFC 8305's own Connection Attempt Delay for exactly that case. Measured on the regression test: **30 s before, 1.3 s after**. The last address keeps the full handshake budget, so an IP literal and a single-address name behave exactly as before. |
 
 ---
 
@@ -826,11 +827,6 @@ Recorded deliberately, not discovered later.
   exist. What ships is authentication plus the identity: applications decide on
   `IncomingMeta::peer`, and the only built-in allow list is a `Trust` pin list on a binding,
   which is connection-wide and all-or-nothing.
-- **The resolver takes the first address.** `Exec::resolve` uses the first entry
-  `lookup_host` returns, so `weida://localhost:…` on a host where `localhost` resolves to
-  `::1` only cannot reach a server bound to `127.0.0.1`. Use the IP literal until address
-  selection learns to try more than one — which is also the cheap path now, since a literal
-  is resolved in place with no task at all (B-025). Filed as B-029.
 - **`stream_receive_window` is not a payload budget.** The DATA header spends the same window
   as the payload, and a receiver announces more window only per eighth of it, so a payload
   sized exactly to the window cannot be written until the application starts reading (§4).

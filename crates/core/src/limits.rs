@@ -44,6 +44,12 @@ pub struct Limits {
     /// peer chooses the scope names, so the table needs a ceiling; at the cap
     /// a new scope is simply not tracked and no gap is reported for it.
     pub max_sequence_scopes: usize,
+    /// Addresses a dialling endpoint will try for one hostname, in the order
+    /// the resolver returned them. More than one is necessary because the
+    /// first is not necessarily reachable — `localhost` commonly resolves to
+    /// both `::1` and `127.0.0.1` — and a ceiling is necessary because a
+    /// resolver answer is remote input.
+    pub max_resolved_addresses: usize,
 }
 
 impl Limits {
@@ -71,6 +77,7 @@ impl Default for Limits {
             max_subscriptions: 256,
             subscriber_buffer_bytes: 8 * 1024 * 1024,
             max_sequence_scopes: 1024,
+            max_resolved_addresses: 8,
         }
     }
 }
@@ -93,6 +100,7 @@ mod tests {
         assert_eq!(l.max_subscriptions, 256);
         assert_eq!(l.subscriber_buffer_bytes, 8 << 20);
         assert_eq!(l.max_sequence_scopes, 1024);
+        assert_eq!(l.max_resolved_addresses, 8);
     }
 
     #[test]

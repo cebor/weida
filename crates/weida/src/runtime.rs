@@ -72,7 +72,22 @@ impl Exec {
         tokio::time::sleep(duration)
     }
 
-    /// Resolves `host:port`.
+    /// Awaits `future`, giving up after `limit`.
+    ///
+    /// `None` means the future had not finished; it is dropped, so whatever
+    /// it held is released. This is the only place the crate bounds an await
+    /// on wall-clock time, for the same reason `sleep` lives here: the timer
+    /// belongs to the runtime, not to the caller.
+    pub(crate) async fn within<F: Future>(&self, limit: Duration, future: F) -> Option<F::Output> {
+        let deadline = self.sleep(limit);
+        tokio::select! {
+            output = future => Some(output),
+            () = deadline => None,
+        }
+    }
+
+    /// Resolves `host:port` to every address the resolver offers, in its
+    /// order, at most `max_addresses` of them.
     ///
     /// An address that is already an IP literal is not resolved at all: it is
     /// parsed in place, with no allocation, no task and no join handle. Every
@@ -82,10 +97,21 @@ impl Exec {
     /// (`docs/IMPLEMENTATION.md` §4, B-012, B-025).
     ///
     /// A real hostname keeps the task: `lookup_host` needs a Tokio context,
-    /// and awaiting the join handle does not.
-    pub(crate) async fn resolve(&self, host: &str, port: u16) -> Result<SocketAddr, Error> {
+    /// and awaiting the join handle does not. All of the addresses are
+    /// returned rather than the first, because the first is not necessarily
+    /// reachable: `localhost` commonly resolves to both `::1` and
+    /// `127.0.0.1`, and a server bound to one of them is unreachable through
+    /// the other. The caller tries them in order (`pool::dial`). The count is
+    /// capped because a resolver answer is remote input
+    /// (`docs/INVARIANTS.md`).
+    pub(crate) async fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+        max_addresses: usize,
+    ) -> Result<Vec<SocketAddr>, Error> {
         if let Ok(ip) = host.parse::<IpAddr>() {
-            return Ok(SocketAddr::new(ip, port));
+            return Ok(vec![SocketAddr::new(ip, port)]);
         }
         let query = (host.to_owned(), port);
         let looked_up = self
@@ -96,12 +122,17 @@ impl Exec {
             })
             .await
             .map_err(|e| Error::Runtime(format!("name resolution task failed: {e}")))?;
-        let addrs = looked_up
-            .map_err(|e| Error::InvalidAddress(format!("cannot resolve {host}:{port}: {e}")))?;
-        addrs
+        let addrs: Vec<SocketAddr> = looked_up
+            .map_err(|e| Error::InvalidAddress(format!("cannot resolve {host}:{port}: {e}")))?
             .into_iter()
-            .next()
-            .ok_or_else(|| Error::InvalidAddress(format!("{host}:{port} resolved to no addresses")))
+            .take(max_addresses)
+            .collect();
+        if addrs.is_empty() {
+            return Err(Error::InvalidAddress(format!(
+                "{host}:{port} resolved to no addresses"
+            )));
+        }
+        Ok(addrs)
     }
 }
 
@@ -410,18 +441,35 @@ mod tests {
     async fn resolves_ip_literals_without_dns() {
         let exec = Exec::current().expect("ambient runtime");
         assert_eq!(
-            exec.resolve("127.0.0.1", 7443).await.unwrap(),
-            SocketAddr::from(([127, 0, 0, 1], 7443))
+            exec.resolve("127.0.0.1", 7443, 8).await.unwrap(),
+            vec![SocketAddr::from(([127, 0, 0, 1], 7443))]
         );
-        let v6 = exec.resolve("::1", 7443).await.unwrap();
-        assert_eq!(v6.port(), 7443);
-        assert!(v6.is_ipv6());
+        let v6 = exec.resolve("::1", 7443, 8).await.unwrap();
+        assert_eq!(v6.len(), 1);
+        assert_eq!(v6[0].port(), 7443);
+        assert!(v6[0].is_ipv6());
+    }
+
+    /// Claim: a hostname yields every address the resolver offers, in its
+    /// order and no more than the cap. `localhost` is the case that matters —
+    /// it commonly resolves to both `::1` and `127.0.0.1`, and dialling only
+    /// the first reaches a server bound to the other never.
+    #[tokio::test]
+    async fn a_hostname_resolves_to_every_address_up_to_the_cap() {
+        let exec = Exec::current().expect("ambient runtime");
+        let all = exec.resolve("localhost", 7443, 8).await.unwrap();
+        assert!(!all.is_empty());
+        assert!(all.iter().all(|a| a.port() == 7443));
+
+        let capped = exec.resolve("localhost", 7443, 1).await.unwrap();
+        assert_eq!(capped.len(), 1, "the cap must bound the answer");
+        assert_eq!(capped[0], all[0], "and it must keep the resolver's order");
     }
 
     #[tokio::test]
     async fn an_unresolvable_host_is_an_address_error() {
         let exec = Exec::current().expect("ambient runtime");
-        let err = exec.resolve("host.invalid.", 7443).await.unwrap_err();
+        let err = exec.resolve("host.invalid.", 7443, 8).await.unwrap_err();
         assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
     }
 
@@ -432,6 +480,41 @@ mod tests {
         assert_eq!(clone.config().limits, rt.config().limits);
         assert_eq!(clone.requester(no_trust()).peer_count(), 0);
         rt.shutdown().await;
+    }
+
+    /// Claim: a hostname whose first address is unreachable still connects,
+    /// because the dialling path tries the rest.
+    ///
+    /// This is the debt entry that said "use the IP literal until address
+    /// selection learns to try more than one". On a host where `localhost`
+    /// resolves to `::1` before `127.0.0.1` — the common Linux ordering, and
+    /// this machine's — a server bound to `127.0.0.1` was simply unreachable
+    /// by name. The address is pinned so trust does not depend on the name: a
+    /// pin consults no hostname.
+    #[tokio::test]
+    async fn a_hostname_whose_first_address_is_unreachable_still_connects() {
+        let identity = Identity::generate().expect("identity");
+        let fingerprint = identity.fingerprint().expect("fingerprint");
+
+        let server = Runtime::new(RuntimeConfig::default()).expect("server runtime");
+        let listener = server.listener();
+        let binding = listener
+            .bind_quic("127.0.0.1:0".parse().unwrap(), identity)
+            .await
+            .expect("bind");
+        let _puller = listener.puller("/sink").expect("puller");
+        let url = format!(
+            "weida://{fingerprint}@localhost:{}/sink",
+            binding.local_addr().port()
+        );
+
+        let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+        let pusher = client.pusher(Trust::by_address());
+        pusher.connect(&url).await.expect("connect by name");
+        assert_eq!(pusher.peer_count(), 1);
+
+        client.shutdown().await;
+        server.shutdown().await;
     }
 
     /// Claim: `shutdown`'s wait for idle sockets is bounded by
