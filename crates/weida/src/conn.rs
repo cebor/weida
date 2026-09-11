@@ -14,7 +14,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
-use weida_core::{Error, ErrorCode, Fingerprint, Limits, LossCause};
+use weida_core::{Error, ErrorCode, Limits, LossCause, PeerIdentity};
 use weida_protocol::header::GuaranteeSet;
 use weida_protocol::{
     Agreed, DataHeader, ErrorHeader, FrameKind, Hello, MAX_PREAMBLE_LEN, Preamble, PreambleError,
@@ -59,7 +59,7 @@ pub(crate) struct ConnCtx {
     pub subs: Option<Arc<SubRegistry>>,
     /// The identity the peer proved in the handshake, `None` for an anonymous
     /// client. Fixed for the life of the connection.
-    pub peer: Option<Fingerprint>,
+    pub peer: Option<PeerIdentity>,
     /// The runtime this connection's tasks and timers run on.
     pub exec: Exec,
     /// The guarantee set this side offers and requires. Negotiation refuses a
@@ -409,8 +409,14 @@ async fn accept_bi_loop(ctx: ConnHandle) {
                     continue;
                 }
                 let ctx = Arc::clone(&ctx);
+                let by_path = ctx.conn.dispatch_by_path();
                 ctx.exec.clone().spawn(async move {
-                    if let Err(e) = handle_bi(&ctx, send, recv).await {
+                    let outcome = if by_path {
+                        handle_local(&ctx, send, recv).await
+                    } else {
+                        handle_bi(&ctx, send, recv).await
+                    };
+                    if let Err(e) = outcome {
                         tracing::debug!(error = %e, "inbound exchange failed");
                     }
                 });
@@ -418,6 +424,82 @@ async fn accept_bi_loop(ctx: ConnHandle) {
             Err(e) => {
                 tracing::debug!(error = %e, "connection closed; bidi accept loop ending");
                 break;
+            }
+        }
+    }
+}
+
+/// Dispatches one accepted **local** connection, by the path it addresses.
+///
+/// A local connection carries no stream kind — that vocabulary is QUIC's —
+/// so what decides whether a reply is expected is the pattern registered at
+/// the path (`docs/PROTOCOL.md` §2.1,
+/// [decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
+/// §4.3). A replier answers on the same connection; everything else is a
+/// one-way transfer and the write half is dropped.
+async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Result<(), Error> {
+    let preamble = match read_preamble(&mut recv, ctx.limits.max_header_bytes).await {
+        Ok(preamble) => preamble,
+        Err(Error::Protocol(reason)) => return violation(ctx, &reason),
+        Err(e) => return Err(e),
+    };
+    let header = read_header(&mut recv, &preamble).await?;
+
+    match preamble.kind {
+        // HELLO belongs to the control connection and nowhere else: a peer
+        // that sends one here has not understood the grouping [0012 §4.1].
+        FrameKind::Hello => violation(ctx, "HELLO is legal only on the control connection"),
+        FrameKind::Error => violation(ctx, "ERROR is legal only in answer to a request"),
+        FrameKind::Subscribe => handle_subscription(ctx, &header, true),
+        FrameKind::Unsubscribe => handle_subscription(ctx, &header, false),
+        FrameKind::Data => {
+            ctx.negotiated().await?;
+            let decoded = match DataHeader::decode(&header) {
+                Ok(h) => h,
+                Err(e) => return violation(ctx, &e.to_string()),
+            };
+            let Some(path) = decoded.endpoint.clone() else {
+                return violation(ctx, "DATA on a local connection must name an endpoint");
+            };
+            let route = ctx.namespace.lookup(&path);
+            match route {
+                // A reply is expected: the exchange rides this connection in
+                // both directions.
+                Some(Route::Request(queue)) => {
+                    let request = IncomingRequest::new(
+                        IncomingTransfer::new(
+                            recv,
+                            Arc::new(IncomingMeta::from_header(&decoded, ctx.peer)),
+                        ),
+                        send,
+                        Arc::clone(ctx),
+                    );
+                    if queue.send(request).await.is_err() {
+                        tracing::debug!(path, "endpoint went away while dispatching");
+                    }
+                    Ok(())
+                }
+                Some(Route::Raw(queue)) => {
+                    let request = IncomingRequest::new(
+                        IncomingTransfer::new(
+                            recv,
+                            Arc::new(IncomingMeta::from_header(&decoded, ctx.peer)),
+                        ),
+                        send,
+                        Arc::clone(ctx),
+                    );
+                    if queue.send(Incoming::Exchange(request)).await.is_err() {
+                        tracing::debug!(path, "acceptor went away while dispatching");
+                    }
+                    Ok(())
+                }
+                // Nothing writes back on a puller or publisher path, so the
+                // write half goes away with the chance to reply; the refusal
+                // of an unknown or mismatched path is `handle_data`'s.
+                _ => {
+                    drop(send);
+                    handle_data(ctx, recv, &header).await
+                }
             }
         }
     }

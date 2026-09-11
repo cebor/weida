@@ -224,6 +224,33 @@ impl RuntimeInner {
         Ok(handle)
     }
 
+    /// Dials an `AF_UNIX` socket, with no pool and no TLS.
+    ///
+    /// The first connection is the peer's control connection and carries the
+    /// HELLO exchange; transfer connections are opened per transfer and
+    /// bound to it by the group token
+    /// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
+    /// §4.1, §4.2).
+    #[cfg(unix)]
+    pub(crate) async fn connect_unix(&self, socket: &str) -> Result<ConnHandle, Error> {
+        let link = crate::unix::dial(
+            std::path::Path::new(socket),
+            self.config.limits.max_local_streams,
+        )
+        .await?;
+        let handle = ConnCtx::spawn(
+            Link::Unix(link),
+            self.config.limits,
+            Arc::new(crate::listener::Namespace::new()),
+            None,
+            self.exec.clone(),
+            self.config.guarantees,
+            self.shared(),
+        );
+        handle.negotiated().await?;
+        Ok(handle)
+    }
+
     /// The state handed to every connection this runtime owns.
     pub(crate) fn shared(&self) -> Arc<Shared> {
         Arc::clone(&self.shared)

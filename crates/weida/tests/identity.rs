@@ -13,7 +13,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use common::{Certs, Server};
-use weida::{ClientTls, Error, Identity, Runtime, RuntimeConfig, ServerTls, Trust};
+use weida::{ClientTls, Error, Identity, PeerIdentity, Runtime, RuntimeConfig, ServerTls, Trust};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -258,7 +258,10 @@ async fn a_binding_that_requires_clients_learns_who_they_are() {
     within(trusted.connect(&url)).await.expect("connect");
     let reply = within(trusted.request(b"?")).await.expect("request");
     assert_eq!(within(reply.collect(16)).await.expect("collect"), b"ok");
-    assert_eq!(within(seen).await.expect("handler"), Some(client_fp));
+    assert_eq!(
+        within(seen).await.expect("handler"),
+        Some(PeerIdentity::Key(client_fp))
+    );
 
     // The reply carries the server's identity the same way.
     let reply = within(trusted.open(weida::TransferMeta::default()))
@@ -306,7 +309,10 @@ async fn the_reply_names_the_server_the_requester_dialled() {
         .await
         .expect("connect");
     let reply = within(requester.request(b"x")).await.expect("request");
-    assert_eq!(reply.meta().peer, Some(server.certs.fingerprint()));
+    assert_eq!(
+        reply.meta().peer,
+        Some(PeerIdentity::Key(server.certs.fingerprint()))
+    );
 
     client.shutdown().await;
 }

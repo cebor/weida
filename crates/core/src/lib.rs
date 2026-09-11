@@ -21,6 +21,6 @@ pub use addr::{
     SCHEME, SCHEME_INPROC, SCHEME_UNIX, UnixAddr, validate_endpoint_path,
 };
 pub use error::{Error, ErrorCode, LossCause, Result, StopReason};
-pub use identity::Fingerprint;
+pub use identity::{Fingerprint, LocalPrincipal, PeerIdentity};
 pub use limits::Limits;
 pub use trace::{TraceContext, TraceError};

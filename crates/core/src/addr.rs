@@ -173,18 +173,24 @@ pub enum Address {
     Quic(EndpointAddr),
     /// `weida+inproc://bus/path` — in process, no socket and no identity.
     Inproc(InprocAddr),
+    /// `weida+unix://<percent-encoded>/path` — `AF_UNIX`, the kernel proves
+    /// the peer.
+    Unix(UnixAddr),
 }
 
 impl Address {
-    /// Parses an address of either transport, by scheme.
+    /// Parses an address of any transport, by scheme.
     pub fn parse(input: &str) -> Result<Address, Error> {
-        match input
+        if let Some(rest) = input
             .strip_prefix(SCHEME_INPROC)
             .and_then(|r| r.strip_prefix("://"))
         {
-            Some(rest) => parse_inproc(input, rest).map(Address::Inproc),
-            None => EndpointAddr::parse(input).map(Address::Quic),
+            return parse_inproc(input, rest).map(Address::Inproc);
         }
+        if input.starts_with(SCHEME_UNIX) {
+            return UnixAddr::parse(input).map(Address::Unix);
+        }
+        EndpointAddr::parse(input).map(Address::Quic)
     }
 
     /// The endpoint path, whatever the transport.
@@ -192,6 +198,7 @@ impl Address {
         match self {
             Address::Quic(a) => &a.path,
             Address::Inproc(a) => &a.path,
+            Address::Unix(a) => &a.path,
         }
     }
 }

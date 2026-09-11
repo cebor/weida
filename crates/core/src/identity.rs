@@ -39,6 +39,79 @@ impl Fingerprint {
     }
 }
 
+/// A principal the **kernel** proved, on a local transport.
+///
+/// Captured at connect time and fixed for the life of the connection, which
+/// is what `SO_PEERCRED` and `LOCAL_PEERCRED` give and all they give
+/// (`docs/research/ipc.md` §1.5, §2.2). Two rules come with it
+/// ([decisions/0010](../../../docs/decisions/0010-local-transport.md) §4.4):
+/// the credential is the one taken at connect and never at send time, and a
+/// **PID is an observation** — it MUST NOT be the thing an application
+/// authorizes on, because it is reusable and racy where it exists at all.
+/// macOS reports no PID, so `pid` is `None` there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LocalPrincipal {
+    /// Effective user id of the peer process at connect time.
+    pub uid: u32,
+    /// Primary group id, where the platform reports one.
+    pub gid: u32,
+    /// Process id, where the platform reports one. An observation only.
+    pub pid: Option<u32>,
+}
+
+/// Who the peer is, once it has been **proved**.
+///
+/// Two kinds of proof, never a claim
+/// ([decisions/0008](../../../docs/decisions/0008-session-identity.md) §4.1 as
+/// amended by [0010](../../../docs/decisions/0010-local-transport.md) §4.4): a
+/// key the peer demonstrated it holds in the TLS handshake, or a principal the
+/// kernel attributed to the process on the other end of a local connection.
+/// An anonymous TLS client and an in-process peer have neither, and are
+/// reported as `None` rather than as an empty identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PeerIdentity {
+    /// The peer's public-key fingerprint, proved by the TLS handshake.
+    Key(Fingerprint),
+    /// The peer's local principal, proved by the kernel.
+    Local(LocalPrincipal),
+}
+
+impl PeerIdentity {
+    /// The proved key, if this identity is one.
+    pub fn key(&self) -> Option<Fingerprint> {
+        match self {
+            PeerIdentity::Key(fp) => Some(*fp),
+            PeerIdentity::Local(_) => None,
+        }
+    }
+
+    /// The proved local principal, if this identity is one.
+    pub fn local(&self) -> Option<LocalPrincipal> {
+        match self {
+            PeerIdentity::Local(principal) => Some(*principal),
+            PeerIdentity::Key(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for PeerIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PeerIdentity::Key(fp) => write!(f, "{fp}"),
+            PeerIdentity::Local(p) => match p.pid {
+                Some(pid) => write!(f, "uid:{} gid:{} pid:{pid}", p.uid, p.gid),
+                None => write!(f, "uid:{} gid:{}", p.uid, p.gid),
+            },
+        }
+    }
+}
+
+impl From<Fingerprint> for PeerIdentity {
+    fn from(fp: Fingerprint) -> PeerIdentity {
+        PeerIdentity::Key(fp)
+    }
+}
+
 impl fmt::Display for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(PREFIX)?;

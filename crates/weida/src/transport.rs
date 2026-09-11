@@ -25,39 +25,66 @@ use std::task::{Context, Poll};
 
 use quinn::VarInt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use weida_core::{Error, Fingerprint};
+use weida_core::{Error, PeerIdentity};
 
 use crate::conn::{conn_error, read_error, write_error};
 use crate::inproc::{LocalConn, LocalRecv, LocalSend};
 
-/// One connection: a QUIC connection, or one in-process link.
+/// One connection: a QUIC connection, one in-process link, or one peer's
+/// group of `AF_UNIX` connections
+/// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)).
 pub(crate) enum Link {
     Quic(quinn::Connection),
     Local(LocalConn),
+    #[cfg(unix)]
+    Unix(crate::unix::UnixLink),
 }
 
 /// The writing half of one stream.
 pub(crate) enum SendHalf {
     Quic(quinn::SendStream),
     Local(LocalSend),
+    #[cfg(unix)]
+    Unix(crate::unix::LocalSend),
 }
 
 /// The reading half of one stream.
 pub(crate) enum RecvHalf {
     Quic(quinn::RecvStream),
     Local(LocalRecv),
+    #[cfg(unix)]
+    Unix(crate::unix::LocalRecv),
 }
 
 impl Link {
-    /// The peer's proved key, or `None`.
+    /// Who the peer is, once it has been proved, or `None`.
     ///
-    /// A local peer has no key to present; who proves it, and whether anybody
-    /// does, is the transport's business [0010 §4.4]. In process there is
-    /// nobody else, so there is nothing to prove and nothing to report.
-    pub(crate) fn peer(&self) -> Option<Fingerprint> {
+    /// Two kinds of proof and never a claim: a key from the TLS handshake, or
+    /// a principal the kernel attributed to the process on the other end
+    /// [0010 §4.4]. In process there is nobody else, so there is nothing to
+    /// prove and nothing to report.
+    pub(crate) fn peer(&self) -> Option<PeerIdentity> {
         match self {
-            Link::Quic(conn) => crate::tls::peer_fingerprint(conn),
+            Link::Quic(conn) => crate::tls::peer_fingerprint(conn).map(PeerIdentity::Key),
             Link::Local(_) => None,
+            #[cfg(unix)]
+            Link::Unix(conn) => conn.peer(),
+        }
+    }
+
+    /// Whether an accepted stream is dispatched by the **path** it addresses
+    /// rather than by its stream kind.
+    ///
+    /// True on the socket transports, where a connection carries no kind and
+    /// the pattern registered at the path says whether a reply is expected
+    /// (`docs/PROTOCOL.md` §2.1,
+    /// [decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
+    /// §4.3).
+    pub(crate) fn dispatch_by_path(&self) -> bool {
+        match self {
+            Link::Quic(_) | Link::Local(_) => false,
+            #[cfg(unix)]
+            Link::Unix(_) => true,
         }
     }
 
@@ -67,6 +94,8 @@ impl Link {
         match self {
             Link::Quic(conn) => conn.stable_id(),
             Link::Local(conn) => conn.stable_id(),
+            #[cfg(unix)]
+            Link::Unix(conn) => conn.stable_id(),
         }
     }
 
@@ -75,6 +104,8 @@ impl Link {
         match self {
             Link::Quic(conn) => conn.close_reason().map(conn_error),
             Link::Local(conn) => conn.close_reason(),
+            #[cfg(unix)]
+            Link::Unix(conn) => conn.close_reason(),
         }
     }
 
@@ -85,6 +116,8 @@ impl Link {
                 reason.as_bytes(),
             ),
             Link::Local(conn) => conn.close(code, reason),
+            #[cfg(unix)]
+            Link::Unix(conn) => conn.close(code, reason),
         }
     }
 
@@ -93,6 +126,8 @@ impl Link {
         match self {
             Link::Quic(conn) => conn_error(conn.closed().await),
             Link::Local(conn) => conn.closed().await,
+            #[cfg(unix)]
+            Link::Unix(conn) => conn.closed().await,
         }
     }
 
@@ -104,6 +139,8 @@ impl Link {
                 .map(SendHalf::Quic)
                 .map_err(conn_error),
             Link::Local(conn) => conn.open_uni().map(SendHalf::Local),
+            #[cfg(unix)]
+            Link::Unix(conn) => conn.open_uni().await.map(SendHalf::Unix),
         }
     }
 
@@ -117,6 +154,11 @@ impl Link {
             Link::Local(conn) => conn
                 .open_bi()
                 .map(|(s, r)| (SendHalf::Local(s), RecvHalf::Local(r))),
+            #[cfg(unix)]
+            Link::Unix(conn) => conn
+                .open_bi()
+                .await
+                .map(|(s, r)| (SendHalf::Unix(s), RecvHalf::Unix(r))),
         }
     }
 
@@ -128,6 +170,8 @@ impl Link {
                 .map(RecvHalf::Quic)
                 .map_err(conn_error),
             Link::Local(conn) => conn.accept_uni().await.map(RecvHalf::Local),
+            #[cfg(unix)]
+            Link::Unix(conn) => conn.accept_uni().await.map(RecvHalf::Unix),
         }
     }
 
@@ -142,6 +186,11 @@ impl Link {
                 .accept_bi()
                 .await
                 .map(|(s, r)| (SendHalf::Local(s), RecvHalf::Local(r))),
+            #[cfg(unix)]
+            Link::Unix(conn) => conn
+                .accept_bi()
+                .await
+                .map(|(s, r)| (SendHalf::Unix(s), RecvHalf::Unix(r))),
         }
     }
 }
@@ -151,6 +200,8 @@ impl SendHalf {
         match self {
             SendHalf::Quic(s) => s.write_all(buf).await.map_err(write_error),
             SendHalf::Local(s) => s.write_all(buf).await,
+            #[cfg(unix)]
+            SendHalf::Unix(s) => s.write_all(buf).await,
         }
     }
 
@@ -162,6 +213,8 @@ impl SendHalf {
                 .finish()
                 .map_err(|_| Error::Transport("stream already closed".into())),
             SendHalf::Local(s) => s.finish(),
+            #[cfg(unix)]
+            SendHalf::Unix(s) => s.finish(),
         }
     }
 
@@ -172,6 +225,8 @@ impl SendHalf {
                 let _ = s.reset(VarInt::from_u64(code).expect("application codes are small"));
             }
             SendHalf::Local(s) => s.reset(code),
+            #[cfg(unix)]
+            SendHalf::Unix(s) => s.reset(code),
         }
     }
 
@@ -197,6 +252,8 @@ impl SendHalf {
                 })
             }
             SendHalf::Local(s) => Box::pin(s.stopped()),
+            #[cfg(unix)]
+            SendHalf::Unix(s) => Box::pin(s.stopped()),
         }
     }
 }
@@ -207,6 +264,8 @@ impl RecvHalf {
         match self {
             RecvHalf::Quic(r) => r.read(buf).await.map_err(read_error),
             RecvHalf::Local(r) => r.read(buf).await,
+            #[cfg(unix)]
+            RecvHalf::Unix(r) => r.read(buf).await,
         }
     }
 
@@ -217,6 +276,8 @@ impl RecvHalf {
                 .await
                 .map_err(|e| Error::Protocol(format!("truncated header: {e}"))),
             RecvHalf::Local(r) => r.read_exact(buf).await,
+            #[cfg(unix)]
+            RecvHalf::Unix(r) => r.read_exact(buf).await,
         }
     }
 
@@ -228,6 +289,8 @@ impl RecvHalf {
                 let _ = r.stop(VarInt::from_u64(code).expect("application codes are small"));
             }
             RecvHalf::Local(r) => r.stop(code),
+            #[cfg(unix)]
+            RecvHalf::Unix(r) => r.stop(code),
         }
     }
 }
@@ -244,6 +307,11 @@ impl AsyncWrite for SendHalf {
                 Some(io) => Pin::new(io).poll_write(cx, buf),
                 None => Poll::Ready(Err(closed_io())),
             },
+            #[cfg(unix)]
+            SendHalf::Unix(s) => match s.io_mut() {
+                Some(io) => Pin::new(io).poll_write(cx, buf),
+                None => Poll::Ready(Err(closed_io())),
+            },
         }
     }
 
@@ -254,6 +322,11 @@ impl AsyncWrite for SendHalf {
                 Some(io) => Pin::new(io).poll_flush(cx),
                 None => Poll::Ready(Ok(())),
             },
+            #[cfg(unix)]
+            SendHalf::Unix(s) => match s.io_mut() {
+                Some(io) => Pin::new(io).poll_flush(cx),
+                None => Poll::Ready(Ok(())),
+            },
         }
     }
 
@@ -261,6 +334,11 @@ impl AsyncWrite for SendHalf {
         match self.get_mut() {
             SendHalf::Quic(s) => AsyncWrite::poll_shutdown(Pin::new(s), cx),
             SendHalf::Local(s) => match s.io_mut() {
+                Some(io) => Pin::new(io).poll_shutdown(cx),
+                None => Poll::Ready(Ok(())),
+            },
+            #[cfg(unix)]
+            SendHalf::Unix(s) => match s.io_mut() {
                 Some(io) => Pin::new(io).poll_shutdown(cx),
                 None => Poll::Ready(Ok(())),
             },
@@ -288,6 +366,11 @@ impl AsyncRead for RecvHalf {
                     None => Poll::Ready(Ok(())),
                 }
             }
+            #[cfg(unix)]
+            RecvHalf::Unix(r) => match r.io_mut() {
+                Some(io) => AsyncRead::poll_read(Pin::new(io), cx, buf),
+                None => Poll::Ready(Ok(())),
+            },
         }
     }
 }

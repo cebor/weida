@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 
 use crate::transport::{RecvHalf, SendHalf};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use weida_core::{Error, ErrorCode, Fingerprint, TraceContext};
+use weida_core::{Error, ErrorCode, PeerIdentity, TraceContext};
 use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes, encode_preamble};
 
 use crate::conn::{ConnHandle, Ctl, read_frame, write_error_frame};
@@ -84,7 +84,7 @@ pub struct IncomingMeta {
     /// This is the identity to authorize on. It comes from the handshake, not
     /// from anything the peer wrote into a header, so it cannot be claimed —
     /// only proved (master doc §47).
-    pub peer: Option<Fingerprint>,
+    pub peer: Option<PeerIdentity>,
     /// The sender's per-producer sequence number, when it numbered this
     /// transfer (DATA key `6`).
     pub sequence: Option<u64>,
@@ -100,7 +100,7 @@ pub struct IncomingMeta {
 }
 
 impl IncomingMeta {
-    pub(crate) fn from_header(header: &DataHeader, peer: Option<Fingerprint>) -> IncomingMeta {
+    pub(crate) fn from_header(header: &DataHeader, peer: Option<PeerIdentity>) -> IncomingMeta {
         IncomingMeta {
             endpoint: header.endpoint.clone(),
             content_len: header.content_len,

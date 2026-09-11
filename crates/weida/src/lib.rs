@@ -54,10 +54,12 @@ mod stream;
 mod tls;
 mod transfer;
 mod transport;
+#[cfg(unix)]
+mod unix;
 
 pub use weida_core::{
-    EndpointAddr, Error, ErrorCode, Fingerprint, Limits, LossCause, Result, StopReason,
-    TraceContext,
+    Address, EndpointAddr, Error, ErrorCode, Fingerprint, InprocAddr, Limits, LocalPrincipal,
+    LossCause, PeerIdentity, Result, StopReason, TraceContext, UnixAddr,
 };
 pub use weida_protocol::{ALPN, VERSION, codes};
 
@@ -67,9 +69,10 @@ pub use endpoint::{
     Endpoint, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher, Rep, Replier, Req, Requester,
     Sub, Subscriber,
 };
+#[cfg(unix)]
+pub use listener::UnixBinding;
 pub use listener::{Binding, Listener, LocalBinding};
 pub use ordering::Gap;
-// The guarantee vocabulary of `docs/PROTOCOL.md` §6.5, for `RuntimeConfig`.
 // `Delivery` keeps its transfer-receipt meaning at this level, so the
 // dimension of the same name is re-exported under the name the guarantee
 // documents use for it.

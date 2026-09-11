@@ -212,6 +212,53 @@ impl Listener {
         })
     }
 
+    /// Binds this Listener's endpoints on an `AF_UNIX` socket.
+    ///
+    /// `SOCK_STREAM` on a filesystem path, no TLS and no credentials of our
+    /// own: the peer is proved by the kernel instead
+    /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
+    /// §4.4, §4.5). The socket file is replaced if a crash left one, and its
+    /// mode is set to `0600` explicitly rather than inherited from `umask` —
+    /// but **the directory is what makes that safe**: unlink-then-bind has a
+    /// substitution race that only directory ownership and permissions close
+    /// (`docs/research/ipc.md` §1.2, §7), so `path` MUST live in a directory
+    /// this process owns and no other user may write.
+    ///
+    /// Connections are grouped into peers by
+    /// [decision 0012](../../../docs/decisions/0012-local-connection-grouping.md):
+    /// the first connection is the peer, further ones carry its group token
+    /// and are admitted only if the kernel credentials match.
+    #[cfg(unix)]
+    pub fn bind_unix(&self, path: impl AsRef<std::path::Path>) -> Result<UnixBinding, Error> {
+        let path = path.as_ref();
+        if path.as_os_str().len() > weida_core::MAX_SOCKET_PATH_BYTES {
+            return Err(Error::InvalidAddress(format!(
+                "socket path exceeds this platform's {}-byte sun_path budget: {}",
+                weida_core::MAX_SOCKET_PATH_BYTES,
+                path.display()
+            )));
+        }
+        let exec = self.inner.runtime.exec.clone();
+        let (binding, listener) = {
+            // Inside the runtime context: tokio registers the socket with the
+            // reactor as it is constructed, and the calling thread may have
+            // no reactor of its own.
+            let _guard = exec.enter();
+            crate::unix::UnixBinding::bind(path)?
+        };
+        exec.spawn(accept_unix(
+            listener,
+            Arc::clone(&self.inner.namespace),
+            Arc::clone(&self.inner.subs),
+            self.inner.runtime.config.limits,
+            exec.clone(),
+            self.inner.runtime.config.guarantees,
+            self.inner.runtime.shared(),
+        ));
+        tracing::info!(path = %path.display(), "unix binding listening");
+        Ok(UnixBinding { inner: binding })
+    }
+
     /// Registers a replier for `path`.
     ///
     /// The path must be a valid endpoint path and must not already be
@@ -312,6 +359,104 @@ impl LocalBinding {
 impl Drop for LocalBinding {
     fn drop(&mut self) {
         inproc::unbind(&self.bus);
+    }
+}
+
+/// One `AF_UNIX` binding: the socket file, removed when this drops.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct UnixBinding {
+    inner: crate::unix::UnixBinding,
+}
+
+#[cfg(unix)]
+impl UnixBinding {
+    /// The socket path actually bound.
+    pub fn path(&self) -> &std::path::Path {
+        self.inner.path()
+    }
+}
+
+/// Accepts `AF_UNIX` connections: control connections become peers, transfer
+/// connections join the peer their token names
+/// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
+/// §4.1, §4.2).
+#[cfg(unix)]
+async fn accept_unix(
+    listener: tokio::net::UnixListener,
+    namespace: Arc<Namespace>,
+    subs: Arc<SubRegistry>,
+    limits: Limits,
+    exec: Exec,
+    guarantees: GuaranteeSet,
+    shared: Arc<Shared>,
+) {
+    let groups = Arc::new(crate::unix::Groups::default());
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            tracing::debug!("unix binding closed; accept loop ending");
+            return;
+        };
+        if shared.drain.is_draining() {
+            // Admission stopped: the same rule as on every other binding
+            // (`docs/decisions/0009-drain.md` §4.5).
+            continue;
+        }
+        let namespace = Arc::clone(&namespace);
+        let subs = Arc::clone(&subs);
+        let exec_for_conn = exec.clone();
+        let shared = Arc::clone(&shared);
+        let groups = Arc::clone(&groups);
+        exec.spawn(async move {
+            let accepted = match crate::unix::read_accepted(stream).await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    tracing::debug!(error = %e, "local connection preamble rejected");
+                    return;
+                }
+            };
+            match accepted {
+                crate::unix::Accepted::Control(stream, principal) => {
+                    let link = match crate::unix::accept_control(
+                        stream,
+                        principal,
+                        Arc::clone(&groups),
+                        limits.max_local_streams,
+                    )
+                    .await
+                    {
+                        Ok(link) => link,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "local control connection failed");
+                            return;
+                        }
+                    };
+                    let ctx = ConnCtx::spawn(
+                        Link::Unix(link),
+                        limits,
+                        namespace,
+                        Some(Arc::clone(&subs)),
+                        exec_for_conn,
+                        guarantees,
+                        shared,
+                    );
+                    let conn_id = ctx.conn.stable_id();
+                    let reason = ctx.conn.closed().await;
+                    subs.remove_connection(conn_id);
+                    tracing::debug!(%reason, "local connection closed");
+                }
+                crate::unix::Accepted::Transfer(token, stream, principal) => {
+                    // The token names the group and the kernel says who is
+                    // asking; an unbound connection is dispatched nowhere
+                    // [0012 §4.2].
+                    if !crate::unix::admit_transfer(&groups, &token, principal, stream) {
+                        tracing::warn!(
+                            "local transfer connection refused: unknown or mismatched group"
+                        );
+                    }
+                }
+            }
+        });
     }
 }
 
