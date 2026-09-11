@@ -91,6 +91,15 @@ pub enum Error {
     /// `ENOTSUP`: the operation does not exist for this socket type — sending
     /// on a SUB, receiving on a PUB.
     ENOTSUP(Cause),
+    /// `ETIMEDOUT`: a bounded wait ran out — one connect attempt against
+    /// `ZMQ_CONNECT_TIMEOUT`, or a handshake against `ZMQ_HANDSHAKE_IVL`.
+    /// The connection is closed, and a socket that reconnects will try
+    /// again.
+    ETIMEDOUT(Cause),
+    /// `ENOENT`: the endpoint named is not one this socket has — what
+    /// `zmq_unbind` and `zmq_disconnect` report for an endpoint that was
+    /// never bound or connected.
+    ENOENT(Cause),
     /// `EIO`: the operating system reported something that is none of the
     /// above. The cause carries its text rather than flattening it away.
     EIO(Cause),
@@ -115,6 +124,8 @@ impl Error {
             Error::EMTHREAD(_) => "EMTHREAD",
             Error::EMSGSIZE(_) => "EMSGSIZE",
             Error::ENOTSUP(_) => "ENOTSUP",
+            Error::ETIMEDOUT(_) => "ETIMEDOUT",
+            Error::ENOENT(_) => "ENOENT",
             Error::EIO(_) => "EIO",
         }
     }
@@ -137,6 +148,8 @@ impl Error {
             | Error::EMTHREAD(cause)
             | Error::EMSGSIZE(cause)
             | Error::ENOTSUP(cause)
+            | Error::ETIMEDOUT(cause)
+            | Error::ENOENT(cause)
             | Error::EIO(cause) => cause,
         }
     }
@@ -194,6 +207,8 @@ impl From<std::io::Error> for Error {
             | ErrorKind::NotConnected
             | ErrorKind::HostUnreachable
             | ErrorKind::NetworkUnreachable => Error::EHOSTUNREACH(cause),
+            ErrorKind::TimedOut => Error::ETIMEDOUT(cause),
+            ErrorKind::NotFound => Error::ENOENT(cause),
             ErrorKind::InvalidInput | ErrorKind::InvalidData => Error::EINVAL(cause),
             _ => Error::EIO(cause),
         }
@@ -223,6 +238,8 @@ mod tests {
             Error::EMTHREAD("".into()),
             Error::EMSGSIZE("".into()),
             Error::ENOTSUP("".into()),
+            Error::ETIMEDOUT("".into()),
+            Error::ENOENT("".into()),
             Error::EIO("".into()),
         ];
         let mut names: Vec<&str> = all.iter().map(Error::errno).collect();

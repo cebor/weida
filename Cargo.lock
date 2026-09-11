@@ -1978,6 +1978,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "tokio",
+ "tracing",
  "weida-core",
  "weida-runtime",
  "weida-zmtp",

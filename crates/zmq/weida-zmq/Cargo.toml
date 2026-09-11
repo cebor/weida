@@ -18,6 +18,9 @@ tokio.workspace = true
 # a body is allocated. Reused rather than reimplemented; its own manifest
 # stays empty (0013 §4.3).
 weida-zmtp.workspace = true
+# Connection lifecycle logging: a reconnect loop that says nothing is a
+# reconnect loop nobody can debug.
+tracing.workspace = true
 
 [dev-dependencies]
 # Drives the owned-context doctest and tests from an executor that is not
