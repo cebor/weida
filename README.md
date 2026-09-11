@@ -78,6 +78,21 @@ cargo run -p weida --example pub_sub     # prefix-filtered topics, two subscribe
 Messages arrive out of order in both. Each transfer is its own QUIC stream, so ordering
 is `None` for these patterns — see [docs/PATTERNS.md](docs/PATTERNS.md) §1.7.
 
+## No reactor of your own
+
+weida does not require you to be inside `#[tokio::main]`. `quinn` needs a Tokio reactor and
+nothing else in the library does, so `Runtime::owned` creates and owns one — one worker
+thread by default — and hands back ordinary futures that any executor can drive. Transfers
+implement both the `tokio::io` and the `futures-io` trait pairs for the same reason.
+
+```
+cargo run -p weida --example owned_runtime   # a full exchange from a plain `fn main`
+```
+
+`Runtime::new` takes the ambient reactor and fails with `Error::Runtime` when there is none;
+`Runtime::with_handle` takes somebody else's. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §5.
+
 ## Build and test
 
 ```
