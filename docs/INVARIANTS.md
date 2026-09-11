@@ -62,6 +62,18 @@ is checked rather than asserted: the unit tests of `crates/weida/src/ordering.rs
 reassembler and dedup window and assert that the backing tables' capacity is still zero
 ([GUARANTEES.md](GUARANTEES.md) §3, [PROTOCOL.md](PROTOCOL.md) §6.5).
 
+The drain of [decisions/0009](decisions/0009-drain.md) needed **no new number**, which is
+worth stating because "wait until things finish" is exactly the shape that usually grows a
+queue. It does hold something, though, and the note's "holds nothing new" is sharpened
+here: a finished transfer whose `Delivery` the application dropped has its receipt parked
+with the runtime, because that receipt is the only handle to the acknowledgement. The set
+of parked receipts is bounded twice over and by quantities that already exist — settled
+receipts are reaped on the way in with a single non-blocking poll, and the set is capped by
+this side's stream budgets, `max_concurrent_uni_streams + max_concurrent_bidi_streams` —
+and it is local: a peer cannot grow it by sending, only this process can, by finishing
+transfers. A receipt evicted at the cap is counted as outstanding by the next drain rather
+than assumed delivered.
+
 A local peer is proved by the **kernel** rather than by a key, which is the one place the
 identity invariant reads differently: `IncomingMeta::peer` carries a key or a local principal,
 an in-process peer carries neither, and a PID is an observation that MUST NOT be authorized on
