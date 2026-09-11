@@ -231,7 +231,14 @@ impl Queue {
     /// socket races one of these per peer so that whichever frees first wins.
     pub async fn wait_for_room(&self) {
         loop {
-            let room = self.room.notified();
+            let mut room = std::pin::pin!(self.room.notified());
+            // `notified()` registers the waiter when it is **polled**, so
+            // registering is `enable()` and not construction: without it a
+            // `notify_waiters()` between the check below and the await wakes
+            // nobody, and this wait never ends. The same at every wait in
+            // this file, and the reason a reply could sit in a queue while
+            // its session slept.
+            room.as_mut().enable();
             if self.has_room() || self.is_closed() {
                 return;
             }
@@ -245,7 +252,8 @@ impl Queue {
     /// races one per peer and then takes from whichever answered.
     pub async fn wait_for_message(&self) {
         loop {
-            let ready = self.ready.notified();
+            let mut ready = std::pin::pin!(self.ready.notified());
+            ready.as_mut().enable();
             {
                 let state = self.lock();
                 if !state.messages.is_empty() || state.closed {
@@ -270,7 +278,8 @@ impl Queue {
         loop {
             // Register before looking, so that room freed between the two
             // wakes this wait instead of being missed by it.
-            let room = self.room.notified();
+            let mut room = std::pin::pin!(self.room.notified());
+            room.as_mut().enable();
             {
                 let mut state = self.lock();
                 if state.closed {
@@ -336,7 +345,8 @@ impl Queue {
     /// peer is gone and nothing further will arrive on it.
     pub async fn recv(&self) -> Result<Multipart> {
         loop {
-            let ready = self.ready.notified();
+            let mut ready = std::pin::pin!(self.ready.notified());
+            ready.as_mut().enable();
             {
                 let mut state = self.lock();
                 if let Some(message) = state.messages.pop_front() {

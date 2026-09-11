@@ -157,6 +157,8 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "blocking")]
+pub mod blocking;
 pub mod context;
 pub mod curve;
 pub mod dealerrouter;

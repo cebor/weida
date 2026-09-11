@@ -27,6 +27,14 @@ tracing.workspace = true
 # own manifest is still empty, and `unsafe_code = "forbid"` below survives
 # this because the crate is pure Rust.
 crypto_box.workspace = true
+# The executor the blocking facade drives its futures on, and only that: the
+# reactor's own threads are busy driving the connections, so a blocking caller
+# polls the socket's future on the thread that asked. `weida-runtime`'s Exec
+# promises exactly this ("the caller may drive the returned futures on any
+# executor - futures::executor::block_on included"); the `blocking` feature is
+# that promise taken up. Optional, so a caller that does not want the facade
+# does not link it.
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Drives the owned-context doctest and tests from an executor that is not
@@ -35,6 +43,18 @@ futures.workspace = true
 # The compile-fail harness for libzmq's thread rule: a socket is `Send` and
 # **not** `Sync`, and the second half only a compiler can assert.
 trybuild.workspace = true
+
+[features]
+# The synchronous facade, off by default: `weida_zmq::blocking`. Not default
+# because a caller that already runs a reactor wants the asynchronous sockets,
+# and a feature nobody asked for is a reactor nobody asked for
+# (`ContextConfig::worker_threads` threads, owned by the context).
+blocking = ["dep:futures"]
+
+[[example]]
+# The zguide's Hello World, in the shape its C original has.
+name = "hello_world"
+required-features = ["blocking"]
 
 [lints.rust]
 unsafe_code = "forbid"
