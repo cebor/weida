@@ -51,6 +51,7 @@ use crate::context::{Context, SocketId, SocketSlot};
 use crate::endpoint::{Endpoint, TcpHost};
 use crate::error::{Error, Result};
 use crate::identity::RoutingId;
+use crate::inproc::{Inproc, InprocBinding};
 use crate::options::SocketOptions;
 use crate::pipe::Pipe;
 use crate::subscriptions::Subscriptions;
@@ -300,6 +301,9 @@ enum Admitted {
 }
 
 struct EngineInner {
+    /// The context's `inproc://` namespace, so that a bind can take a name
+    /// and a dial can find one.
+    inproc: Arc<Inproc>,
     exec: Exec,
     session: Arc<dyn Session>,
     options: SocketOptions,
@@ -342,6 +346,8 @@ pub struct Engine {
 /// What a task needs to run a connection without keeping the engine alive.
 #[derive(Clone)]
 struct TaskCtx {
+    inproc: Arc<Inproc>,
+    socket: SocketId,
     engine: Weak<EngineInner>,
     exec: Exec,
     session: Arc<dyn Session>,
@@ -363,6 +369,7 @@ impl Engine {
         let slot = context.open_socket()?;
         Ok(Engine {
             inner: Arc::new(EngineInner {
+                inproc: context.inproc_shared(),
                 exec: context.exec().clone(),
                 session,
                 options,
@@ -404,36 +411,55 @@ impl Engine {
     ///
     /// `ZMQ_BACKLOG` is passed to `listen(2)`, and `SO_REUSEADDR` is set —
     /// what libzmq and Rust's own `TcpListener` both do, and what lets a
-    /// restarted process bind the port it just had.
+    /// restarted process bind the port it just had. Neither applies to
+    /// `inproc://`, which takes a name in the context's namespace instead:
+    /// there is no kernel queue to size and nobody to steal the name.
     pub async fn bind(&self, endpoint: &Endpoint) -> Result<Endpoint> {
         self.alive()?;
-        let addr = self.resolve_one(endpoint).await?;
-        let listener = {
-            // Inside the runtime context: tokio registers the socket with the
-            // reactor as it is constructed, and the calling thread may have
-            // no reactor of its own.
-            let _guard = self.inner.exec.enter();
-            let socket = if addr.is_ipv4() {
-                TcpSocket::new_v4()
-            } else {
-                TcpSocket::new_v6()
-            }?;
-            socket.set_reuseaddr(true)?;
-            socket.bind(addr)?;
-            socket.listen(self.inner.options.backlog)?
+        check_transport(endpoint)?;
+        let (bound, task) = match endpoint {
+            Endpoint::Inproc(name) => {
+                let binding = self.inner.inproc.bind(name)?;
+                let ctx = self.task_ctx();
+                let accepting = endpoint.clone();
+                // The binding moves into the task, so aborting the task —
+                // what `unbind` and `close` do — releases the name.
+                let task = self
+                    .inner
+                    .exec
+                    .spawn(async move { inproc_accept_loop(ctx, binding, accepting).await });
+                (endpoint.clone(), task)
+            }
+            _ => {
+                let addr = self.resolve_one(endpoint).await?;
+                let listener = {
+                    // Inside the runtime context: tokio registers the socket
+                    // with the reactor as it is constructed, and the calling
+                    // thread may have no reactor of its own.
+                    let _guard = self.inner.exec.enter();
+                    let socket = if addr.is_ipv4() {
+                        TcpSocket::new_v4()
+                    } else {
+                        TcpSocket::new_v6()
+                    }?;
+                    socket.set_reuseaddr(true)?;
+                    socket.bind(addr)?;
+                    socket.listen(self.inner.options.backlog)?
+                };
+                let local = listener.local_addr()?;
+                let bound = Endpoint::Tcp {
+                    host: TcpHost::Ip(local.ip()),
+                    port: local.port(),
+                };
+                let ctx = self.task_ctx();
+                let accepting = bound.clone();
+                let task = self
+                    .inner
+                    .exec
+                    .spawn(async move { accept_loop(ctx, listener, accepting).await });
+                (bound, task)
+            }
         };
-        let local = listener.local_addr()?;
-        let bound = Endpoint::Tcp {
-            host: TcpHost::Ip(local.ip()),
-            port: local.port(),
-        };
-
-        let ctx = self.task_ctx();
-        let accepting = bound.clone();
-        let task = self
-            .inner
-            .exec
-            .spawn(async move { accept_loop(ctx, listener, accepting).await });
 
         let mut state = self.lock();
         state.last_endpoint = Some(bound.clone());
@@ -682,9 +708,8 @@ impl Engine {
     }
 
     async fn resolve_one(&self, endpoint: &Endpoint) -> Result<SocketAddr> {
-        check_transport(endpoint)?;
         let Endpoint::Tcp { host, port } = endpoint else {
-            unreachable!("check_transport admits only tcp");
+            unreachable!("only a tcp endpoint is resolved to an address");
         };
         match host {
             TcpHost::Any => Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), *port)),
@@ -702,6 +727,8 @@ impl Engine {
 
     fn task_ctx(&self) -> TaskCtx {
         TaskCtx {
+            inproc: Arc::clone(&self.inner.inproc),
+            socket: self.inner.slot.id(),
             engine: Arc::downgrade(&self.inner),
             exec: self.inner.exec.clone(),
             session: Arc::clone(&self.inner.session),
@@ -739,16 +766,16 @@ fn snapshot(id: PeerId, entry: &PeerEntry) -> Peer {
     }
 }
 
-/// The engine carries `tcp` today. `ipc` and `inproc` parse — they are legal
-/// ZeroMQ endpoints — and are refused here until the slices that implement
-/// them land, because a socket that accepted them and did nothing would be
-/// worse than one that says so.
+/// The engine carries `tcp` and `inproc`. `ipc` parses — it is a legal
+/// ZeroMQ endpoint — and is refused here until the slice that implements it
+/// lands, because a socket that accepted it and did nothing would be worse
+/// than one that says so.
 fn check_transport(endpoint: &Endpoint) -> Result<()> {
     match endpoint {
-        Endpoint::Tcp { .. } => Ok(()),
+        Endpoint::Tcp { .. } | Endpoint::Inproc(_) => Ok(()),
         other => Err(Error::EPROTONOSUPPORT(
             format!(
-                "the {} transport is not carried by this socket yet; only tcp is",
+                "the {} transport is not carried by this socket yet; tcp and inproc are",
                 other.transport()
             )
             .into(),
@@ -932,6 +959,74 @@ async fn accept_loop(ctx: TaskCtx, listener: TcpListener, endpoint: Endpoint) {
     }
 }
 
+/// Accepts dials to one bound `inproc://` name.
+///
+/// The same shape as [`accept_loop`], and deliberately so: an accepted
+/// in-process connection is an accepted connection — no endpoint of its own,
+/// its pipe destroyed with it, `max_peers` enforced at admission — and the
+/// session that runs over it is the same ZMTP session that runs over TCP.
+///
+/// Holding the [`InprocBinding`] is what holds the name: when this task is
+/// aborted by `unbind` or by closing the socket, the binding drops and the
+/// name is free again.
+async fn inproc_accept_loop(ctx: TaskCtx, mut binding: InprocBinding, endpoint: Endpoint) {
+    loop {
+        let Some(dial) = binding.accept().await else {
+            return;
+        };
+        let Some(engine) = ctx.engine.upgrade() else {
+            return;
+        };
+        let pipe = Pipe::new(ctx.options.pipe);
+        let peer = match engine.admit(None, pipe.clone()) {
+            Admitted::Peer(peer) => peer,
+            Admitted::AtCeiling => {
+                tracing::warn!(
+                    ceiling = ctx.options.max_peers,
+                    from = dial.from.to_string(),
+                    "refused an inproc connection: this socket already holds its max_peers"
+                );
+                drop(dial);
+                continue;
+            }
+            Admitted::SocketClosed => return,
+        };
+        let identity = engine.identity_slot(peer).unwrap_or_default();
+        let subscriptions = engine.subscriptions_of(peer).unwrap_or_else(|| {
+            Arc::new(Subscriptions::new(
+                ctx.options.max_subscriptions,
+                ctx.options.max_subscription_bytes,
+            ))
+        });
+        drop(engine);
+
+        let ctx = ctx.clone();
+        let endpoint = endpoint.clone();
+        let exec = ctx.exec.clone();
+        exec.spawn(async move {
+            let outcome = run_session(
+                &ctx,
+                dial.stream,
+                PeerSession {
+                    peer,
+                    pipe,
+                    endpoint,
+                    role: Role::Binder,
+                    identity,
+                    subscriptions,
+                },
+            )
+            .await;
+            if let Err(e) = outcome {
+                tracing::debug!(%peer, error = %e, "an inproc connection ended");
+            }
+            if let Some(engine) = ctx.engine.upgrade() {
+                engine.forget(peer);
+            }
+        });
+    }
+}
+
 /// Dials one endpoint, forever, with `ZMQ_RECONNECT_IVL` backoff.
 async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
     let mut delay: Option<Duration> = None;
@@ -1005,9 +1100,25 @@ async fn connecter_loop(ctx: TaskCtx, peer: PeerId, endpoint: Endpoint) {
 }
 
 /// One connect attempt, bounded by `ZMQ_CONNECT_TIMEOUT`.
+///
+/// **`inproc` has no attempt to bound.** There is no kernel, no address and
+/// no handshake to time out: either the name is bound, in which case a buffer
+/// pair is made at once, or nobody holds it, in which case the dial *waits*
+/// for the bind — libzmq 4.0's "no longer requires bind before connect"
+/// (`docs/research/zeromq.md` §12). So `ZMQ_CONNECT_TIMEOUT`, which
+/// `zmq_setsockopt(3)` documents for TCP, is not applied to it; the caller
+/// that wants to stop waiting drops the socket.
 async fn dial(ctx: &TaskCtx, endpoint: &Endpoint) -> Result<Stream> {
+    if let Endpoint::Inproc(name) = endpoint {
+        loop {
+            if let Some(stream) = ctx.inproc.dial(name, ctx.socket) {
+                return Ok(stream);
+            }
+            ctx.inproc.wait_until_bound(name).await;
+        }
+    }
     let Endpoint::Tcp { host, port } = endpoint else {
-        return check_transport(endpoint).map(|()| unreachable!("tcp only"));
+        return check_transport(endpoint).map(|()| unreachable!("tcp and inproc only"));
     };
     let addrs: Vec<SocketAddr> = match host {
         TcpHost::Ip(ip) => vec![SocketAddr::new(*ip, *port)],
@@ -1244,6 +1355,61 @@ mod tests {
             .expect("unbind by the requested form");
         assert!(engine.bound().is_empty());
         drop(bound);
+    }
+
+    /// Claim: an `inproc://` bind and connect meet inside one context, both
+    /// sides get a session with the role they played, and the name is
+    /// released when the bind is undone — the `ipc` transport's stealing is
+    /// what `inproc` does not do.
+    #[tokio::test]
+    async fn an_inproc_bind_and_connect_meet_in_one_context() {
+        let ctx = context();
+        let binder = Recorder::new();
+        let server = Engine::new(&ctx, options(), as_session(&binder)).expect("engine");
+        let dialler = Recorder::new();
+        let client = Engine::new(&ctx, options(), as_session(&dialler)).expect("engine");
+
+        let endpoint = Endpoint::parse("inproc://orders").expect("endpoint");
+        let bound = server.bind(&endpoint).await.expect("bind");
+        assert_eq!(bound, endpoint, "an inproc bind has nothing to resolve");
+        assert_eq!(server.last_endpoint().as_ref(), Some(&endpoint));
+        assert!(ctx.inproc().is_bound("orders"));
+
+        client.connect(&endpoint).expect("connect");
+        wait_for(|| binder.count() == 1 && dialler.count() == 1).await;
+        assert_eq!(binder.roles(), vec![Role::Binder]);
+        assert_eq!(dialler.roles(), vec![Role::Connecter]);
+
+        // A second socket cannot take a name somebody holds: no stealing.
+        let other = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
+        let err = other.bind(&endpoint).await.unwrap_err();
+        assert_eq!(err.errno(), "EADDRINUSE", "{err}");
+
+        server.unbind(&endpoint).expect("unbind");
+        wait_for(|| !ctx.inproc().is_bound("orders")).await;
+        other.bind(&endpoint).await.expect("free after the unbind");
+    }
+
+    /// Claim: a connect that arrives before the bind **parks** and completes
+    /// when the bind arrives, which is what libzmq 4.0 changed — and the
+    /// pipe existed the whole time, because a queue belongs to the endpoint
+    /// rather than to the connection.
+    #[tokio::test]
+    async fn an_inproc_connect_before_the_bind_completes_on_it() {
+        let ctx = context();
+        let dialler = Recorder::new();
+        let client = Engine::new(&ctx, options(), as_session(&dialler)).expect("engine");
+        let endpoint = Endpoint::parse("inproc://later").expect("endpoint");
+
+        let peer = client.connect(&endpoint).expect("connect before any bind");
+        assert!(client.peer(peer).is_some(), "the queue exists at once");
+        assert_eq!(dialler.count(), 0, "and nothing is connected yet");
+
+        let binder = Recorder::new();
+        let server = Engine::new(&ctx, options(), as_session(&binder)).expect("engine");
+        server.bind(&endpoint).await.expect("bind");
+        wait_for(|| dialler.count() == 1 && binder.count() == 1).await;
+        wait_for(|| client.peer(peer).is_some_and(|peer| peer.connected)).await;
     }
 
     /// Claim: one socket binds many endpoints and connects many, and accepts
@@ -1484,20 +1650,22 @@ mod tests {
         assert_eq!(err.errno(), "ENOENT", "{err}");
     }
 
-    /// Claim: the transports this engine does not carry are refused where
-    /// they are asked for, naming themselves, rather than accepted and
-    /// ignored.
+    /// Claim: the transport this engine does not carry is refused where it
+    /// is asked for, naming itself, rather than accepted and ignored — and
+    /// `inproc`, which it now carries, is not refused.
     #[tokio::test]
     async fn a_transport_the_engine_does_not_carry_is_refused() {
         let ctx = context();
         let engine = Engine::new(&ctx, options(), Recorder::new()).expect("engine");
-        for endpoint in ["ipc:///tmp/weida-zmq-test.sock", "inproc://orders"] {
-            let endpoint = Endpoint::parse(endpoint).expect("endpoint");
-            let err = engine.bind(&endpoint).await.unwrap_err();
-            assert_eq!(err.errno(), "EPROTONOSUPPORT", "{err}");
-            let err = engine.connect(&endpoint).unwrap_err();
-            assert_eq!(err.errno(), "EPROTONOSUPPORT", "{err}");
-        }
+        let ipc = Endpoint::parse("ipc:///tmp/weida-zmq-test.sock").expect("endpoint");
+        let err = engine.bind(&ipc).await.unwrap_err();
+        assert_eq!(err.errno(), "EPROTONOSUPPORT", "{err}");
+        let err = engine.connect(&ipc).unwrap_err();
+        assert_eq!(err.errno(), "EPROTONOSUPPORT", "{err}");
+
+        let inproc = Endpoint::parse("inproc://orders").expect("endpoint");
+        engine.bind(&inproc).await.expect("inproc is carried");
+        engine.connect(&inproc).expect("inproc is carried");
 
         // The wildcard binds; it does not dial.
         let err = engine

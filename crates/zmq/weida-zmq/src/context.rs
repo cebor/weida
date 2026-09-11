@@ -15,10 +15,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::Notify;
-use weida_runtime::{CloseBudget, Exec, NameRegistry, OwnedReactor};
+use weida_runtime::{CloseBudget, Exec, OwnedReactor};
 
 use crate::endpoint::MAX_INPROC_NAME_BYTES;
 use crate::error::{Error, Result};
+use crate::inproc::Inproc;
 
 /// Sockets one context may hold at once, by default.
 ///
@@ -112,23 +113,11 @@ impl std::fmt::Display for SocketId {
     }
 }
 
-/// A dial to an `inproc://` name, handed to whoever bound it.
-///
-/// The `inproc` namespace is a [`NameRegistry`], so a bind hands back the
-/// queue of these and a connect pushes one onto it. Today it carries the
-/// dialling socket's id, which is what the accepting side needs to identify
-/// its new peer; the pipe pair rides along with it once queues exist.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InprocDial {
-    /// The socket that dialled.
-    pub from: SocketId,
-}
-
 /// What every socket of one context shares.
 struct ContextInner {
     config: ContextConfig,
     exec: Exec,
-    inproc: NameRegistry<InprocDial>,
+    inproc: Arc<Inproc>,
     state: Mutex<State>,
     /// Signalled whenever a socket slot is released, so that `shutdown` can
     /// wait for the last one without polling.
@@ -222,7 +211,7 @@ impl Context {
         Context {
             inner: Arc::new(ContextInner {
                 exec,
-                inproc: NameRegistry::new(MAX_INPROC_NAME_BYTES),
+                inproc: Arc::new(Inproc::new(MAX_INPROC_NAME_BYTES)),
                 state: Mutex::new(State {
                     open: 0,
                     next_id: 1,
@@ -252,8 +241,20 @@ impl Context {
     /// is invisible in another, "two contexts are two separate ZeroMQ
     /// instances" (`docs/research/zeromq.md` §2). Names are bounded at
     /// [`MAX_INPROC_NAME_BYTES`].
-    pub fn inproc(&self) -> &NameRegistry<InprocDial> {
+    /// Handed out as the shared handle it is: a binding outlives the call
+    /// that made it and unbinds its name when it is dropped, so the
+    /// namespace has to be reference-counted rather than borrowed.
+    pub fn inproc(&self) -> &Arc<Inproc> {
         &self.inner.inproc
+    }
+
+    /// The namespace as a handle a connection task can keep.
+    ///
+    /// A task dialling an `inproc://` name outlives the call that started it
+    /// and must not keep the socket alive, so it holds this rather than a
+    /// `Context`.
+    pub(crate) fn inproc_shared(&self) -> Arc<Inproc> {
+        Arc::clone(&self.inner.inproc)
     }
 
     /// Sockets currently open on this context.
@@ -425,6 +426,7 @@ impl Terminated {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
 
     fn small(max_sockets: usize) -> ContextConfig {
         ContextConfig {
@@ -596,36 +598,34 @@ mod tests {
         );
     }
 
-    /// Claim: the `inproc` namespace belongs to the context — one owner per
-    /// name inside it, and libzmq's 256-byte budget on the name.
+    /// Claim: the `inproc` namespace belongs to the context — the same name
+    /// is free in a second context, a dial in one never reaches the other,
+    /// and the budget is libzmq's 256 bytes.
     #[tokio::test]
     async fn the_inproc_namespace_is_the_contexts_own() {
         let ctx = Context::new(ContextConfig::default()).expect("context");
         let other = Context::new(ContextConfig::default()).expect("second context");
 
-        let mut incoming = ctx.inproc().bind("orders").expect("bind");
-        assert_eq!(
-            ctx.inproc().bind("orders").unwrap_err().to_string(),
-            weida_core::Error::AlreadyRegistered.to_string()
-        );
-
+        let mut here = ctx.inproc().bind("orders").expect("bind");
         // A second context is a second ZeroMQ instance: the same name is free
         // there, and a dial in one never reaches the other.
-        let _elsewhere = other
+        let mut elsewhere = other
             .inproc()
             .bind("orders")
             .expect("free in a fresh context");
-        assert!(other.inproc().lookup("orders").is_some());
 
         let dialler = ctx.open_socket().expect("a slot");
-        ctx.inproc()
-            .lookup("orders")
-            .expect("bound")
-            .send(InprocDial { from: dialler.id() })
-            .expect("the owner is listening");
+        let _ours = ctx
+            .inproc()
+            .dial("orders", dialler.id())
+            .expect("our own binder");
         assert_eq!(
-            incoming.try_recv().expect("delivered"),
-            InprocDial { from: dialler.id() }
+            here.accept().await.expect("delivered here").from,
+            dialler.id()
+        );
+        assert!(
+            elsewhere.accept().now_or_never().is_none(),
+            "the other context's binder must have seen nothing"
         );
 
         assert_eq!(ctx.inproc().max_name_bytes(), MAX_INPROC_NAME_BYTES);
