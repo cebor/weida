@@ -60,8 +60,9 @@ acceptance: a bench measuring `connect` latency and the runtime's RSS delta for 
 note: "pooled connections to one server" cannot be dialled from one runtime today — the pool keys on `(host, port, ClientTls, address fingerprint)` — so the memory figures use one client runtime per connection and separate the per-runtime delta (0-4 KiB) from the per-connection one, both ends in one process. New bench target `crates/weida/benches/connections.rs`, which B-012 extends.
 
 ### B-012 — Measure: connections per dialled path
-kind: measure | size: 45 | status: in_progress 2026-09-11T05:18Z | needs: [B-011]
+kind: measure | size: 45 | status: done b1ad06b | needs: [B-011]
 acceptance: the same bench with one connection per path for 16 and 256 paths, against `max_connections`; handshake time, RSS, and the point where the server refuses with `LIMIT_EXCEEDED`; numbers recorded.
+note: measures both shapes, because they are two systems: pooled today (256 paths share one connection, 1.47 ms for all 256 dials) and one connection per path as 0002 will have it (277.7 ms for 256, 1.08 ms each, 995 KiB per connection). The refusal point is confirmed at `max_connections`: the ninth dial against a ceiling of 8 fails with `Error::LimitExceeded`. The run also caught a +12 % `cold_handshake` regression that B-016 introduced — filed as B-025, not fixed here.
 
 ### B-013 — Wire: DATA keys 6 and 7 in weida-protocol
 kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T05:25Z | needs: [B-006]
@@ -110,3 +111,7 @@ acceptance: `crates/weida/tests/foreign_executor.rs` gains a Push/Pull and a Pub
 ### B-024 — An example without `#[tokio::main]`
 kind: code | size: 30 | status: ready | needs: [B-016]
 acceptance: one existing example (or a new small one) drives a full exchange from a plain `fn main` using `Runtime::owned`, showing what a caller with no async runtime of its own writes; the README's build-and-run section names it; `cargo run -p weida --example <name>` works. Proposed by the B-016 worker, and it is the user-visible half of `Runtime::owned` — the API exists but nothing in the tree demonstrates it.
+
+### B-025 — Do not resolve a literal address on every connect
+kind: code | size: 30 | status: ready | needs: []
+acceptance: `Exec::resolve` (or its caller in `crates/weida/src/pool.rs`) short-circuits a host that is already an IP literal — `host.parse::<IpAddr>()` — so no string is allocated, no task is spawned and no join handle is awaited for `weida://127.0.0.1:7443/x`; name resolution keeps its current shape for real hostnames, including the spawn that `lookup_host` needs for its Tokio context; `connect/cold_handshake` returns to ~1.05 ms in `cargo bench -p weida --bench connections` and the number replaces the regression paragraph in IMPLEMENTATION.md §4 (B-012). Found by B-012: the current path costs +12 % of a cold handshake (1.02-1.10 ms to 1.18-1.24 ms, p = 0.00) for a lookup that a literal address does not need.

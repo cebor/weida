@@ -46,6 +46,20 @@ connection at all. 64 handshakes in series take 65.6-73.9 ms with no degradation
 millisecond and under a megabyte for the pair, against the unbounded head-of-line coupling it
 removes. Recorded in IMPLEMENTATION.md §4.
 
+**B-012 — connections per dialled path.** Same command, same machine. Today the pool ignores
+the path, so **256 dials share one connection** and cost **1.47 ms** in total. With one
+connection per path as 0002 will have it: **277.7 ms** for 256 paths, **1.08 ms** each, **995
+KiB** of RSS per connection for both ends — linear, no degradation with the count. Against
+`max_connections = 8` the ninth dial fails with `Error::LimitExceeded` after the server
+completes the handshake and closes with `LIMIT_EXCEEDED`. Consequence for B-017: the bulk tier
+wants **lazy** per-path connections (256 paths would otherwise cost 278 ms of handshakes where
+they cost 1.5 ms today) while the control connection stays eager.
+
+**Regression caught in passing:** `connect/cold_handshake` is **+12 %** (1.02-1.10 ms to
+1.18-1.24 ms, p = 0.00) since B-016, because `Exec::resolve` spawns a task and awaits a join
+handle on every `connect` even for a literal `127.0.0.1`. Filed as **B-025**, not fixed inside
+a measure item. Both recorded in IMPLEMENTATION.md §4.
+
 ## Chronology
 
 2026-09-11T00:00Z | — | seeded | loop, backlog B-001..B-018 and this log created | next B-001
@@ -65,3 +79,4 @@ removes. Recorded in IMPLEMENTATION.md §4.
 2026-09-11T05:05Z | B-008 | done 64ba40b | PATTERNS §1.3 narrowed to bulk writers on one path's connection, §1.4 states the stream budget is the L0 message credit, §1.6 cites 0005 including "a late refusal reaches no observer", §1.7 carries B-010's reorder cost, §4 gains the segmented grammar and subscriber-side drop detection, §7 gains the "must know whether it was accepted" row; INVARIANTS permits the control connection, names three unimplemented bounds and makes the mapping document the home of adapter honesty; ARCHITECTURE §5 describes both pool tiers, the fingerprint binding and the two Limits profiles with B-011's numbers; SYNTHESIS §8 closes 8.1/8.2/8.4 and states that only 8.6 and 8.8 remain open; docs-only, no gate | next merge B-016 from `b016-runtime`
 2026-09-11T05:15Z | B-016 | done 2741dfd | `b016-runtime` (parallel worker, 6dee879 + bfc5fee) merged `--no-ff` with no conflicts and gated here: fmt, clippy in both feature configurations, **222 tests** pass with 1 ignored, rustdoc clean. Verified: `Runtime::owned` (multi-thread, `worker_threads` default 1, `0` rejected) and `with_handle`; `Exec` in `runtime.rs` is the only caller of `tokio::spawn`, `tokio::time::sleep` and `lookup_host`; `futures_io` traits on both transfer types; `a_req_rep_round_trip_runs_without_a_tokio_executor` is a plain `#[test]` under `block_on`. Two worker follow-ups filed as B-023 and B-024 | next B-019 when delivered, else B-012
 2026-09-11T05:27Z | B-019 | done 4343af2 | FAILURE_MODEL §4 states the refusal race as decided (parallel worker): both deterministic constructions and no third, no sender outcome for a refusal seen after the receipt resolved, and the 2 MiB payload of the three tests named as load-bearing in prose and in their doc comments; no executable test line changed, full gate green anyway (222 tests) | next B-012; B-013 and B-020 delegated on branches `b013-data-keys` and `b020-segment-filter`
+2026-09-11T05:45Z | B-012 | done b1ad06b | per-path fan added to `benches/connections.rs`: 256 paths are one pooled connection today (1.47 ms) against 277.7 ms for 256 real connections (1.08 ms, 995 KiB each), refusal confirmed at `max_connections` with `Error::LimitExceeded`; full gate green; numbers above and in IMPLEMENTATION.md §4; B-025 filed for the +12 % handshake regression the run exposed | next B-023, then B-024
