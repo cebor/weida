@@ -30,9 +30,11 @@ use weida::{
 /// figure, one where moving the bytes is.
 const SIZES: [usize; 2] = [1024, 1024 * 1024];
 
-/// Local connections held live for the memory figure. Below
-/// `max_local_streams` (255), since every live transfer is one of them.
-const LOCAL_CONNECTIONS: usize = 64;
+/// Local connections held live for the memory figure. Just under
+/// `max_local_streams` (255), since every live transfer is one of them, and
+/// as close to it as possible because the delta is a handful of KiB against
+/// a page-granular RSS.
+const LOCAL_CONNECTIONS: usize = 200;
 
 fn tokio_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -363,11 +365,12 @@ fn report_memory(_c: &mut Criterion) {
 
             let delta = after.saturating_sub(before);
             println!(
-                "{:>6}: {:>8} B per live transfer connection ({} held, {:?} to open them, \
-                 {:.2} ms each)",
+                "{:>6}: {:>8} B per live transfer connection ({} held, {} B in total, \
+                 {:?} to open them, {:.3} ms each)",
                 kind.name(),
                 delta / LOCAL_CONNECTIONS as u64,
                 LOCAL_CONNECTIONS,
+                delta,
                 elapsed,
                 elapsed.as_secs_f64() * 1000.0 / LOCAL_CONNECTIONS as f64,
             );
@@ -375,7 +378,9 @@ fn report_memory(_c: &mut Criterion) {
             drop(open);
             client.shutdown().await;
             server.runtime.clone().shutdown().await;
-            let _ = held.await;
+            // Aborted rather than awaited: the accept loop ends when its
+            // binding goes, and this one's outlives the runtime in `server`.
+            held.abort();
         });
     }
 }
