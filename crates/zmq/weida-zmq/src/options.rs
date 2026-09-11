@@ -19,6 +19,7 @@
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+use crate::identity::RoutingId;
 use crate::message::DEFAULT_MAX_MESSAGE_SIZE;
 use crate::pipe::PipeConfig;
 
@@ -41,6 +42,10 @@ pub const DEFAULT_BACKLOG: u32 = 100;
 /// necessary because the first is not necessarily reachable — `localhost`
 /// commonly resolves to both `::1` and `127.0.0.1`.
 pub const DEFAULT_MAX_RESOLVED_ADDRESSES: usize = 8;
+
+/// The largest `ZMQ_HEARTBEAT_TTL` the wire can carry: the field is
+/// deciseconds in a `u16`, so 6553.5 s (`docs/research/zeromq.md` §11).
+pub const MAX_HEARTBEAT_TTL: Duration = Duration::from_millis(6_553_500);
 
 /// What a socket's connection engine is configured with.
 ///
@@ -80,6 +85,26 @@ pub struct SocketOptions {
     /// 0013 §4.4 item 5's second deliberate deviation — see
     /// [`DEFAULT_MAX_MESSAGE_SIZE`].
     pub max_message_size: u64,
+    /// `ZMQ_HEARTBEAT_IVL`: how often to send a `PING`. `None` is libzmq's
+    /// `0`: no heartbeat, and liveness is the transport's business.
+    ///
+    /// `PING`/`PONG` are ZMTP 3.1 commands, so a connection that negotiated
+    /// 3.0 gets no heartbeat whatever this says — see
+    /// [`crate::session::ZmtpSession`].
+    pub heartbeat_ivl: Option<Duration>,
+    /// `ZMQ_HEARTBEAT_TIMEOUT`: how long a peer may be silent before it is
+    /// declared dead. `None` is libzmq's `0`, which means
+    /// `ZMQ_HEARTBEAT_IVL` (`docs/research/zeromq.md` §11).
+    pub heartbeat_timeout: Option<Duration>,
+    /// `ZMQ_HEARTBEAT_TTL`: the hint carried in our `PING` telling the peer
+    /// how long to wait for us before giving up. `None` is libzmq's `0`: no
+    /// hint. The wire field is deciseconds in a `u16`, so the maximum is
+    /// 6553.5 s and finer granularity is rounded down.
+    pub heartbeat_ttl: Option<Duration>,
+    /// `ZMQ_ROUTING_ID`: the identity this socket announces in its `READY`,
+    /// so that a ROUTER peer can address it by a name it chose rather than
+    /// by a generated one (`docs/research/zeromq.md` §4.2).
+    pub routing_id: Option<RoutingId>,
     /// `ZMQ_SNDHWM`/`ZMQ_RCVHWM` and the mute action, per peer.
     pub pipe: PipeConfig,
     /// See [`DEFAULT_MAX_RESOLVED_ADDRESSES`].
@@ -96,6 +121,10 @@ impl Default for SocketOptions {
             immediate: false,
             backlog: DEFAULT_BACKLOG,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            heartbeat_ivl: None,
+            heartbeat_timeout: None,
+            heartbeat_ttl: None,
+            routing_id: None,
             pipe: PipeConfig::default(),
             max_resolved_addresses: DEFAULT_MAX_RESOLVED_ADDRESSES,
         }
@@ -131,6 +160,24 @@ impl SocketOptions {
             return Err(Error::EINVAL(
                 "ZMQ_RECONNECT_IVL_MAX is set while reconnection is disabled \
                  (ZMQ_RECONNECT_IVL = -1)"
+                    .into(),
+            ));
+        }
+        if let Some(ttl) = self.heartbeat_ttl
+            && ttl > MAX_HEARTBEAT_TTL
+        {
+            return Err(Error::EINVAL(
+                format!(
+                    "ZMQ_HEARTBEAT_TTL travels as deciseconds in a u16, so its maximum is \
+                     {MAX_HEARTBEAT_TTL:?}; this one is {ttl:?}"
+                )
+                .into(),
+            ));
+        }
+        if self.heartbeat_timeout.is_some() && self.heartbeat_ivl.is_none() {
+            return Err(Error::EINVAL(
+                "ZMQ_HEARTBEAT_TIMEOUT is set while the heartbeat is off \
+                 (ZMQ_HEARTBEAT_IVL = 0), so nothing would ever measure the silence"
                     .into(),
             ));
         }
