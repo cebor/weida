@@ -5,9 +5,10 @@ first, then the numbers, then the chronology.
 
 ## Review needed
 
-**Nothing is waiting on disk.** `b057-cross-adapter` is merged (`525db84`, gate green at 503
-tests), B-059's open choice is decided — a local `open` blocks on a free slot — and is in
-progress on `b059-local-block` in the parallel worktree.
+**Nothing is waiting on disk and nothing is in flight.** `b057-cross-adapter` and
+`b059-local-block` are both merged (`525db84`, `6ca89ad`), the gate is green at **505 tests**,
+and the tree is clean. Phase A is complete but for its two named gaps (A5 parked by 0011,
+A9's Windows half blocked on a runner) and Phase B2 is six slices of six.
 
 **Then read these three, in this order.**
 
@@ -40,10 +41,9 @@ progress on `b059-local-block` in the parallel worktree.
   it: 0011 §4.3 parks 0002 §6.3's per-peer control connection, because the rule 0011 settles
   leaves that tier with no frame to carry. 0002 and 0003 carry amendment markers; neither was
   rewritten.
-- **No stashes.** Blocked: B-039 only, on the runner above. Parked: B-045, the control
-  connection, with a written revival condition, and B-058, the Python binding, at your
-  decision that Phase C waits for B3. Delegated and running: B-059, the local `Block` fix, on
-  `b059-local-block` in the parallel worktree. Eight items are `ready`: B-060 (the CLI),
+- **No stashes, nothing delegated.** Blocked: B-039 only, on the runner above. Parked: B-045,
+  the control connection, with a written revival condition, and B-058, the Python binding, at
+  your decision that Phase C waits for B3. Eight items are `ready`: B-060 (the CLI),
   B-061 (CI), B-062 (the MQTT mapping document, which is what Phase B does next) and the five
   filed from the zeughaus requirements note now at
   [requirements/zeughaus-video.md](requirements/zeughaus-video.md) — B-064 streaming fan-out,
@@ -142,6 +142,23 @@ real forwarding on the other, so they are recorded but not compared.
 from 1024 *messages* to 8 MiB of *bytes* for the same reason — a depth multiplies by the cap.
 Recorded in IMPLEMENTATION.md §4.
 
+**B-059 — what the local transports cost against QUIC.**
+`cargo bench -p weida --bench transports -- --warm-up-time 1 --measurement-time 3` (two runs,
+release, both ends in this process, loopback for the QUIC rows, same machine as above).
+Req/Rep round trip at 1 KiB: **58.3-58.8 µs** QUIC, **13.2-13.5 µs** inproc (4.4×),
+**50.6-50.8 µs** `AF_UNIX` (1.2×); at 1 MiB **2.70-2.73 ms**, **144-145 µs** (19×),
+**266-312 µs** (9-10×). Push one-way at 1 KiB: **7.97-8.08 µs**, **2.03-2.07 µs**,
+**24.0-24.1 µs**; at 1 MiB **1.36 ms**, **57.7-79.5 µs**, **130-147 µs**. A live local
+connection costs **0-1761 B** of RSS against the **995 KiB** of a QUIC one (B-012) — two to
+three orders of magnitude, at the low end below what RSS resolves.
+**The row that decides something is the 1 KiB Push: `AF_UNIX` is 3× *slower* than loopback
+QUIC** (24.0 µs against 8.0), because QUIC opens a stream inside a connection it already has
+while `AF_UNIX` opens a connection — a fixed ~22 µs per message that is invisible at 1 MiB
+and is most of the message at 1 KiB. So 0010 §4.2's "the OS connection is the stream" holds
+for bulk and for in-process work and fails at high message rates over `AF_UNIX`; that is the
+price of not reimplementing a stream layer, and it now has a number. Recorded in
+IMPLEMENTATION.md §4.
+
 ## Chronology
 
 2026-09-11T00:00Z | — | seeded | loop, backlog B-001..B-018 and this log created | next B-001
@@ -202,3 +219,4 @@ Recorded in IMPLEMENTATION.md §4.
 2026-09-11T20:10Z | B-057 | delivered, not merged | the cross-adapter test both mapping documents had been promising exists on `b057-cross-adapter` (head `14c27fd`, main `e357a4e` merged in, gate green there) and is **not on main**, because the session stopped first — merging it is the first thing to do tomorrow, followed by the one "cross-adapter" line zmtp.md §10 item 7 and nng.md §10 each owe. Nine tests in a new `crates/adapters/cross-tests` crate, both foreign ends the real `zeromq` and `nng`: a message enters through the ZMTP bridge and leaves through the SP one in both directions, each protocol's envelope restored on its own side, and the claim the chain can actually make asserted rather than described — **`BestEffort` end to end**, shown by a ZeroMQ send that succeeds while the far end is closed and a fresh puller that proves nothing arrived. The composed losses are tests too: a ZMTP multipart refused at the first hop with nothing reaching the second, the smaller of the two caps deciding, and an SP hop-count ceiling that reaches the first peer only as silence. One honest exception, stated in the test: that last peer is raw TCP on `weida-sp`, because no single REP produces a multi-hop tag stack without an `nng_device` topology. **One finding worth carrying into any future `nng` work:** `nng_dial` is synchronous and returns only once the SP handshake is answered, so it must not run on the thread a bridge's accept loop needs — two tests timed out until the dial moved to a blocking thread. | next: merge it, then B-059's open choice
 2026-09-11T12:17Z | B-057 | done 525db84 | the **cross-adapter test is on main**: `b057-cross-adapter` merged `--no-ff` and the gate run here — fmt, clippy in both configurations, **503 tests** with one ignored, rustdoc — no conflicts, main had moved only by backlog commits since the branch took `e357a4e`. (The clock: the timestamps above this line were ahead of the machine's UTC; this one is the real time.) The two "cross-adapter" lines the mapping documents owed are written — zmtp.md §10 item 7 and nng.md §10 item 7, each naming the three pattern chains in both directions, the composed losses and `BestEffort` asserted rather than described — and IMPLEMENTATION.md §1 gained the sixteenth increment with the reasoning from the test file's own module documentation. One thing the merge settles that the acceptance line did not ask for: the `nng` C library builds on this machine, so the SP end of the chain is the **real implementation and not `#[ignore]`d**, which makes this the independent run nng.md §10 items 3 and 4 were owed and answers §11's first question (a real `Rep0` replies to a raw requester that never retransmits). PAIR is in no chain, so the v1 hop-count disagreement is still open on the wire | next B-069, the SP research item that mirrors B-055
 2026-09-11T12:40Z | B-069 | done 2035786 | the SP sheet now says what the implementation taught it, which is the mirror of B-055 and the item LOOP §9 owes after every Phase B slice. Everything new is **source [30]** — `nng` 1.0.1 over `nng-sys` 1.4.0-rc.0, the vendored C library — so a reader can tell an observation of NNG 1.4.0-rc.0 from a claim about SP, and no sentence in the sheet mentions weida (research/README rule 1). The addition that would have saved the most time if it had been there: **`nng_dial` returns only once the peer's protocol header has arrived**, so calling it on the thread that must answer a greeting deadlocks — two cross-adapter tests timed out on exactly that before the dial moved to a blocking thread. The one that matters most for any future SP work: **SP has no refusal frame at all**, so a close and silence are the whole vocabulary and every sending-side diagnosis is an inference — which is also why a hop ceiling reached at the second hop reaches the first peer as nothing. §3 now carries the octets the RFCs leave in prose (the 8-octet header, eleven endpoint type ids from NNG's registry, the 64-bit framing, the tag stacks, PAIR v1's word, with the prose's "hop count starts at one" against the implementation's `0` side by side), §4 what receiver-side filtering costs on the link, §11 the second hop ceiling (`NNI_MAX_MAX_TTL` = 15 against the manual's 255), §13 what the crate actually is. nng.md §11 loses two entries and narrows the PAIR one to "recorded, not observed", because no chain uses PAIR | next: nothing — the instructed items are done; the backlog's first `ready` item is B-060
+2026-09-11T13:05Z | B-059 | done 6ca89ad | `b059-local-block` merged `--no-ff` and gated here: **505 tests**, one ignored; IMPLEMENTATION.md auto-merged and nothing needed resolving. Your decision built: **a local `open` waits for a free slot**, so `Block` means the same thing on every transport. `StreamSlot` is a tokio `Semaphore` permit and the local links await it in `select!` against `closed()` — a waiter holds nothing, and dropping the future cancels the wait, so the caller's own deadline is the bound. `LimitExceeded` survives in exactly one place, the reverse-pool park, which takes its permit with `try_acquire` because a pool that waited for itself would deadlock. `push_pull_waits_for_a_slot_over_{inproc,unix}` push 600 concurrent sends through 255 slots and fail on the old code with "send 255 of 600 failed: LimitExceeded". The numbers this item existed for are in the Numbers section above and in IMPLEMENTATION.md §4; the one worth your attention is that **a 1 KiB Push over `AF_UNIX` costs 3× the same Push over loopback QUIC** — one connection per transfer is free at 1 MiB and is the whole cost at 1 KiB, which is the honest boundary of 0010 §4.2's structural argument. A pre-existing hang in the bench's memory report was fixed on the way. With this, **Phase A is complete but for the two named gaps (A5 parked, A9's Windows half blocked) and Phase B2 is six slices of six** | next: nothing scheduled — the backlog's first `ready` item is B-060, the CLI
