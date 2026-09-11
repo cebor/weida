@@ -40,8 +40,9 @@ acceptance: PATTERNS §1.3 narrowed to "bulk writers on the same path's connecti
 note: INVARIANTS gained a third named-but-unimplemented bound beside the reassembly hold and the per-peer connection count — the dedup window's identity count, which a time window does not bound — plus a paragraph naming the adapter mapping document as the home of the adapter-honesty invariant per 0006 §4.9. SYNTHESIS §8 also gained a preamble stating which seven entries are closed and that §8.6 and §8.8 remain open; the question text above each closing paragraph is left untouched, because a decision is only legible against its question.
 
 ### B-019 — Spec sync: FAILURE_MODEL.md per 0005
-kind: spec | size: 30 | status: in_progress (delegated) 2026-09-11T04:30Z | needs: []
+kind: spec | size: 30 | status: done 4343af2 | needs: []
 acceptance: §4 keeps "a refusal can lose the race with the transport" and gains 0005 §4.4's consequence — no sender outcome exists for a refusal observed after the receipt resolved, and none is added — plus 0005 §4.3's two deterministic constructions (payload beyond the peer's stream receive window, or an exchange) with the note number; the three 2 MiB tests named in 0005 §2 get a doc-comment sentence saying their payload size is what makes the refusal deterministic; `grep` shows no document still calling the race an open question.
+note: verified — the `docs/FAILURE_MODEL.md` §4 change states both deterministic constructions and that there is no third, adds "no sender outcome exists for a refusal observed after the receipt resolved", and makes the 2 MiB payload size load-bearing in prose and in the three test doc comments. The diff touches no executable line in `pushpull.rs` or `pubsub.rs`; the gate ran anyway because Rust files changed, and it is green (222 tests).
 
 ### B-009 — Measure: DATA header cost at high message rate
 kind: measure | size: 60 | status: done 178a95c | needs: []
@@ -63,8 +64,9 @@ kind: measure | size: 45 | status: in_progress 2026-09-11T05:18Z | needs: [B-011
 acceptance: the same bench with one connection per path for 16 and 256 paths, against `max_connections`; handshake time, RSS, and the point where the server refuses with `LIMIT_EXCEEDED`; numbers recorded.
 
 ### B-013 — Wire: DATA keys 6 and 7 in weida-protocol
-kind: code | size: 90 | status: ready | needs: [B-006]
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T05:25Z | needs: [B-006]
 acceptance: `DataHeader` gains `sequence: Option<u64>` and `producer: Option<...>` per 0008's encoding; encoder writes them only when set; decoder accepts, caps and skips per §5; golden vectors for both; fuzz targets extended; no runtime behaviour change yet.
+note: delegated to the parallel worker on branch `b013-data-keys` in the worktree `../weida-b016` with its own `CARGO_TARGET_DIR`. Encoding is fixed by [PROTOCOL §6.2] and 0008 §4.4: `sequence` a `uint`, `producer` a `bstr` capped at 32 B and absent whenever the producer is the connection peer. Merged, gated and finished here on delivery, as B-016 was.
 
 ### B-014 — Wire: HELLO guarantee declarations and intersection
 kind: code | size: 90 | status: ready | needs: [B-006, B-013]
@@ -89,8 +91,9 @@ acceptance: `docs/adapters/zmtp.md` derived from `docs/research/zeromq.md`: sock
 note: delivered with `docs/adapters/README.md` as well — the mapping-document template and its own table, so no row was needed in `docs/decisions/README.md`. Exceeds the acceptance line with ten named losses, six refused configurations and a per-loss test in the bench plan.
 
 ### B-020 — Segmented topic filter matching in code
-kind: code | size: 90 | status: ready | needs: [B-006]
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-11T05:25Z | needs: [B-006]
 acceptance: `matches_filter` in `crates/weida/src/pubsub.rs` becomes the allocation-free, backtracking-free segment walker of 0007 §4.3, and its doc-comment objection is rewritten rather than deleted; filter grammar validation lands in `weida-protocol` beside the other header rules so an invalid filter (`*` not alone in its segment, `#` not final) is rejected at the codec boundary; `Subscriber::subscribe`'s documentation states the grammar; golden vectors for a literal filter, a middle-segment `*`, a trailing `#`, the empty filter and a topic containing a literal `*`; `subscribe_prefix_filters_topics` is renamed and extended, including the boundary case a byte prefix over-matched (`sensors.temp` must not select `sensors.temperature`).
+note: delegated to the parallel worker on branch `b020-segment-filter` in the worktree `../weida-b016`, after B-013. It is the one item that makes the implementation agree with [PROTOCOL §6.4] again, so the §8 golden vectors and the `px.` note in that section are part of it; the existing `subscribe_prefix_filters_topics` must fail before the change and pass after it in its extended form.
 
 ### B-021 — Measure: segment matching in the fan-out path
 kind: measure | size: 45 | status: ready | needs: [B-020]
