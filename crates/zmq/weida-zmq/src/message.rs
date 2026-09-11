@@ -361,6 +361,39 @@ impl From<Message> for Multipart {
     }
 }
 
+/// Every one-frame conversion a [`Message`] has, a single-frame message has
+/// too: the overwhelmingly common case is one frame, and making a caller
+/// write it twice buys nothing.
+impl From<Vec<u8>> for Multipart {
+    fn from(bytes: Vec<u8>) -> Multipart {
+        Multipart::single(Message::from(bytes))
+    }
+}
+
+impl From<&[u8]> for Multipart {
+    fn from(bytes: &[u8]) -> Multipart {
+        Multipart::single(Message::from(bytes))
+    }
+}
+
+impl<const N: usize> From<&[u8; N]> for Multipart {
+    fn from(bytes: &[u8; N]) -> Multipart {
+        Multipart::single(Message::from(bytes))
+    }
+}
+
+impl From<String> for Multipart {
+    fn from(text: String) -> Multipart {
+        Multipart::single(Message::from(text))
+    }
+}
+
+impl From<&str> for Multipart {
+    fn from(text: &str) -> Multipart {
+        Multipart::single(Message::from(text))
+    }
+}
+
 impl IntoIterator for Multipart {
     type Item = Message;
     type IntoIter = std::vec::IntoIter<Message>;
