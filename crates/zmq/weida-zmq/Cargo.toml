@@ -100,6 +100,22 @@ name = "majordomo"
 name = "freelance"
 
 [[example]]
+# The zguide's Clone, on 12/CHP's three-port wire.
+name = "clone"
+
+[[example]]
+# The zguide's Binary Star: the state machine and the PUB-SUB exchange.
+name = "binary_star"
+
+[[example]]
+# The zguide's Espresso: the proxy capture socket as a pub-sub trace.
+name = "espresso"
+
+[[example]]
+# The zguide's Last Value Caching: an XSUB/XPUB proxy with a cache.
+name = "last_value_cache"
+
+[[example]]
 # The zguide's Hello World, in the shape its C original has.
 name = "hello_world"
 required-features = ["blocking"]
