@@ -13,7 +13,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Harness, Transport};
-use weida::{Error, TransferMeta};
+use weida::{Deduplication, Error, GuaranteeSet, OrderingMode, RuntimeConfig, TransferMeta};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -238,4 +238,62 @@ async fn a_local_peer_that_goes_away_is_reported_as_connection_loss() {
         "{err:?}"
     );
     client.shutdown().await;
+}
+
+/// Claim: the guarantees and the drain are above the transport, so they work
+/// over the in-process one unchanged.
+///
+/// Ordering, deduplication and `Runtime::drain` are all defined on headers
+/// and receipts rather than on sockets, and the transport boundary is what
+/// keeps that true. Nothing about them is excluded locally
+/// (`docs/decisions/0010-local-transport.md` §4.2).
+#[tokio::test]
+async fn guarantees_and_the_drain_work_over_inproc() {
+    let guarantees = GuaranteeSet {
+        ordering: OrderingMode::PerProducerDetect,
+        deduplication: Deduplication::Bounded,
+        dedup_window_ms: Some(500),
+        ..GuaranteeSet::CORE
+    };
+    let config = RuntimeConfig {
+        guarantees,
+        ..RuntimeConfig::default()
+    };
+    let h = Harness::start_with(Transport::Inproc, config.clone()).await;
+    let puller = h.listener.puller("/jobs").expect("puller");
+
+    let client = h.client_with(config);
+    let pusher = client.pusher(h.trust());
+    within(pusher.connect(&h.url("/jobs")))
+        .await
+        .expect("connect");
+
+    for body in [&b"first"[..], &b"second"[..]] {
+        let mut transfer = within(pusher.open(TransferMeta::default()))
+            .await
+            .expect("open");
+        within(transfer.write_all(body)).await.expect("write");
+        // Fire and forget: the receipt is dropped, so only a drain can wait
+        // for it.
+        drop(transfer.finish().expect("finish"));
+    }
+
+    for expected in [0u64, 1] {
+        let transfer = within(puller.recv()).await.expect("recv");
+        assert_eq!(
+            transfer.meta().sequence,
+            Some(expected),
+            "the negotiated ordering numbers local transfers too"
+        );
+        assert_eq!(transfer.meta().gap, None);
+        within(transfer.collect(1024)).await.expect("collect");
+    }
+
+    let drained = within(client.drain(Duration::from_secs(2))).await;
+    assert_eq!(
+        drained.outstanding, 0,
+        "a local drain waits on the same receipts: {drained:?}"
+    );
+    assert!(drained.delivered <= 2, "{drained:?}");
+    h.shutdown().await;
 }

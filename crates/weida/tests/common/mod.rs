@@ -274,7 +274,12 @@ impl Harness {
 
     /// A client runtime for this harness.
     pub fn client(&self) -> Runtime {
-        Runtime::new(RuntimeConfig::default()).expect("client runtime")
+        self.client_with(RuntimeConfig::default())
+    }
+
+    /// A client runtime with a whole configuration.
+    pub fn client_with(&self, config: RuntimeConfig) -> Runtime {
+        Runtime::new(config).expect("client runtime")
     }
 
     /// Shuts the server down, closing its connections on either transport.

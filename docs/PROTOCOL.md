@@ -858,7 +858,6 @@ sender MAY await the transport receipt (§9.2) or discard it.
 **Pub/Sub.** A subscriber sends SUBSCRIBE frames (§6.4) naming the publisher's path and a
 topic **filter** (§6.4). Publishing a message means writing one DATA frame per matching subscriber,
 each on its own uni stream, each carrying `topic` (key `5`). Every copy is independent.
-
 Delivery to a subscriber is best effort with **explicit drops**. A publisher bounds the
 payload bytes it will hold queued for one subscriber (`subscriber_buffer_bytes`); a message
 that does not fit is dropped for that subscriber alone, and the publisher continues. A slow
@@ -899,6 +898,7 @@ remote peer can cause to be allocated (master doc §50, §81 rule 17).
 | `max_sequence_scopes` | `1024` | producer scopes — paths and topics — a receiver tracks per connection for gap detection or reassembly under `PerProducer` ordering; the peer names the scopes, so at the cap a new one is simply not tracked |
 | `max_reorder_hold` | `256` | transfers a receiver holds back at once, over all scopes, under `PerProducer(reassemble)`; at the cap the oldest held transfer is released out of order with its gap reported (§6.5, [GUARANTEES.md](GUARANTEES.md) §3). A held transfer is an unread stream, so the bytes it pins are bounded again by `stream_receive_window` and `connection_receive_window` |
 | `max_dedup_entries` | `4096` | identities a receiver remembers per connection under `Bounded` deduplication; the negotiated window bounds how long an identity is kept and this bounds how many, evicting the oldest at the cap (§6.5) |
+| `max_local_streams` | `255` | live transfers on one **local** connection (§2.1), where the stream is the OS object and there is no multiplexing; opening past the cap fails with `LIMIT_EXCEEDED` locally rather than queueing. The number is Windows' named-pipe instance limit, the tightest of the three platforms [0010 §4.2] |
 | `max_resolved_addresses` | `8` | addresses a dialling endpoint will try for one hostname, in the resolver's order; a resolver answer is remote input, so its length needs a ceiling |
 | `connect_attempt_timeout` | 250 ms | how long a dial waits on one resolved address before trying the next. Every address but the last is bounded by it; an IP literal and a single-address name keep the full handshake budget. The value is RFC 8305's Connection Attempt Delay, and it exists because an address that answers nothing gives QUIC no refusal to observe |
 | `max_connections_per_peer` | *spec ahead of code* | connections one peer may hold across both tiers of §10.1; exceeding it closes the excess connection with `LIMIT_EXCEEDED` |

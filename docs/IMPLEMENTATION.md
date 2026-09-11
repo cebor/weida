@@ -444,6 +444,63 @@ Not covered by a test: the admission refusals. Both are three lines in the accep
 neither has an observable that does not need a second frozen peer to hold a drain open long
 enough to race a connect against it.
 
+**Delivered in the tenth increment — the transport boundary and inproc (B-037):**
+
+The first non-QUIC transport, and therefore the first time the runtime had to say what a
+transport *is*. `crates/weida/src/transport.rs` defines three types — `Link`,
+`SendHalf`, `RecvHalf` — and everything above them is transport-blind: the frame readers,
+the patterns, the guarantees and the drain are written once and run over either transport,
+which is what makes [PROTOCOL.md](PROTOCOL.md) §2.1's "same frames, same HELLO, same
+negotiation" checkable rather than merely stated. An enum, not a trait object: the set of
+transports is closed and small, and the payload path must stay a direct call rather than a
+vtable hop. `AF_UNIX` (B-038) and named pipes (B-039) are one variant each.
+
+`crates/weida/src/inproc.rs` is the first of them. A process-global registry maps a bus
+name — at most 256 bytes, libzmq's budget for the same thing — to a bound listener, and
+`Listener::bind_inproc` returns a `LocalBinding` that unregisters the name when it drops.
+A connection is a pair of queues, one per stream kind, and **a stream is one channel
+pair**: opening mints a `tokio::io::duplex` pair whose capacity is `stream_receive_window`,
+so the backpressure is the buffer's, as [0010](decisions/0010-local-transport.md) §4.2
+expects where there is no connection window. That is also why the two accept queues are
+separate: the uni and bidi accept loops are separate tasks, and one queue would let each
+consume the other's stream — which is exactly the bug the first cut had, and the
+`req_rep_over_inproc` failure that found it.
+
+**No TLS, no credentials, nobody proved.** A local binding takes no identity and a local
+dial ignores the trust it is handed, because there is no key to check [0010 §4.3]; the
+address form rejects the `sha256:…@` userinfo so that it cannot look otherwise [0010 §4.8].
+In process there is nothing to prove at all, so `IncomingMeta::peer` is `None` [0010 §4.4].
+`weida_core::Address` parses both schemes and the scheme alone picks the transport: nothing
+falls back from one to the other [0010 §4.6].
+
+**Ordering, deduplication and the drain are not excluded**, because they are defined on
+headers and receipts rather than on sockets: `guarantees_and_the_drain_work_over_inproc`
+negotiates `PerProducer(detect)` and `Bounded` over a bus, asserts the sequence numbers on
+the arriving transfers and then drains the client to zero outstanding. Two transport-level
+details make that work: `LocalSend::stopped` resolves once the payload and its FIN are in
+the peer's buffer — in process, that *is* "the peer's transport holds every byte" — and
+`Runtime::shutdown` now closes the registered links as well as the endpoints, because a
+local connection has no endpoint to close.
+
+**`max_local_streams` (255) is enforced, not just named.** Live transfers on one local
+connection are counted, and opening past the cap fails with `LimitExceeded` rather than
+queueing; the number is Windows' named-pipe instance limit, the tightest of the three
+platforms [0010 §4.2]. INVARIANTS' named-bounds table is down to one entry,
+`max_connections_per_peer`.
+
+**The tests are parametrized rather than copied.** `crates/weida/tests/transports.rs`
+writes one Req/Rep body, one Push/Pull body and one Pub/Sub body and runs each over both
+transports through a `Harness`; the address rules, local peer loss and the guarantee/drain
+case are inproc-specific tests beside them. Nine tests in that file, and the pre-existing
+QUIC suites are untouched — they cover what is QUIC-specific (trust, pooling, hostile
+peers), which is the split that keeps the shared bodies honest.
+
+**Not in this slice**, and named rather than discovered: no pooling for local connections
+(each dial is a fresh pair, and the pool exists for the expensive case), no control/bulk
+split locally (there is no shared window to separate), and the `AF_UNIX` and named-pipe
+variants with their platform rules and their local-principal identity, which are B-038 and
+B-039 with the acceptance already written in [0010](decisions/0010-local-transport.md) §4.5.
+
 **Deliberately deferred** (recorded now, not discovered later):
 
 - Connecting publishers and binding pushers; v0 fixes Pub/Pull as binders and Sub/Push as
