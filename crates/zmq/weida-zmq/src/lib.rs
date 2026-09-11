@@ -23,15 +23,24 @@
 //! - [`Endpoint`] — `tcp://`, `ipc://` and `inproc://` parsed under libzmq's
 //!   own length rules, with every other ZeroMQ transport named absent rather
 //!   than called a typo.
+//! - [`Message`] and [`Multipart`] — a frame and a whole message, the latter
+//!   handed over as one value because ZMTP delivers "all frames or none", with
+//!   `ZMQ_MAXMSGSIZE` judged from the declared length before a body is
+//!   allocated.
+//! - [`Pipe`] and [`Queue`] — the per-peer double queue every pattern RFC
+//!   specifies, bounded by `ZMQ_SNDHWM`/`ZMQ_RCVHWM` in messages, with
+//!   [`MuteAction`] carrying `zmq_socket(3)`'s "Action in mute state" column
+//!   so that no socket type re-decides it.
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
 //!
 //! The socket types — `ReqSocket`, `RepSocket`, `DealerSocket`,
 //! `RouterSocket`, `PubSocket`, `SubSocket`, `XPubSocket`, `XSubSocket`,
 //! `PushSocket`, `PullSocket`, `PairSocket` — are the following slices, as
-//! are messages, queues, the connection engine, security and the option
-//! surface [0013 §5.3]. They are named here so that a reader knows what this
-//! crate is for and what it does not do yet; nothing stands in for them.
+//! are the connection engine with its reconnect, security and authorization,
+//! and the option surface [0013 §5.3]. They are named here so that a reader
+//! knows what this crate is for and what it does not do yet; nothing stands
+//! in for them.
 //!
 //! # Rules this crate keeps
 //!
@@ -40,8 +49,9 @@
 //!   configured, with `EINVAL` and a message naming the value.
 //! - **Two defaults deliberately differ from libzmq** [0013 §4.4 item 5]:
 //!   the close budget is finite where `ZMQ_LINGER` is infinite (see
-//!   [`DEFAULT_CLOSE_BUDGET`]), and `ZMQ_MAXMSGSIZE` will have a real default
-//!   where libzmq has none. Both are settable back; neither is silent.
+//!   [`DEFAULT_CLOSE_BUDGET`]), and `ZMQ_MAXMSGSIZE` has a real default where
+//!   libzmq has "no limit" (see [`DEFAULT_MAX_MESSAGE_SIZE`]). Both are
+//!   settable back; neither is silent.
 //! - **Identity types stay apart** [0013 §4.4 item 6]. A ZeroMQ identity —
 //!   a CURVE key, a routing id, a ZAP user id — and weida's proved
 //!   `Fingerprint` are different claims about different things, so no `From`,
@@ -65,6 +75,8 @@
 pub mod context;
 pub mod endpoint;
 pub mod error;
+pub mod message;
+pub mod pipe;
 
 pub use context::{
     Context, ContextConfig, DEFAULT_CLOSE_BUDGET, DEFAULT_MAX_SOCKETS, InprocDial, SocketId,
@@ -72,3 +84,7 @@ pub use context::{
 };
 pub use endpoint::{Endpoint, MAX_INPROC_NAME_BYTES, MAX_IPC_ENDPOINT_BYTES, TcpHost};
 pub use error::{Cause, Error, Result};
+pub use message::{DEFAULT_MAX_MESSAGE_SIZE, Decoded, Message, Multipart};
+pub use pipe::{
+    DEFAULT_RCVHWM, DEFAULT_SNDHWM, MuteAction, Pipe, PipeConfig, Queue, QueueConfig, Sent,
+};

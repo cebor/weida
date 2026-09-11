@@ -13,6 +13,11 @@ version.workspace = true
 weida-core.workspace = true
 weida-runtime.workspace = true
 tokio.workspace = true
+# The sans-I/O ZMTP codec: the greeting, the flags octet and the size field,
+# with the declared-length check that makes ZMQ_MAXMSGSIZE enforceable before
+# a body is allocated. Reused rather than reimplemented; its own manifest
+# stays empty (0013 §4.3).
+weida-zmtp.workspace = true
 
 [dev-dependencies]
 # Drives the owned-context doctest and tests from an executor that is not

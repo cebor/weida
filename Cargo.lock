@@ -1980,6 +1980,7 @@ dependencies = [
  "tokio",
  "weida-core",
  "weida-runtime",
+ "weida-zmtp",
 ]
 
 [[package]]
