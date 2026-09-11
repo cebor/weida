@@ -36,18 +36,25 @@
 //!   `ZMQ_HANDSHAKE_IVL`, `ZMQ_CONNECT_TIMEOUT`, `ZMQ_IMMEDIATE`,
 //!   `ZMQ_BACKLOG` and `ZMQ_LAST_ENDPOINT`, handing each established
 //!   connection to a [`Session`].
+//! - [`ZmtpSession`] and [`Wire`] — the protocol itself over one connection:
+//!   the greeting with its 3.0 downgrade, the NULL handshake, `READY` with
+//!   `Socket-Type` and `Identity`, MORE/COMMAND framing, `PING`/`PONG` gated
+//!   on the negotiated version, and `ERROR` sent and understood. Everything
+//!   byte-exact in it is `weida-zmtp`'s.
+//! - [`RoutingId`] — 1-255 self-asserted bytes with a nonzero first octet,
+//!   and the type-level distance from weida's proved identities.
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
 //!
 //! The socket types — `ReqSocket`, `RepSocket`, `DealerSocket`,
 //! `RouterSocket`, `PubSocket`, `SubSocket`, `XPubSocket`, `XSubSocket`,
 //! `PushSocket`, `PullSocket`, `PairSocket` — are the following slices, as
-//! are the ZMTP session that fills [`Session`], security and authorization,
-//! and the rest of the option surface [0013 §5.3]. They are named here so
-//! that a reader knows what this crate is for and what it does not do yet;
-//! nothing stands in for them, and in particular there is no default
-//! `Session`: a socket that handed its peers to a no-op would be a ZeroMQ
-//! implementation that speaks nothing.
+//! are security and authorization and the rest of the option surface
+//! [0013 §5.3]. They are named here so that a reader knows what this crate
+//! is for and what it does not do yet; nothing stands in for them, and in
+//! particular there is no default [`Session`] beyond [`ZmtpSession`]: a
+//! socket that handed its peers to a no-op would be a ZeroMQ implementation
+//! that speaks nothing.
 //!
 //! # Rules this crate keeps
 //!
@@ -83,9 +90,11 @@ pub mod context;
 pub mod endpoint;
 pub mod engine;
 pub mod error;
+pub mod identity;
 pub mod message;
 pub mod options;
 pub mod pipe;
+pub mod session;
 pub mod transport;
 
 pub use context::{
@@ -97,6 +106,7 @@ pub use engine::{
     Connection, Discarded, Engine, HandshakeGate, Peer, PeerId, Role, Session, SessionFuture,
 };
 pub use error::{Cause, Error, Result};
+pub use identity::{MAX_ROUTING_ID_BYTES, RoutingId};
 pub use message::{DEFAULT_MAX_MESSAGE_SIZE, Decoded, Message, Multipart};
 pub use options::{
     DEFAULT_BACKLOG, DEFAULT_HANDSHAKE_IVL, DEFAULT_MAX_RESOLVED_ADDRESSES, DEFAULT_RECONNECT_IVL,
@@ -105,4 +115,5 @@ pub use options::{
 pub use pipe::{
     DEFAULT_RCVHWM, DEFAULT_SNDHWM, MuteAction, Pipe, PipeConfig, Queue, QueueConfig, Sent,
 };
+pub use session::{Incoming, Negotiated, Wire, ZmtpSession};
 pub use transport::Stream;

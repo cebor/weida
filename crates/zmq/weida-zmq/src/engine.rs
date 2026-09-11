@@ -79,6 +79,12 @@ impl PeerId {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// A peer id belonging to no engine, for driving a session without one.
+    #[cfg(test)]
+    pub(crate) const fn detached() -> PeerId {
+        PeerId(0)
+    }
 }
 
 impl std::fmt::Display for PeerId {
@@ -108,6 +114,12 @@ impl HandshakeGate {
         if let Some(done) = self.done.take() {
             let _ = done.send(());
         }
+    }
+
+    /// A gate nobody watches, for driving a session without an engine.
+    #[cfg(test)]
+    pub(crate) const fn detached() -> HandshakeGate {
+        HandshakeGate { done: None }
     }
 }
 
