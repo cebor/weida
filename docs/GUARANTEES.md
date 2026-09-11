@@ -451,7 +451,7 @@ name a level that is decided and specified but not yet implemented.
 | Indeterminate outcomes | implemented | First-class: `Error::Indeterminate` is deliberately excluded from `Error::is_definite_failure()`. See [FAILURE_MODEL.md](FAILURE_MODEL.md). |
 | Peer identity | implemented | Every inbound transfer carries the sending peer's proved public-key fingerprint in `IncomingMeta::peer` (`None` for an anonymous client). It comes from the TLS handshake, never from a header, so it can be authorized on but not claimed (master doc §47). Trust is stated per dialling endpoint (`Trust`: pins, anchors, or only what the address names) and optionally required of clients per binding (`ServerTls::require_client`). Authorization beyond "is this key trusted at all" is the application's decision on the fingerprint. The fingerprint is also the peer's name **across** connections — two connections that proved the same key are one peer, which is what binds a control connection to its bulk connections — and it carries no session: recognizing a peer restores nothing from a previous connection ([decisions/0008](decisions/0008-session-identity.md) §4.1, §4.2, §4.4). |
 | Hop-locality | implemented, trivially | Exactly one hop exists in v0 (direct connection). No composition of hops is possible yet. |
-| Transport | QUIC, in-process and `AF_UNIX` | The local transports of [decisions/0010](decisions/0010-local-transport.md): in-process and `AF_UNIX` are **implemented**, Windows named pipes are decided and unbuilt. Two of their properties belong in this table because they change what a row above means: a local peer is proved by the **kernel**, so `IncomingMeta::peer` is a `PeerIdentity` — a key on QUIC, a `Local { uid, gid, pid }` principal on `AF_UNIX`, and nothing in process [0010 §4.4]; and a local transfer is its own OS connection, so there is no shared connection window and `Block` is that connection's own buffer rather than a budget shared with siblings [0010 §4.2]. What a local peer *is* — the connections the kernel credentials and a group token bind together — is [decisions/0012](decisions/0012-local-connection-grouping.md) §4.2. **Pub/Sub is not available on a socket transport**: a publisher has no stream toward a peer that dialled it until the reverse pool of [0012 §4.4] exists, and the transport refuses rather than dropping silently. |
+| Transport | QUIC, in-process and `AF_UNIX` | The local transports of [decisions/0010](decisions/0010-local-transport.md): in-process and `AF_UNIX` are **implemented**, Windows named pipes are decided and unbuilt. Two of their properties belong in this table because they change what a row above means: a local peer is proved by the **kernel**, so `IncomingMeta::peer` is a `PeerIdentity` — a key on QUIC, a `Local { uid, gid, pid }` principal on `AF_UNIX`, and nothing in process [0010 §4.4]; and a local transfer is its own OS connection, so there is no shared connection window and `Block` is that connection's own buffer rather than a budget shared with siblings [0010 §4.2]. What a local peer *is* — the connections the kernel credentials and a group token bind together — is [decisions/0012](decisions/0012-local-connection-grouping.md) §4.2, and fan-out toward such a peer rides the connections it parked, bounded by `Limits::max_parked_reverse` [0012 §4.4]. |
 
 ### Per pattern
 
@@ -460,6 +460,7 @@ name a level that is decided and specified but not yet implemented.
 | Req/Rep | `BestEffort` | the reply itself | `None` across exchanges |
 | Push/Pull | `BestEffort` | optional transport receipt | `None` |
 | Pub/Sub | `BestEffort`, with per-subscriber drop | none | `None` |
+| Pub/Sub over a local **socket** transport | `BestEffort`, with a second drop cause: the subscriber's reverse pool | none | `None` |
 
 Three points deserve emphasis, because each is easy to assume otherwise:
 
@@ -481,6 +482,17 @@ Three points deserve emphasis, because each is easy to assume otherwise:
   (`a_full_hold_reports_the_pub_sub_drop_it_was_waiting_for`). Either way the loss is
   observable, which is the capability [decisions/0001](decisions/0001-sequence-field.md)
   §7.2 required.
+- **Over a local socket transport a copy has a second way to be dropped.** A publisher
+  cannot dial a peer that dialled it, so every copy needs one of the connections the
+  subscriber parked; a publisher that finds the pool empty drops that copy and counts it
+  in the same `Publisher::dropped`
+  ([decisions/0012](decisions/0012-local-connection-grouping.md) §4.4,
+  `an_exhausted_reverse_pool_drops_the_copy_and_counts_it`). Two consequences are worth
+  stating plainly: the publisher is never stalled by a subscriber that is slow to
+  replenish, and the subscription survives its drops — the pool refills and the next copy
+  goes out. A subscriber that parks nothing cannot receive fan-out at all and is refused
+  when it subscribes, because silence is not an answer
+  (`a_subscriber_that_parks_nothing_is_refused_at_connect`).
 - **Ordering is `None` for the new patterns unless it is configured.** Each message is its
   own stream and QUIC does not order streams relative to each other. A publisher's
   per-subscriber writer enqueues copies in publication order, but that is an implementation

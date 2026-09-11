@@ -158,18 +158,39 @@ impl Link {
         }
     }
 
-    /// Whether the accepting side of this connection can open a stream back.
+    /// Whether a peer that dialled this side can only be written to over
+    /// connections it parked.
     ///
-    /// QUIC and the in-process pair can; a socket transport cannot, because
-    /// an accepted socket is not dialable and the reverse connections that
-    /// would replace it are
-    /// [0012](../../../docs/decisions/0012-local-connection-grouping.md) §4.4.
-    /// Pub/Sub is the one pattern that needs it.
-    pub(crate) fn carries_reverse_streams(&self) -> bool {
+    /// QUIC and the in-process pair let either end open a stream at any
+    /// time. A socket transport does not: an accepted socket is not
+    /// dialable, so fan-out rides the reverse pool of
+    /// [0012](../../../docs/decisions/0012-local-connection-grouping.md)
+    /// §4.4, and a subscriber over such a transport must park before it can
+    /// receive anything.
+    pub(crate) fn needs_reverse_pool(&self) -> bool {
         match self {
             #[cfg(unix)]
-            Link::Unix(_) => false,
-            _ => true,
+            Link::Unix(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Fills this connection's reverse pool, returning how many are parked.
+    /// Transports that need no pool park nothing and say so.
+    pub(crate) async fn park_reverse(&self) -> Result<usize, Error> {
+        match self {
+            #[cfg(unix)]
+            Link::Unix(conn) => conn.park_reverse().await,
+            _ => Ok(0),
+        }
+    }
+
+    /// Replaces parked connections as the peer spends them, until this
+    /// connection closes.
+    pub(crate) async fn maintain_reverse(&self) {
+        #[cfg(unix)]
+        if let Link::Unix(conn) = self {
+            conn.maintain_reverse().await;
         }
     }
 

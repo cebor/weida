@@ -566,11 +566,61 @@ races unless the directory's ownership and permissions prevent substitution
 a node behind, binds over it and checks the mode. The path budget is checked after
 percent-decoding, against 107 bytes on Linux and 104 on macOS.
 
-**What is not here.** Pub/Sub over `AF_UNIX`: a publisher has no stream to a peer that
-dialled it, so the reverse pool of [0012 §4.4] is filed as **B-048** and the transport
-refuses with `Unsupported` in the meantime rather than pretending. No pooling, and no
-control/bulk split, for the same reasons as inproc. The suite is `#[cfg(unix)]`, so Windows
-builds compile the transport out entirely; B-039 adds the pipe variant to the same shape.
+**What was not here, and landed next.** Pub/Sub over `AF_UNIX`: a publisher has no stream
+to a peer that dialled it, so this increment refused it with `Unsupported` and filed the
+reverse pool of [0012 §4.4] as **B-048**, which the increment below implements. No
+pooling, and no control/bulk split, for the same reasons as inproc. The suite is
+`#[cfg(unix)]`, so Windows builds compile the transport out entirely; B-039 adds the pipe
+variant to the same shape.
+
+**Delivered in the twelfth increment — the reverse pool (B-048), which closes 0012 §4.4:**
+
+Fan-out over `AF_UNIX` was the one pattern B-038 could not serve, because a publisher has
+no way to dial a peer that dialled it. It now rides connections the subscriber parks in
+advance, which is the shape [0012 §4.4] proposed without precedent; this increment is the
+evidence that decides it.
+
+**The pool.** `Subscriber::connect` over a socket transport opens
+`Limits::max_parked_reverse` connections (default 8), each carrying preamble `0x03` plus
+the group token, and each admitted by exactly the rule a transfer connection is: the token
+names a live peer and the kernel credentials match. The server keeps their *write* halves
+in a `ReversePool` shared with that peer's link; the subscriber keeps their read halves,
+and hands them to its own connection driver, where they wait like any other inbound
+stream. Nothing new is on the wire: what the publisher writes is a DATA frame, and the
+client dispatches it by the path in its header — `dispatch_by_path` of B-038, in the other
+direction.
+
+**Replenishment is driven by the first byte, not by the end of the copy.** A parked
+connection is spent the moment the peer writes on it, so `LocalRecv` signals a deficit on
+its first successful read (and on drop, for one that dies unused); a maintainer task per
+subscribing connection parks a replacement per deficit. Refilling at the *end* of a copy
+would have shrunk the pool for the whole duration of a long transfer.
+
+**Both bounds are real.** A parked connection is capped twice: by `max_parked_reverse`,
+the pool's own ceiling, and by `max_local_streams`, which counts it like any other live
+local connection — on this transport a stream is a file descriptor, so the pool is a
+descriptor budget. `StreamSlot::acquire` is now the one place that accounting happens.
+
+**An empty pool is a drop, not a stall and not a teardown.** `Link::open_uni` on the
+accepting side returns the new `Error::NoParkedConnection`, and the per-subscriber writer
+counts that copy in `Publisher::dropped` and carries on — the same answer an exhausted
+subscriber byte budget already gets, and the reason 0012 gave for choosing a drop: a local
+subscriber that replenishes slowly must not be able to stall a publisher serving remote
+ones. `an_exhausted_reverse_pool_drops_the_copy_and_counts_it` runs a pool of one against
+a subscriber that never reads, and asserts both halves: the drop is counted within a
+handful of publishes — the other two drop causes need 1024 queued copies or 8 MiB of them,
+so the cause is unambiguous — and a later copy still arrives, so the subscription survived.
+
+**A subscriber that parks nothing is refused when it subscribes.** With
+`max_parked_reverse = 0` there is no route for a copy at all, so `Subscriber::connect`
+returns `Unsupported` rather than registering a subscription that would be silent
+(`a_subscriber_that_parks_nothing_is_refused_at_connect`). This replaces B-038's blanket
+refusal of Pub/Sub on this transport.
+
+**The shared Pub/Sub body now runs over all three transports.** `pub_sub_over_unix` uses
+the same fan-out body as QUIC and inproc, which is the strongest statement available that
+the pool is not a special case: nothing above the transport knows it is there. 17 tests in
+`transports.rs`.
 
 **Deliberately deferred** (recorded now, not discovered later):
 

@@ -422,6 +422,7 @@ async fn accept_unix(
                         principal,
                         Arc::clone(&groups),
                         limits.max_local_streams,
+                        limits.max_parked_reverse,
                     )
                     .await
                     {
@@ -452,6 +453,15 @@ async fn accept_unix(
                     if !crate::unix::admit_transfer(&groups, &token, principal, stream) {
                         tracing::warn!(
                             "local transfer connection refused: unknown or mismatched group"
+                        );
+                    }
+                }
+                crate::unix::Accepted::Reverse(token, stream, principal) => {
+                    // A connection parked for fan-out, under the same
+                    // admission rule and the two bounds of [0012 §4.4].
+                    if !crate::unix::admit_reverse(&groups, &token, principal, stream) {
+                        tracing::debug!(
+                            "local reverse connection not parked: unknown group or pool full"
                         );
                     }
                 }

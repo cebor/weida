@@ -236,6 +236,7 @@ impl RuntimeInner {
         let link = crate::unix::dial(
             std::path::Path::new(socket),
             self.config.limits.max_local_streams,
+            self.config.limits.max_parked_reverse,
         )
         .await?;
         let handle = ConnCtx::spawn(

@@ -43,6 +43,14 @@ pub enum Error {
     UnknownEndpoint,
     /// The peer does not support a requested protocol feature.
     Unsupported,
+    /// A stream toward the peer was needed and the peer had parked no
+    /// connection for one. Only a local socket transport can produce this:
+    /// an accepted socket cannot be dialled back, so fan-out rides the
+    /// connections a subscriber parks
+    /// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
+    /// §4.4). A publisher treats it as a drop of that copy, not as a failure
+    /// of the subscription.
+    NoParkedConnection,
     /// The peer accepted the request but never opened a reply stream.
     NoReply,
     /// The transfer was canceled, locally or by the peer.
@@ -123,6 +131,9 @@ impl fmt::Display for Error {
             Error::Rejected => f.write_str("peer rejected the transfer"),
             Error::UnknownEndpoint => f.write_str("peer has no such endpoint"),
             Error::Unsupported => f.write_str("peer does not support the requested feature"),
+            Error::NoParkedConnection => {
+                f.write_str("peer has no parked connection for a stream toward it")
+            }
             Error::NoReply => f.write_str("peer accepted the request but sent no reply"),
             Error::Canceled => f.write_str("transfer canceled"),
             Error::Indeterminate => {
@@ -166,6 +177,7 @@ impl Error {
                 | Error::Rejected
                 | Error::UnknownEndpoint
                 | Error::Unsupported
+                | Error::NoParkedConnection
                 | Error::Canceled
                 | Error::NotConnected
                 | Error::LimitExceeded
