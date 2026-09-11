@@ -125,8 +125,9 @@ acceptance: `Exec::resolve` (or its caller in `crates/weida/src/pool.rs`) short-
 note: no new test — `resolves_ip_literals_without_dns` in `runtime.rs` already pins the contract for both literal families and now exercises the short-circuit, and the whole suite dials `127.0.0.1`, so the branch is covered 222 times over. The proof is the bench: 1.05-1.09 ms, `change: −11.6 % (p = 0.00)`.
 
 ### B-026 — Decision 0009: a bounded drain at shutdown
-kind: research | size: 45 | status: in_progress 2026-09-11T07:28Z | needs: []
+kind: research | size: 45 | status: done dec2c62 | needs: []
 acceptance: `docs/decisions/0009-drain.md`, accepted, closing SYNTHESIS §8.6: whether `Runtime::shutdown` gains a bounded drain and whether the drain belongs to the runtime or to L2, decided against the evidence the entry already names — ZeroMQ's `ZMQ_LINGER` with its infinite default that can hang forever, RabbitMQ's requeue-on-channel-close, AMQP 1.0's `drain`/`echo` quiescence point, NATS Lame Duck Mode, and D12's finding that none of them is a drain *acknowledgement*; a bound in wall-clock time is mandatory if a drain exists at all, because an unbounded one is the ZeroMQ failure mode; SYNTHESIS §8.6 closed, README row added, and the consequences name what PATTERNS §1.1 and the ZMTP mapping's loss L9 must then say.
+note: the evidence turned up a defect while it was being gathered: `Runtime::shutdown` already waits on `wait_idle()` with **no bound**, so today's tree has ZeroMQ's failure mode in a place where it buys nothing. The note names it and B-031 fixes it separately, ahead of the drain feature itself (B-032) and its spec sync (B-033). The ZMTP mapping's loss L9 was updated in place, since "SYNTHESIS §8.6, still open" had become false.
 
 ### B-027 — Decision 0010: the local transport, per platform
 kind: research | size: 60 | status: ready | needs: []
@@ -143,3 +144,15 @@ acceptance: `Exec::resolve` returns the resolved addresses in order and the dial
 ### B-030 — ZMTP codec: sans-I/O, golden vectors, fuzz target
 kind: adapter | size: 90 | status: ready | needs: [B-018]
 acceptance: `crates/adapters/weida-zmtp`, no I/O and no weida dependency in the codec itself: the 64-octet greeting, version negotiation, the NULL handshake with `READY` metadata, short and long frames with the MORE and COMMAND flags, `SUBSCRIBE`/`CANCEL`, `PING`/`PONG`; the golden vectors of `docs/adapters/zmtp.md` §10 byte-exact in both directions, including the 255/256-octet frame boundary; a fuzz target over the decoder that caps before allocating, since a ZMTP frame may declare up to 2^63-1 octets and `ZMQ_MAXMSGSIZE` is the only defence; no bridge, no sockets, no interop bench yet — those are slices 3 to 5.
+
+### B-031 — Bound every wait in shutdown
+kind: code | size: 30 | status: ready | needs: []
+acceptance: `Runtime::shutdown` stops awaiting `wait_idle()` without a bound — today it can hang on a peer's behaviour, which is the one failure mode the whole catalogue warns about ([0009](decisions/0009-drain.md) §4.4, [zeromq §12/P17]); the wait is capped (QUIC's own closing and draining periods are "at least three times the current PTO interval", so a cap in the hundreds of milliseconds is generous), the cap is a `RuntimeConfig` field with a stated default, and a test proves that shutdown returns even when the peer never acknowledges — a server whose process is suspended or a connection to a black hole. This is a defect in shipped code and does not wait for B-032.
+
+### B-032 — `Runtime::drain(Duration)`
+kind: code | size: 90 | status: ready | needs: [B-031]
+acceptance: `Runtime::drain(Duration)` per [0009](decisions/0009-drain.md) §4.1-§4.6: admission stops first (bindings accept no new connection, a new inbound stream on an existing connection is refused with `SHUTDOWN`), then transfers already `finish()`ed are awaited to their transport receipt, then the same close as `shutdown` runs; the deadline is a mandatory `Duration` with no infinite variant; the return value counts what reached the peer's transport and what was still outstanding, and an expired drain is not an error; `shutdown`'s documentation names itself **abortive**. Tests: a finished transfer that would be cut short by `shutdown` arrives under `drain`, and a drain against a peer that reads nothing returns at its deadline with a non-zero outstanding count.
+
+### B-033 — Spec sync: the drain of 0009
+kind: spec | size: 30 | status: ready | needs: [B-032]
+acceptance: PATTERNS §1.1 keeps "the one thing that cuts a finished transfer short" for `shutdown` and gains `drain` as its counterpart; GUARANTEES §3 notes that the drain waits on the transport receipt and inherits its meaning, including that a drained transfer may still have been discarded by the peer's application (0005 §4.2); PROTOCOL §11 lists drain as a *local* operation with no wire representation, so nobody invents a quiescence frame; `grep` shows no document still calling §8.6 open.
