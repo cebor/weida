@@ -105,7 +105,7 @@ kind: code | size: 90 | status: ready | needs: [B-015]
 acceptance: `PerProducer(reassemble)` holds out-of-order transfers and releases them in sequence order, with the hold bounded by a named `Limits` field and the bound enforced by refusing or releasing out of order rather than by growing — B-010 measured the peak at N − 1 of the transfers in flight, and 84 of 256 with no adversarial pattern, so the cap is a configured number and not an assumption about arrival order; the cap appears in INVARIANTS' named bounds; a subscriber in detect or reassemble mode reports a Pub/Sub drop through `IncomingMeta`; a test drives reordering with the two FIN modes of `reverse_order_completion_measures_the_reorder_buffer`.
 
 ### B-023 — Foreign-executor coverage for Push/Pull and Pub/Sub
-kind: code | size: 45 | status: ready | needs: [B-016]
+kind: code | size: 45 | status: in_progress 2026-09-11T06:25Z | needs: [B-016]
 acceptance: `crates/weida/tests/foreign_executor.rs` gains a Push/Pull and a Pub/Sub round trip as plain `#[test]`s under `futures::executor::block_on`, so the claim "weida needs no ambient reactor" is proved for every pattern rather than for Req/Rep alone; each test bounds every await with the suite's deadline helper; a pattern that cannot run without a tokio context is a bug in `runtime.rs`, not a reason to skip the test. Proposed by the B-016 worker.
 
 ### B-024 — An example without `#[tokio::main]`
