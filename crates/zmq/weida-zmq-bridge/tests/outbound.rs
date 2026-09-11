@@ -13,8 +13,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use weida::{ClientTls, Error, Identity, Runtime, RuntimeConfig, ServerTls, Trust};
+use weida_zmq_bridge::{Dialling, Outbound, OutboundConfig};
 use weida_zmtp::{Command, FrameKind, Greeting, Mechanism, Metadata, SocketType, frame, greeting};
-use weida_zmtp_bridge::{Dialling, Outbound, OutboundConfig};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 const CAP: u64 = 1024 * 1024;
@@ -155,7 +155,7 @@ impl Peer {
 /// Starts an outbound bridge and returns the weida URL to dial and its runtime.
 async fn bridge(config: OutboundConfig) -> (String, Runtime) {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("weida_zmtp_bridge=debug")
+        .with_env_filter("weida_zmq_bridge=debug")
         .try_init();
     let identity = Identity::generate().expect("identity");
     let fingerprint = identity.fingerprint().expect("fingerprint");

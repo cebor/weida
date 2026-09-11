@@ -19,9 +19,9 @@ use tokio::net::TcpStream;
 use weida::{
     ClientTls, GuaranteeSet, Identity, Runtime, RuntimeConfig, ServerTls, TransferMeta, Trust,
 };
+use weida_nng_bridge::{BridgeError, Inbound, InboundConfig, Presenting};
 use weida_sp::header::{EndpointType, HEADER_LEN};
 use weida_sp::{Backtrace, ProtocolHeader, backtrace, message};
-use weida_sp_bridge::{BridgeError, Inbound, InboundConfig, Presenting};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -74,7 +74,7 @@ impl WeidaSide {
 /// Starts a bridge, serving in the background, and returns where to reach it.
 async fn bridge(config: InboundConfig) -> (SocketAddr, Runtime) {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("weida_sp_bridge=debug")
+        .with_env_filter("weida_nng_bridge=debug")
         .try_init();
     let inbound = Inbound::bind(config, ClientTls::new(Trust::by_address()))
         .await

@@ -24,7 +24,7 @@
 //! suppressed heartbeat says so once rather than leaving a silently different
 //! behaviour to be found in a packet capture.
 //!
-//! The behaviour here is ported from `crates/adapters/weida-zmtp-bridge`'s
+//! The behaviour here is ported from `crates/zmq/weida-zmq-bridge`'s
 //! `wire.rs` and `Liveness`, which is where it was first proved against real
 //! ZeroMQ peers. The bridge keeps running on its own copy until B-094 rebuilds
 //! it on this crate; nothing here touches it.

@@ -17,10 +17,16 @@ within `0.x`). Phases 0-2 implemented: docs, core model, native QUIC transport w
 Phase 3 in progress: Push/Pull, Pub/Sub, the raw L0 stream API, peer identity by public-key
 fingerprint, opt-in per-producer ordering and bounded deduplication, one connection per
 dialled endpoint path, a bounded `drain`, and an in-process transport beside QUIC have
-landed. The ZeroMQ adapter has its first three slices: a standalone ZMTP 3.1 codec
-(`crates/adapters/weida-zmtp`) and a bridge in both directions — foreign ZeroMQ peers onto
-weida endpoints, and weida endpoints onto foreign ZeroMQ peers
-(`crates/adapters/weida-zmtp-bridge`).
+landed. Beside weida the repository ships a **ZeroMQ library**: `weida-zmq` is a native Rust
+ZeroMQ on the ZMTP 3.1 codec `weida-zmtp`, complete against
+[decisions/0013](docs/decisions/0013-competitor-libraries.md) §4.7's definition of
+first-class — every socket type of `zmq_socket(3)` bar `ZMQ_STREAM`, `tcp`/`ipc`/`inproc`,
+NULL/PLAIN/CURVE with ZAP, the option table honoured or refused row by row, the monitor and
+the devices, the zguide's canonical recipes as examples that assert the guide's own claims,
+and interop against libzmq 4.3.5 and the pure-Rust `zeromq` crate in both roles
+([docs/libraries/zmq.md](docs/libraries/zmq.md)). `weida-zmq-bridge` is the forwarder beside
+it, joining ZeroMQ peers and weida endpoints in both directions. The NNG family has its codec
+and its bridge; its library is next.
 
 ## Documentation
 
@@ -38,14 +44,24 @@ weida endpoints, and weida endpoints onto foreign ZeroMQ peers
 
 ## Crates
 
-| Path | Package | Responsibility |
-| --- | --- | --- |
-| `crates/core` | `weida-core` | I/O-free model: errors, endpoint addresses, limits, trace context |
-| `crates/protocol` | `weida-protocol` | wire codec, no I/O: varints, framing, CBOR headers, negotiation, error codes |
-| `crates/runtime` | `weida-runtime` | the reactor and the OS plumbing, with no protocol in it: tasks, timers, DNS with a capped resolver, the three reactor-ownership constructors, a bounded close budget, an in-process name registry and `AF_UNIX` bind hygiene with peer credentials |
-| `crates/weida` | `weida` | runtime, the QUIC and in-process transports, the raw stream core, and the Req/Rep, Push/Pull and Pub/Sub patterns |
-| `crates/adapters/weida-zmtp` | `weida-zmtp` | ZMTP 3.1 codec — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |
-| `crates/adapters/weida-zmtp-bridge` | `weida-zmtp-bridge` | bridges ZeroMQ peers and weida endpoints in both directions, terminating both protocols |
+This repository holds **two kinds of product**: weida itself, and standalone implementations
+of foreign protocols that are usable with no weida in the picture — with a forwarder beside
+each one for the deployments that want both networks joined. The `kind` column says which is
+which, and no row calls a library an adapter or a bridge a library
+([decisions/0013](docs/decisions/0013-competitor-libraries.md) §5.5).
+
+| Path | Package | kind | Responsibility |
+| --- | --- | --- | --- |
+| `crates/core` | `weida-core` | weida | I/O-free model: errors, endpoint addresses, limits, trace context |
+| `crates/protocol` | `weida-protocol` | weida | wire codec, no I/O: varints, framing, CBOR headers, negotiation, error codes |
+| `crates/runtime` | `weida-runtime` | weida | the reactor and the OS plumbing, with no protocol in it: tasks, timers, DNS with a capped resolver, the three reactor-ownership constructors, a bounded close budget, an in-process name registry and `AF_UNIX` bind hygiene with peer credentials |
+| `crates/weida` | `weida` | weida | runtime, the QUIC and in-process transports, the raw stream core, and the Req/Rep, Push/Pull and Pub/Sub patterns |
+| `crates/zmq/weida-zmtp` | `weida-zmtp` | library | ZMTP 3.1 codec — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |
+| `crates/zmq/weida-zmq` | `weida-zmq` | library | the ZeroMQ implementation: every socket type of `zmq_socket(3)` bar `ZMQ_STREAM`, `tcp`/`ipc`/`inproc`, NULL/PLAIN/CURVE with ZAP, the option table, the monitor and the devices, interop-tested against libzmq 4.3.5 in both roles ([docs/libraries/zmq.md](docs/libraries/zmq.md)) |
+| `crates/zmq/weida-zmq-bridge` | `weida-zmq-bridge` | bridge | joins ZeroMQ peers and weida endpoints in both directions, terminating both protocols; the ZeroMQ half is `weida-zmq`'s sockets and what is here is the mapping |
+| `crates/nng/weida-sp` | `weida-sp` | library | nanomsg/NNG Scalability Protocols codec — the eight-octet header, the 64-bit framing, the REQ/REP tag stacks — with no I/O and no dependency on weida |
+| `crates/nng/weida-nng-bridge` | `weida-nng-bridge` | bridge | joins NNG peers and weida endpoints in both directions |
+| `crates/interop/cross-tests` | `weida-cross-tests` | weida | no library code: one message in through one foreign protocol and out through the other, which belongs to neither family |
 
 ## Identity in one line
 
@@ -111,9 +127,9 @@ cargo test -p weida --test transports            # one pattern suite over QUIC, 
 cargo test -p weida --test identity              # pins, anchors, addresses, client identity
 cargo test -p weida --test large -- --ignored     # 1 GiB echo, asserts bounded peak RSS
 cargo test -p weida-zmtp                         # ZMTP golden vectors and hostile input
-cargo test -p weida-zmtp-bridge                  # both bridge directions, plus a real ZeroMQ peer
+cargo test -p weida-zmq-bridge                  # both bridge directions, plus a real ZeroMQ peer
 cargo bench                                      # codec and loopback QUIC throughput
-cargo bench -p weida-zmtp-bridge --bench interop # the bridge's cost against no bridge
+cargo bench -p weida-zmq-bridge --bench interop # the bridge's cost against no bridge
 ```
 
 No license file yet.

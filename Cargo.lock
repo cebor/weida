@@ -2246,11 +2246,22 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "weida",
+ "weida-nng-bridge",
  "weida-sp",
- "weida-sp-bridge",
+ "weida-zmq-bridge",
  "weida-zmtp",
- "weida-zmtp-bridge",
  "zeromq",
+]
+
+[[package]]
+name = "weida-nng-bridge"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "weida",
+ "weida-sp",
 ]
 
 [[package]]
@@ -2276,17 +2287,6 @@ name = "weida-sp"
 version = "0.1.0"
 
 [[package]]
-name = "weida-sp-bridge"
-version = "0.1.0"
-dependencies = [
- "tokio",
- "tracing",
- "tracing-subscriber",
- "weida",
- "weida-sp",
-]
-
-[[package]]
 name = "weida-zmq"
 version = "0.1.0"
 dependencies = [
@@ -2304,11 +2304,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "weida-zmtp"
-version = "0.1.0"
-
-[[package]]
-name = "weida-zmtp-bridge"
+name = "weida-zmq-bridge"
 version = "0.1.0"
 dependencies = [
  "bytes",
@@ -2321,6 +2317,10 @@ dependencies = [
  "weida-zmtp",
  "zeromq",
 ]
+
+[[package]]
+name = "weida-zmtp"
+version = "0.1.0"
 
 [[package]]
 name = "win_uds"

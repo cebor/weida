@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use weida::{ClientTls, Error, Identity, Runtime, RuntimeConfig, ServerTls, TransferMeta, Trust};
-use weida_zmtp_bridge::{
+use weida_zmq_bridge::{
     Dialling, Inbound, InboundConfig, Outbound, OutboundConfig, Presenting, SubscriptionForm,
 };
 use zeromq::{Socket, SocketRecv, SocketSend, ZmqMessage};
@@ -34,7 +34,7 @@ async fn within<F: Future>(f: F) -> F::Output {
 
 fn tracing_once() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("weida_zmtp_bridge=debug")
+        .with_env_filter("weida_zmq_bridge=debug")
         .try_init();
 }
 

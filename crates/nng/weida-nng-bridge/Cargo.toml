@@ -1,5 +1,5 @@
 [package]
-name = "weida-sp-bridge"
+name = "weida-nng-bridge"
 description = "Bridges foreign nanomsg/NNG SP peers onto weida endpoints, terminating both protocols"
 edition.workspace = true
 rust-version.workspace = true

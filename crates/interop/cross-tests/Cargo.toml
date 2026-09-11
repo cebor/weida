@@ -8,7 +8,7 @@ publish = false
 
 # No library code, deliberately. This crate exists so that the two adapters
 # can be tested *together* without either adapter crate depending on the
-# other: `weida-zmtp-bridge` and `weida-sp-bridge` know nothing of each other,
+# other: `weida-zmq-bridge` and `weida-nng-bridge` know nothing of each other,
 # and a chain that runs through both belongs to neither
 # (`docs/ARCHITECTURE.md` §4, `docs/LOOP.md` §9 Phase B slice 6).
 [dependencies]
@@ -16,9 +16,9 @@ publish = false
 [dev-dependencies]
 weida.workspace = true
 weida-zmtp.workspace = true
-weida-zmtp-bridge = { path = "../weida-zmtp-bridge" }
+weida-zmq-bridge = { path = "../../zmq/weida-zmq-bridge" }
 weida-sp.workspace = true
-weida-sp-bridge = { path = "../weida-sp-bridge" }
+weida-nng-bridge = { path = "../../nng/weida-nng-bridge" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 tracing-subscriber.workspace = true
 # Both foreign ends are the real implementations, which is what makes a

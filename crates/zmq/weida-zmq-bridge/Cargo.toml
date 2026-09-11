@@ -1,5 +1,5 @@
 [package]
-name = "weida-zmtp-bridge"
+name = "weida-zmq-bridge"
 description = "Bridges foreign ZeroMQ peers onto weida endpoints, terminating both protocols"
 edition.workspace = true
 rust-version.workspace = true

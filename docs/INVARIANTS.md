@@ -57,7 +57,7 @@ entry will be the named-pipe instance count of [0010 §4.5] if it turns out to n
 than `max_local_streams`.
 
 **The adapters are inside this invariant too, and had been read as if they were not.** The
-review pass of B-051 swept `crates/adapters` for the first time and found two structures a
+review pass of B-051 swept the adapter crates for the first time and found two structures a
 foreign peer or a weida client could grow without a ceiling — both in the ZMTP bridge, which
 is the code actually exposed to strangers. The outbound bridge now bounds the exchanges
 waiting for a ZMTP reply with `max_pending_exchanges` (64), refusing past it with

@@ -1,8 +1,8 @@
 # ZMTP 3.1 — adapter mapping
 
-Status: mapping document; slice 1 (the codec) implemented as `crates/adapters/weida-zmtp` and
+Status: mapping document; slice 1 (the codec) implemented as `crates/zmq/weida-zmtp` and
 slices 2, 3 and 5 (both bridge directions and the interop run against an independent ZeroMQ)
-as `crates/adapters/weida-zmtp-bridge`. What is left is the contract the adapter's
+as `crates/zmq/weida-zmq-bridge`. What is left is the contract the adapter's
 documentation owes its user
 ([LOOP.md](../LOOP.md) §9 Phase B, [0006](../decisions/0006-guarantee-sets.md) §4.9).
 Date: 2026-09-11
@@ -40,7 +40,7 @@ subscriptions — and it terminates weida; nothing is forwarded opaquely. That i
 ([INVARIANTS.md](../INVARIANTS.md)) checkable at this edge, and it is why §7 can name exactly
 where the chain ends.
 
-**What the inbound slice built** (`crates/adapters/weida-zmtp-bridge`): one `Inbound` listens
+**What the inbound slice built** (`crates/zmq/weida-zmq-bridge`): one `Inbound` listens
 on a TCP address, presents one ZeroMQ socket type, and speaks to one weida endpoint —
 `REP` for a `REQ`/`DEALER` peer, `PULL` for a `PUSH` peer, `PUB` for a `SUB`/`XSUB` peer. It
 drives the greeting and the NULL handshake, checks the peer's socket type against §2's table
@@ -424,19 +424,19 @@ which is the outcome [LOOP §2]'s supervisor rule was there to make safe.
 **The bench itself.**
 
 1. **Golden vectors, no I/O** — *done, slice 1*: §10.1 below publishes the octets and
-   `crates/adapters/weida-zmtp/tests/golden_vectors.rs` asserts every one of them in both
+   `crates/zmq/weida-zmtp/tests/golden_vectors.rs` asserts every one of them in both
    directions [zeromq §1], [zeromq §3]. Byte-exact both ways, the shape [PROTOCOL §8] already
    requires of the weida codec.
 2. **Fuzz target** over the ZMTP decoder, cap-before-allocate on the declared frame size —
    a frame may declare up to 2^63-1 octets and `ZMQ_MAXMSGSIZE` is the only defence
    [zeromq §11] — mirroring `max_header_bytes`'s rule [PROTOCOL §3.1]. *Done, slice 1*: five
-   `cargo fuzz` targets under `crates/adapters/weida-zmtp/fuzz` (frame, frame stream, command,
+   `cargo fuzz` targets under `crates/zmq/weida-zmtp/fuzz` (frame, frame stream, command,
    metadata, greeting) and a stable-Rust `fuzz_smoke.rs` that runs the same properties in
    `cargo test`, including a long header with an arbitrary 64-bit length and no body.
 3. **Inbound matrix.** zmq.rs REQ → adapter → weida `Replier`; zmq.rs PUSH → adapter →
    `Puller`; zmq.rs SUB ← adapter ← weida `Publisher`, including a boundary-aligned prefix and
    a rejected mid-segment prefix (L2). *Done, slice 5*
-   (`crates/adapters/weida-zmtp-bridge/tests/interop.rs`), against the pure-Rust `zeromq`
+   (`crates/zmq/weida-zmq-bridge/tests/interop.rs`), against the pure-Rust `zeromq`
    crate as an independent implementation; slice 2's own matrix stays, against a peer built on
    this repository's codec, because the two catch different things — a faithful peer pins the
    bridge's behaviour, and a foreign one pins its assumptions. Three of those assumptions were
@@ -460,9 +460,9 @@ which is the outcome [LOOP §2]'s supervisor rule was there to make safe.
    the adapter against a direct zmq.rs pair on loopback, recorded in
    [IMPLEMENTATION.md](../IMPLEMENTATION.md) verified results with the command that produced
    them [LOOP §5 measure]. *Done, slice 5*:
-   `cargo bench -p weida-zmtp-bridge --bench interop`, and the two numbers §11 was holding
+   `cargo bench -p weida-zmq-bridge --bench interop`, and the two numbers §11 was holding
    open are decided there.
-7. **Cross-adapter (slice 6).** `crates/adapters/cross-tests` runs a message in through one
+7. **Cross-adapter (slice 6).** `crates/interop/cross-tests` runs a message in through one
    adapter and out through the other against `zeromq` and `nng`: the three pattern chains in
    both directions, the composed losses (a ZMTP multipart refused at hop one — L1, so the
    second protocol never sees it — the smaller `max_message_bytes` deciding, an SP hop-count

@@ -28,7 +28,7 @@
   <!-- band: adapters -->
   <rect x="20" y="126" width="920" height="80" class="band"/>
   <text x="28" y="142" class="side">ADAPTERS</text>
-  <text x="28" y="156" class="sub">crates/adapters/*</text>
+  <text x="28" y="156" class="sub">crates/zmq/*, crates/nng/*</text>
   <rect x="140" y="138" width="150" height="56" rx="4" class="built"/><text x="148" y="156" class="lbl">weida-zmtp</text><text x="148" y="170" class="sub">codec, no deps, fuzzed</text><text x="148" y="184" class="sub">weida-zmtp-bridge in/out</text>
   <rect x="300" y="138" width="150" height="56" rx="4" class="built"/><text x="308" y="156" class="lbl">weida-sp</text><text x="308" y="170" class="sub">codec, no deps, fuzzed</text><text x="308" y="184" class="sub">weida-sp-bridge in/out</text>
   <rect x="460" y="138" width="150" height="56" rx="4" class="missing"/><text x="468" y="156" class="lbl">weida-mqtt</text>
