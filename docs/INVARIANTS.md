@@ -61,11 +61,16 @@ review pass of B-051 swept `crates/adapters` for the first time and found two st
 foreign peer or a weida client could grow without a ceiling — both in the ZMTP bridge, which
 is the code actually exposed to strangers. The outbound bridge now bounds the exchanges
 waiting for a ZMTP reply with `max_pending_exchanges` (64), refusing past it with
-`ERROR{REJECTED}` **before** reading the body, so the exposure is a stated product —
-`max_pending_exchanges × max_message_bytes`, 64 MiB at the defaults — rather than whatever
-weida clients choose to open; a foreign peer's subscription tables are the second and are
-B-054. The lesson is worth keeping beside the list: a bound named for the core is not a bound
-until the code at the edge has it too.
+`ERROR{REJECTED}` **before** reading the
+body, so the exposure is a stated product — `max_pending_exchanges × max_message_bytes`,
+64 MiB at the defaults — rather than whatever weida clients choose to open. The inbound
+bridge bounds a foreign peer's subscription table the same way, with weida's own two numbers
+for the same thing: 256 distinct prefixes (`max_subscriptions`) of at most 256 B each (the
+wire cap on a SUBSCRIBE `filter`), which is 64 KiB of prefixes per peer. A **repeat** of a
+held prefix is still accepted at the ceiling, because ZeroMQ's non-idempotent count is what
+loss L3 exists to preserve and a refused second SUBSCRIBE would make the first cancellable
+by one CANCEL where the peer sent two. The lesson is worth keeping beside the list: a bound
+named for the core is not a bound until the code at the edge has it too.
 
 The hot-path invariant binds all three structures that now exist: a connection that
 negotiated `Ordering = None` and `Deduplication = None` — which is every connection that

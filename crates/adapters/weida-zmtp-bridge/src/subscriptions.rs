@@ -123,6 +123,23 @@ pub(crate) fn translate(prefix: &[u8], mid: MidSegment) -> Result<Translated, Br
     }
 }
 
+/// How many distinct prefixes one ZeroMQ peer may subscribe to, and how long
+/// each may be.
+///
+/// Both numbers are weida's own for the same thing — `Limits`'
+/// `max_subscriptions` and the 256 B cap the wire puts on a SUBSCRIBE
+/// `filter` (`docs/PROTOCOL.md` §10) — and both are here because the bridge is
+/// the side a stranger talks to. ZeroMQ subscriptions are **additive and
+/// non-idempotent** by design: "N repeated SUBSCRIBE commands cost N entries",
+/// which the ZeroMQ sheet records as a denial-of-service surface in libzmq
+/// itself [zeromq §11]. Counting repeats costs nothing, since a repeat only
+/// increments; what needs a ceiling is the number of *distinct* prefixes and
+/// the length of each, because those are what a peer can choose freely. The
+/// exposure is therefore the product, 64 KiB of prefixes per peer, and it is
+/// stated rather than implied.
+const MAX_PREFIXES: usize = 256;
+const MAX_PREFIX_BYTES: usize = 256;
+
 /// The subscriptions of one ZeroMQ peer, reference-counted the way ZeroMQ
 /// counts them and deduplicated the way weida needs them.
 #[derive(Default)]
@@ -152,12 +169,32 @@ pub(crate) enum Change {
 
 impl Subscriptions {
     /// Records a `SUBSCRIBE`.
+    ///
+    /// Refuses past either ceiling, and the order matters: a **repeat** of a
+    /// prefix the peer already holds is always accepted, because it allocates
+    /// nothing new and refusing it would break L3's count — two SUBSCRIBEs
+    /// need two CANCELs, and a refused second one would make the first
+    /// cancellable once. Only a prefix the table does not hold yet can be
+    /// turned away.
     pub(crate) fn subscribe(
         &mut self,
         prefix: &[u8],
         mid: MidSegment,
     ) -> Result<Change, BridgeError> {
+        if prefix.len() > MAX_PREFIX_BYTES {
+            return Err(BridgeError::Subscription(format!(
+                "the subscription prefix is {} B, past the {MAX_PREFIX_BYTES} B a weida filter \
+                 may carry (docs/PROTOCOL.md §10)",
+                prefix.len()
+            )));
+        }
         let translated = translate(prefix, mid)?;
+        if !self.raw.contains_key(prefix) && self.raw.len() >= MAX_PREFIXES {
+            return Err(BridgeError::Subscription(format!(
+                "this peer already holds {MAX_PREFIXES} distinct subscriptions, which is what \
+                 weida's max_subscriptions allows one connection"
+            )));
+        }
         let count = self.raw.entry(prefix.to_vec()).or_insert(0);
         *count += 1;
         if *count > 1 {
@@ -359,5 +396,61 @@ mod tests {
         let mut exact = Subscriptions::default();
         exact.subscribe(b"px.", MidSegment::Refuse).expect("exact");
         assert!(exact.wants("px.anything"));
+    }
+
+    /// The table a foreign peer can grow is bounded by a count, and the
+    /// refusal costs the peer only the subscription it was refused.
+    ///
+    /// The repeat is the case worth pinning: at the ceiling, subscribing to a
+    /// prefix the peer *already holds* must still be accepted, because L3
+    /// counts repeats and a refused second SUBSCRIBE would leave the first
+    /// cancellable by one CANCEL when the peer sent two.
+    #[test]
+    fn a_peer_cannot_hold_more_prefixes_than_the_ceiling() {
+        let mut subs = Subscriptions::default();
+        for i in 0..MAX_PREFIXES {
+            let prefix = format!("p{i}.");
+            subs.subscribe(prefix.as_bytes(), MidSegment::Refuse)
+                .expect("inside the ceiling");
+        }
+
+        let refused = subs.subscribe(b"one.too.many.", MidSegment::Refuse);
+        assert!(refused.is_err(), "past the ceiling: {refused:?}");
+
+        // A repeat of something held is not a new entry and is accepted.
+        assert_eq!(
+            subs.subscribe(b"p0.", MidSegment::Refuse).expect("repeat"),
+            Change::None
+        );
+        // And the count is intact: two subscriptions need two cancels.
+        assert_eq!(subs.cancel(b"p0.", MidSegment::Refuse), Change::None);
+        assert_eq!(
+            subs.cancel(b"p0.", MidSegment::Refuse),
+            Change::Unsubscribe("p0.#".into())
+        );
+
+        // The freed slot is usable, so the ceiling is a ceiling and not a
+        // lifetime quota.
+        subs.subscribe(b"one.too.many.", MidSegment::Refuse)
+            .expect("a slot came free");
+    }
+
+    /// A prefix longer than a weida filter may carry is refused **before** it
+    /// is stored, so the length a peer chooses cannot become the length this
+    /// side allocates.
+    #[test]
+    fn an_over_long_prefix_is_refused_before_it_is_stored() {
+        let mut subs = Subscriptions::default();
+        let mut prefix = vec![b'a'; MAX_PREFIX_BYTES + 1];
+        prefix.push(b'.');
+        assert!(subs.subscribe(&prefix, MidSegment::Refuse).is_err());
+        assert_eq!(subs.filters().count(), 0, "nothing was stored");
+
+        // The boundary itself is allowed: 256 B is the cap, not the first
+        // refusal.
+        let mut at_cap = vec![b'a'; MAX_PREFIX_BYTES - 1];
+        at_cap.push(b'.');
+        subs.subscribe(&at_cap, MidSegment::Refuse)
+            .expect("a prefix exactly at the cap is fine");
     }
 }
