@@ -47,6 +47,13 @@ minicbor = { version = "2", features = ["alloc"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
 ring = "0.17"
+# The one cryptographic dependency of `weida-zmq`, for CURVE. RustCrypto's
+# NaCl-compatible `crypto_box`: X25519 key agreement, HSalsa20 to derive the
+# shared key, XSalsa20-Poly1305 for the box - which is exactly the
+# construction 26/CURVEZMQ is specified in terms of, rather than a lookalike,
+# so a box this workspace seals opens in libsodium and libzmq. Pure Rust, so
+# `unsafe_code = "forbid"` survives it.
+crypto_box = "0.9"
 
 rcgen = "0.14"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

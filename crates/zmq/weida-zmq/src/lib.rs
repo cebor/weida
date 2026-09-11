@@ -95,11 +95,21 @@
 //!   handler per context because the namespace says so, and a refusal that
 //!   lands before any message flows.
 //!
-//! What remains is CURVE and the rest of the option surface [0013 §5.3].
-//! They are named here so that a reader knows what this crate is for and what
-//! it does not do yet; nothing stands in for them, and in particular there is
-//! no default [`Session`] beyond [`ZmtpSession`]: a socket that handed its
-//! peers to a no-op would be a ZeroMQ implementation that speaks nothing.
+//! - [`CurveClient`], [`CurveServer`] and [`CurveTransport`] — CURVE, as
+//!   either end: the four keys, the cookie discarded by a valid `INITIATE`
+//!   or by its interval, the nonce counters that never repeat within a
+//!   connection, session keys destroyed when the connection closes, the
+//!   peer's long-term key handed to the ZAP handler as the CURVE credential,
+//!   and every frame after the `READY` inside a `MESSAGE` box. The layouts
+//!   are `weida-zmtp`'s; the one cryptographic dependency is `crypto_box`,
+//!   RustCrypto's NaCl `crypto_box` — see [`curve`].
+//!
+//! What remains is the rest of the option surface, the monitor events and
+//! the devices [0013 §5.3]. They are named here so that a reader knows what
+//! this crate is for and what it does not do yet; nothing stands in for
+//! them, and in particular there is no default [`Session`] beyond
+//! [`ZmtpSession`]: a socket that handed its peers to a no-op would be a
+//! ZeroMQ implementation that speaks nothing.
 //!
 //! # Rules this crate keeps
 //!
@@ -132,6 +142,7 @@
 #![warn(missing_docs)]
 
 pub mod context;
+pub mod curve;
 pub mod dealerrouter;
 pub mod endpoint;
 pub mod engine;
@@ -157,6 +168,10 @@ pub mod zap;
 pub use context::{
     Context, ContextConfig, DEFAULT_CLOSE_BUDGET, DEFAULT_MAX_SOCKETS, SocketId, SocketSlot,
     Terminated,
+};
+pub use curve::{
+    COOKIE_LIFETIME, CurveClient, CurvePublicKey, CurveSecretKey, CurveServer, CurveTransport,
+    OpenedInitiate, SecurityModel,
 };
 pub use dealerrouter::{DealerSocket, RouterSocket};
 pub use endpoint::{Endpoint, MAX_INPROC_NAME_BYTES, MAX_IPC_ENDPOINT_BYTES, TcpHost};

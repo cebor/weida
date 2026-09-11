@@ -36,10 +36,14 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use weida_runtime::Exec;
 use weida_zmtp::{
-    Command, CommandError, Greeting, GreetingError, Metadata, SocketType, Version, greeting,
+    Command, CommandError, FrameKind, Greeting, GreetingError, Metadata, SocketType, Version,
+    curve as curve_layout, frame, greeting,
 };
 
 use crate::context::Context;
+use crate::curve::{
+    COOKIE_LIFETIME, CurveClient, CurvePublicKey, CurveSecretKey, CurveServer, CurveTransport,
+};
 use crate::engine::{Connection, Role, Session, SessionFuture};
 use crate::error::{Error, Result};
 use crate::identity::RoutingId;
@@ -204,7 +208,7 @@ async fn drive(
             .await?;
     }
 
-    pump(
+    let outcome = pump(
         &mut wire,
         ours,
         &subscriptions,
@@ -213,7 +217,12 @@ async fn drive(
         &exec,
         negotiated.version,
     )
-    .await
+    .await;
+    // "Session keys are held in memory and destroyed when the connection is
+    // closed" — this is that close, and it happens on the way out of every
+    // ending, not only the clean one.
+    wire.destroy_session_keys();
+    outcome
 }
 
 /// What the handshake knows about the connection besides its bytes.
@@ -275,12 +284,14 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
         .accept_downgrading(security.mechanism())
         .map_err(greeting_error)?;
     if security != Security::Null && peer.as_server == security.as_server() {
-        // 24/ZMTP-PLAIN gives the roles to the `as-server` octet, so two
-        // servers or two clients on one connection is a configuration
-        // mistake that would otherwise deadlock waiting for HELLO.
+        // 24/ZMTP-PLAIN and 26/CURVEZMQ both give the roles to the
+        // `as-server` octet, so two servers or two clients on one connection
+        // is a configuration mistake that would otherwise deadlock waiting
+        // for a HELLO neither side will send.
         return Err(Error::ENOCOMPATPROTO(
             format!(
-                "both ends of this connection are the PLAIN {}",
+                "both ends of this connection are the {} {}",
+                security.mechanism(),
                 if security.as_server() {
                     "server"
                 } else {
@@ -293,10 +304,10 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
 
     let ours_metadata = handshake_metadata(ours, options);
     let mut user_id = None;
-    let peer_metadata_bytes = match security {
+    let peer_metadata = match security {
         Security::Null => {
             wire.write_command(&Command::Ready(ours_metadata)).await?;
-            expect_command(wire, "READY").await?
+            PeerMetadata::Command(expect_command(wire, "READY").await?)
         }
         Security::PlainClient => {
             // `C:HELLO(user,pass) -> S:WELCOME|S:ERROR`, then
@@ -317,7 +328,7 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
             }
             wire.write_command(&Command::Initiate(ours_metadata))
                 .await?;
-            expect_command(wire, "READY").await?
+            PeerMetadata::Command(expect_command(wire, "READY").await?)
         }
         Security::PlainServer => {
             let body = expect_command(wire, "HELLO").await?;
@@ -344,23 +355,102 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
             wire.write_command(&Command::Welcome).await?;
             let peer_metadata = expect_command(wire, "INITIATE").await?;
             wire.write_command(&Command::Ready(ours_metadata)).await?;
-            peer_metadata
+            PeerMetadata::Command(peer_metadata)
+        }
+        Security::CurveClient => {
+            // 26/CURVEZMQ: `C:HELLO -> S:WELCOME`, `C:INITIATE -> S:READY`,
+            // and then nothing in clear text ever again.
+            let mut client = CurveClient::new(
+                curve_key(options.curve_publickey, "ZMQ_CURVE_PUBLICKEY")?,
+                curve_secret(options)?,
+                curve_key(options.curve_serverkey, "ZMQ_CURVE_SERVERKEY")?,
+            );
+            let hello = client.hello()?;
+            wire.write_handshake(&hello).await?;
+            let body = expect_command(wire, "WELCOME").await?;
+            refused(&body)?;
+            client.read_welcome(&body)?;
+            let initiate = client.initiate(&ours_metadata)?;
+            wire.write_handshake(&initiate).await?;
+            let body = expect_command(wire, "READY").await?;
+            refused(&body)?;
+            let metadata = client.read_ready(&body)?;
+            // Everything after this point is a MESSAGE box.
+            wire.encrypt_with(client.into_transport()?);
+            PeerMetadata::Dictionary(metadata)
+        }
+        Security::CurveServer => {
+            let mut server = CurveServer::new(curve_secret(options)?, COOKIE_LIFETIME);
+            let body = expect_command(wire, "HELLO").await?;
+            refused(&body)?;
+            if let Err(e) = server.read_hello(&body) {
+                // A HELLO that does not open is a peer that does not know
+                // this server's key: it gets an ERROR rather than silence,
+                // which is what 37/ZMTP asks for and what a misconfigured
+                // client needs to see.
+                wire.refuse("the HELLO signature box does not open").await;
+                return Err(e);
+            }
+            let welcome = server.welcome()?;
+            wire.write_handshake(&welcome).await?;
+            let body = expect_command(wire, "INITIATE").await?;
+            refused(&body)?;
+            let opened = match server.read_initiate(&body) {
+                Ok(opened) => opened,
+                Err(e) => {
+                    wire.refuse("the INITIATE was refused").await;
+                    return Err(e);
+                }
+            };
+            // The domain is the switch between 26/CURVEZMQ's security
+            // models: without one, "the server does not check client keys at
+            // all" and knowing `S` was the authorization. With one, the
+            // credential is `C` — "a 32-byte long-term public key of the peer
+            // being authenticated", the key that never travelled in clear
+            // text — and the identity frame is the peer's own `Identity`
+            // property, out of the same box.
+            if options.authorizes() {
+                let identity = opened
+                    .metadata()?
+                    .get("Identity")
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default();
+                user_id = authorize(
+                    wire,
+                    options,
+                    facts,
+                    "CURVE",
+                    vec![opened.client_key.as_bytes().to_vec()],
+                    identity,
+                )
+                .await?;
+            }
+            let ready = server.ready(&ours_metadata)?;
+            wire.write_handshake(&ready).await?;
+            let metadata = opened.metadata_bytes().to_vec();
+            wire.encrypt_with(server.into_transport()?);
+            PeerMetadata::Dictionary(metadata)
         }
     };
 
-    let metadata = match Command::decode(&peer_metadata_bytes).map_err(command_error)? {
-        Command::Ready(metadata) | Command::Initiate(metadata) => metadata,
-        // "The peer SHALL treat an incoming ERROR command as fatal."
-        Command::Error(reason) => {
-            return Err(Error::ENOCOMPATPROTO(
-                format!("the peer refused the handshake: {}", sanitize(reason)).into(),
-            ));
-        }
-        other => {
-            return Err(Error::ENOCOMPATPROTO(
-                format!("expected the peer's metadata, got {}", other.name()).into(),
-            ));
-        }
+    let metadata = match &peer_metadata {
+        PeerMetadata::Command(body) => match Command::decode(body).map_err(command_error)? {
+            Command::Ready(metadata) | Command::Initiate(metadata) => metadata,
+            // "The peer SHALL treat an incoming ERROR command as fatal."
+            Command::Error(reason) => {
+                return Err(Error::ENOCOMPATPROTO(
+                    format!("the peer refused the handshake: {}", sanitize(reason)).into(),
+                ));
+            }
+            other => {
+                return Err(Error::ENOCOMPATPROTO(
+                    format!("expected the peer's metadata, got {}", other.name()).into(),
+                ));
+            }
+        },
+        // CURVE's metadata came out of a box rather than out of a command:
+        // the property dictionary is all that was in there.
+        PeerMetadata::Dictionary(bytes) => Metadata::decode(bytes).map_err(command_error)?,
     };
 
     let identity = match metadata.get("Identity") {
@@ -416,6 +506,53 @@ pub async fn handshake_on<S: AsyncRead + AsyncWrite + Unpin>(
         version,
         identity,
         user_id,
+    })
+}
+
+/// Where the peer's metadata dictionary came from.
+///
+/// NULL and PLAIN carry it in a command — `READY` or `INITIATE` — and CURVE
+/// carries it inside a box, where the box holds the property dictionary and
+/// nothing else. Both shapes are held as owned octets so that the
+/// [`Metadata`] borrowed from them outlives the handshake.
+enum PeerMetadata {
+    /// A `READY` or `INITIATE` command body.
+    Command(Vec<u8>),
+    /// The property dictionary out of an `INITIATE` or `READY` box.
+    Dictionary(Vec<u8>),
+}
+
+/// Reports a peer that answered a handshake command with `ERROR`.
+///
+/// Every mechanism may: 26/CURVEZMQ has `ERROR` in its own grammar, and
+/// 37/ZMTP calls an incoming one fatal. A CURVE command can never be
+/// mistaken for one, because no CURVE command is named `ERROR`.
+fn refused(body: &[u8]) -> Result<()> {
+    match Command::decode(body) {
+        Ok(Command::Error(reason)) => Err(Error::ENOCOMPATPROTO(
+            format!("the peer refused the handshake: {}", sanitize(reason)).into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// A CURVE key an option must carry, or `EINVAL` naming the option.
+///
+/// [`SocketOptions::validate`] refuses the missing ones at configuration
+/// time, so this is the same rule stated where the value is finally read
+/// rather than a second policy.
+fn curve_key(key: Option<CurvePublicKey>, option: &str) -> Result<CurvePublicKey> {
+    key.ok_or_else(|| {
+        Error::EINVAL(format!("this CURVE socket has no {option}, so it cannot handshake").into())
+    })
+}
+
+/// This socket's long-term secret key, which both CURVE roles need.
+fn curve_secret(options: &SocketOptions) -> Result<&CurveSecretKey> {
+    options.curve_secretkey.as_ref().ok_or_else(|| {
+        Error::EINVAL(
+            "this CURVE socket has no ZMQ_CURVE_SECRETKEY, so it holds no key at all".into(),
+        )
     })
 }
 
@@ -868,6 +1005,20 @@ pub struct Wire<S> {
     /// change what is parsed.
     scratch: Vec<u8>,
     limits: MessageLimits,
+    /// The CURVE session keys, once a handshake has agreed them. `None` is
+    /// NULL and PLAIN, where the wire is what it says it is.
+    curve: Option<CurveTransport>,
+    /// Opened frames waiting to be assembled into a message, under CURVE.
+    ///
+    /// Re-framed rather than re-implemented: each opened box holds one
+    /// frame's flags and body, which are written back as ZMTP frame octets so
+    /// that [`Multipart::decode`] does the assembly and applies
+    /// `ZMQ_MAXMSGSIZE` and the frame ceiling — the same code, and therefore
+    /// the same limits, as an unencrypted connection. It is bounded by those
+    /// limits: the assembly is attempted after every opened frame, so a peer
+    /// that sends MORE forever is refused with `EMSGSIZE` one frame past the
+    /// cap rather than growing this buffer.
+    plain: Vec<u8>,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
@@ -880,7 +1031,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
             buf: Vec::new(),
             scratch: vec![0u8; CHUNK],
             limits,
+            curve: None,
+            plain: Vec::new(),
         }
+    }
+
+    /// Installs the CURVE session keys a handshake agreed, after which every
+    /// frame in either direction travels inside a `MESSAGE` box.
+    pub fn encrypt_with(&mut self, transport: CurveTransport) {
+        self.curve = Some(transport);
+    }
+
+    /// Destroys the session keys: "Session keys are held in memory and
+    /// destroyed when the connection is closed."
+    ///
+    /// The decrypted staging buffer is overwritten as well, for the same
+    /// reason and with the same honesty about it: without a volatile write
+    /// neither erasure is guaranteed to survive the optimizer, and what is
+    /// guaranteed is that nothing can be sealed or opened afterwards.
+    pub fn destroy_session_keys(&mut self) {
+        if let Some(curve) = &mut self.curve {
+            curve.destroy();
+        }
+        self.curve = None;
+        self.plain.fill(0);
+        self.plain.clear();
     }
 
     /// Reads the next whole message or command.
@@ -893,6 +1068,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     /// from declared lengths and a multipart message is delivered only once
     /// its last frame has arrived.
     pub async fn read_next(&mut self) -> Result<Incoming> {
+        if self.curve.is_some() {
+            return self.read_next_sealed().await;
+        }
         loop {
             match Multipart::decode(&self.buf, self.limits)? {
                 Decoded::Message { message, consumed } => {
@@ -909,20 +1087,131 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         }
     }
 
+    /// [`Self::read_next`] for a CURVE connection: the same assembly over
+    /// the frames that came out of the boxes.
+    ///
+    /// Cancel-safe for the same two reasons and one more: an opened frame is
+    /// appended to `plain` before anything is returned, so a dropped future
+    /// loses neither the octets nor the plaintext — and never re-opens a box,
+    /// which would fail the nonce check.
+    async fn read_next_sealed(&mut self) -> Result<Incoming> {
+        loop {
+            match Multipart::decode(&self.plain, self.limits)? {
+                Decoded::Message { message, consumed } => {
+                    self.plain.drain(..consumed);
+                    return Ok(Incoming::Message(message));
+                }
+                Decoded::Command { body, consumed } => {
+                    let body = body.to_vec();
+                    self.plain.drain(..consumed);
+                    return Ok(Incoming::Command(body));
+                }
+                Decoded::Incomplete => self.open_next_box().await?,
+            }
+        }
+    }
+
+    /// Reads one `MESSAGE` command, opens its box and appends the frame it
+    /// held to the plaintext buffer.
+    async fn open_next_box(&mut self) -> Result<()> {
+        let body = loop {
+            match frame::decode(&self.buf, self.limits.max_bytes) {
+                Ok((header, body, used)) => {
+                    let body = body.to_vec();
+                    self.buf.drain(..used);
+                    if header.kind != FrameKind::Command {
+                        return Err(Error::ENOCOMPATPROTO(
+                            "a CURVE connection carries command frames after its READY, and \
+                             this is a message frame in clear text"
+                                .into(),
+                        ));
+                    }
+                    break body;
+                }
+                Err(e) if !e.is_violation() => self.fill().await?,
+                Err(e) => {
+                    return Err(Error::ENOCOMPATPROTO(
+                        format!("malformed frame: {e}").into(),
+                    ));
+                }
+            }
+        };
+        // An `ERROR` is the one command that still arrives in clear text:
+        // 37/ZMTP calls it fatal and a peer sending it is giving up, so
+        // reading it turns a clean refusal into a reason instead of a
+        // timeout. Nothing else is accepted outside a box.
+        if let Ok(Command::Error(reason)) = Command::decode(&body) {
+            return Err(Error::ENOCOMPATPROTO(
+                format!("the peer refused the connection: {}", sanitize(reason)).into(),
+            ));
+        }
+        let curve = self
+            .curve
+            .as_mut()
+            .ok_or_else(|| Error::ENOTSOCK("this connection has no CURVE session".into()))?;
+        let (flags, frame_body) = curve.open_message(&body)?;
+        let kind = if flags & curve_layout::MESSAGE_FLAG_COMMAND != 0 {
+            FrameKind::Command
+        } else {
+            FrameKind::Message {
+                more: flags & curve_layout::MESSAGE_FLAG_MORE != 0,
+            }
+        };
+        self.plain
+            .extend_from_slice(&frame::encode(kind, &frame_body));
+        Ok(())
+    }
+
     /// Writes one whole message: every frame in one buffer, MORE on all but
     /// the last.
     ///
     /// One write, because "on sending, the peer SHALL queue all frames of a
     /// message in memory until the final frame is sent" — a peer must never
-    /// see half a message.
+    /// see half a message. Under CURVE each frame is sealed on its own, with
+    /// its MORE flag inside the box, and the boxes go out in that one write.
     pub async fn write_message(&mut self, message: &Multipart) -> Result<()> {
-        self.write_all(&message.encode()).await
+        let bytes = match self.curve.as_mut() {
+            None => message.encode(),
+            Some(curve) => {
+                let last = message.len() - 1;
+                let mut out = Vec::new();
+                for (index, frame) in message.frames().iter().enumerate() {
+                    let flags = if index == last {
+                        0
+                    } else {
+                        curve_layout::MESSAGE_FLAG_MORE
+                    };
+                    out.extend_from_slice(&curve.seal_frame(flags, frame.as_slice())?);
+                }
+                out
+            }
+        };
+        self.write_all(&bytes).await
     }
 
-    /// Writes one command frame.
+    /// Writes one command frame — sealed, on a CURVE connection.
     pub async fn write_command(&mut self, command: &Command<'_>) -> Result<()> {
-        let bytes = command.encode().map_err(command_error)?;
+        let bytes = self.command_bytes(command)?;
         self.write_all(&bytes).await
+    }
+
+    /// Writes one CURVE handshake frame, which is already complete octets:
+    /// the handshake is what agrees the session keys, so it is never sealed
+    /// by them.
+    async fn write_handshake(&mut self, frame_bytes: &[u8]) -> Result<()> {
+        self.write_all(frame_bytes).await
+    }
+
+    /// One command's frame octets, sealed or not.
+    fn command_bytes(&mut self, command: &Command<'_>) -> Result<Vec<u8>> {
+        match self.curve.as_mut() {
+            None => command.encode().map_err(command_error),
+            Some(curve) => {
+                let mut body = Vec::new();
+                command.encode_body(&mut body).map_err(command_error)?;
+                curve.seal_frame(curve_layout::MESSAGE_FLAG_COMMAND, &body)
+            }
+        }
     }
 
     /// Reads exactly `out.len()` octets — a peer's greeting, in a test that
@@ -941,9 +1230,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     /// Writes an `ERROR` and gives up on the connection.
     ///
     /// Best effort by construction: the peer is being closed on, so a write
-    /// that fails changes nothing.
+    /// that fails changes nothing — including one that cannot be sealed.
     async fn refuse(&mut self, reason: &str) {
-        if let Ok(bytes) = Command::Error(reason).encode() {
+        if let Ok(bytes) = self.command_bytes(&Command::Error(reason)) {
             let _ = self.io.write_all(&bytes).await;
             let _ = self.io.flush().await;
         }
@@ -1924,5 +2213,300 @@ mod tests {
             .expect("the peer finished")
             .expect("the peer task");
         assert_eq!(delivered, b"through the engine");
+    }
+
+    /// A CURVE server's options, and the key a client needs to reach it.
+    fn curve_server_options(zap_domain: &str) -> (SocketOptions, crate::curve::CurvePublicKey) {
+        let (public, secret) = crate::curve::keypair();
+        (
+            SocketOptions {
+                curve_server: true,
+                curve_secretkey: Some(secret),
+                zap_domain: zap_domain.to_owned(),
+                ..options()
+            },
+            public,
+        )
+    }
+
+    /// A CURVE client on a raw socket: greets, runs 26/CURVEZMQ's four
+    /// commands against a server session, and hands back the transport the
+    /// handshake agreed.
+    ///
+    /// Driven by this crate's client half over the wire rather than by a
+    /// second session, so what a test asserts is octets on a socket and not
+    /// an agreement between two copies of one state machine.
+    async fn curve_handshake_as_client(
+        peer: &mut CodecPeer,
+        server_key: crate::curve::CurvePublicKey,
+        client_public: crate::curve::CurvePublicKey,
+        client_secret: &crate::curve::CurveSecretKey,
+    ) -> CurveTransport {
+        let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
+        assert_eq!(greeting.mechanism, weida_zmtp::Mechanism::CURVE);
+        assert!(
+            greeting.as_server,
+            "a CURVE server's as-server octet is one"
+        );
+        peer.greet_as(weida_zmtp::Mechanism::CURVE, false).await;
+
+        let mut client = CurveClient::new(client_public, client_secret, server_key);
+        let hello = client.hello().expect("HELLO");
+        assert_eq!(
+            hello.len(),
+            2 + curve_layout::HELLO_LEN,
+            "a HELLO is 200 octets behind a short frame header"
+        );
+        peer.send(&hello).await;
+
+        let (kind, body) = peer.read_frame().await;
+        assert_eq!(kind, FrameKind::Command);
+        assert_eq!(body.len(), curve_layout::WELCOME_LEN);
+        client.read_welcome(&body).expect("read WELCOME");
+        let initiate = client
+            .initiate(&Metadata::new().with_socket_type(SocketType::Pair))
+            .expect("INITIATE");
+        peer.send(&initiate).await;
+
+        let (kind, body) = peer.read_frame().await;
+        assert_eq!(kind, FrameKind::Command);
+        let metadata_bytes = client.read_ready(&body).expect("read READY");
+        let metadata = Metadata::decode(&metadata_bytes).expect("the server's metadata");
+        assert_eq!(metadata.socket_type(), Some(SocketType::Pair));
+        client.into_transport().expect("transport")
+    }
+
+    /// Claim: the octets a CURVE server puts on the wire are 26/CURVEZMQ's,
+    /// and nothing after the `READY` is in clear text.
+    ///
+    /// Driven from the other side by this crate's own client half over a raw
+    /// socket, so what is asserted is the wire and not an agreement between
+    /// two copies of the same state machine.
+    #[tokio::test]
+    async fn a_curve_server_seals_everything_after_its_ready() {
+        let context = context();
+        let (server_options, server_key) = curve_server_options("");
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (pipe, _user, task) = drive_session(
+            ours,
+            SocketType::Pair,
+            server_options,
+            Role::Binder,
+            &context,
+        );
+
+        let (public, secret) = crate::curve::keypair();
+        let mut transport = curve_handshake_as_client(&mut peer, server_key, public, &secret).await;
+
+        // Outbound: the server's message is a MESSAGE command, and the
+        // plaintext is nowhere in the octets.
+        pipe.outgoing()
+            .send(Multipart::single("the quiet part"))
+            .await
+            .expect("queued");
+        let (kind, body) = peer.read_frame().await;
+        assert_eq!(kind, FrameKind::Command, "even a message is a command now");
+        assert!(body.starts_with(b"\x07MESSAGE"), "named MESSAGE");
+        assert!(
+            !body.windows(14).any(|window| window == b"the quiet part"),
+            "the payload travelled in clear text"
+        );
+        let (flags, payload) = transport.open_message(&body).expect("open");
+        assert_eq!(flags, 0, "one frame, so no MORE");
+        assert_eq!(payload, b"the quiet part");
+
+        // A multipart message: MORE travels inside the box under CURVE, so a
+        // single frame would not exercise it.
+        let mut multipart = Multipart::single("first");
+        multipart.push("second");
+        pipe.outgoing().send(multipart).await.expect("queued");
+        for (expected_flags, expected_body) in [
+            (curve_layout::MESSAGE_FLAG_MORE, &b"first"[..]),
+            (0, &b"second"[..]),
+        ] {
+            let (kind, body) = peer.read_frame().await;
+            assert_eq!(kind, FrameKind::Command);
+            let (flags, payload) = transport.open_message(&body).expect("open");
+            assert_eq!(flags, expected_flags);
+            assert_eq!(payload, expected_body);
+        }
+
+        // Inbound: a sealed message reaches the application, and a plaintext
+        // one does not.
+        peer.send(&transport.seal_frame(0, b"the other way").expect("seal"))
+            .await;
+        let arrived = tokio::time::timeout(Duration::from_secs(10), pipe.incoming().recv())
+            .await
+            .expect("the message arrived")
+            .expect("a message");
+        assert_eq!(arrived.frames()[0].as_slice(), b"the other way");
+
+        peer.send(&Multipart::single("in the open").encode()).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the session ended")
+            .expect("the task");
+        let err = outcome.unwrap_err();
+        assert_eq!(err.errno(), "ENOCOMPATPROTO", "{err}");
+        assert!(err.cause().contains("clear text"), "{err}");
+    }
+
+    /// Claim: the CURVE credential a ZAP handler is given is the peer's
+    /// long-term public key — the one that never travelled in clear text —
+    /// and 26/CURVEZMQ's second and third security models are the handler's
+    /// answer to it: an allowed key is admitted, a 200 that names a user is
+    /// kept per connection, and a key that is not in the table is refused
+    /// before any message flows.
+    #[tokio::test]
+    async fn a_curve_server_hands_the_peers_key_to_the_handler() {
+        let context = context();
+        let (server_options, server_key) = curve_server_options("realm");
+        let (allowed_public, allowed_secret) = crate::curve::keypair();
+
+        // Model 3: a table with one entry per client, whose 200 also names
+        // the user that key belongs to. Model 2 is the same handler with one
+        // shared entry, and this one's refusal path is what both do to a key
+        // they do not hold.
+        let allowed = allowed_public;
+        let (asked, handler) = zap_handler(&context, move |request| {
+            assert_eq!(request.mechanism, "CURVE");
+            assert_eq!(request.domain, "realm");
+            let key = crate::curve::CurvePublicKey::parse(&request.credentials[0])
+                .expect("a 32-octet key");
+            if key == allowed {
+                ZapReply::allowed(request.request_id, "client-a")
+            } else {
+                ZapReply::refused(
+                    request.request_id,
+                    ZapStatus::AuthenticationFailure,
+                    "not on the list",
+                )
+            }
+        })
+        .await;
+
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (pipe, user, task) = drive_session(
+            ours,
+            SocketType::Pair,
+            server_options.clone(),
+            Role::Binder,
+            &context,
+        );
+        let mut transport =
+            curve_handshake_as_client(&mut peer, server_key, allowed_public, &allowed_secret).await;
+
+        peer.send(&transport.seal_frame(0, b"authorized").expect("seal"))
+            .await;
+        let arrived = tokio::time::timeout(Duration::from_secs(10), pipe.incoming().recv())
+            .await
+            .expect("the message arrived")
+            .expect("a message");
+        assert_eq!(arrived.frames()[0].as_slice(), b"authorized");
+        assert_eq!(
+            user.get().expect("a user id").as_str(),
+            "client-a",
+            "model 3: access granted according to an authenticated identity"
+        );
+        {
+            let asked = asked.lock().expect("asked");
+            assert_eq!(asked.len(), 1);
+            assert_eq!(
+                asked[0].credentials,
+                vec![allowed_public.as_bytes().to_vec()],
+                "one frame, the peer's 32-octet long-term key"
+            );
+        }
+        assert_eq!(
+            crate::curve::security_model(&server_options),
+            Some(crate::curve::SecurityModel::CheckedByHandler)
+        );
+        drop(peer);
+        let _ = task.await;
+
+        // A key the table does not hold: the handshake ends with the
+        // handler's own text, and no message ever flows.
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (pipe, user, task) = drive_session(
+            ours,
+            SocketType::Pair,
+            server_options,
+            Role::Binder,
+            &context,
+        );
+        let (stranger_public, stranger_secret) = crate::curve::keypair();
+        let greeting = Greeting::decode(&peer.read_greeting().await).expect("greeting");
+        assert_eq!(greeting.mechanism, weida_zmtp::Mechanism::CURVE);
+        peer.greet_as(weida_zmtp::Mechanism::CURVE, false).await;
+        let mut client = CurveClient::new(stranger_public, &stranger_secret, server_key);
+        peer.send(&client.hello().expect("HELLO")).await;
+        let (_, body) = peer.read_frame().await;
+        client.read_welcome(&body).expect("read WELCOME");
+        peer.send(&client.initiate(&Metadata::new()).expect("INITIATE"))
+            .await;
+
+        // The refusal is an ERROR carrying the handler's status and text,
+        // sent before the READY that would have completed the handshake.
+        let (kind, body) = peer.read_frame().await;
+        assert_eq!(kind, FrameKind::Command);
+        let Command::Error(reason) = Command::decode(&body).expect("a command") else {
+            panic!("expected an ERROR");
+        };
+        assert!(reason.contains("not on the list"), "{reason}");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the session ended")
+            .expect("the task");
+        let err = outcome.unwrap_err();
+        assert_eq!(err.errno(), "EACCES", "{err}");
+        assert_eq!(user.get(), None, "a refusal names no user");
+        assert!(
+            pipe.incoming().try_recv().is_err(),
+            "nothing flowed under a refused connection"
+        );
+        handler.abort();
+    }
+
+    /// Claim: a client that does not hold the server's public key cannot get
+    /// past `HELLO`, and is told so rather than left waiting.
+    #[tokio::test]
+    async fn a_curve_client_with_the_wrong_server_key_is_refused() {
+        let context = context();
+        let (server_options, _) = curve_server_options("");
+        let (ours, theirs) = pair().await;
+        let mut peer = CodecPeer::new(theirs);
+        let (_pipe, _user, task) = drive_session(
+            ours,
+            SocketType::Pair,
+            server_options,
+            Role::Binder,
+            &context,
+        );
+
+        peer.read_greeting().await;
+        peer.greet_as(weida_zmtp::Mechanism::CURVE, false).await;
+        // A HELLO whose signature box is sealed to another server's key: the
+        // octets are 26/CURVEZMQ's and the box does not open.
+        let (elsewhere, _) = crate::curve::keypair();
+        let (public, secret) = crate::curve::keypair();
+        let mut client = CurveClient::new(public, &secret, elsewhere);
+        peer.send(&client.hello().expect("HELLO")).await;
+
+        let (kind, body) = peer.read_frame().await;
+        assert_eq!(kind, FrameKind::Command);
+        let Command::Error(reason) = Command::decode(&body).expect("a command") else {
+            panic!("expected an ERROR rather than silence");
+        };
+        assert!(reason.contains("signature box"), "{reason}");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the session ended")
+            .expect("the task");
+        let err = outcome.unwrap_err();
+        assert_eq!(err.errno(), "EACCES", "{err}");
     }
 }

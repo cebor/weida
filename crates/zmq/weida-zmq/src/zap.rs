@@ -478,6 +478,12 @@ pub async fn authorize(context: &Context, request: &ZapRequest) -> Result<ZapRep
 }
 
 /// The mechanism name and credential frames a security choice sends.
+///
+/// These are the frames a socket's **own** options carry, which is why CURVE
+/// contributes none: its credential is "a 32-byte long-term public key of the
+/// peer being authenticated", and the peer's key arrives inside an `INITIATE`
+/// box rather than out of a configuration. The session passes it to
+/// [`authorize`] directly.
 pub fn credentials_of(security: Security, options: &SocketOptions) -> (String, Vec<Vec<u8>>) {
     match security {
         Security::Null => ("NULL".to_owned(), Vec::new()),
@@ -496,6 +502,7 @@ pub fn credentials_of(security: Security, options: &SocketOptions) -> (String, V
                     .into_bytes(),
             ],
         ),
+        Security::CurveServer | Security::CurveClient => ("CURVE".to_owned(), Vec::new()),
     }
 }
 
