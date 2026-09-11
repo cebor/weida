@@ -1897,6 +1897,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "weida-sp"
+version = "0.1.0"
+
+[[package]]
 name = "weida-zmtp"
 version = "0.1.0"
 
