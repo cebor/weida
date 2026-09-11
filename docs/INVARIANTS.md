@@ -45,11 +45,16 @@ the subsystem they constrain does not exist.
 | No remote input can cause unbounded memory allocation | `header_len` is compared against `max_header_bytes` **before** allocating ([PROTOCOL.md](PROTOCOL.md) §3.1); CBOR skip is iterative with `max_depth = 8`; QUIC `stream_receive_window`, `connection_receive_window`, `max_concurrent_uni_streams` and `max_concurrent_bidi_streams` bound buffered payload and concurrent stream state; `max_connections` bounds accepted connections per binding and `max_connections_per_peer` (64) bounds what **one** peer may hold there, counted by the fingerprint it proved and released when a connection closes — the bound one connection per dialled path makes necessary, since the dialling side then chooses the count; connections that proved no identity are each their own peer and are bounded only by `max_connections`, because two anonymous connections cannot be shown to be one peer; a peer's subscriptions are bounded by `max_subscriptions` filters per connection, each capped at 256 B, and dropped wholesale when the connection closes; payload queued for one subscriber is bounded by `subscriber_buffer_bytes`; the per-connection scope table of the gap detector and of the reassembler is bounded by `max_sequence_scopes` (1024), and at the cap a new scope is left untracked rather than inserted; the reassembly hold is bounded by `max_reorder_hold` (256) transfers over all scopes, enforced by releasing the oldest held transfer out of order with its gap reported, never by growing — a held transfer is an unread stream, so the bytes it pins are quinn's and are bounded again by `connection_receive_window`; the dedup window's identity table is bounded in time by the negotiated window **and** in count by `max_dedup_entries` (4096), evicting its oldest entry at the cap, so a peer that sends fast buys itself missed suppression rather than memory; a resolver answer — remote input, since whoever answers DNS chooses its length — is bounded by `max_resolved_addresses` (8), and a dial tries them in order with every attempt but the last bounded by `connect_attempt_timeout`; live transfers on one local connection are bounded by `max_local_streams` (255), and opening past the cap fails with `LimitExceeded` rather than queueing, because there the stream *is* the OS object ([decisions/0010](decisions/0010-local-transport.md) §4.2); worst-case hostile per-connection header memory is `max_header_bytes * (max_concurrent_uni_streams + max_concurrent_bidi_streams)` = **48 MiB** ([PROTOCOL.md](PROTOCOL.md) §10) |
 
 Every bound this list names is now **implemented**: `max_connections_per_peer` with the
-per-path connections of B-017, and `max_local_streams` with the first local transport of
-[decisions/0010](decisions/0010-local-transport.md) (B-037). The habit stays — a bound is
-named here before the allocation it caps exists, so that no implementation can land
-without one — and the next entries will be the `AF_UNIX` and named-pipe socket paths of
-[0010 §4.5] if they turn out to need more than `max_local_streams`.
+per-path connections of B-017, `max_local_streams` with the first local transport of
+[decisions/0010](decisions/0010-local-transport.md) (B-037), and `max_parked_reverse`
+with the reverse pool of
+[decisions/0012](decisions/0012-local-connection-grouping.md) §4.4 (B-048) — a parked
+connection is a descriptor held open for a copy that may never come, so it is bounded
+twice: by the pool's own ceiling and by `max_local_streams`, which counts it like any
+other live local connection. The habit stays — a bound is named here before the
+allocation it caps exists, so that no implementation can land without one — and the next
+entry will be the named-pipe instance count of [0010 §4.5] if it turns out to need more
+than `max_local_streams`.
 
 The hot-path invariant binds all three structures that now exist: a connection that
 negotiated `Ordering = None` and `Deduplication = None` — which is every connection that

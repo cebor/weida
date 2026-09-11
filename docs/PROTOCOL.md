@@ -123,6 +123,8 @@ of the transport and appears on no QUIC connection:
 0x01                     control connection; the server answers with
                          16 bytes of group token, then HELLO both ways
 0x02 <16-byte token>     transfer connection; one weida stream
+0x03 <16-byte token>     reverse connection; parked, for a stream the
+                         accepting side opens toward this peer
 ```
 
 A transfer connection is admitted only if the token names a live control
@@ -133,10 +135,20 @@ connections and resumes nothing: no subscriptions, no sequence position, no
 dedup window, and it is meaningless once the control connection closes, which
 is why it is not the session state §11 excludes [0012 §4.5].
 
-A server has no way to open a stream toward a peer that dialled it, so
-**Pub/Sub over a socket transport is not available** until the parked reverse
-connections of [0012 §4.4] exist; a publisher that has no stream to a local
-subscriber refuses with `UNSUPPORTED` rather than pretending.
+A server has no way to *dial* a peer that dialled it, so a stream toward such
+a peer rides a connection that peer parked in advance: a subscriber over a
+socket transport opens `Limits::max_parked_reverse` reverse connections and
+parks a replacement as each is spent [0012 §4.4]. A parked connection is
+admitted by the same rule as a transfer connection, and counts against
+`max_local_streams` on both sides. Whatever the server writes on one is a
+DATA frame dispatched by the path in its header, exactly as an accepted
+unidirectional stream is on QUIC; there is no reverse-specific frame.
+
+**A publisher that finds no parked connection drops that copy and counts
+it** — the answer fan-out already gives an exhausted subscriber budget (§6.4,
+[GUARANTEES.md](GUARANTEES.md) §6), and never a stall of the publisher. A
+subscriber configured to park nothing therefore cannot receive fan-out at
+all, and is refused when it subscribes rather than left silent.
 
 ### 2.2 HELLO exchange
 
@@ -954,6 +966,7 @@ Per connection (`Limits`):
 | `max_reorder_hold` | `256` | transfers a receiver holds back at once, over all scopes, under `PerProducer(reassemble)`; at the cap the oldest held transfer is released out of order with its gap reported (§6.5, [GUARANTEES.md](GUARANTEES.md) §3). A held transfer is an unread stream, so the bytes it pins are bounded again by `stream_receive_window` and `connection_receive_window` |
 | `max_dedup_entries` | `4096` | identities a receiver remembers per connection under `Bounded` deduplication; the negotiated window bounds how long an identity is kept and this bounds how many, evicting the oldest at the cap (§6.5) |
 | `max_local_streams` | `255` | live transfers on one **local** connection (§2.1), where the stream is the OS object and there is no multiplexing; opening past the cap fails with `LIMIT_EXCEEDED` locally rather than queueing. The number is Windows' named-pipe instance limit, the tightest of the three platforms [0010 §4.2] |
+| `max_parked_reverse` | `8` | connections a subscriber parks toward a peer it dialled, so that peer can open a stream back (§2.1); each is a descriptor held for a copy that may never come and each counts against `max_local_streams` on both sides. A publisher that finds none parked drops that copy and counts it; zero disables the pool, which makes subscribing over a socket transport an error rather than a silence [0012 §4.4] |
 
 Per runtime (`RuntimeConfig`):
 

@@ -1,6 +1,6 @@
 # 0012: Grouping local connections into a peer
 
-Status: provisional
+Status: accepted
 Date: 2026-09-11
 Relates to: [0010](0010-local-transport.md) §4.2, §4.4; [0008](0008-session-identity.md) §4.1,
 §4.2, §4.5; [0002](0002-control-and-bulk-separation.md) §6.2; B-038, B-039
@@ -161,7 +161,7 @@ direction that does not.
   `weida+unix://`; Pub/Sub does not.
 - **Follow-up item, filed with this note:**
 
-  > ### B-047 — AF_UNIX: parked reverse connections for fan-out
+  > ### B-048 — AF_UNIX: parked reverse connections for fan-out
   > kind: code | size: 90 | status: ready | needs: [B-038]
   > acceptance: a subscriber over `weida+unix://` parks spare connections carrying the `reverse`
   > preamble and its group token, bounded by the new `Limits::max_parked_reverse` and counted
@@ -178,13 +178,20 @@ direction that does not.
   sends before its first frame (the token, and later the `reverse` marker), and the rule that an
   unbound connection is refused. This is a *local* framing detail, not a wire-version change:
   nothing about it appears on a QUIC connection.
-- **[INVARIANTS.md](../INVARIANTS.md)** gains `max_parked_reverse` as a named bound when B-047
+- **[INVARIANTS.md](../INVARIANTS.md)** gains `max_parked_reverse` as a named bound when B-048
   lands; `max_local_streams` already covers the connections themselves.
 - **[GUARANTEES.md](../GUARANTEES.md) §6** records that Pub/Sub over a socket transport depends
   on the reverse pool, and that an exhausted pool is a counted drop.
-- **Status is provisional** because the reverse pool of §4.4 has no precedent in the sheets and
-  no measurement behind its bound. It becomes accepted when B-047 has run: if the pool turns out
-  to be the wrong shape, §4.4 is what changes, and §4.1-§4.3 stand on their own.
+- **Status was provisional** because the reverse pool of §4.4 had no precedent in the sheets
+  and no measurement behind its bound. B-048 has run: the shape holds unchanged, the shared
+  Pub/Sub test body passes over `AF_UNIX` exactly as over QUIC and inproc
+  (`pub_sub_over_unix`), an exhausted pool is a counted drop that leaves the subscription
+  alive (`an_exhausted_reverse_pool_drops_the_copy_and_counts_it`), and a subscriber that
+  parks nothing is refused at subscribe time
+  (`a_subscriber_that_parks_nothing_is_refused_at_connect`). The one thing the
+  implementation sharpened is *when* a replacement is parked: on the first byte the peer
+  writes, not at the end of the copy, so a long transfer does not shrink the pool for its
+  duration.
 
 ## 6. Sources
 
