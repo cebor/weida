@@ -36,6 +36,16 @@ Awaiting each FIN's transport receipt does reverse it: N = 16 gives **16 of 16**
 **15 = N − 1**. So an eager reassembler's bound is N − 1 and it is reachable; the cap must be
 a configured number. Recorded in IMPLEMENTATION.md §4.
 
+**B-011 — what a connection to a peer costs.**
+`cargo bench -p weida --bench connections -- --warm-up-time 1 --measurement-time 3` (release,
+loopback, pinned trust, mTLS off, three runs). A cold handshake is **1.04-1.10 ms**; dialling
+a peer the pool already holds is **3.8 µs**, about **280x** cheaper, because it is not a
+connection at all. 64 handshakes in series take 65.6-73.9 ms with no degradation. Memory:
+**0-4 KiB** per idle runtime, **488-596 KiB** per live connection at 2 and **750-850 KiB** at
+64, covering both ends in one process. So 0002's second connection per peer costs about a
+millisecond and under a megabyte for the pair, against the unbounded head-of-line coupling it
+removes. Recorded in IMPLEMENTATION.md §4.
+
 ## Chronology
 
 2026-09-11T00:00Z | — | seeded | loop, backlog B-001..B-018 and this log created | next B-001
@@ -50,3 +60,4 @@ a configured number. Recorded in IMPLEMENTATION.md §4.
 2026-09-11T03:50Z | review | 4e0c899 | 4 findings, all filed: B-019 FAILURE_MODEL per 0005, B-020 segment matcher in code, B-021 its cost in the fan-out path, B-022 capped reassembly + drop detection; B-017's acceptance extended with 0008 §4.2's fingerprint binding. Gate green on the tree; no public API changed since the anchor (bench and test only); no stale identifier in the normative docs — the four that no longer exist in code (`transfer_id`, `role`, `correlation_id`, `ack_mode`, plus `max_pending`) are PROTOCOL's own "these are gone" statements; no new remote-influenced allocation | next B-011
 2026-09-11T04:06Z | B-018 | done fecd996 | ZMTP mapping document (parallel worker), verified: socket table, stream mapping, HWM against the two L0 credit units, CURVE/ZAP against Identity/Trust, transfer points, ten named losses, six refused configurations, interop bench plan on zmq.rs; `docs/adapters/README.md` added as the template and index | next B-007
 2026-09-11T04:07Z | B-007 | done 30b8942 | GUARANTEES.md synced (parallel worker), verified: §1 durability levels per 0004, §3 `PerProducer(detect|reassemble)`, `Bounded(window)`, `PerKey` L2-only, guarantee-set subsection per 0006, receipt paragraph citing RFC 9000 §3.1/§3.2/§4.1 per 0005, §6 backpressure row naming bytes and streams as the two credit units; stale-term grep clean, the race is stated as decided rather than open | next B-011, then B-006; B-016 delegated on branch `b016-runtime`
+2026-09-11T04:20Z | B-011 | done 417a359 | new bench target `benches/connections.rs`: cold handshake 1.04-1.10 ms, pooled dial 3.8 µs, 0-4 KiB per idle runtime, 750-850 KiB per live connection at 64; full gate green; numbers above and in IMPLEMENTATION.md §4 | next B-006
