@@ -8,6 +8,7 @@ members = [
     "crates/adapters/weida-zmtp-bridge",
     "crates/adapters/weida-sp",
     "crates/adapters/weida-sp-bridge",
+    "crates/adapters/cross-tests",
 ]
 
 [workspace.package]
