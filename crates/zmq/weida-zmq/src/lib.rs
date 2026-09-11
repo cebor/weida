@@ -104,12 +104,18 @@
 //!   are `weida-zmtp`'s; the one cryptographic dependency is `crypto_box`,
 //!   RustCrypto's NaCl `crypto_box` — see [`curve`].
 //!
-//! What remains is the rest of the option surface, the monitor events and
-//! the devices [0013 §5.3]. They are named here so that a reader knows what
-//! this crate is for and what it does not do yet; nothing stands in for
-//! them, and in particular there is no default [`Session`] beyond
-//! [`ZmtpSession`]: a socket that handed its peers to a no-op would be a
-//! ZeroMQ implementation that speaks nothing.
+//! - [`optiontable`] — every `zmq_setsockopt` and `zmq_ctx_set` option by
+//!   name, honoured under the name this library gives it or refused with one
+//!   of five reasons: no transport, draft only, deprecated in favour of ZAP,
+//!   replaced by a `weida-runtime` construct, or absent with what is missing
+//!   named. Nothing is silently ignored, and the two deliberate default
+//!   changes are rows in that table.
+//!
+//! What remains is the monitor events and the devices [0013 §5.3]. They are
+//! named here so that a reader knows what this crate is for and what it does
+//! not do yet; nothing stands in for them, and in particular there is no
+//! default [`Session`] beyond [`ZmtpSession`]: a socket that handed its
+//! peers to a no-op would be a ZeroMQ implementation that speaks nothing.
 //!
 //! # Rules this crate keeps
 //!
@@ -153,6 +159,7 @@ pub mod inproc;
 pub mod ipc;
 pub mod message;
 pub mod options;
+pub mod optiontable;
 pub mod pair;
 pub mod pipe;
 pub mod pipeline;
@@ -192,6 +199,7 @@ pub use options::{
     DEFAULT_BACKLOG, DEFAULT_HANDSHAKE_IVL, DEFAULT_MAX_RESOLVED_ADDRESSES, DEFAULT_RECONNECT_IVL,
     MAX_ZAP_DOMAIN_BYTES, Security, SocketOptions,
 };
+pub use optiontable::{OPTIONS, Refusal, Scope, Verdict, ZmqOption};
 pub use pair::PairSocket;
 pub use pipe::{
     DEFAULT_RCVHWM, DEFAULT_SNDHWM, MuteAction, Pipe, PipeConfig, Queue, QueueConfig, Sent,
