@@ -56,7 +56,13 @@
 //! `uv`-managed virtualenv under the worktree, installs `maturin` and `pytest`
 //! into that virtualenv and nothing into the system interpreter, runs
 //! `maturin develop` and then the Python tests. The wheel is `abi3` from
-//! CPython 3.9, so one build serves every later interpreter.
+//! CPython 3.9, so one build serves every later interpreter, and
+//! `package.sh` builds it and proves it runs in a fresh virtualenv with no
+//! Rust toolchain on `PATH`.
+//!
+//! # What differs from `pyzmq`
+//!
+//! Row by row in `docs/libraries/zmq-py.md`, this binding's parity document.
 
 use pyo3::prelude::*;
 

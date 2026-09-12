@@ -41,12 +41,14 @@ asyncio.run(main())
 Every call is a coroutine: nothing blocks the event loop, nothing holds the GIL
 while waiting, and a cancelled task cancels the operation underneath.
 
-## What is not here yet
+## What is not here, and what differs from pyzmq
 
-`send` and `recv` exist on `ReqSocket` and `RepSocket`. The other nine socket
-types, the `Multipart` value, the non-blocking forms and the per-call timeouts
-are the next item; the option table, security, the monitor, the devices and the
-synchronous surface follow it.
+Named row by row in [`docs/libraries/zmq-py.md`](../../../docs/libraries/zmq-py.md),
+which is this binding's parity document against pyzmq 27.2.0 / libzmq 4.3.5.
+The one difference worth repeating here: **a socket does one operation at a
+time**, so a task parked in `recv` makes a concurrent `send` on that same
+socket wait. That is the Rust library's `&mut self` and is filed against it;
+two sockets, or one coroutine owning the socket, is the way round it today.
 
 ## Building it from a checkout
 
@@ -57,3 +59,15 @@ crates/zmq/weida-zmq-py/develop.sh
 It creates a `uv`-managed virtualenv at the repository root, installs `maturin`
 and `pytest` into it, runs `maturin develop` and then the Python tests. Nothing
 is installed into a system interpreter.
+
+## Building the wheel
+
+```sh
+crates/zmq/weida-zmq-py/package.sh
+```
+
+`maturin build --release` produces one `abi3` wheel for every CPython from 3.9
+on, and the script then installs it into a fresh virtualenv and runs the round
+trip above with `cargo`, `rustc` and `maturin` off `PATH` — because a wheel
+that needed a Rust toolchain to *run* would not be a wheel. The package version
+is the workspace's, taken from `Cargo.toml` rather than typed a second time.
