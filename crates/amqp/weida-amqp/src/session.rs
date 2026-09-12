@@ -41,15 +41,18 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
-use weida_amqp_codec::Multiple;
 use weida_amqp_codec::frame::{self, FrameKind};
 use weida_amqp_codec::performative::{Begin, End, Flow, Performative};
 use weida_amqp_codec::types::condition;
 
 use crate::error::{Condition, Error, Result};
+use crate::link::{Link, LinkOptions, Links};
+use crate::options::multiple;
 use crate::window::{DEFAULT_WINDOW, RemoteFlow, Windows};
+use weida_runtime::Exec;
 
 /// How many frames may be queued for one session before the driver waits.
 ///
@@ -166,6 +169,10 @@ pub struct Session {
     /// `close` stays the last thing ever written.
     outbound: mpsc::Sender<crate::connection::Outbound>,
     events: mpsc::Receiver<SessionEvent>,
+    /// The reactor, for bounding the wait on an answering `attach`. The
+    /// protocol gives no deadline for it, so the deadline is ours.
+    exec: Exec,
+    attach_timeout: Duration,
 }
 
 impl Session {
@@ -173,11 +180,49 @@ impl Session {
         shared: Arc<Shared>,
         outbound: mpsc::Sender<crate::connection::Outbound>,
         events: mpsc::Receiver<SessionEvent>,
+        exec: Exec,
+        attach_timeout: Duration,
     ) -> Self {
         Self {
             shared,
             outbound,
             events,
+            exec,
+            attach_timeout,
+        }
+    }
+
+    /// Attaches a link on the lowest free handle.
+    ///
+    /// Returns once the answering `attach` has arrived, because until then
+    /// nothing is known about what the peer actually created — which
+    /// terminus, which settle modes, which handle to expect its frames on.
+    ///
+    /// A link whose name and direction are already attached on this
+    /// connection **steals** the incumbent: the first is detached with
+    /// `amqp:link:stolen` and this one proceeds. That is Part 2 §2.6.1's
+    /// rule and not a convenience — it is what makes re-establishment work
+    /// when only one party has noticed a failure.
+    pub async fn attach(&self, options: LinkOptions) -> Result<Link> {
+        options.validate()?;
+        if !self.state().is_usable() {
+            return Err(Error::ConnectionGone);
+        }
+        let (reply, wait) = oneshot::channel();
+        self.outbound
+            .send(crate::connection::Outbound::Attach {
+                channel: self.shared.outgoing_channel,
+                options: Box::new(options),
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ConnectionGone)?;
+        match self.exec.within(self.attach_timeout, wait).await {
+            Some(Ok(result)) => result,
+            Some(Err(_)) => Err(Error::ConnectionGone),
+            None => Err(Error::HandshakeTimeout {
+                step: "the answering attach",
+            }),
         }
     }
 
@@ -307,6 +352,12 @@ pub(crate) struct Table {
 #[derive(Debug)]
 pub(crate) struct Entry {
     pub(crate) shared: Arc<Shared>,
+    /// This session's links, owned by the driver.
+    pub(crate) links: Links,
+    /// The `handle-max` the peer advertised in its answering `begin`. The
+    /// bound on this session's link table, and the peer's number rather
+    /// than ours.
+    pub(crate) remote_handle_max: u32,
     pub(crate) events: mpsc::Sender<SessionEvent>,
     /// The caller waiting for the answering `begin`.
     pub(crate) pending: Option<oneshot::Sender<Result<Session>>>,
@@ -390,14 +441,6 @@ pub(crate) fn begin_frame(
     Ok(bytes)
 }
 
-fn multiple(items: &[String]) -> Multiple<'_> {
-    match items {
-        [] => Multiple::None,
-        [one] => Multiple::One(one),
-        many => Multiple::Many(many.iter().map(String::as_str).collect()),
-    }
-}
-
 /// The flow state a `begin` or a `flow` carries.
 pub(crate) fn remote_flow_of_begin(begin: &Begin<'_>) -> RemoteFlow {
     RemoteFlow {
@@ -448,6 +491,8 @@ mod tests {
                 options: SessionOptions::default(),
             }),
             events,
+            links: Links::default(),
+            remote_handle_max: 255,
             pending: None,
             outbound,
             rx: Some(rx),
