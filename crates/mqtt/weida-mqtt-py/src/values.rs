@@ -71,6 +71,13 @@ pub struct PyMessage {
     pub(crate) inner: Message,
 }
 
+impl PyMessage {
+    /// The library's message, as the blocking surface takes it.
+    pub fn inner(&self) -> &Message {
+        &self.inner
+    }
+}
+
 #[pymethods]
 impl PyMessage {
     /// A message on `topic` carrying `payload`.
@@ -325,6 +332,13 @@ impl PyDelivery {
 #[pyclass(frozen, name = "Subscription", module = "weida_mqtt")]
 pub struct PySubscription {
     pub(crate) inner: Subscription,
+}
+
+impl PySubscription {
+    /// The library's subscription, as the blocking surface takes it.
+    pub fn inner(&self) -> &Subscription {
+        &self.inner
+    }
 }
 
 #[pymethods]

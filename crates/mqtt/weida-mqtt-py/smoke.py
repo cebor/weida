@@ -23,6 +23,27 @@ def unused_port():
         return probe.getsockname()[1]
 
 
+def the_sync_surface_is_there():
+    """`weida_mqtt.sync`, importable under both spellings.
+
+    A PyO3 submodule is not in `sys.modules` unless the binding puts it
+    there, so `from weida_mqtt import sync` would work and
+    `import weida_mqtt.sync` would not — which is the kind of asymmetry a
+    smoke test exists to catch.
+    """
+    from weida_mqtt import sync
+
+    import importlib
+
+    also = importlib.import_module("weida_mqtt.sync")
+    assert also is sync
+    for name in ("Context", "Client", "Deliveries"):
+        assert hasattr(sync, name), name
+    # A context with no loop in the process, which is the whole claim.
+    sync.Context(worker_threads=1)
+    print("the synchronous surface is there and needs no loop")
+
+
 def the_module_has_its_surface():
     for name in (
         "Context",
@@ -131,6 +152,7 @@ def a_connect_to_nothing_is_named_and_not_a_hang():
 
 if __name__ == "__main__":
     the_module_has_its_surface()
+    the_sync_surface_is_there()
     the_reason_codes_are_classes_carrying_their_byte()
     the_matcher_is_mqtts()
     the_values_refuse_what_the_protocol_forbids()

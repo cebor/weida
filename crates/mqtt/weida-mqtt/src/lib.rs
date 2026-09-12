@@ -126,6 +126,8 @@
 #![warn(missing_docs)]
 
 pub mod alias;
+#[cfg(feature = "blocking")]
+pub mod blocking;
 pub mod client;
 pub mod connection;
 pub mod error;

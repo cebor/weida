@@ -29,6 +29,15 @@ tracing.workspace = true
 # messaging library's (5.4.3).
 tokio-rustls = { workspace = true, optional = true }
 
+# The executor the blocking facade drives its futures on, and only that: the
+# reactor's own threads are busy driving the connection, so a blocking caller
+# polls the client's future on the thread that asked. `weida-runtime`'s Exec
+# promises exactly this ("the caller may drive the returned futures on any
+# executor - futures::executor::block_on included"); the `blocking` feature is
+# that promise taken up. Optional, so a caller that does not want the facade
+# does not link it.
+futures = { workspace = true, optional = true }
+
 [dev-dependencies]
 # Drives the owned-context tests from an executor that is not tokio, which is
 # what `Context::owned` exists for.
@@ -39,6 +48,10 @@ rcgen.workspace = true
 
 [features]
 default = ["tls"]
+# The synchronous facade, off by default: `weida_mqtt::blocking`. Not default
+# because a caller that already runs a reactor wants the asynchronous client,
+# and a facade nobody asked for is a `futures` dependency nobody asked for.
+blocking = ["dep:futures"]
 # `mqtts` on 8883: the TLS handshake completed before the CONNECT is written,
 # which is what makes the credentials in it worth sending.
 tls = ["dep:tokio-rustls"]
