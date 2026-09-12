@@ -1,0 +1,713 @@
+//! B-147 on the wire: TLS on 8883, the CONNECT credentials, and the AUTH
+//! exchange of 4.12 including re-authentication over a live connection.
+//!
+//! The TLS test completes a **real** handshake against a certificate this test
+//! generates, rather than asserting a type: the claim being made is that the
+//! CONNECT travels inside TLS, and only a real handshake can carry it.
+
+mod harness;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use harness::{Act, Server, bytes};
+use weida_mqtt::{
+    Authenticator, Client, ConnectOptions, Context, DisconnectReasonCode, Error, Event, Result,
+};
+use weida_mqtt_codec::{Connack, ConnectReasonCode, Packet, Properties};
+
+fn connack(properties: Properties<'_>) -> Vec<u8> {
+    bytes(&Packet::Connack(Connack {
+        session_present: false,
+        reason_code: ConnectReasonCode::Success,
+        properties,
+    }))
+}
+
+fn options() -> ConnectOptions {
+    let mut options = ConnectOptions::new("b147-client");
+    options.keep_alive = Duration::ZERO;
+    options.connect_timeout = Duration::from_secs(5);
+    options
+}
+
+/// An AUTH the server sends: a reason code, the method it repeats, and its
+/// `Authentication Data`.
+fn auth(code: u8, method: &str, data: &[u8]) -> Vec<u8> {
+    bytes(&Packet::Auth(weida_mqtt_codec::Auth {
+        reason_code: weida_mqtt_codec::AuthReasonCode::from_byte(code).expect("an AUTH code"),
+        properties: Properties {
+            authentication_method: Some(method),
+            authentication_data: Some(data),
+            ..Properties::new()
+        },
+    }))
+}
+
+/// An authenticator that answers every challenge with the challenge's own
+/// bytes plus a counter, so a test can tell the opening move from the answers
+/// and one round from the next.
+struct Counting {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Counting {
+    fn new() -> Arc<Counting> {
+        Arc::new(Counting {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Authenticator for Counting {
+    fn challenge(&self, data: Option<&[u8]>) -> Result<Vec<u8>> {
+        let round = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut answer = data.unwrap_or_default().to_vec();
+        answer.push(u8::try_from(round).unwrap_or(u8::MAX));
+        Ok(answer)
+    }
+}
+
+/// An authenticator that refuses, which is a client that cannot answer what
+/// the server asked.
+struct Refusing;
+
+impl Authenticator for Refusing {
+    fn challenge(&self, _data: Option<&[u8]>) -> Result<Vec<u8>> {
+        Err(Error::Configuration(
+            "no credential for this challenge".into(),
+        ))
+    }
+}
+
+/// User Name and Password reach the wire, **including 5.0's password with no
+/// user name**, which 3.1.1 forbade (3.1.2.9) [mqtt5 §10].
+#[tokio::test]
+async fn the_connect_credentials_reach_the_wire_in_all_three_forms() {
+    let server = Server::start_all(vec![
+        vec![Act::Send(connack(Properties::new())), Act::Expect],
+        vec![Act::Send(connack(Properties::new())), Act::Expect],
+        vec![Act::Send(connack(Properties::new())), Act::Expect],
+    ])
+    .await;
+    let address = server.address();
+    let context = Context::new().expect("ambient");
+
+    // Both.
+    let mut both = options();
+    both.user_name = Some("operator".into());
+    both.password = Some(b"secret".to_vec());
+    // A user name and no password.
+    let mut name_only = options();
+    name_only.user_name = Some("operator".into());
+    // A password and no user name: legal in 5.0 and a Protocol Error in
+    // 3.1.1, which is the difference this asserts.
+    let mut password_only = options();
+    password_only.password = Some(b"secret".to_vec());
+
+    for options in [both, name_only, password_only] {
+        let (client, _events) = Client::connect(&context, &address, options)
+            .await
+            .expect("connects");
+        client
+            .disconnect(DisconnectReasonCode::NormalDisconnection)
+            .await
+            .expect("disconnects");
+        // A plain connection: the credentials just travelled in the clear,
+        // and a client can ask.
+        assert!(!client.is_encrypted());
+    }
+
+    let recorded = server.seen_bytes().await;
+    let credentials: Vec<(Option<String>, Option<Vec<u8>>)> = recorded
+        .iter()
+        .filter_map(|raw| match Packet::decode(raw, u32::MAX) {
+            Ok((Packet::Connect(connect), _)) => Some((
+                connect.user_name.map(str::to_owned),
+                connect.password.map(<[u8]>::to_vec),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        credentials,
+        [
+            (Some("operator".to_owned()), Some(b"secret".to_vec())),
+            (Some("operator".to_owned()), None),
+            (None, Some(b"secret".to_vec())),
+        ]
+    );
+}
+
+/// The AUTH exchange of 4.12 during the handshake: the server challenges, the
+/// client answers, and every packet repeats the same method
+/// ([MQTT-4.12.0-5]).
+#[tokio::test]
+async fn the_handshake_auth_exchange_runs_to_a_connack() {
+    let mut server = Server::start(vec![
+        // The **server** challenges first: the client's CONNECT is already
+        // read by the time a script starts, and it is then waiting for either
+        // an AUTH or the CONNACK ([MQTT-3.1.2-30]).
+        Act::Send(auth(0x18, "SCRAM-SHA-1", b"challenge-1")),
+        // Reads the client's answer and challenges again.
+        Act::AnswerAuth(0x18),
+        // Reads the second answer, then ends the exchange with the CONNACK.
+        Act::Expect,
+        Act::Send(connack(Properties::new())),
+        Act::Expect,
+    ])
+    .await;
+    let context = Context::new().expect("ambient");
+    let mut options = options();
+    options.authentication_method = Some("SCRAM-SHA-1".into());
+    options.authentication_data = Some(b"opening".to_vec());
+    let authenticator = Counting::new();
+
+    let (client, _events) = Client::connect_with(
+        &context,
+        &server.address(),
+        options,
+        authenticator.clone() as Arc<dyn Authenticator>,
+    )
+    .await
+    .expect("connects");
+    assert_eq!(
+        authenticator.calls(),
+        2,
+        "one call per challenge, and none for the CONNECT's opening data - \
+         which the caller supplied directly"
+    );
+
+    let recorded = server.seen_bytes().await;
+    // The CONNECT carried the method and the opening data.
+    let (Packet::Connect(connect), _) = Packet::decode(&recorded[0], u32::MAX).expect("a connect")
+    else {
+        panic!("a connect")
+    };
+    assert_eq!(
+        connect.properties.authentication_method,
+        Some("SCRAM-SHA-1")
+    );
+    assert_eq!(
+        connect.properties.authentication_data,
+        Some(&b"opening"[..])
+    );
+
+    // Both answers repeated the method, which is what [MQTT-4.12.0-5]
+    // requires of every AUTH in the exchange.
+    let auths: Vec<(u8, Option<String>)> = recorded
+        .iter()
+        .filter_map(|raw| match Packet::decode(raw, u32::MAX) {
+            Ok((Packet::Auth(auth), _)) => Some((
+                auth.reason_code.as_byte(),
+                auth.properties.authentication_method.map(str::to_owned),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        auths,
+        [
+            (0x18, Some("SCRAM-SHA-1".to_owned())),
+            (0x18, Some("SCRAM-SHA-1".to_owned())),
+        ]
+    );
+
+    client
+        .disconnect(DisconnectReasonCode::NormalDisconnection)
+        .await
+        .expect("disconnects");
+    server.finished().await;
+}
+
+/// Re-authentication over the live connection: AUTH 0x19 from the client,
+/// challenges, then AUTH 0x00 ([MQTT-4.12.1-1]) (4.12.1) [mqtt5 §10].
+///
+/// **Other traffic continues during the exchange**, which the specification is
+/// explicit about, and the test proves it by publishing between the rounds and
+/// asserting the publish reached the wire while the re-authentication was
+/// still open.
+#[tokio::test]
+async fn re_authentication_runs_on_the_live_connection() {
+    let mut server = Server::start(vec![
+        Act::Send(connack(Properties::new())),
+        Act::AnswerAuth(0x18), // the client's 0x19, answered with a challenge
+        Act::AnswerAuth(0x00), // the client's 0x18, answered with success
+        Act::AckPublish,
+        Act::Expect,
+    ])
+    .await;
+    let context = Context::new().expect("ambient");
+    let mut options = options();
+    options.authentication_method = Some("SCRAM-SHA-1".into());
+    let authenticator = Counting::new();
+    let (client, _events) = Client::connect_with(
+        &context,
+        &server.address(),
+        options,
+        authenticator.clone() as Arc<dyn Authenticator>,
+    )
+    .await
+    .expect("connects");
+
+    client.reauthenticate().await.expect("re-authenticates");
+    assert_eq!(
+        authenticator.calls(),
+        2,
+        "the opening move and one challenge answer"
+    );
+
+    // The connection is still usable, and its credentials are the new ones.
+    client
+        .publish(weida_mqtt::Message::new("a/b", "x").at(weida_mqtt::QoS::AtLeastOnce))
+        .await
+        .expect("publishes after re-authenticating");
+
+    let recorded = server.seen_bytes().await;
+    let kinds: Vec<weida_mqtt::PacketType> = recorded
+        .iter()
+        .map(|raw| {
+            Packet::decode(raw, u32::MAX)
+                .expect("a packet")
+                .0
+                .packet_type()
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            weida_mqtt::PacketType::Connect,
+            weida_mqtt::PacketType::Auth,
+            weida_mqtt::PacketType::Auth,
+            weida_mqtt::PacketType::Publish,
+        ]
+    );
+    // The client's opening move is 0x19 and its answer is 0x18: the two codes
+    // are not interchangeable, and a client that sent 0x18 first would be
+    // continuing an exchange that does not exist.
+    let codes: Vec<u8> = recorded[1..3]
+        .iter()
+        .map(|raw| match Packet::decode(raw, u32::MAX) {
+            Ok((Packet::Auth(auth), _)) => auth.reason_code.as_byte(),
+            _ => panic!("an auth"),
+        })
+        .collect();
+    assert_eq!(codes, [0x19, 0x18]);
+
+    client
+        .disconnect(DisconnectReasonCode::NormalDisconnection)
+        .await
+        .expect("disconnects");
+    server.finished().await;
+}
+
+/// A client that named no `Authentication Method` has nothing to
+/// re-authenticate with, and the refusal is local: a server "MUST NOT send
+/// AUTH" to such a client ([MQTT-4.12.0-6]), so there is nobody to ask.
+#[tokio::test]
+async fn re_authentication_without_a_method_is_refused_locally() {
+    let server = Server::start(vec![
+        Act::Send(connack(Properties::new())),
+        Act::Idle(Duration::from_secs(2)),
+    ])
+    .await;
+    let context = Context::new().expect("ambient");
+    let (client, _events) = Client::connect(&context, &server.address(), options())
+        .await
+        .expect("connects");
+
+    let error = client.reauthenticate().await.expect_err("refused");
+    assert!(matches!(error, Error::Configuration(_)), "{error}");
+    // Nothing reached the wire.
+    assert_eq!(server.seen().await.len(), 1);
+
+    client
+        .disconnect(DisconnectReasonCode::NormalDisconnection)
+        .await
+        .ok();
+}
+
+/// A server that switches method mid-exchange is not continuing this
+/// authentication ([MQTT-4.12.0-5]), and the client says which fault it is
+/// rather than reporting a generic protocol error.
+#[tokio::test]
+async fn a_method_switch_during_re_authentication_is_named() {
+    let server = Server::start(vec![
+        Act::Send(connack(Properties::new())),
+        Act::AnswerAuthAs(0x18, "SCRAM-SHA-256"),
+        Act::Idle(Duration::from_secs(2)),
+    ])
+    .await;
+    let context = Context::new().expect("ambient");
+    let mut options = options();
+    options.authentication_method = Some("SCRAM-SHA-1".into());
+    let (client, mut events) = Client::connect_with(
+        &context,
+        &server.address(),
+        options,
+        Counting::new() as Arc<dyn Authenticator>,
+    )
+    .await
+    .expect("connects");
+
+    let error = client.reauthenticate().await.expect_err("refused");
+    assert!(
+        matches!(error, Error::AuthenticationMethodMismatch),
+        "{error}"
+    );
+    // And the connection ends, because "both sides SHOULD send DISCONNECT and
+    // MUST close" ([MQTT-4.12.1-2]).
+    let Some(Event::Disconnected(reported)) = events.next().await else {
+        panic!("the connection ends")
+    };
+    assert!(
+        matches!(reported, Error::AuthenticationMethodMismatch),
+        "{reported}"
+    );
+}
+
+/// **The failure mode the sheet records for two large deployments**: a server
+/// that does not implement AUTH.
+///
+/// It is reported by its reason code and not by a hang. Two shapes, and this
+/// client answers both with a code: a CONNACK 0x8C (Bad authentication
+/// method), and a server that simply never answers - for which the client's
+/// own `connect_timeout` is the bound, because the specification gives none.
+#[tokio::test]
+async fn a_server_without_auth_is_a_code_and_not_a_hang() {
+    // Shape 1: a refusal with the code that names the fault.
+    let refusal = bytes(&Packet::Connack(Connack {
+        session_present: false,
+        reason_code: ConnectReasonCode::BadAuthenticationMethod,
+        properties: Properties::new(),
+    }));
+    let mut server = Server::start(vec![Act::Send(refusal)]).await;
+    let context = Context::new().expect("ambient");
+    let mut options = options();
+    options.authentication_method = Some("SCRAM-SHA-1".into());
+    let error = Client::connect_with(
+        &context,
+        &server.address(),
+        options.clone(),
+        Counting::new() as Arc<dyn Authenticator>,
+    )
+    .await
+    .expect_err("refused");
+    assert_eq!(error.reason_code(), Some(0x8C));
+    server.finished().await;
+
+    // Shape 2: silence. The specification puts no deadline on the CONNACK, so
+    // the bound is this client's and it is finite.
+    let silent = Server::start(vec![Act::Idle(Duration::from_secs(5))]).await;
+    options.connect_timeout = Duration::from_millis(300);
+    let error = Client::connect_with(
+        &context,
+        &silent.address(),
+        options,
+        Counting::new() as Arc<dyn Authenticator>,
+    )
+    .await
+    .expect_err("times out");
+    assert!(matches!(error, Error::Timeout("CONNACK")), "{error}");
+}
+
+/// An authenticator that cannot answer ends the connection, which is the MUST
+/// of [MQTT-4.12.1-2] - and the caller who asked for the re-authentication
+/// learns why rather than only that it ended.
+#[tokio::test]
+async fn an_unanswerable_challenge_ends_the_connection_with_its_cause() {
+    let server = Server::start(vec![
+        Act::Send(connack(Properties::new())),
+        Act::AnswerAuth(0x18),
+        Act::Idle(Duration::from_secs(2)),
+    ])
+    .await;
+    let context = Context::new().expect("ambient");
+    let mut options = options();
+    options.authentication_method = Some("SCRAM-SHA-1".into());
+    // Answers the opening move, refuses the challenge.
+    struct OpeningOnly;
+    impl Authenticator for OpeningOnly {
+        fn challenge(&self, data: Option<&[u8]>) -> Result<Vec<u8>> {
+            match data {
+                None => Ok(b"opening".to_vec()),
+                Some(_) => Err(Error::Configuration("cannot answer that".into())),
+            }
+        }
+    }
+    let (client, mut events) = Client::connect_with(
+        &context,
+        &server.address(),
+        options,
+        Arc::new(OpeningOnly) as Arc<dyn Authenticator>,
+    )
+    .await
+    .expect("connects");
+
+    let error = client.reauthenticate().await.expect_err("refused");
+    assert!(
+        error.to_string().contains("cannot answer that"),
+        "the caller learns the authenticator's own reason: {error}"
+    );
+    let Some(Event::Disconnected(reported)) = events.next().await else {
+        panic!("the connection ends")
+    };
+    assert!(
+        reported.to_string().contains("re-authentication failed"),
+        "and the event stream learns why the connection ended: {reported}"
+    );
+}
+
+/// An authenticator that refuses the **opening** move never reaches the wire.
+#[tokio::test]
+async fn an_authenticator_that_refuses_the_opening_move_sends_nothing() {
+    let server = Server::start(vec![
+        Act::Send(connack(Properties::new())),
+        Act::Idle(Duration::from_secs(2)),
+    ])
+    .await;
+    let context = Context::new().expect("ambient");
+    let mut options = options();
+    options.authentication_method = Some("SCRAM-SHA-1".into());
+    options.authentication_data = Some(b"opening".to_vec());
+    let (client, _events) = Client::connect_with(
+        &context,
+        &server.address(),
+        options,
+        Arc::new(Refusing) as Arc<dyn Authenticator>,
+    )
+    .await
+    .expect("connects: the CONNECT's own data came from the options");
+
+    assert!(client.reauthenticate().await.is_err());
+    assert_eq!(
+        server.seen().await.len(),
+        1,
+        "the CONNECT and nothing else: a re-authentication that cannot even \
+         open does not send an AUTH"
+    );
+
+    client
+        .disconnect(DisconnectReasonCode::NormalDisconnection)
+        .await
+        .ok();
+}
+
+/// An AUTH arriving outside an exchange the client started is the server
+/// breaking the protocol ([MQTT-4.12.1-1]), and it is reported as an
+/// unexpected packet rather than answered.
+#[tokio::test]
+async fn an_unrequested_auth_after_the_connack_is_refused() {
+    let unrequested = bytes(&Packet::Auth(weida_mqtt_codec::Auth {
+        reason_code: weida_mqtt_codec::AuthReasonCode::ContinueAuthentication,
+        properties: Properties {
+            authentication_method: Some("SCRAM-SHA-1"),
+            ..Properties::new()
+        },
+    }));
+    let server = Server::start(vec![
+        Act::Send(connack(Properties::new())),
+        Act::Send(unrequested),
+        Act::Idle(Duration::from_secs(2)),
+    ])
+    .await;
+    let context = Context::new().expect("ambient");
+    let mut options = options();
+    options.authentication_method = Some("SCRAM-SHA-1".into());
+    let (client, mut events) = Client::connect_with(
+        &context,
+        &server.address(),
+        options,
+        Counting::new() as Arc<dyn Authenticator>,
+    )
+    .await
+    .expect("connects");
+
+    let Some(Event::Disconnected(error)) = events.next().await else {
+        panic!("the connection ends")
+    };
+    assert!(
+        matches!(
+            error,
+            Error::UnexpectedPacket {
+                packet_type: weida_mqtt::PacketType::Auth
+            }
+        ),
+        "{error}"
+    );
+    drop(client);
+}
+
+/// TLS on 8883, against a certificate this test generates: a **real**
+/// handshake, and the CONNECT travels inside it.
+///
+/// The trust anchors are the caller's everywhere in this crate; here the test
+/// is the caller, which is the only way to prove the contract.
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn the_connect_travels_inside_a_real_tls_handshake() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+
+    let issued =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("a certificate");
+    let cert = CertificateDer::from(issued.cert.der().to_vec());
+    let key = PrivateKeyDer::try_from(issued.signing_key.serialize_der()).expect("a key");
+
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .expect("a server config"),
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(cert).expect("a trust anchor");
+    let client_config = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds");
+    let port = listener.local_addr().expect("an address").port();
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+    let connack = connack(Properties::new());
+    let served = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accepts");
+        let mut tls = acceptor.accept(tcp).await.expect("the TLS handshake");
+        // Read exactly the CONNECT, which arrives decrypted here and only
+        // here: on the wire it was TLS application data.
+        let mut header = [0u8; 2];
+        tls.read_exact(&mut header).await.expect("a fixed header");
+        let remaining = usize::from(header[1]);
+        let mut body = vec![0u8; remaining];
+        tls.read_exact(&mut body).await.expect("a body");
+        tls.write_all(&connack).await.expect("writes the connack");
+        tls.flush().await.expect("flushes");
+        let mut packet = header.to_vec();
+        packet.extend_from_slice(&body);
+        // Hold the connection until the client goes away.
+        let mut sink = [0u8; 64];
+        while let Ok(read) = tls.read(&mut sink).await {
+            if read == 0 {
+                break;
+            }
+        }
+        packet
+    });
+
+    let context = Context::new().expect("ambient");
+    let mut options = options();
+    options.user_name = Some("operator".into());
+    options.password = Some(b"secret".to_vec());
+    options.tls = Some(weida_mqtt::TlsOptions::new(client_config).with_server_name("localhost"));
+
+    let (client, _events) = Client::connect(&context, &format!("127.0.0.1:{port}"), options)
+        .await
+        .expect("connects over TLS");
+    assert!(
+        client.is_encrypted(),
+        "the credentials in that CONNECT were protected, and a caller can ask"
+    );
+    client
+        .disconnect(DisconnectReasonCode::NormalDisconnection)
+        .await
+        .ok();
+    drop(client);
+
+    let connect = served.await.expect("the server task");
+    let (Packet::Connect(connect), _) = Packet::decode(&connect, u32::MAX).expect("a connect")
+    else {
+        panic!("a connect")
+    };
+    assert_eq!(connect.user_name, Some("operator"));
+    assert_eq!(connect.password, Some(&b"secret"[..]));
+}
+
+/// The server name is what the certificate is validated against, and it has to
+/// be settable because the connect address is often an IP literal that no
+/// certificate names.
+///
+/// Validating `127.0.0.1` against a certificate for `localhost` fails, which
+/// is the whole point of validation - and the failure is reported rather than
+/// papered over.
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn a_certificate_that_does_not_name_the_server_is_refused() {
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+
+    let issued = rcgen::generate_simple_self_signed(vec!["some.other.host".to_owned()])
+        .expect("a certificate");
+    let cert = CertificateDer::from(issued.cert.der().to_vec());
+    let key = PrivateKeyDer::try_from(issued.signing_key.serialize_der()).expect("a key");
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .expect("a server config"),
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(cert).expect("a trust anchor");
+    let client_config = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds");
+    let port = listener.local_addr().expect("an address").port();
+    let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+    tokio::spawn(async move {
+        if let Ok((tcp, _)) = listener.accept().await {
+            let _ = acceptor.accept(tcp).await;
+        }
+    });
+
+    let context = Context::new().expect("ambient");
+    let mut options = options();
+    // The certificate is trusted and names `some.other.host`, so validating
+    // it against `localhost` must fail.
+    options.tls = Some(weida_mqtt::TlsOptions::new(client_config).with_server_name("localhost"));
+    let error = Client::connect(&context, &format!("127.0.0.1:{port}"), options)
+        .await
+        .expect_err("the certificate does not name localhost");
+    assert!(
+        matches!(error, Error::Io(_)),
+        "a validation failure is a transport failure and is reported: {error}"
+    );
+}
+
+/// A `server_name` that is neither a DNS name nor an IP address is refused at
+/// configuration time, before a socket is opened.
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn an_unusable_server_name_is_refused_before_the_dial() {
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+    let client_config = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth(),
+    );
+    let context = Context::new().expect("ambient");
+    let mut options = options();
+    options.tls =
+        Some(weida_mqtt::TlsOptions::new(client_config).with_server_name("not a host name"));
+    // Port 1 on loopback: nothing is listening, so if the name were accepted
+    // this would fail with a connection error instead of a configuration one.
+    let error = Client::connect(&context, "127.0.0.1:1", options)
+        .await
+        .expect_err("refused");
+    assert!(matches!(error, Error::Configuration(_)), "{error}");
+    assert!(error.to_string().contains("server name"));
+}

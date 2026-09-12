@@ -6,6 +6,7 @@
 
 mod harness;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use harness::{Act, Server, bytes};
@@ -490,9 +491,10 @@ async fn an_auth_exchange_completes_before_the_connack() {
     let mut options = options();
     options.authentication_method = Some("SCRAM-SHA-1".into());
     options.authentication_data = Some(b"initial".to_vec());
-    let (client, _events) = Client::connect_with(&context, &server.address(), options, &Echo)
-        .await
-        .expect("authenticates");
+    let (client, _events) =
+        Client::connect_with(&context, &server.address(), options, Arc::new(Echo))
+            .await
+            .expect("authenticates");
 
     client
         .disconnect(DisconnectReasonCode::NormalDisconnection)
@@ -531,7 +533,7 @@ async fn an_auth_that_switches_method_is_refused() {
     let context = Context::new().expect("ambient");
     let mut options = options();
     options.authentication_method = Some("SCRAM-SHA-1".into());
-    let error = Client::connect_with(&context, &server.address(), options, &Echo)
+    let error = Client::connect_with(&context, &server.address(), options, Arc::new(Echo))
         .await
         .expect_err("refused");
     assert!(
