@@ -49,7 +49,7 @@ use weida_sp::EndpointType;
 use crate::context::{Context, SocketSlot};
 use crate::endpoint::{Endpoint, TcpHost};
 use crate::error::{Cause, Error, Result};
-use crate::options::SocketOptions;
+use crate::options::{EndpointOptions, SocketOptions};
 use crate::pipe::{Discarded, Pipe, PipeId};
 use crate::transport::Stream;
 
@@ -337,6 +337,9 @@ pub struct Engine {
 #[derive(Clone)]
 struct TaskCtx {
     engine: Engine,
+    /// What the dialer or listener that owns this task configured for
+    /// itself, which is where a per-endpoint `NNG_OPT_RECVMAXSZ` lives.
+    endpoint_options: EndpointOptions,
 }
 
 impl Engine {
@@ -450,7 +453,18 @@ impl Engine {
     /// Unlike NNG's, this wait costs no thread and is bounded by
     /// [`SocketOptions::handshake_timeout`](crate::SocketOptions::handshake_timeout).
     pub async fn dial(&self, endpoint: &Endpoint) -> Result<Dialer> {
-        let (id, rx) = self.start_dialer(endpoint, false)?;
+        self.dial_with(endpoint, EndpointOptions::default()).await
+    }
+
+    /// Dials `endpoint` under this endpoint's own options — which is
+    /// where a per-endpoint `NNG_OPT_RECVMAXSZ` goes, "set before endpoint
+    /// creation, ideally per listener/dialer" (§3).
+    pub async fn dial_with(
+        &self,
+        endpoint: &Endpoint,
+        endpoint_options: EndpointOptions,
+    ) -> Result<Dialer> {
+        let (id, rx) = self.start_dialer(endpoint, false, endpoint_options)?;
         match rx.await {
             Ok(Ok(())) => Ok(self.dialer_handle(id, endpoint.clone())),
             Ok(Err(error)) => {
@@ -473,7 +487,16 @@ impl Engine {
     /// `NNG_OPT_RECONNMAXT`. The dialer exists immediately and the pipe
     /// appears whenever the peer does.
     pub fn dial_nonblocking(&self, endpoint: &Endpoint) -> Result<Dialer> {
-        let (id, _rx) = self.start_dialer(endpoint, true)?;
+        self.dial_nonblocking_with(endpoint, EndpointOptions::default())
+    }
+
+    /// The non-blocking dial under this endpoint's own options.
+    pub fn dial_nonblocking_with(
+        &self,
+        endpoint: &Endpoint,
+        endpoint_options: EndpointOptions,
+    ) -> Result<Dialer> {
+        let (id, _rx) = self.start_dialer(endpoint, true, endpoint_options)?;
         Ok(self.dialer_handle(id, endpoint.clone()))
     }
 
@@ -482,6 +505,18 @@ impl Engine {
     /// Returns the endpoint actually bound, which for a wildcard port is the
     /// only way to learn the port.
     pub async fn listen(&self, endpoint: &Endpoint) -> Result<Listener> {
+        self.listen_with(endpoint, EndpointOptions::default()).await
+    }
+
+    /// Listens under this endpoint's own options — which is where a
+    /// per-listener `NNG_OPT_RECVMAXSZ` goes, so that a socket can hold a
+    /// tighter limit on the address strangers reach than on the one it
+    /// dialled itself (§11).
+    pub async fn listen_with(
+        &self,
+        endpoint: &Endpoint,
+        endpoint_options: EndpointOptions,
+    ) -> Result<Listener> {
         // Before the OS, not after: a closed socket refuses without taking
         // an address, so a close followed by a listen reports the close
         // rather than whatever the address happens to be doing.
@@ -499,6 +534,7 @@ impl Engine {
         };
         let ctx = TaskCtx {
             engine: self.clone(),
+            endpoint_options,
         };
         let url = bound.clone();
         let task = self
@@ -606,6 +642,7 @@ impl Engine {
         &self,
         endpoint: &Endpoint,
         retry_first: bool,
+        endpoint_options: EndpointOptions,
     ) -> Result<(DialerId, oneshot::Receiver<Result<()>>)> {
         let id = {
             let mut state = self.lock();
@@ -617,6 +654,7 @@ impl Engine {
         let (tx, rx) = oneshot::channel();
         let ctx = TaskCtx {
             engine: self.clone(),
+            endpoint_options,
         };
         let task = self.inner.exec.spawn(dialer_loop(
             ctx,
@@ -872,7 +910,9 @@ async fn run_pipe(
         endpoint: endpoint.clone(),
         protocol: ctx.engine.protocol(),
         recv_max_size: if endpoint.enforces_recv_max_size() {
-            ctx.engine.inner.options.recv_max_size
+            ctx.endpoint_options
+                .recv_max_size
+                .unwrap_or(ctx.engine.inner.options.recv_max_size)
         } else {
             // "`inproc` accepts but deliberately ignores `RECVMAXSZ`,
             // because peers share an address space" (§3). The option is

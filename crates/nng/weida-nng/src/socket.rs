@@ -110,6 +110,26 @@ impl SocketCore {
         self.engine.listen(&Endpoint::parse(url)?).await
     }
 
+    /// `nng_dial()` with this endpoint's own options.
+    pub async fn dial_with(
+        &self,
+        url: &str,
+        options: crate::options::EndpointOptions,
+    ) -> Result<Dialer> {
+        self.engine.dial_with(&Endpoint::parse(url)?, options).await
+    }
+
+    /// `nng_listen()` with this endpoint's own options.
+    pub async fn listen_with(
+        &self,
+        url: &str,
+        options: crate::options::EndpointOptions,
+    ) -> Result<Listener> {
+        self.engine
+            .listen_with(&Endpoint::parse(url)?, options)
+            .await
+    }
+
     /// `nng_close()`.
     pub fn close(&self) {
         self.engine.close();
@@ -313,6 +333,28 @@ macro_rules! socket_endpoints {
                 url: &str,
             ) -> $crate::error::Result<$crate::engine::Listener> {
                 self.core.listen(url).await
+            }
+
+            /// `nng_listen()` with this endpoint's own options, which is
+            /// where a per-listener `NNG_OPT_RECVMAXSZ` goes — "set
+            /// before endpoint creation, ideally per listener/dialer"
+            /// (§3), so that the address strangers reach can be bounded
+            /// more tightly than one this socket dialled itself (§11).
+            pub async fn listen_with(
+                &self,
+                url: &str,
+                options: $crate::options::EndpointOptions,
+            ) -> $crate::error::Result<$crate::engine::Listener> {
+                self.core.listen_with(url, options).await
+            }
+
+            /// `nng_dial()` with this endpoint's own options.
+            pub async fn dial_with(
+                &self,
+                url: &str,
+                options: $crate::options::EndpointOptions,
+            ) -> $crate::error::Result<$crate::engine::Dialer> {
+                self.core.dial_with(url, options).await
             }
 
             /// `nng_pipe_notify()`: the callback that sees every pipe event.

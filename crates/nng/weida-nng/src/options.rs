@@ -161,6 +161,36 @@ pub struct SocketOptions {
     pub tls: Option<crate::tls::TlsConfig>,
 }
 
+/// What one dialer or listener may configure for itself, before it starts.
+///
+/// "`RECVMAXSZ` should be set before endpoint creation, ideally per
+/// listener/dialer" (§3), and the reason is trust boundaries: "a
+/// socket-level maximum can be overridden on an individual dialer or
+/// listener. This permits different limits for different trust
+/// boundaries" (§11). A socket that listens on a public address and dials
+/// a peer it deployed itself wants two numbers, and this is where the
+/// second one goes.
+///
+/// Applied when the endpoint is created, never after: a connection that
+/// has already read a declared length was judged against the limit that
+/// was in force when it arrived.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EndpointOptions {
+    /// `NNG_OPT_RECVMAXSZ` for this endpoint only. `None` uses the
+    /// socket's.
+    pub recv_max_size: Option<u64>,
+}
+
+impl EndpointOptions {
+    /// An endpoint whose `NNG_OPT_RECVMAXSZ` is `bytes` rather than the
+    /// socket's.
+    pub const fn with_recv_max_size(bytes: u64) -> EndpointOptions {
+        EndpointOptions {
+            recv_max_size: Some(bytes),
+        }
+    }
+}
+
 impl Default for SocketOptions {
     fn default() -> SocketOptions {
         SocketOptions {

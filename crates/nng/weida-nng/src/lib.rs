@@ -120,6 +120,7 @@ pub mod inproc;
 pub mod ipc;
 pub mod message;
 pub mod options;
+pub mod optiontable;
 pub mod pair;
 pub mod pipe;
 pub mod pipeline;
@@ -148,8 +149,9 @@ pub use engine::{
 pub use error::{Cause, Error, Result};
 pub use message::{DEFAULT_RECV_MAX_SIZE, Message, RECV_MAX_SIZE_UNLIMITED};
 pub use options::{
-    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_ADDRESSES, DEFAULT_MAX_PIPES, DEFAULT_RECONNECT_MAX,
-    DEFAULT_RECONNECT_MIN, SocketOptions,
+    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_ADDRESSES, DEFAULT_MAX_PIPES, DEFAULT_MAX_TTL,
+    DEFAULT_RECONNECT_MAX, DEFAULT_RECONNECT_MIN, DEFAULT_RESEND_TIME, DEFAULT_SURVEY_TIME,
+    EndpointOptions, NNG_MAX_TTL, SPEC_MAX_TTL, SocketOptions,
 };
 pub use pair::{POLYAMOROUS_ABSENT, Pair0Socket, Pair1Socket};
 pub use pipe::{
@@ -171,4 +173,5 @@ pub use transport::Stream;
 pub use inproc::{INPROC_BUFFER_BYTES, Inproc, InprocBinding, InprocDial};
 #[cfg(unix)]
 pub use ipc::IpcBinding;
+pub use optiontable::{Disposition, OPTIONS, OptionRow, Refusal, Scope};
 pub use tls::{AuthMode, TlsConfig, TlsPeer};
