@@ -23,6 +23,7 @@
 // reports the other's half as dead.
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,7 +32,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
-use weida_mqtt_codec::{FixedHeader, Packet, PacketType, varint};
+use weida_mqtt_codec::{
+    FixedHeader, Packet, PacketType, Properties, Puback, PubackReasonCode, Pubcomp,
+    PubcompReasonCode, Pubrec, QoS, varint,
+};
 
 /// The ceiling every harness decode is done under: the largest packet the
 /// encoding can express (2.1.4). The harness is not the thing under test, so
@@ -39,12 +43,49 @@ use weida_mqtt_codec::{FixedHeader, Packet, PacketType, varint};
 const CAP: u32 = varint::MAX + 5;
 
 /// What the scripted server does after the CONNECT arrives.
+///
+/// The acknowledging acts exist so a test can express a **lost packet**: the
+/// four packets of a QoS 2 handshake, each in turn read and then not answered,
+/// are the four cases [mqtt5 §6]'s figure 4.3 can be interrupted at. `Expect`
+/// is "received and not answered", which is what a lost acknowledgement looks
+/// like from the client's side.
 #[derive(Clone, Debug)]
 pub enum Act {
     /// Send this packet's bytes.
     Send(Vec<u8>),
-    /// Read one packet and record it.
+    /// Read one packet and record it, answering nothing.
     Expect,
+    /// Read one PUBLISH and answer it: PUBACK at QoS 1, PUBREC at QoS 2.
+    ///
+    /// Counts an onward delivery, and applies the receiver's own duplicate
+    /// suppression: a QoS 2 Packet Identifier already awaiting its PUBREL is
+    /// answered with another PUBREC and **not** counted again, which is what
+    /// [MQTT-4.3.3-10] requires of a receiver.
+    AckPublish,
+    /// Read one PUBLISH, **accept** it — counting the delivery and holding
+    /// the QoS 2 identifier — and answer nothing.
+    ///
+    /// This is a lost PUBREC or PUBACK: the server has the message and the
+    /// client does not know it. Indistinguishable from a lost PUBLISH on the
+    /// wire, and distinguishable in the outcome, because the resent PUBLISH
+    /// is then a repeat and MUST NOT be delivered again ([MQTT-4.3.3-10]).
+    AcceptPublish,
+    /// Read one PUBREL, **release** the identifier, and answer nothing.
+    ///
+    /// This is a lost PUBCOMP: the server is finished and the client is not.
+    /// The resent PUBREL then draws 0x92, because the identifier is gone.
+    AcceptPubrel,
+    /// Read one PUBLISH and answer PUBREC — or PUBACK at QoS 1 — with this
+    /// failure code, which ends the exchange: the message "MUST NOT be
+    /// retransmitted" ([MQTT-4.4.0-2]) [mqtt5 §6].
+    RefusePublish(u8),
+    /// Read one PUBREL and answer PUBCOMP 0x00.
+    CompletePubrel,
+    /// Read one PUBREL and answer PUBCOMP 0x92 (Packet Identifier not found),
+    /// which is what a server whose PUBCOMP was lost answers the second time:
+    /// it has already released the identifier. "Not an error during recovery"
+    /// (3.6.2.1) [mqtt5 §6].
+    ForgetPubrel,
     /// Wait, so a client timer can expire.
     Idle(Duration),
     /// Drop the connection with no DISCONNECT, which is always available to a
@@ -61,6 +102,7 @@ pub struct Server {
     address: SocketAddr,
     seen: Arc<Mutex<Vec<Vec<u8>>>>,
     connects: Arc<AtomicUsize>,
+    deliveries: Arc<AtomicUsize>,
     done: mpsc::Receiver<()>,
 }
 
@@ -79,9 +121,19 @@ impl Server {
         let address = listener.local_addr().expect("local addr");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let connects = Arc::new(AtomicUsize::new(0));
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        // Shared across connections on purpose: a QoS 2 identifier held when
+        // a connection drops is still held by the *session* when the client
+        // reconnects, which is what makes the duplicate-suppression half of
+        // the lost-packet replays testable.
+        let unreleased = Arc::new(Mutex::new(BTreeSet::new()));
         let (finished, done) = mpsc::channel(scripts.len().max(1));
 
-        let task_seen = Arc::clone(&seen);
+        let shared = Shared {
+            seen: Arc::clone(&seen),
+            deliveries: Arc::clone(&deliveries),
+            unreleased: Arc::clone(&unreleased),
+        };
         let task_connects = Arc::clone(&connects);
         tokio::spawn(async move {
             for script in scripts {
@@ -89,7 +141,16 @@ impl Server {
                     return;
                 };
                 task_connects.fetch_add(1, Ordering::SeqCst);
-                run(stream, script, Arc::clone(&task_seen)).await;
+                run(
+                    stream,
+                    script,
+                    Shared {
+                        seen: Arc::clone(&shared.seen),
+                        deliveries: Arc::clone(&shared.deliveries),
+                        unreleased: Arc::clone(&shared.unreleased),
+                    },
+                )
+                .await;
                 if finished.send(()).await.is_err() {
                     return;
                 }
@@ -100,6 +161,7 @@ impl Server {
             address,
             seen,
             connects,
+            deliveries,
             done,
         }
     }
@@ -135,18 +197,37 @@ impl Server {
         self.connects.load(Ordering::SeqCst)
     }
 
+    /// Onward deliveries this server accepted, with a repeated QoS 2 Packet
+    /// Identifier counted once. The number a lost-packet replay must leave at
+    /// exactly one.
+    pub fn deliveries(&self) -> usize {
+        self.deliveries.load(Ordering::SeqCst)
+    }
+
     /// Waits for one script to finish.
     pub async fn finished(&mut self) {
         let _ = self.done.recv().await;
     }
 }
 
-async fn run(mut stream: TcpStream, script: Vec<Act>, seen: Arc<Mutex<Vec<Vec<u8>>>>) {
+/// What one connection's script shares with the server handle.
+struct Shared {
+    seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// Onward deliveries this server accepted, counting a repeated QoS 2
+    /// Packet Identifier once — the receiver's own duplicate suppression
+    /// ([MQTT-4.3.3-10]).
+    deliveries: Arc<AtomicUsize>,
+    /// QoS 2 identifiers received and not yet released by a PUBREL, which is
+    /// the state that suppression needs.
+    unreleased: Arc<Mutex<BTreeSet<u16>>>,
+}
+
+async fn run(mut stream: TcpStream, script: Vec<Act>, shared: Shared) {
     // The client's first packet MUST be CONNECT ([MQTT-3.1.0-1]), so reading
     // it unconditionally is not an assumption but the protocol.
     let mut buf = Vec::new();
     match read_packet(&mut stream, &mut buf).await {
-        Some(packet) => seen.lock().await.push(packet),
+        Some(packet) => shared.seen.lock().await.push(packet),
         None => return,
     }
 
@@ -159,9 +240,60 @@ async fn run(mut stream: TcpStream, script: Vec<Act>, seen: Arc<Mutex<Vec<Vec<u8
                 let _ = stream.flush().await;
             }
             Act::Expect => match read_packet(&mut stream, &mut buf).await {
-                Some(packet) => seen.lock().await.push(packet),
+                Some(packet) => shared.seen.lock().await.push(packet),
                 None => return,
             },
+            Act::AckPublish | Act::RefusePublish(_) | Act::AcceptPublish => {
+                let Some(raw) = read_packet(&mut stream, &mut buf).await else {
+                    return;
+                };
+                shared.seen.lock().await.push(raw.clone());
+                let answer = answer_publish(&raw, &act, &shared).await;
+                if let Some(answer) = answer {
+                    if stream.write_all(&answer).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.flush().await;
+                }
+            }
+            Act::CompletePubrel | Act::ForgetPubrel | Act::AcceptPubrel => {
+                let Some(raw) = read_packet(&mut stream, &mut buf).await else {
+                    return;
+                };
+                shared.seen.lock().await.push(raw.clone());
+                let Packet::Pubrel(pubrel) = decode(&raw) else {
+                    panic!(
+                        "the script expected a PUBREL, got {}",
+                        decode(&raw).packet_type()
+                    );
+                };
+                let reason_code = match act {
+                    Act::CompletePubrel => {
+                        shared.unreleased.lock().await.remove(&pubrel.packet_id);
+                        Some(PubcompReasonCode::Success)
+                    }
+                    // The server already released it, which is the state a
+                    // server whose PUBCOMP was lost is in.
+                    Act::ForgetPubrel => Some(PubcompReasonCode::PacketIdentifierNotFound),
+                    // Released, and the PUBCOMP is lost on the way back.
+                    _ => {
+                        shared.unreleased.lock().await.remove(&pubrel.packet_id);
+                        None
+                    }
+                };
+                let Some(reason_code) = reason_code else {
+                    continue;
+                };
+                let answer = bytes(&Packet::Pubcomp(Pubcomp {
+                    packet_id: pubrel.packet_id,
+                    reason_code,
+                    properties: Properties::new(),
+                }));
+                if stream.write_all(&answer).await.is_err() {
+                    return;
+                }
+                let _ = stream.flush().await;
+            }
             Act::Idle(duration) => tokio::time::sleep(duration).await,
             Act::Close => return,
         }
@@ -172,6 +304,74 @@ async fn run(mut stream: TcpStream, script: Vec<Act>, seen: Arc<Mutex<Vec<Vec<u8
     while let Ok(read) = stream.read(&mut sink).await {
         if read == 0 {
             return;
+        }
+    }
+}
+
+/// The answer to a PUBLISH, applying the receiver's duplicate suppression.
+///
+/// `None` means the server accepted the message and answered nothing, which
+/// is a lost acknowledgement.
+async fn answer_publish(raw: &[u8], act: &Act, shared: &Shared) -> Option<Vec<u8>> {
+    let Packet::Publish(publish) = decode(raw) else {
+        panic!(
+            "the script expected a PUBLISH, got {}",
+            decode(raw).packet_type()
+        );
+    };
+    let failure = match act {
+        Act::RefusePublish(code) => Some(*code),
+        _ => None,
+    };
+    let silent = matches!(act, Act::AcceptPublish);
+
+    match publish.qos {
+        QoS::AtMostOnce => {
+            // No response at all, and no retry: QoS 0 "arrives either once or
+            // not at all" (4.3.1).
+            shared.deliveries.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+        QoS::AtLeastOnce => {
+            let packet_id = publish.packet_id.expect("QoS 1 carries an identifier");
+            let reason_code = match failure {
+                Some(code) => PubackReasonCode::from_byte(code).expect("a PUBACK code"),
+                None => {
+                    shared.deliveries.fetch_add(1, Ordering::SeqCst);
+                    PubackReasonCode::Success
+                }
+            };
+            if silent {
+                return None;
+            }
+            Some(bytes(&Packet::Puback(Puback {
+                packet_id,
+                reason_code,
+                properties: Properties::new(),
+            })))
+        }
+        QoS::ExactlyOnce => {
+            let packet_id = publish.packet_id.expect("QoS 2 carries an identifier");
+            let reason_code = match failure {
+                Some(code) => PubackReasonCode::from_byte(code).expect("a PUBREC code"),
+                None => {
+                    // [MQTT-4.3.3-10]: a repeat is answered again and MUST NOT
+                    // cause a duplicate onward delivery.
+                    let first_sight = shared.unreleased.lock().await.insert(packet_id);
+                    if first_sight {
+                        shared.deliveries.fetch_add(1, Ordering::SeqCst);
+                    }
+                    PubackReasonCode::Success
+                }
+            };
+            if silent {
+                return None;
+            }
+            Some(bytes(&Packet::Pubrec(Pubrec {
+                packet_id,
+                reason_code,
+                properties: Properties::new(),
+            })))
         }
     }
 }

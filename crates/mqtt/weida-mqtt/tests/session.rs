@@ -523,12 +523,18 @@ async fn the_servers_receive_maximum_becomes_the_sessions_ceiling() {
     let mut options = options(true);
     options.limits.receive_maximum = 64;
     let session = Session::new("session-client", &options.limits);
-    assert_eq!(session.quota(), 64, "the client's placeholder");
+    assert_eq!(session.send_quota(), 64, "the client's placeholder");
 
     let (client, _events) = Client::connect_session(&context, &server.address(), options, &session)
         .await
         .expect("connects");
-    assert_eq!(session.quota(), 2, "the server's number replaced it");
+    assert_eq!(session.send_quota(), 2, "the server's number replaced it");
+    assert_eq!(
+        session.receive_maximum(),
+        64,
+        "the client's own declared value is a different number and is not \
+         overwritten by the server's (3.1.2.11.3 against 3.2.2.3.3)"
+    );
 
     session.allocate(message("a", QoS::AtLeastOnce)).unwrap();
     session.allocate(message("b", QoS::AtLeastOnce)).unwrap();

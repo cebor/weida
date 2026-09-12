@@ -247,10 +247,16 @@ struct State {
     /// The `Session Expiry Interval` the last CONNECT declared, in seconds.
     /// `None` until a CONNECT has been built from this session.
     declared_expiry: Option<u32>,
-    /// The ceiling on concurrent unacknowledged QoS > 0 messages: the peer's
-    /// `Receive Maximum` once a CONNACK has said so, and the client's own
-    /// configured value before that.
-    quota: u16,
+    /// The ceiling on what **this client** may have in flight toward the
+    /// server: the peer's `Receive Maximum` once a CONNACK has said so
+    /// ([MQTT-4.9.0-1]), and the client's own configured value as a
+    /// placeholder before that.
+    send_quota: u16,
+    /// The ceiling on what the **server** may have in flight toward this
+    /// client: the `Receive Maximum` this client declared in CONNECT. A
+    /// different number from `send_quota`, and never overwritten by the
+    /// server's.
+    receive_maximum: u16,
 }
 
 impl Session {
@@ -269,7 +275,8 @@ impl Session {
                 next_packet_id: 1,
                 sequence: 0,
                 declared_expiry: None,
-                quota: limits.receive_maximum,
+                send_quota: limits.receive_maximum,
+                receive_maximum: limits.receive_maximum,
             })),
         }
     }
@@ -447,14 +454,31 @@ impl Session {
     /// quota itself is per connection and re-initialised each time — it is
     /// "explicitly not session state" (4.9) — but the *count of stored
     /// exchanges* is session state, so the two meet here.
-    pub fn set_quota(&self, receive_maximum: u16) {
-        self.lock().quota = receive_maximum;
+    ///
+    /// **This replaces the send side only.** The two ceilings are different
+    /// numbers and conflating them is a real bug: the send quota is the
+    /// *server's* `Receive Maximum` and bounds what this client may have in
+    /// flight toward it, while [`Session::receive_maximum`] is the *client's*
+    /// own declared value and bounds what the server may have in flight
+    /// toward this client (3.1.2.11.3, 3.2.2.3.3) [mqtt5 §11]. A server that
+    /// declares nothing means 65,535 for the first and changes nothing about
+    /// the second.
+    pub fn set_send_quota(&self, server_receive_maximum: u16) {
+        self.lock().send_quota = server_receive_maximum;
     }
 
-    /// The ceiling in force.
+    /// The send quota's ceiling: the server's `Receive Maximum`
+    /// ([MQTT-4.9.0-1]).
     #[must_use]
-    pub fn quota(&self) -> u16 {
-        self.lock().quota
+    pub fn send_quota(&self) -> u16 {
+        self.lock().send_quota
+    }
+
+    /// This client's own declared `Receive Maximum`: how many unacknowledged
+    /// QoS 2 messages the server may have in flight toward it.
+    #[must_use]
+    pub fn receive_maximum(&self) -> u16 {
+        self.lock().receive_maximum
     }
 
     /// Allocates an unused Packet Identifier and stores `message` against it.
@@ -474,8 +498,10 @@ impl Session {
     pub fn allocate(&self, message: StoredPublish) -> Result<u16> {
         debug_assert_ne!(message.qos, QoS::AtMostOnce, "QoS 0 is never stored");
         let mut state = self.lock();
-        if state.outbound.len() >= usize::from(state.quota) {
-            return Err(Error::QuotaExhausted { quota: state.quota });
+        if state.outbound.len() >= usize::from(state.send_quota) {
+            return Err(Error::QuotaExhausted {
+                quota: state.send_quota,
+            });
         }
 
         let packet_id = next_free(&state.outbound, state.next_packet_id)
@@ -558,8 +584,12 @@ impl Session {
         if state.inbound_qos2.contains(&packet_id) {
             return Ok(false);
         }
-        if state.inbound_qos2.len() >= usize::from(state.quota) {
-            return Err(Error::ReceiveMaximumExceeded { quota: state.quota });
+        // Our own declared `Receive Maximum`, not the peer's: this table is
+        // what the **server** may have in flight toward us.
+        if state.inbound_qos2.len() >= usize::from(state.receive_maximum) {
+            return Err(Error::ReceiveMaximumExceeded {
+                quota: state.receive_maximum,
+            });
         }
         state.inbound_qos2.insert(packet_id);
         Ok(true)
@@ -757,9 +787,16 @@ mod tests {
             Err(Error::QuotaExhausted { quota: 2 })
         ));
 
-        // And the server's number replaces the client's once CONNACK says so.
-        session.set_quota(4);
-        assert_eq!(session.quota(), 4);
+        // And the server's number replaces the client's once CONNACK says so
+        // — on the **send** side only, which is the distinction a single
+        // `quota` field got wrong.
+        session.set_send_quota(4);
+        assert_eq!(session.send_quota(), 4);
+        assert_eq!(
+            session.receive_maximum(),
+            2,
+            "the client's own declared Receive Maximum is untouched"
+        );
         assert!(session.allocate(message("d", QoS::AtLeastOnce)).is_ok());
     }
 
