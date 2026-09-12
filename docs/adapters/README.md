@@ -81,6 +81,10 @@ Two rules keep these documents honest:
 | --- | --- | --- | --- |
 | `zmtp.md` | ZeroMQ ZMTP 3.1 (libzmq 4.3.x, CURVE/ZAP) | [`zeromq.md`](../research/zeromq.md) | codec, both bridge directions and the interop run against the pure-Rust `zeromq` crate |
 | `nng.md` | nanomsg / NNG Scalability Protocols (SP v1 RFCs rev 01, NNG 1.10.0) | [`nanomsg-nng.md`](../research/nanomsg-nng.md) | mapping written; codec built (`weida-sp`), bridges next |
+| `mqtt5.md` | MQTT 5.0 (OASIS Standard 2019-03-07; 3.1.1 differences) | [`mqtt5.md`](../research/mqtt5.md) | mapping written for the **client** ([0014](../decisions/0014-parallel-libraries.md) §2); the broker half of each rule is marked deferred to Phase D, and no forwarder exists yet |
 
-Planned, in the order Phase B builds them ([LOOP.md](../LOOP.md) §9): MQTT 5, AMQP 1.0,
-NATS core. Each gets its document in the same shape before its bridge code exists.
+Planned, in the order the parallel workstreams build them
+([0014](../decisions/0014-parallel-libraries.md) §2): AMQP 1.0 and NATS core. Each gets its
+document in the same shape before its bridge code exists. MQTT is the first entry whose
+document precedes a *library* rather than a bridge, because MQTT's server side is a broker and
+the broker is Phase D ([LOOP.md](../LOOP.md) §9).
