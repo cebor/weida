@@ -94,6 +94,10 @@
 //! - [`Pair0Socket`] and [`Pair1Socket`] — the exclusive pair: one peer
 //!   at a time refused at the pipe-add-pre hook, PAIR v0 with no header
 //!   and PAIR v1 with its hop-count word under `NNG_OPT_MAXTTL`.
+//! - [`SurveyorSocket`] and [`RespondentSocket`] — a broadcast with a
+//!   deadline that starts at the send, at most one response per
+//!   respondent, late responses discarded, and silence indistinguishable
+//!   from slowness.
 
 #![warn(missing_docs)]
 
@@ -108,9 +112,11 @@ pub mod pipe;
 pub mod pipeline;
 pub mod protocol;
 pub mod pubsub;
+pub mod replier;
 pub mod reqrep;
 pub mod session;
 pub mod socket;
+pub mod survey;
 pub mod transport;
 
 pub use context::{
@@ -138,7 +144,9 @@ pub use pipe::{Discarded, Pipe, PipeConfig};
 pub use pipeline::{PullSocket, PushSocket};
 pub use protocol::{PROTOCOLS, Protocol, protocol};
 pub use pubsub::{PubSocket, SubSocket};
-pub use reqrep::{CtxId, RepCtx, RepSocket, ReqCtx, ReqSocket};
+pub use replier::{CtxId, Replier, ReplierCtx};
+pub use reqrep::{RepCtx, RepSocket, ReqCtx, ReqSocket};
 pub use session::SpSession;
 pub use socket::{Broadcast, SocketCore};
+pub use survey::{RespondentCtx, RespondentSocket, SurveyorCtx, SurveyorSocket};
 pub use transport::Stream;

@@ -39,6 +39,7 @@ use crate::error::{Error, Result};
 use crate::message::Message;
 use crate::options::SocketOptions;
 use crate::pipe::PipeId;
+use crate::replier::{CtxId, Replier, ReplierCtx, framed};
 use crate::socket::{SocketCore, socket_endpoints, within};
 
 /// How often the socket's resend clock looks at its contexts.
@@ -67,28 +68,6 @@ static REQUEST_IDS: LazyLock<AtomicU32> = LazyLock::new(|| {
 
 fn next_request_id() -> u32 {
     REQUEST_IDS.fetch_add(1, Ordering::Relaxed) & backtrace::MAX_ID
-}
-
-/// A context's identity within its socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CtxId(u64);
-
-impl CtxId {
-    /// The number, as `nng_ctx_id()` reports it.
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl std::fmt::Display for CtxId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "context {}", self.0)
-    }
-}
-
-/// The wire form of a request or a reply: the tag stack, then the payload.
-fn framed(stack: &Backtrace, payload: &[u8]) -> Message {
-    Message::from_parts(stack.encode(), payload.to_vec())
 }
 
 // --------------------------------------------------------------------------
@@ -253,7 +232,7 @@ impl Drop for ReqHandle {
 
 impl ReqCtx {
     fn open(shared: &Arc<ReqShared>) -> ReqCtx {
-        let id = CtxId(shared.next_ctx.fetch_add(1, Ordering::Relaxed));
+        let id = CtxId::new(shared.next_ctx.fetch_add(1, Ordering::Relaxed));
         shared.lock().insert(id, ReqCtxState::default());
         ReqCtx {
             handle: Arc::new(ReqHandle {
@@ -494,46 +473,20 @@ fn resend_due(shared: &Arc<ReqShared>) {
 // REP
 // --------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
-struct Answering {
-    stack: Backtrace,
-    pipe: PipeId,
-}
-
-#[derive(Debug, Default)]
-struct RepCtxState {
-    /// The stack and the pipe of the request this context is answering.
-    answering: Option<Answering>,
-    receiving: bool,
-}
-
-struct RepShared {
-    core: Arc<SocketCore>,
-    contexts: Mutex<HashMap<CtxId, RepCtxState>>,
-    next_ctx: AtomicU64,
-}
-
-impl RepShared {
-    fn lock(&self) -> MutexGuard<'_, HashMap<CtxId, RepCtxState>> {
-        self.contexts.lock().expect("rep contexts poisoned")
-    }
-}
-
-impl std::fmt::Debug for RepShared {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RepShared")
-            .field("contexts", &self.lock().len())
-            .finish_non_exhaustive()
-    }
-}
-
 /// A REP socket: receive then reply, in that order, once per context.
+///
+/// The machine underneath is [`crate::replier`]'s, which RESPONDENT uses
+/// too: the two protocols differ in the id in their header and in what the
+/// terminal tag is called, and in nothing a replier does.
 #[derive(Clone, Debug)]
 pub struct RepSocket {
     core: Arc<SocketCore>,
-    shared: Arc<RepShared>,
+    shared: Arc<Replier>,
     implicit: RepCtx,
 }
+
+/// One REP transaction: an `nng_ctx` on a REP socket.
+pub type RepCtx = ReplierCtx;
 
 impl RepSocket {
     /// A REP socket on `context`, with NNG's defaults.
@@ -543,13 +496,14 @@ impl RepSocket {
 
     /// A REP socket with `options`.
     pub fn with_options(context: &Context, options: SocketOptions) -> Result<RepSocket> {
-        let core = Arc::new(SocketCore::new(context, EndpointType::Rep, options)?);
-        let shared = Arc::new(RepShared {
-            core: Arc::clone(&core),
-            contexts: Mutex::new(HashMap::new()),
-            next_ctx: AtomicU64::new(1),
-        });
-        let implicit = RepCtx::open(&shared);
+        let shared = Replier::new(
+            context,
+            EndpointType::Rep,
+            options,
+            "a REP context may send only the reply to a request it received",
+        )?;
+        let core = Arc::clone(shared.core());
+        let implicit = ReplierCtx::open(&shared);
         Ok(RepSocket {
             core,
             shared,
@@ -557,11 +511,11 @@ impl RepSocket {
         })
     }
 
-    /// `nng_ctx_open()`: a context that processes one request independently
-    /// of the others, which is how "several requests to be processed in
-    /// parallel over one socket" works (§4).
+    /// `nng_ctx_open()`: a context that processes one request
+    /// independently of the others, which is how "several requests to be
+    /// processed in parallel over one socket" works (§4).
     pub fn context(&self) -> RepCtx {
-        RepCtx::open(&self.shared)
+        ReplierCtx::open(&self.shared)
     }
 
     /// The context a bare [`RepSocket::recv`] and [`RepSocket::send`] use.
@@ -581,127 +535,3 @@ impl RepSocket {
 }
 
 socket_endpoints!(RepSocket);
-
-/// One REP transaction: an `nng_ctx` on a REP socket.
-#[derive(Clone, Debug)]
-pub struct RepCtx {
-    handle: Arc<RepHandle>,
-}
-
-#[derive(Debug)]
-struct RepHandle {
-    id: CtxId,
-    shared: Arc<RepShared>,
-}
-
-impl Drop for RepHandle {
-    fn drop(&mut self) {
-        self.shared.lock().remove(&self.id);
-    }
-}
-
-impl RepCtx {
-    fn open(shared: &Arc<RepShared>) -> RepCtx {
-        let id = CtxId(shared.next_ctx.fetch_add(1, Ordering::Relaxed));
-        shared.lock().insert(id, RepCtxState::default());
-        RepCtx {
-            handle: Arc::new(RepHandle {
-                id,
-                shared: Arc::clone(shared),
-            }),
-        }
-    }
-
-    /// This context's id.
-    pub fn id(&self) -> CtxId {
-        self.handle.id
-    }
-
-    fn shared(&self) -> &Arc<RepShared> {
-        &self.handle.shared
-    }
-
-    /// Receives one request, remembering how to answer it.
-    ///
-    /// A second concurrent receive on one context is `NNG_ESTATE`: "a
-    /// second simultaneous receive is likewise rejected" (§4).
-    pub async fn recv(&self) -> Result<Message> {
-        {
-            let mut contexts = self.shared().lock();
-            let state = contexts.entry(self.id()).or_default();
-            if state.receiving {
-                return Err(Error::ESTATE(
-                    "this context already has a receive in progress; one per context".into(),
-                ));
-            }
-            state.receiving = true;
-        }
-        let _guard = RepReceiving {
-            shared: self.shared(),
-            id: self.id(),
-        };
-        let limit = self.shared().core.options().recv_timeout;
-        within(self.shared().core.exec(), limit, self.take_request()).await
-    }
-
-    async fn take_request(&self) -> Result<Message> {
-        let max_hops = self.shared().core.options().max_ttl;
-        loop {
-            let Some((pipe, message)) = self.shared().core.try_take_any() else {
-                self.shared().core.wait_for_message().await;
-                continue;
-            };
-            let Ok((stack, payload)) = backtrace::decode(message.body(), max_hops) else {
-                // A malformed stack makes the message unusable; NNG drops
-                // the message and keeps the pipe (§8), so take the next.
-                continue;
-            };
-            let request = framed(&stack, payload);
-            let mut contexts = self.shared().lock();
-            let state = contexts.entry(self.id()).or_default();
-            state.answering = Some(Answering { stack, pipe });
-            return Ok(request);
-        }
-    }
-
-    /// Replies to the request this context received.
-    ///
-    /// `NNG_ESTATE` when nothing was received: "a cooked REP may send only
-    /// after receiving its corresponding request … violations return
-    /// `NNG_ESTATE`" (§4).
-    ///
-    /// A reply whose requester has gone is discarded rather than reported:
-    /// SP has no way to tell anybody, and the requester's own resend timer
-    /// is what recovers (§4, §6).
-    pub async fn send(&self, body: impl Into<Vec<u8>>) -> Result<()> {
-        let Some(answering) = self
-            .shared()
-            .lock()
-            .get_mut(&self.id())
-            .and_then(|state| state.answering.take())
-        else {
-            return Err(Error::ESTATE(
-                "a REP context may send only the reply to a request it received".into(),
-            ));
-        };
-        let reply = framed(&answering.stack, &body.into());
-        match self.shared().core.send_to(answering.pipe, reply).await {
-            Ok(_) => Ok(()),
-            Err(Error::ECLOSED(_)) => Ok(()),
-            Err(other) => Err(other),
-        }
-    }
-}
-
-struct RepReceiving<'a> {
-    shared: &'a RepShared,
-    id: CtxId,
-}
-
-impl Drop for RepReceiving<'_> {
-    fn drop(&mut self) {
-        if let Some(state) = self.shared.lock().get_mut(&self.id) {
-            state.receiving = false;
-        }
-    }
-}
