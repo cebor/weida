@@ -314,11 +314,6 @@ note: delegated on `b057-cross-adapter` from `b057-sp-outbound`, now that both h
 note: **delivered on `b057-cross-adapter`, head `14c27fd`, main `e357a4e` merged in and the gate green there — not merged into main, because the session stopped first.** Whoever resumes: merge `--no-ff`, gate, close the item, then write the one "cross-adapter" line each mapping document's bench-plan section owes (zmtp.md §10 item 7, nng.md §10) — the worker left that text in its final report rather than touching the main tree after the stop. What it contains: a new `crates/adapters/cross-tests` crate (`publish = false`, no library code) with nine tests — ZMTP REQ→NNG REP with each envelope restored on its own side, ZMTP PUSH→NNG PULL, ZMTP PUB→NNG SUB through both topic conventions, the reverse PUSH and PUB chains, **`BestEffort` asserted end to end** (the ZeroMQ send succeeds while the far end is closed, and a fresh puller proves nothing arrived), a ZMTP multipart refused at the first hop with nothing reaching the second, the smaller of the two caps deciding, and an SP hop-count ceiling at the second hop reaching the first peer only as silence. Both foreign ends are the real `zeromq` and `nng` crates as the acceptance line asks, with one stated exception: the hop-count test's SP peer is raw TCP on `weida-sp`, because no single REP produces a multi-hop tag stack without an `nng_device` topology — the test says so rather than implying independence it does not have.
 note: merged `--no-ff` as 525db84 and gated here: **503 tests**, one ignored (the 1 GiB memory test), no conflicts. The two "cross-adapter" lines the mapping documents owed are written ([adapters/zmtp.md](adapters/zmtp.md) §10 item 7, [adapters/nng.md](adapters/nng.md) §10 item 7) and IMPLEMENTATION.md §1 gained the sixteenth increment. One thing the merge settles beyond the acceptance line: the `nng` crate builds on this machine, so the chain's SP end is the real C library and **not** `#[ignore]`d — which makes this run the independent peer nng.md §10 items 3 and 4 were owed, and answers §11's first open question (a real `Rep0` replies to a raw requester that never retransmits). PAIR is in no chain, so the v1 hop-count disagreement stays open on the wire.
 
-### B-058 — Python binding slice 1: the sync client
-kind: code | size: 90 | status: parked: user decision, Phase C not before B3 | needs: []
-acceptance: Phase C's first slice ([LOOP.md](LOOP.md) §9): a PyO3 module exposing the **synchronous** client surface — `Runtime`, `Requester`, `Pusher`, `Subscriber`, `Trust` — over `Runtime::owned`, which is what A8 built it for, so the binding owns its reactor and a Python process needs no async framework at all. Payloads cross as `bytes` without a copy where PyO3 allows it and the cost of the copy is measured where it does not; every weida error becomes a distinct Python exception class rather than one `RuntimeError`; the round trip is tested from Python against a Rust server in CI-runnable form (`maturin develop` documented, the test invoked by a script the loop can run), and IMPLEMENTATION.md records what a Python round trip costs against the Rust one.
-note: startable now — Phase C's stated prerequisite is A8's runtime ownership, which landed as B-016, and `owned_runtime.rs` already proves a full exchange from a plain `fn main` with no ambient reactor. Sized as one slice deliberately: the sync client first, asyncio second, because the two have different failure modes and the first is what proves the boundary.
-
 ### B-059 — Measure: what the local transports cost against QUIC
 kind: measure | size: 60 | status: done 6ca89ad | needs: [B-048]
 acceptance: the pattern bench extended with the inproc and `AF_UNIX` transports beside loopback QUIC, in the shape `benches/patterns.rs` already uses: Req/Rep round trip and Push/Pull one-way at 1 KiB and 1 MiB over all three, plus what a local connection costs in memory against the 995 KiB per QUIC connection B-012 measured. The numbers go into IMPLEMENTATION.md verified results with the command, and they answer the question 0010 §4.2 left implicit — whether "the OS connection is the stream" pays for the connection per transfer it costs, and at which payload size the answer changes.
@@ -336,11 +331,6 @@ note: my own judgement of what a user of this tree hits first, which is §4's fi
 kind: code | size: 45 | status: ready | needs: []
 acceptance: the debt entry "No CI" in [IMPLEMENTATION.md](IMPLEMENTATION.md) §6 closed for the part that does not need a decision: a workflow that runs exactly the gate of [LOOP.md](LOOP.md) §6 — `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and again `-p weida --no-default-features --all-targets`, `cargo test --workspace`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` — on a Linux runner with the pinned toolchain, plus the `-- --ignored` suite as a separate, non-blocking job because the 1 GiB echo asserts an RSS ceiling a shared runner may not honour. The fuzz targets stay out: they need nightly and a time budget. Windows and macOS are named as absent rather than silently missing, which is also what B-039 waits for.
 note: the gate exists only in this loop's head today, so a contributor cannot reproduce the bar the loop holds itself to. Sized 45 because it is configuration plus one honest decision — which suites block a push and which report — and no library code.
-
-### B-062 — Research: MQTT 5 adapter mapping document
-kind: research | size: 60 | status: ready | needs: []
-acceptance: `docs/adapters/mqtt5.md` plus its row in the adapters index, derived from [research/mqtt5.md](research/mqtt5.md) in the shape the ZMTP and SP documents now share: sessions and their expiry against weida's explicit absence of a session ([0008](decisions/0008-session-identity.md) §4.5), QoS 0/1/2 against the transport receipt and the reserved broker vocabulary ([GUARANTEES.md](GUARANTEES.md) §3), topic filters with `+`/`#` against the segmented filters of [0007](decisions/0007-topic-namespace.md), retained messages and shared subscriptions as things weida has no counterpart for, the transfer point where each guarantee chain ends, and every named loss with **how it would be observed**. The server side comes first, per [LOOP.md](LOOP.md) §9 B3, so the document must say which half of each rule binds a broker rather than a client.
-note: the next protocol in the roadmap and the first whose mapping is genuinely hard: MQTT has a session, weida deliberately does not, and QoS 2's "exactly once, strictly per hop" is the case SYNTHESIS §7.2 already calls the weakest link of the MQTT-weida-AMQP chain. Better written before any code than discovered inside a bridge.
 
 ### B-064 — Streaming fan-out: a publisher that hands out a stream per subscriber
 kind: code | size: 90 | status: ready | needs: []
@@ -711,3 +701,336 @@ kind: code | size: 60 | status: ready | needs: [B-076, B-077, B-078, B-079]
 acceptance: the exposure a socket hands a real peer is bounded in bytes rather than only in messages, or — where libzmq's message-counting HWM must be preserved exactly — the product `hwm × max_message_size` per direction per peer is stated at every place the numbers are taken and a test asserts the ceiling actually holds; the answer is the same shape B-053 and B-054 gave the bridge ([INVARIANTS.md](INVARIANTS.md)), and it says which of the two it chose and why.
 note: found by B-072 rather than by a review pass. `ZMQ_SNDHWM`/`ZMQ_RCVHWM` count **messages**, so at the defaults one peer can hold 1000 × 1 MiB per direction; `DEFAULT_MAX_MESSAGE_SIZE`'s documentation states the product, which is honest but is not a bound. Deliberately after the pattern sockets exist (B-076..B-079): before them nothing hands these numbers to a stranger, and the right answer may differ per socket type — a PUB that drops is not exposed the way a PULL that blocks is.
 note: the B-097 review pass found this item's other half and filed it as **B-099**: the per-peer product is one factor, the number of peers a stranger may open is the other, and `Engine::admit` bounds neither. Answer them with one number each — a ceiling on what a peer holds and a ceiling on how many peers there are — because either alone leaves the product unbounded.
+
+### B-111 — `weida-py-core`: the shared PyO3 foundation
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-12T02:18Z | needs: []
+acceptance: `crates/py/weida-py-core` holds what every binding of [0014](decisions/0014-parallel-libraries.md) shares and nothing protocol-specific — the error mapping that turns a library's errno-named enum into one distinct Python exception class per variant under a single base class, the `Runtime`/`Context` bridge that drives a library future on the caller's running asyncio loop and hands back an awaitable, Python-side cancellation propagated onto the Rust future instead of swallowed, and the `bytes` boundary that avoids a copy where PyO3 allows it and measures the copy where it does not — with `pyo3` and `weida-runtime` as its only external dependencies and neither `weida`, `weida-protocol` nor any protocol library in its manifest; one throwaway consumer in the crate's own tests proves an awaitable completing, an exception class arriving with its errno name, and a cancelled Python task cancelling the Rust future.
+note: workstream W1, worktree ../weida-w1, branch b111-weida-py-core
+
+### B-058 — `weida-zmq-py`: the module, the context and the eleven socket types
+kind: code | size: 90 | status: ready | needs: [B-111]
+acceptance: `crates/zmq/weida-zmq-py`, a PyO3 module built by maturin (abi3, `maturin develop` documented and driven by a script the loop can run), exposing `Context` with the three constructors of [0013](decisions/0013-competitor-libraries.md) §4.4 and the eleven stable socket types as distinct Python classes with `bind`, `connect`, `unbind` and `disconnect` over `tcp://`, `ipc://` and `inproc://`; every failure is a `weida-py-core` exception class carrying libzmq's errno name rather than one `RuntimeError`; an asyncio REQ/REP round trip between two sockets of this module, run from Python, is the item's proof.
+note: workstream W1, worktree ../weida-w1, branch b058-zmq-py-context
+note: un-parked by [0014](decisions/0014-parallel-libraries.md), and restated twice over. "Phase C waits for B3" was scarcity rather than dependency: this item's stated prerequisite is A8's runtime ownership, which landed as B-016. The surface is now `weida-zmq`'s rather than weida's, because W1 binds the library that is finished; and **asyncio comes first, the sync surface second** (B-116), which reverses what the original note argued — the blocking facade of 0013 §4.4 item 3 already exists in Rust, so building sync first would build it twice. A binding of weida itself is not part of W1-W4 and is not filed here.
+
+### B-112 — The asyncio surface: send, receive and the multipart message
+kind: code | size: 90 | status: ready | needs: [B-058]
+acceptance: `await sock.send(...)` and `await sock.recv()` on all eleven types, with `Multipart` a first-class Python value sent and received atomically ("all frames or none"), `send_nowait`/`recv_nowait` for `ZMQ_DONTWAIT`'s `EAGAIN` and a timeout argument for `ZMQ_SNDTIMEO`/`ZMQ_RCVTIMEO`; payloads cross as `bytes` without a copy where PyO3 allows it and the copy's cost is recorded in [IMPLEMENTATION.md](IMPLEMENTATION.md) where it does not, and a cancelled `asyncio.Task` waiting in `recv` leaves the socket usable, which a test proves by receiving the next message on it.
+note: workstream W1, worktree ../weida-w1, branch b112-zmq-py-asyncio
+
+### B-113 — The option table and the error vocabulary from Python
+kind: code | size: 90 | status: ready | needs: [B-112]
+acceptance: every row of `weida-zmq`'s 98-row option table is reachable from Python, a refused option raises **at configuration time** with the reason the Rust table names — no transport, draft only, deprecated in favour of ZAP, replaced by a `weida-runtime` construct — instead of being silently ignored, and the two deliberate default changes (finite `ZMQ_LINGER`, bounded `ZMQ_MAXMSGSIZE`) are readable as such from Python; a Python test walks the table and asserts one honoured row and one row of each refusal reason.
+note: workstream W1, worktree ../weida-w1, branch b113-zmq-py-options
+
+### B-114 — PLAIN, CURVE and a ZAP handler written in Python
+kind: code | size: 90 | status: ready | needs: [B-113]
+acceptance: `ZMQ_PLAIN_*` and `ZMQ_CURVE_*` settable from Python with keys taken as 32 bytes or 40-character Z85, `CurveKey`, `RoutingId` and `ZapUserId` as distinct Python types with no conversion to or from any weida identity anywhere in the module, and a ZAP handler **written in Python** answering 200/300/400/500 over `inproc://zeromq.zap.01` for a socket of this module; a 400 from that handler refuses the connection before any message flows, which the test asserts by the absence of the message rather than by the status code alone.
+note: workstream W1, worktree ../weida-w1, branch b114-zmq-py-security
+
+### B-115 — The monitor and the devices from Python
+kind: code | size: 60 | status: ready | needs: [B-113]
+acceptance: the `zmq_socket_monitor` event set delivered to Python as an async iterator of typed events **and** over the `inproc://` PAIR form the Espresso recipe reads, plus `proxy(frontend, backend, capture)` and the steerable form with PAUSE/RESUME/TERMINATE/STATISTICS; a Python test runs an XSUB/XPUB proxy with a capture socket and asserts a message crossing in each direction and one captured copy.
+note: workstream W1, worktree ../weida-w1, branch b115-zmq-py-monitor
+
+### B-116 — The sync surface over the blocking facade
+kind: code | size: 90 | status: ready | needs: [B-112]
+acceptance: a synchronous Python surface for the same eleven socket types over `weida-zmq`'s non-default `blocking` feature and a `Context::owned` reactor, so a Python process needs no asyncio loop at all — no second implementation of any protocol behaviour, the timeouts and `DONTWAIT` of the async surface preserved, and one zguide recipe (lazy pirate) written in synchronous Python asserting the guide's own claim, an in-order reply or abandonment, rather than merely running.
+note: workstream W1, worktree ../weida-w1, branch b116-zmq-py-sync
+
+### B-117 — Interop: the binding against libzmq and against the Rust sockets, both roles
+kind: adapter | size: 90 | status: ready | needs: [B-114, B-116]
+acceptance: the Phase C bench of [LOOP.md](LOOP.md) §9 for this binding — every pairing this module and `pyzmq` (libzmq 4.3.5) both support, with the Python binding as the connecting side **and** as the bound side, plus the same matrix against `weida-zmq` sockets in Rust, and PLAIN and CURVE in both directions; where `pyzmq` is absent the run is skipped with the install command named in the same place [LOOP.md](LOOP.md) §2 puts it, and what a Python round trip costs against the Rust one goes into [IMPLEMENTATION.md](IMPLEMENTATION.md).
+note: workstream W1, worktree ../weida-w1, branch b117-zmq-py-interop
+
+### B-118 — Packaging: the wheel, the version and the bindings index
+kind: code | size: 60 | status: ready | needs: [B-117]
+acceptance: `maturin build` produces an abi3 wheel for CPython on Linux carrying the metadata a registry requires, the Python package version derives from the workspace version rather than being typed a second time, and `docs/libraries/README.md` gains this binding's row stating what it covers and what it does not; a fresh virtualenv installs the built wheel and runs B-058's round trip with no Rust toolchain present.
+note: workstream W1, worktree ../weida-w1, branch b118-zmq-py-packaging
+
+### B-119 — `weida-nng`: context, sockets, endpoints and the error vocabulary
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-12T02:18Z | needs: []
+acceptance: `crates/nng/weida-nng` with one socket type per SP protocol on `weida-runtime`'s `Exec`, dialers and listeners as named endpoint objects that create pipes, URLs parsed for `tcp://`, `ipc://`, `inproc://` and `tls+tcp://` under `NNG_MAXADDRLEN` and the 122-byte legacy IPC path bound, and an error enum carrying NNG's own names (`NNG_ESTATE`, `NNG_ETIMEDOUT`, `NNG_ECLOSED`, `NNG_EMSGSIZE`, `NNG_ECONNREFUSED`); no dependency on `weida` or `weida-protocol`, and the sans-I/O `weida-sp` keeps its empty `[dependencies]`.
+note: workstream W2, worktree ../weida-w2, branch b119-nng-context
+
+### B-120 — The message, the per-socket queues and `RECVMAXSZ`
+kind: code | size: 90 | status: ready | needs: [B-119]
+acceptance: a message with protocol header and application body in separate storage, delivered wholly or not at all with no streaming body; `SENDBUF`/`RECVBUF` as message depths 0-8192 with PUSH's documented default of 0 and the protocols that permit neither (REQ, one transaction per context) refusing them by name; `RECVMAXSZ` checked from the 64-bit declared length **before** any allocation; and the per-protocol full-queue action — PUSH and PAIR block or `NNG_ETIMEDOUT`, BUS drops, SUB drops oldest or rejects newest per `SUB_PREFNEW` — with one test per action.
+note: workstream W2, worktree ../weida-w2, branch b120-nng-message-queues
+
+### B-121 — The endpoint engine: dialers, listeners, pipes and reconnect
+kind: code | size: 90 | status: ready | needs: [B-120]
+acceptance: one socket owns many dialers and listeners, each creating pipes that map 1:1 to connections; a synchronous dial returns only once the peer's protocol header has arrived and a non-blocking dial retries, with backoff from `RECONNMINT` growing to `RECONNMAXT`; pipe add-before, add-after and remove-after events reach a callback that may not touch the socket; and the number of pipes one socket admits has a named, documented ceiling, because SP bounds nothing a stranger opens ([INVARIANTS.md](INVARIANTS.md)).
+note: workstream W2, worktree ../weida-w2, branch b121-nng-engine
+
+### B-122 — The SP session on the existing codec
+kind: adapter | size: 90 | status: ready | needs: [B-121]
+acceptance: both sides send the 8-octet protocol header immediately and wait for the peer's before anything else, the peer's endpoint type is checked against the pairing rule *before any traffic*, a mismatched magic, version or reserved field is answered by disconnection and nothing else — no reply, no reason code — and 64-bit framing runs through `weida-sp` unchanged; the codec's golden vectors still assert byte-for-byte, and nothing that parses SP is left in `weida-nng-bridge`.
+note: workstream W2, worktree ../weida-w2, branch b122-nng-session
+
+### B-123 — REQ and REP with contexts
+kind: code | size: 90 | status: ready | needs: [B-122]
+acceptance: contexts that each hold one outstanding request with their own request ID and resend timer over a shared socket, the 32-bit tag stack written with the terminal bit set and the reply matched by it, requests spread over the available REP peers, REP able to send only after receiving with `NNG_ESTATE` for every other order and one pending receive per context, and a newer request cancelling interest in the older reply without withdrawing it from the replier; all three resend triggers — timer, peer disconnect, peer becoming available — with a test asserting the duplicate the sheet says a REP will see, rather than pretending retry is free.
+note: workstream W2, worktree ../weida-w2, branch b123-nng-req-rep
+
+### B-124 — PUSH and PULL
+kind: code | size: 60 | status: ready | needs: [B-122]
+acceptance: PUSH round-robins over the pullers that can accept *now* — an unavailable peer is skipped rather than held for its turn — and waits or fails with `NNG_ETIMEDOUT` when none can; PULL fair-queues arrivals with no defined order between simultaneously ready peers; PUSH has no receive and PULL no send, at the type level.
+note: workstream W2, worktree ../weida-w2, branch b124-nng-push-pull
+
+### B-125 — PUB and SUB
+kind: code | size: 90 | status: ready | needs: [B-122]
+acceptance: PUB offers every message to every connected subscriber without testing any subscription, SUB matches an arbitrary byte prefix of the body locally with an empty subscription admitting everything and several subscriptions per socket, and `SUB_PREFNEW` chooses oldest-drop or new-reject at a full queue; a test asserts the consequence the sheet measured — a subscriber that asked for one prefix is still sent the others and discards them — so the filtering locus is an assertion rather than a paragraph.
+note: workstream W2, worktree ../weida-w2, branch b125-nng-pub-sub
+
+### B-126 — PAIR v0 and PAIR v1
+kind: code | size: 90 | status: ready | needs: [B-122]
+acceptance: PAIR v0 with no protocol header, PAIR v1 with its 32-bit word whose low octet is the hop count, `MAXTTL` between 1 and 255 enforced locally, and both readings of the initial count decoded — the RFC's one and NNG's zero — with what we send named in the doc comment and asserted by a vector; a paired socket rejects a second connection while one is live, and polyamorous mode is absent with the manual's own deprecation as the stated reason.
+note: workstream W2, worktree ../weida-w2, branch b126-nng-pair
+
+### B-127 — SURVEYOR and RESPONDENT
+kind: code | size: 90 | status: ready | needs: [B-123]
+acceptance: a survey broadcast to every respondent with `SURVEYTIME` starting **at send**, at most one response collected per respondent, late responses discarded, a blocked receive expiring as `NNG_ETIMEDOUT` and a receive with no active survey returning `NNG_ESTATE`, contexts overlapping surveys with independent deadlines; a respondent that declines by silence is indistinguishable from a slow one, and the test asserts that equality rather than treating silence as failure.
+note: workstream W2, worktree ../weida-w2, branch b127-nng-survey
+
+### B-128 — BUS
+kind: code | size: 60 | status: ready | needs: [B-125]
+acceptance: BUS sends to every *directly connected* peer only, best-effort and non-blocking, discarding the copy for a peer that cannot receive while the send still succeeds; a three-node line asserts the far node receives nothing, which turns "a mesh must be fully connected" into a test, and raw BUS carries the ingress pipe ID and excludes that pipe when re-broadcasting.
+note: workstream W2, worktree ../weida-w2, branch b128-nng-bus
+
+### B-129 — Raw sockets and the device
+kind: code | size: 90 | status: ready | needs: [B-127, B-128]
+acceptance: a raw variant of each protocol that preserves the wire headers and omits the state machine, retry and matching, refusing contexts the way NNG does because the state they hold is deliberately absent; plus `device`-style forwarding between two raw sockets where the REQ/REP backtrace and the PAIR v1 hop count supply the routing and the loop control, with a test running a request through a forwarder and back and asserting the forwarder's own peer ID was pushed and popped.
+note: workstream W2, worktree ../weida-w2, branch b129-nng-raw-device
+
+### B-130 — The inproc and ipc transports
+kind: code | size: 90 | status: ready | needs: [B-121]
+acceptance: `inproc://` as a namespace on `weida-runtime`'s registry that accepts and deliberately ignores `RECVMAXSZ` for NNG's own reason (peers share an address space), and `ipc://` on `weida-runtime`'s `AF_UNIX` hygiene — unlink-then-bind, explicit mode, socket-type check before unlinking, the path budget — with the kernel's UID, GID and PID reaching a pipe-add-pre hook as adapter policy and the PID documented as an observation that must not be authorized on ([0010](decisions/0010-local-transport.md) §4.4).
+note: workstream W2, worktree ../weida-w2, branch b130-nng-local-transports
+
+### B-131 — The TLS transport
+kind: code | size: 90 | status: ready | needs: [B-121]
+acceptance: `tls+tcp://` with what NNG exposes — authentication mode, CA, certificate and key, the verification result, the peer common name and its alternative names — reaching the pipe-add-pre hook where an allow-list runs; the crate's documentation states at the point of configuration that this authenticates the transport peer of one SP connection and terminates there, and no API turns it into a sender identity, because SP has none.
+note: workstream W2, worktree ../weida-w2, branch b131-nng-tls
+
+### B-132 — The option table, honoured or refused
+kind: code | size: 90 | status: ready | needs: [B-129, B-130]
+acceptance: every socket, dialer, listener and pipe option the sheet names is honoured or refused **at configuration time** with the reason named — no such transport, the protocol does not support it (`SENDBUF` on REQ), experimental and out of scope (ZeroTier), replaced by a `weida-runtime` construct — and never silently ignored; `RECVMAXSZ` is settable per endpoint before that endpoint starts, as the manual requires, and a test walks the whole table.
+note: workstream W2, worktree ../weida-w2, branch b132-nng-options
+
+### B-133 — Interop against the `nng` crate, both roles
+kind: adapter | size: 90 | status: ready | needs: [B-123, B-124, B-125, B-126]
+acceptance: every pairing this library and NNG both implement, with our socket dialling **and** listening, against the `nng` crate over its vendored C library — its blocking calls kept off the reactor's threads and `RecvTimeout`/`SendTimeout` set so a stall is an error rather than a hang, `#[ignore]` with the reason where no C toolchain is present ([LOOP.md](LOOP.md) §2); the two things the sheet says only the implementation can settle are exercised rather than assumed — the PAIR v1 initial hop count and the endpoint-type role nibble — and every disagreement is recorded as measured against a named version.
+note: workstream W2, worktree ../weida-w2, branch b133-nng-interop
+
+### B-134 — The bridge rebuilt on the library
+kind: adapter | size: 90 | status: ready | needs: [B-133]
+acceptance: `weida-nng-bridge` keeps `Inbound`/`Outbound`, their configuration and their refusals and drops `wire.rs`, the handshake driving, the tag-stack bookkeeping and the local prefix matching in favour of `weida-nng` sockets; it still states `core` on the weida side and SP's absent transfer point on the other ([adapters/nng.md](adapters/nng.md) §7), `max_message_bytes` becomes `RECVMAXSZ` on the socket with the bridge keeping its own weida-side cap, and every existing bridge test **and** the cross-adapter suite of B-057 pass with unchanged observable behaviour.
+note: workstream W2, worktree ../weida-w2, branch b134-nng-bridge-rebuild
+
+### B-135 — The parity table against NNG 1.10.0
+kind: spec | size: 60 | status: ready | needs: [B-132, B-133]
+acceptance: `docs/libraries/nng.md` in the shape `docs/libraries/zmq.md` set, row by row over protocols cooked and raw, transports, options, pipe events and the device, each present, refused-with-reason or absent-with-reason; the security rows say plainly that SP defines no message-level authentication, authorization or sender identity and that TLS and IPC credentials authenticate a transport peer only; no row says "partial" without naming what is missing.
+note: workstream W2, worktree ../weida-w2, branch b135-nng-parity
+
+### B-136 — Research: what the NNG implementation taught the sheet
+kind: research | size: 45 | status: ready | needs: [B-134]
+acceptance: [research/nanomsg-nng.md](research/nanomsg-nng.md) updated with what building the library and running it against the C implementation established, in the sheet's own protocol-native vocabulary and with no sentence mentioning weida ([research/README.md](research/README.md) rule 1), every addition attributed to a new numbered source naming the crate and C library versions and what was observed; the §11 open questions the run settled are marked settled, and the ones it did not are left open with what would settle them.
+note: workstream W2, worktree ../weida-w2, branch b136-nng-sheet-update
+
+### B-137 — `weida-nng-py`: the asyncio surface
+kind: code | size: 90 | status: ready | needs: [B-111, B-133]
+acceptance: `crates/nng/weida-nng-py` on `weida-py-core`: one Python class per SP protocol with `dial`, `listen`, `close`, `await send` and `await recv`, contexts as their own Python objects so concurrent requests are concurrent, `NNG_E*` names as distinct exception classes, and options refused at configuration time exactly as the Rust table refuses them; an asyncio REQ/REP round trip and a SUB prefix match run from Python, and one exchange against the `nng` crate's C library proves the binding on the wire rather than only against itself.
+note: workstream W2, worktree ../weida-w2, branch b137-nng-py-asyncio
+
+### B-138 — `weida-nng-py`: the sync surface
+kind: code | size: 60 | status: ready | needs: [B-137]
+acceptance: the synchronous Python surface over the same sockets with no asyncio loop required in the process and no second implementation of any protocol behaviour, send and receive timeouts turning a stalled exchange into an exception instead of a hang; B-137's round trip runs unchanged in synchronous form.
+note: workstream W2, worktree ../weida-w2, branch b138-nng-py-sync
+
+### B-062 — Research: MQTT 5 adapter mapping document
+kind: research | size: 60 | status: in_progress (delegated) 2026-09-12T02:18Z | needs: []
+acceptance: `docs/adapters/mqtt5.md` plus its row in the adapters index, derived from [research/mqtt5.md](research/mqtt5.md) in the shape the ZMTP and SP documents now share: sessions and their expiry against weida's explicit absence of a session ([0008](decisions/0008-session-identity.md) §4.5), QoS 0/1/2 against the transport receipt and the reserved broker vocabulary ([GUARANTEES.md](GUARANTEES.md) §3), topic filters with `+`/`#` against the segmented filters of [0007](decisions/0007-topic-namespace.md), retained messages and shared subscriptions as things weida has no counterpart for, the transfer point where each guarantee chain ends, and every named loss with **how it would be observed**. The **client** side comes first, per [LOOP.md](LOOP.md) §9 B3 as amended by [0014](decisions/0014-parallel-libraries.md), so the document must say for each rule which half binds a broker and which a client — the broker half is Phase D, and the client half is what W3 is read against.
+note: the next protocol in the roadmap and the first whose mapping is genuinely hard: MQTT has a session, weida deliberately does not, and QoS 2's "exactly once, strictly per hop" is the case SYNTHESIS §7.2 already calls the weakest link of the MQTT-weida-AMQP chain. Better written before any code than discovered inside a bridge.
+note: workstream W3, worktree ../weida-w3, branch b062-mqtt5-mapping
+note: restated by [0014](decisions/0014-parallel-libraries.md): the acceptance kept every clause it had and changed one — the server side no longer comes first, because an MQTT server is a broker and the broker is Phase D, so the document is written for the client W3 builds and marks the broker half of each rule as deferred rather than absent.
+
+### B-139 — `weida-mqtt-codec`: the fixed header, the type system and CONNECT/CONNACK
+kind: adapter | size: 90 | status: ready | needs: [B-062]
+acceptance: `crates/mqtt/weida-mqtt-codec` with an **empty `[dependencies]`**: the one-byte type-and-flags header, Remaining Length as a Variable Byte Integer of 1-4 bytes refused when not minimally encoded, UTF-8 strings and binary data with their 65,535-byte bound, the property framework with its Variable Byte Integer identifiers, and CONNECT/CONNACK with every property of 3.1.2.11 and 3.2.2.3 encoded and decoded; golden vectors follow the normative body's payload order (Client Identifier, Will Properties, Will Topic, Will Payload, User Name, Password) rather than Appendix B's, a fuzz target rides along, and nothing is allocated before a declared length is checked against a caller-supplied maximum packet size.
+note: workstream W3, worktree ../weida-w3, branch b139-mqtt-codec-connect
+
+### B-140 — The codec's remaining thirteen packet types
+kind: adapter | size: 90 | status: ready | needs: [B-139]
+acceptance: PUBLISH, PUBACK, PUBREC, PUBREL, PUBCOMP, SUBSCRIBE, SUBACK, UNSUBSCRIBE, UNSUBACK, PINGREQ, PINGRESP, DISCONNECT and AUTH encoded and decoded with their flags, packet identifiers, reason codes and properties; repetition is a Protocol Error for every property except User Property and Subscription Identifier, an unknown identifier or a wrong type is a Malformed Packet, and a golden vector per packet type plus the extended fuzz target assert it — with the codec still dependency-free and weida-free.
+note: workstream W3, worktree ../weida-w3, branch b140-mqtt-codec-packets
+
+### B-141 — The client: connection, negotiation and keep-alive
+kind: code | size: 90 | status: ready | needs: [B-140]
+acceptance: `crates/mqtt/weida-mqtt` on `weida-runtime`: CONNECT as the first packet and CONNACK awaited before anything but AUTH, both declarative property sets exchanged with the server's Receive Maximum, Maximum QoS, Maximum Packet Size, Topic Alias Maximum and the five availability flags honoured — using an unavailable feature is this client's own error and never reaches the wire — Server Keep Alive overriding the client's value when present, PINGREQ sent when nothing else has been within the interval, and a server DISCONNECT's reason code surfaced as a named error rather than as a closed socket.
+note: workstream W3, worktree ../weida-w3, branch b141-mqtt-connection
+
+### B-142 — The session: Clean Start, Session Expiry, Session Present and takeover
+kind: code | size: 90 | status: ready | needs: [B-141]
+acceptance: the client half of the session state — QoS 1 and 2 messages sent but not fully acknowledged, QoS 2 messages received but not fully acknowledged — held across connections under one Client Identifier, Clean Start 1 discarding and Clean Start 0 resuming, `Session Present` 1 with no local state closing the connection and 0 with local state discarding it, Session Expiry Interval set on CONNECT and revised on DISCONNECT with "zero then non-zero is a Protocol Error" enforced before sending; retransmission happens **on reconnect only**, with the original packet identifiers and DUP 1, and a test asserts nothing is resent inside a live connection.
+note: workstream W3, worktree ../weida-w3, branch b142-mqtt-session
+
+### B-143 — QoS 1 and QoS 2 with the Receive Maximum quota
+kind: code | size: 90 | status: ready | needs: [B-142]
+acceptance: both delivery state machines in both directions — PUBLISH/PUBACK, and PUBLISH/PUBREC/PUBREL/PUBCOMP — over one packet-identifier space per direction per session, freed on PUBACK, PUBCOMP, a PUBREC of 0x80 or above, or SUBACK/UNSUBACK; the send quota is the peer's Receive Maximum counted in QoS 1 and 2 PUBLISH packets and nothing else, and exhausting it stalls the sender rather than exceeding it; a QoS 2 exchange interrupted by a reconnect completes across the resumed session with neither loss nor duplication, which is the test that earns this item.
+note: workstream W3, worktree ../weida-w3, branch b143-mqtt-qos
+
+### B-144 — Subscriptions: the `+` and `#` filters and the subscription options
+kind: code | size: 90 | status: ready | needs: [B-142]
+acceptance: SUBSCRIBE and UNSUBSCRIBE with per-filter options — maximum QoS, No Local, Retain As Published, Retain Handling 0/1/2 and 3 refused as a Protocol Error — plus an optional Subscription Identifier reported on every delivery it caused; matching asserted with the specification's own worked examples (`sport/tennis/player1/#` matching the parent level, `sport/+` matching `sport/` but not `sport`, `/finance` matching `+/+` and `/+` but not `+`, and a leading-wildcard filter never matching a `$` topic); a per-filter SUBACK reason code, and re-subscribing a filter replacing it without losing messages.
+note: workstream W3, worktree ../weida-w3, branch b144-mqtt-subscriptions
+
+### B-145 — Retained messages and the Will
+kind: code | size: 90 | status: ready | needs: [B-144]
+acceptance: publishing with RETAIN, a zero-byte retained payload as the delete that is itself not stored, and a receiver that can tell a retained delivery from a live one under both Retain As Published settings and all three Retain Handling values; the Will carried in CONNECT with its properties, QoS, retain flag and Will Delay Interval, discarded by DISCONNECT 0x00 and requested anyway by DISCONNECT 0x04 — with a test asserting the Will fires on an abortive close, does not on an orderly one, and is not published when the session is resumed inside its delay.
+note: workstream W3, worktree ../weida-w3, branch b145-mqtt-retain-will
+
+### B-146 — Shared subscriptions, topic aliases and request/response
+kind: code | size: 90 | status: ready | needs: [B-143, B-144]
+acceptance: `$share/{ShareName}/{filter}` subscribed **as a client**, with a ShareName containing none of `/`, `+`, `#`, No Local refused on it, and no retained message expected at subscribe; Topic Alias per direction and per connection, bounded by the peer's Topic Alias Maximum, established by a non-zero-length Topic Name, never zero and never carried across a reconnect; and request/response with Response Topic and Correlation Data, deriving the response topic from CONNACK's Response Information where the server offered it and saying so where it did not.
+note: workstream W3, worktree ../weida-w3, branch b146-mqtt-shared-alias-reqrep
+
+### B-147 — TLS and enhanced authentication
+kind: code | size: 60 | status: ready | needs: [B-141]
+acceptance: TLS on 8883 with the certificate configuration a client needs, User Name and Password in CONNECT including 5.0's password without a user name, and the AUTH exchange of 4.12 — a client that sets Authentication Method sends nothing but AUTH or DISCONNECT until CONNACK, and re-authentication over a live connection works; a server that does not implement AUTH is reported by its reason code rather than by a hang, which is the failure mode the sheet records for two large deployments.
+note: workstream W3, worktree ../weida-w3, branch b147-mqtt-tls-auth
+
+### B-148 — Interop against `rumqttd`, both roles
+kind: adapter | size: 90 | status: ready | needs: [B-143, B-145]
+acceptance: the client against `rumqttd` started through the process supervisor with a `ready` condition and stopped in the same item on success and on failure alike ([LOOP.md](LOOP.md) §2), over everything that broker implements — QoS 0, 1 and 2, retained messages, the Will, sessions and retransmission — with our client on both sides of the broker so publisher and subscriber roles are both ours; what `rumqttd` 0.20.0 cannot exercise is named in the test file rather than worked around, because its own checklist leaves MQTT 5 unchecked.
+note: workstream W3, worktree ../weida-w3, branch b148-mqtt-interop-rumqttd
+
+### B-149 — MQTT 5 interop against a 5.0 broker
+kind: adapter | size: 90 | status: ready | needs: [B-148]
+acceptance: everything B-148 cannot reach because its broker speaks 3.1.1 — properties end to end, reason codes, Session Expiry, shared subscriptions, topic aliases, Retain Handling and the availability flags — against a broker claiming full 5.0 support (Mosquitto), under the supervisor and stopped in the same item, `#[ignore]` with the install command in the doc comment where it is absent ([LOOP.md](LOOP.md) §2); every disagreement is recorded as measured against a named version rather than inferred.
+note: workstream W3, worktree ../weida-w3, branch b149-mqtt-interop-mqtt5
+
+### B-150 — The parity table against MQTT 5.0
+kind: spec | size: 60 | status: ready | needs: [B-146, B-148]
+acceptance: `docs/libraries/mqtt.md` in the shape `docs/libraries/zmq.md` set — every packet type, every property, every subscription option, every reason-code group, the three QoS levels and the transports, each present, refused-with-reason or absent-with-reason — with the client/broker line of [0014](decisions/0014-parallel-libraries.md) drawn explicitly so a reader learns why there is no server column; no row says "partial" without naming what is missing.
+note: workstream W3, worktree ../weida-w3, branch b150-mqtt-parity
+
+### B-151 — `weida-mqtt-py`: the asyncio surface
+kind: code | size: 90 | status: ready | needs: [B-111, B-148]
+acceptance: `crates/mqtt/weida-mqtt-py` on `weida-py-core`: connect, publish, subscribe and an async iterator of deliveries carrying topic, QoS, the retain flag, the properties and the subscription identifiers, with reason codes as distinct exception classes; a QoS 2 publish awaited to its PUBCOMP from Python, and the whole round trip run against the broker B-148 supervises.
+note: workstream W3, worktree ../weida-w3, branch b151-mqtt-py-asyncio
+
+### B-152 — `weida-mqtt-py`: the sync surface
+kind: code | size: 60 | status: ready | needs: [B-151]
+acceptance: the synchronous Python surface over the same client, no asyncio loop required in the process and no second implementation of any protocol behaviour, with a receive timeout where the async surface has cancellation; B-151's QoS 2 round trip runs unchanged in synchronous form.
+note: workstream W3, worktree ../weida-w3, branch b152-mqtt-py-sync
+
+### B-153 — Research: what the MQTT implementation taught the sheet
+kind: research | size: 45 | status: ready | needs: [B-149]
+acceptance: [research/mqtt5.md](research/mqtt5.md) updated with what building the client and running it against two brokers established, in the sheet's own protocol-native vocabulary and with no sentence mentioning weida ([research/README.md](research/README.md) rule 1), every addition attributed to a new numbered source naming the broker versions and what was observed; §13's incompatibility list gains what the runs measured, and the specification's two internal inconsistencies are marked confirmed or not by an implementation that had to choose between them.
+note: workstream W3, worktree ../weida-w3, branch b153-mqtt-sheet-update
+
+### B-154 — `weida-amqp-codec`: the AMQP 1.0 type system
+kind: adapter | size: 90 | status: in_progress (delegated) 2026-09-12T02:18Z | needs: []
+acceptance: `crates/amqp/weida-amqp-codec` with an **empty `[dependencies]`**: the Part 1 primitive types with their format codes in fixed and variable width, described types, composite types, arrays, lists and maps, decoded from every form the specification permits and encoded in one canonical form; golden vectors from the specification's own examples, a fuzz target, and nothing allocated before a declared size or element count is checked against a caller-supplied bound — a list header declares its count, which is remote input.
+note: workstream W4, worktree ../weida-w4, branch b154-amqp-types
+
+### B-155 — The frame header and the nine performatives
+kind: adapter | size: 90 | status: ready | needs: [B-154]
+acceptance: the 8-byte frame header (`SIZE`, `DOFF`, `TYPE`, two type-specific bytes) with `SIZE` < 8 or `DOFF` < 2 malformed and the extended header skipped, AMQP (`0x00`) and SASL (`0x01`) frames distinguished, the 8-octet protocol headers for `%d0`, `%d2` and `%d3`, and all nine performatives — `open` `0x10` through `close` `0x18` — plus the SASL bodies encoded and decoded as described types; a golden vector per performative, the fuzz target extended, and the 512-octet pre-negotiation minimum honoured as the bound before `open` has been read.
+note: workstream W4, worktree ../weida-w4, branch b155-amqp-performatives
+
+### B-156 — The message sections and the delivery states
+kind: adapter | size: 60 | status: ready | needs: [B-155]
+acceptance: header, delivery-annotations, message-annotations, properties, application-properties, the three body forms (`data`, `amqp-sequence`, `amqp-value`) and footer encoded and decoded in the order the specification fixes, plus the terminal delivery states `accepted`, `rejected` with its error, `released` and `modified` with its flags; a multi-frame message is reassembled from its transfer fragments and bounded before allocation by a caller-supplied `max-message-size`.
+note: workstream W4, worktree ../weida-w4, branch b156-amqp-message
+
+### B-157 — The client: version negotiation, SASL, TLS and `open`
+kind: code | size: 90 | status: ready | needs: [B-155]
+acceptance: `crates/amqp/weida-amqp` on `weida-runtime`: the 8-octet header sent immediately on connect and the partner's answer read as its demand — a `%d3` reply to a `%d0` request means a security layer is mandatory, and the client reports that rather than retrying blind — the SASL dialog with ANONYMOUS and PLAIN inside 512-octet frames and all five outcome codes, TLS layered by `%d2` or reached as a bare `amqps` listener, then `open` on channel 0 with `container-id`, `max-frame-size`, `channel-max` and `idle-time-out`; the idle timeout is answered with an empty frame at half the advertised interval, and `close` is the last thing ever written.
+note: workstream W4, worktree ../weida-w4, branch b157-amqp-connection
+
+### B-158 — The session: `begin`, `end` and the session windows
+kind: code | size: 90 | status: ready | needs: [B-157]
+acceptance: a session begun on the lowest free outgoing channel and answered with `remote-channel`, the two directions numbered independently, the six flow-control variables maintained so the peer's `incoming-window` is never exceeded, `end` with and without an error, and the `DISCARDING` state silently discarding input until the partner's `end` instead of acting on it; a test drives the window to zero and asserts the sender stalls rather than overruns, and a frame on an unmapped channel ends the session with the error the specification names.
+note: workstream W4, worktree ../weida-w4, branch b158-amqp-session
+
+### B-159 — The link: `attach`, `detach`, termini and the settle modes
+kind: code | size: 90 | status: ready | needs: [B-158]
+acceptance: links attached in both directions with a name unique among the links of that direction between the two containers, `source` and `target` termini carrying `address`, `durable`, `expiry-policy`, `timeout` and `dynamic`, handles allocated lowest-free with an `attach` on a handle in use answered by `close` carrying `amqp:session:handle-in-use`, `snd-settle-mode` and `rcv-settle-mode` negotiated, and an errored link endpoint detached with its error and its handle never silently reused; a second attach of the same link name steals it and the loser is closed with `amqp:link:stolen`.
+note: workstream W4, worktree ../weida-w4, branch b159-amqp-link
+
+### B-160 — `transfer` and link credit
+kind: code | size: 90 | status: ready | needs: [B-156, B-159]
+acceptance: link credit counted in **messages** and granted only by the receiver through `flow`, with `delivery-count` and `link-credit` maintained at both ends, `drain` honoured and `echo` answered; a sender with no credit stalls instead of sending, transfers with `more` set reassemble into one delivery that never interleaves with another on the same link, `max-message-size` is refused before allocation, and the session's transfer window applies **on top of** the link's credit, because the two schemes are independent and simultaneously active.
+note: workstream W4, worktree ../weida-w4, branch b160-amqp-transfer-credit
+
+### B-161 — Dispositions, settlement and the unsettled map
+kind: code | size: 90 | status: ready | needs: [B-160]
+acceptance: an unsettled map at each end with settlement idempotent and one-way, `disposition` over ranges of delivery-ids carrying `accepted`, `rejected`, `released` or `modified`, and each settle-mode combination behaving as specified — settled on send, settled on disposition, and the `second` dance where the receiver waits for the sender's settlement; each test asserts what the mode *proves* to the application (the message is durable-or-not, the peer will or will not redeliver) rather than that a frame arrived.
+note: workstream W4, worktree ../weida-w4, branch b161-amqp-disposition
+
+### B-162 — Interop against `fe2o3-amqp` and RabbitMQ
+kind: adapter | size: 90 | status: ready | needs: [B-161]
+acceptance: sender and receiver roles against `fe2o3-amqp` as the pure-Rust peer that always runs, plus RabbitMQ 4.x — which speaks 1.0 natively on 5672 — under the process supervisor and `#[ignore]` with the reason where it is absent ([LOOP.md](LOOP.md) §2); the four things the sheet says implementations refuse are probed rather than assumed — `rcv-settle-mode=second`, transactions, link resumption and terminus expiry — and each outcome, including the address syntax each peer demanded, is recorded as measured against a named version.
+note: workstream W4, worktree ../weida-w4, branch b162-amqp-interop
+
+### B-163 — The parity table against the OASIS core
+kind: spec | size: 60 | status: ready | needs: [B-162]
+acceptance: `docs/libraries/amqp.md` in the shape `docs/libraries/zmq.md` set — every performative, every message section, both credit schemes, the settle modes and delivery states, the SASL mechanisms and the transports, each present, refused-with-reason or absent-with-reason — with Part 4 transactions, link resumption and the three coexisting filter families named absent and the evidence for why, and the client/broker line of [0014](decisions/0014-parallel-libraries.md) stated once; no row says "partial" without naming what is missing.
+note: workstream W4, worktree ../weida-w4, branch b163-amqp-parity
+
+### B-164 — `weida-nats-codec`: the text protocol
+kind: adapter | size: 90 | status: ready | needs: []
+acceptance: `crates/nats/weida-nats-codec` with an **empty `[dependencies]`**: `INFO`, `CONNECT`, `PUB`, `HPUB`, `SUB`, `UNSUB`, `MSG`, `HMSG`, `PING`, `PONG`, `+OK` and `-ERR` encoded and decoded, CRLF-delimited with the declared byte count read before the payload and the payload never scanned for a terminator, the `NATS/1.0` header block with repeated names and preserved case, and a caller-supplied `max_payload` checked from the declared count before any allocation; a golden vector per verb and a fuzz target.
+note: workstream W4, worktree ../weida-w4, branch b164-nats-codec
+
+### B-165 — The client: `INFO`, `CONNECT`, TLS and the pings
+kind: code | size: 90 | status: ready | needs: [B-164]
+acceptance: `crates/nats/weida-nats` on `weida-runtime`: the server's `INFO` read first, `CONNECT` answered with the selected capabilities and one of token, user and password, JWT, or an NKey signature over the server's nonce; TLS completed before ordinary traffic where `INFO` requires it; `PING`/`PONG` in both directions with the number of unanswered pings bounded rather than infinite; later asynchronous `INFO` handled outside the handshake, including `connect_urls` and the `ldm: true` drain notice; and the server's `max_payload` enforced locally so an oversized publish fails before the wire.
+note: workstream W4, worktree ../weida-w4, branch b165-nats-connection
+
+### B-166 — Subscriptions, subject matching and queue groups
+kind: code | size: 90 | status: ready | needs: [B-165]
+acceptance: `SUB` with a client-chosen `sid` and an optional queue group, `UNSUB` with and without a message count, `MSG`/`HMSG` dispatched to the subscription that asked for it, and subject matching where `*` is exactly one token and `>` is one or more trailing tokens and must be last — `orders.*` matching `orders.created` and not `orders.eu.created`, `orders.>` matching both; two subscribers in one queue group receive one copy between them per publication while an ordinary subscriber beside them receives its own, which is the test that separates a group from a subject.
+note: workstream W4, worktree ../weida-w4, branch b166-nats-subscriptions
+
+### B-167 — Request-reply over an inbox
+kind: code | size: 60 | status: ready | needs: [B-166]
+acceptance: a request publishes with a reply-to subject under a unique `_INBOX.` prefix and the responder answers on it by ordinary subject interest with no hidden correlation field, the requester's timeout is its own and always bounded, and the scatter-gather form collects several responses inside one window; with `no_responders` and headers negotiated, a request with no responder returns that status immediately instead of waiting out the timeout, and the test asserts the difference between the two outcomes rather than only the happy path.
+note: workstream W4, worktree ../weida-w4, branch b167-nats-request-reply
+
+### B-168 — Interop against `nats-server`
+kind: adapter | size: 90 | status: ready | needs: [B-167]
+acceptance: publish, subscribe, queue groups and request-reply against `nats-server` started through the process supervisor with a `ready` condition and stopped in the same item on success and on failure alike, with an `async-nats` peer on the other side of that server for every case so the exchange is ours against an independent client rather than ours against ourselves; where the `nats-server` binary is absent the whole file is `#[ignore]` with the install command in its doc comment ([LOOP.md](LOOP.md) §2), and the item states plainly that there is no pure-Rust substitute — an `async-nats` peer is a client and needs the same server — so absence means no interop rather than a weaker one.
+note: workstream W4, worktree ../weida-w4, branch b168-nats-interop
+
+### B-169 — The parity table against Core NATS
+kind: spec | size: 45 | status: ready | needs: [B-168]
+acceptance: `docs/libraries/nats.md` in the shape `docs/libraries/zmq.md` set: every client verb, the two subject wildcards, queue groups, request-reply with inboxes, the authentication mechanisms and the transports, each present, refused-with-reason or absent-with-reason; JetStream, clusters, gateways and leaf nodes are named absent as server features with what a client would need to reach them, and the client/broker line of [0014](decisions/0014-parallel-libraries.md) is stated once.
+note: workstream W4, worktree ../weida-w4, branch b169-nats-parity
+
+### B-170 — `weida-amqp-py`: the asyncio surface
+kind: code | size: 90 | status: ready | needs: [B-111, B-162]
+acceptance: `crates/amqp/weida-amqp-py` on `weida-py-core`: connection, session and link as Python objects, `await send` returning the delivery's terminal state rather than a boolean, an async iterator of received deliveries with their sections and annotations, credit granted explicitly from Python, and AMQP error conditions as distinct exception classes; a send awaited to `accepted` and a receive settled from Python both run against the peer of B-162.
+note: workstream W4, worktree ../weida-w4, branch b170-amqp-py-asyncio
+
+### B-171 — `weida-amqp-py`: the sync surface
+kind: code | size: 45 | status: ready | needs: [B-170]
+acceptance: the synchronous Python surface over the same client with no asyncio loop required in the process and no second implementation of any protocol behaviour, a receive timeout where the async surface has cancellation; B-170's send-to-`accepted` runs unchanged in synchronous form.
+note: workstream W4, worktree ../weida-w4, branch b171-amqp-py-sync
+
+### B-172 — `weida-nats-py`: the asyncio surface
+kind: code | size: 90 | status: ready | needs: [B-111, B-168]
+acceptance: `crates/nats/weida-nats-py` on `weida-py-core`: connect, publish with optional headers, subscribe returning an async iterator of messages with subject, `sid`, reply-to and payload, queue-group membership, `unsubscribe` with a message count, and `request` with a mandatory timeout that raises rather than hangs — the no-responder status among the exception classes; the round trip runs against the server B-168 supervises.
+note: workstream W4, worktree ../weida-w4, branch b172-nats-py-asyncio
+
+### B-173 — `weida-nats-py`: the sync surface
+kind: code | size: 45 | status: ready | needs: [B-172]
+acceptance: the synchronous Python surface over the same client with no asyncio loop required and no second implementation of any protocol behaviour, subscriptions drained by a blocking `next_msg(timeout)`; B-172's request-reply runs unchanged in synchronous form.
+note: workstream W4, worktree ../weida-w4, branch b173-nats-py-sync
+
+### B-174 — Research: what the AMQP and NATS implementations taught their sheets
+kind: research | size: 45 | status: ready | needs: [B-162, B-168]
+acceptance: [research/amqp10.md](research/amqp10.md) and [research/nats.md](research/nats.md) updated with what building the two clients and running them against foreign peers established, each in its own sheet's protocol-native vocabulary and with no sentence mentioning weida ([research/README.md](research/README.md) rule 1), every addition attributed to a new numbered source naming the peer versions and what was observed; the AMQP sheet's "known incompatibilities" list gains what the RabbitMQ run measured, and every claim the runs could **not** settle is left standing as an open question rather than quietly resolved.
+note: workstream W4, worktree ../weida-w4, branch b174-amqp-nats-sheet-update
