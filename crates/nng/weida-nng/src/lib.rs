@@ -131,6 +131,7 @@ pub mod reqrep;
 pub mod session;
 pub mod socket;
 pub mod survey;
+pub mod tls;
 pub mod transport;
 
 pub use bus::BusSocket;
@@ -170,3 +171,4 @@ pub use transport::Stream;
 pub use inproc::{INPROC_BUFFER_BYTES, Inproc, InprocBinding, InprocDial};
 #[cfg(unix)]
 pub use ipc::IpcBinding;
+pub use tls::{AuthMode, TlsConfig, TlsPeer};

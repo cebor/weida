@@ -175,6 +175,13 @@ pub struct PipeInfo {
     /// an observation that must not be authorized on
     /// ([0010](../../../docs/decisions/0010-local-transport.md) §4.4).
     pub credentials: Option<weida_core::LocalPrincipal>,
+    /// What TLS established about the peer, for the one transport where
+    /// that question has an answer.
+    ///
+    /// `Some` only for `tls+tcp://`. It authenticates the transport peer
+    /// of this one connection and terminates there, and no API turns it
+    /// into a sender identity — see [`crate::tls`].
+    pub tls: Option<crate::tls::TlsPeer>,
 }
 
 /// A callback's answer to [`PipeEvent::AddPre`].
@@ -660,6 +667,7 @@ impl Engine {
                     local_addr: stream.local_addr(),
                     remote_addr: stream.remote_addr(),
                     credentials: stream.peer_credentials(),
+                    tls: stream.tls_peer(),
                 },
                 admitted: false,
                 dialer,
@@ -943,6 +951,45 @@ async fn connect(engine: &Engine, endpoint: &Endpoint) -> Result<Stream> {
             }
             Err(last)
         }
+        Endpoint::TlsTcp { host, port } => {
+            let Some(tls) = options.tls.as_ref() else {
+                return Err(Error::EINVAL(
+                    "a tls+tcp endpoint needs SocketOptions::tls; a TLS transport with no \
+                     configuration is a TCP transport with a longer name"
+                        .into(),
+                ));
+            };
+            // The name the peer's certificate is checked against: the
+            // option where one is set, otherwise the URL's host, which is
+            // what NNG validates (§1). An address carries no name, so an
+            // endpoint that has neither is refused rather than dialled
+            // with nothing to verify.
+            let name = match (tls.server_name.as_deref(), host) {
+                (Some(name), _) => name.to_owned(),
+                (None, TcpHost::Name(name)) => name.clone(),
+                (None, other) => {
+                    return Err(Error::EADDRINVAL(
+                        format!(
+                            "tls+tcp://{other}:{port} names no host, so there is nothing for a \
+                             certificate to be checked against; set \
+                             NNG_OPT_TLS_SERVER_NAME (SocketOptions::tls.server_name)"
+                        )
+                        .into(),
+                    ));
+                }
+            };
+            let mut last = Error::EADDRINVAL("no address to dial".into());
+            for addr in addresses(&engine.inner.exec, host, *port, options.max_addresses).await? {
+                match TcpStream::connect(addr).await {
+                    Ok(stream) => {
+                        let (tls_stream, peer) = crate::tls::connect(tls, &name, stream).await?;
+                        return Ok(Stream::tls(tls_stream, peer));
+                    }
+                    Err(error) => last = Error::from(error),
+                }
+            }
+            Err(last)
+        }
         Endpoint::Inproc(name) => {
             // NNG's inproc dialer retries rather than failing outright, so
             // a dial to a name nobody holds waits for the bind. The wait is
@@ -966,13 +1013,18 @@ async fn connect(engine: &Engine, endpoint: &Endpoint) -> Result<Stream> {
             let principal = crate::ipc::credentials(&stream)?;
             Ok(Stream::unix(stream, principal))
         }
-        other => Err(unsupported(other)),
+        #[cfg(not(unix))]
+        Endpoint::Ipc(_) => Err(unsupported(endpoint)),
     }
 }
 
 /// One listening endpoint, whichever transport it is on.
 enum Bound {
     Tcp(TcpListener),
+    Tls {
+        listener: TcpListener,
+        config: Box<crate::tls::TlsConfig>,
+    },
     Inproc(crate::inproc::InprocBinding),
     #[cfg(unix)]
     Ipc(crate::ipc::IpcBinding),
@@ -986,6 +1038,11 @@ impl Bound {
             Bound::Tcp(listener) => {
                 let (stream, _) = listener.accept().await.map_err(Error::from)?;
                 Ok(Stream::tcp(stream))
+            }
+            Bound::Tls { listener, config } => {
+                let (stream, _) = listener.accept().await.map_err(Error::from)?;
+                let (tls, peer) = crate::tls::accept(config, stream).await?;
+                Ok(Stream::tls(tls, peer))
             }
             Bound::Inproc(binding) => match binding.accept().await {
                 Some(dial) => Ok(dial.stream),
@@ -1013,6 +1070,13 @@ impl Bound {
             (Bound::Tcp(listener), Endpoint::Tcp { host, .. }) => {
                 let local = listener.local_addr().map_err(Error::from)?;
                 Ok(Endpoint::Tcp {
+                    host: host.clone(),
+                    port: local.port(),
+                })
+            }
+            (Bound::Tls { listener, .. }, Endpoint::TlsTcp { host, .. }) => {
+                let local = listener.local_addr().map_err(Error::from)?;
+                Ok(Endpoint::TlsTcp {
                     host: host.clone(),
                     port: local.port(),
                 })
@@ -1053,10 +1117,43 @@ async fn bind(engine: &Engine, endpoint: &Endpoint) -> Result<Bound> {
                 .map(Bound::Tcp)
                 .map_err(Error::from)
         }
+        Endpoint::TlsTcp { host, port } => {
+            let Some(config) = engine.inner.options.tls.as_ref() else {
+                return Err(Error::EINVAL(
+                    "a tls+tcp listener needs SocketOptions::tls with a certificate and key".into(),
+                ));
+            };
+            // Refused here rather than at the first connection: a listener
+            // that cannot present a certificate would accept connections
+            // and then fail every one of them.
+            config.validate(true)?;
+            let addr = match host {
+                TcpHost::Any => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), *port),
+                TcpHost::Ip(ip) => SocketAddr::new(*ip, *port),
+                TcpHost::Name(name) => {
+                    let ip: IpAddr = name.parse().map_err(|_| {
+                        Error::EADDRINVAL(
+                            format!(
+                                "cannot listen on {name:?}: a listening address must be an IP \
+                                 literal or *"
+                            )
+                            .into(),
+                        )
+                    })?;
+                    SocketAddr::new(ip, *port)
+                }
+            };
+            let listener = TcpListener::bind(addr).await.map_err(Error::from)?;
+            Ok(Bound::Tls {
+                listener,
+                config: Box::new(config.clone()),
+            })
+        }
         Endpoint::Inproc(name) => engine.inner.inproc.bind(name).map(Bound::Inproc),
         #[cfg(unix)]
         Endpoint::Ipc(path) => crate::ipc::IpcBinding::bind(path).map(Bound::Ipc),
-        other => Err(unsupported(other)),
+        #[cfg(not(unix))]
+        Endpoint::Ipc(_) => Err(unsupported(endpoint)),
     }
 }
 
@@ -1075,6 +1172,12 @@ async fn addresses(
     })
 }
 
+/// A transport this build cannot carry, refused by name rather than
+/// accepted and dropped somewhere quieter.
+///
+/// Only reachable where the platform lacks `AF_UNIX`: every transport
+/// `Endpoint` parses is carried otherwise.
+#[cfg(not(unix))]
 fn unsupported(endpoint: &Endpoint) -> Error {
     Error::ENOTSUP(
         format!(
@@ -1438,14 +1541,13 @@ mod tests {
         assert!(matches!(error, Error::ECLOSED(_)), "{error:?}");
     }
 
-    /// Claim: a transport this engine does not carry is refused by name
-    /// rather than accepted and quietly dropped, because SP's only way to
-    /// refuse anything is a close and a silent one is a hang (§6).
-    ///
-    /// `tls+tcp` parses — a URL is not a capability — and is refused here
-    /// until the slice that carries it lands.
+    /// Claim: every transport an [`Endpoint`] parses is carried, and a
+    /// `tls+tcp` endpoint with no TLS configuration is refused **where it
+    /// is configured** rather than accepted and failed at the first
+    /// connection — a TLS transport with no configuration is a TCP
+    /// transport with a longer name.
     #[tokio::test]
-    async fn an_uncarried_transport_is_refused_by_name() {
+    async fn a_tls_endpoint_without_a_configuration_is_refused() {
         let ctx = Context::new(ContextConfig::default()).expect("context");
         let seen = counter();
         let socket = engine(&ctx, EndpointType::Bus, SocketOptions::default(), &seen);
@@ -1453,13 +1555,19 @@ mod tests {
             .listen(&Endpoint::parse("tls+tcp://127.0.0.1:0").unwrap())
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::ENOTSUP(_)), "{error:?}");
-        assert!(error.cause().contains("tls+tcp"));
+        assert!(matches!(error, Error::EINVAL(_)), "{error:?}");
+        assert!(error.cause().contains("certificate"));
 
-        // And the two that are now carried are not refused.
+        // And the transports that need no configuration are not refused.
         assert!(
             socket
                 .listen(&Endpoint::parse("inproc://orders").unwrap())
+                .await
+                .is_ok()
+        );
+        assert!(
+            socket
+                .listen(&Endpoint::parse("tcp://127.0.0.1:0").unwrap())
                 .await
                 .is_ok()
         );

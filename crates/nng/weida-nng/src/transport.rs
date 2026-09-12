@@ -32,6 +32,13 @@ pub struct Stream(Inner);
 #[derive(Debug)]
 enum Inner {
     Tcp(TcpStream),
+    /// Boxed because a TLS session's buffers make this variant an order of
+    /// magnitude larger than the others, and every `Stream` would
+    /// otherwise carry that weight.
+    Tls {
+        stream: Box<tokio_rustls::TlsStream<TcpStream>>,
+        peer: crate::tls::TlsPeer,
+    },
     Inproc(DuplexStream),
     #[cfg(unix)]
     Unix {
@@ -75,6 +82,27 @@ impl Stream {
         Stream(Inner::Unix { stream, principal })
     }
 
+    /// Wraps an established TLS connection together with what the
+    /// handshake established about its peer.
+    pub fn tls(stream: tokio_rustls::TlsStream<TcpStream>, peer: crate::tls::TlsPeer) -> Stream {
+        Stream(Inner::Tls {
+            stream: Box::new(stream),
+            peer,
+        })
+    }
+
+    /// What TLS established about this connection's peer, for the one
+    /// transport where that question has an answer.
+    ///
+    /// It authenticates the transport peer of this one connection and
+    /// terminates there; see [`crate::tls`].
+    pub fn tls_peer(&self) -> Option<crate::tls::TlsPeer> {
+        match &self.0 {
+            Inner::Tls { peer, .. } => Some(peer.clone()),
+            _ => None,
+        }
+    }
+
     /// The credentials the kernel attributes to this connection's peer.
     ///
     /// `None` for every transport where there is no such fact: TCP has an
@@ -93,6 +121,7 @@ impl Stream {
     pub const fn transport(&self) -> &'static str {
         match &self.0 {
             Inner::Tcp(_) => "tcp",
+            Inner::Tls { .. } => "tls+tcp",
             Inner::Inproc(_) => "inproc",
             #[cfg(unix)]
             Inner::Unix { .. } => "ipc",
@@ -104,6 +133,9 @@ impl Stream {
     pub fn local_addr(&self) -> Option<String> {
         match &self.0 {
             Inner::Tcp(stream) => stream.local_addr().ok().map(|a| a.to_string()),
+            Inner::Tls { stream, .. } => {
+                stream.get_ref().0.local_addr().ok().map(|a| a.to_string())
+            }
             Inner::Inproc(_) => None,
             #[cfg(unix)]
             Inner::Unix { stream, .. } => stream
@@ -121,6 +153,7 @@ impl Stream {
     pub fn remote_addr(&self) -> Option<String> {
         match &self.0 {
             Inner::Tcp(stream) => stream.peer_addr().ok().map(|a| a.to_string()),
+            Inner::Tls { stream, .. } => stream.get_ref().0.peer_addr().ok().map(|a| a.to_string()),
             Inner::Inproc(_) => None,
             #[cfg(unix)]
             Inner::Unix { stream, .. } => stream
@@ -139,6 +172,7 @@ impl AsyncRead for Stream {
     ) -> Poll<io::Result<()>> {
         match &mut self.get_mut().0 {
             Inner::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            Inner::Tls { stream, .. } => Pin::new(stream.as_mut()).poll_read(cx, buf),
             Inner::Inproc(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(unix)]
             Inner::Unix { stream, .. } => Pin::new(stream).poll_read(cx, buf),
@@ -154,6 +188,7 @@ impl AsyncWrite for Stream {
     ) -> Poll<io::Result<usize>> {
         match &mut self.get_mut().0 {
             Inner::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            Inner::Tls { stream, .. } => Pin::new(stream.as_mut()).poll_write(cx, buf),
             Inner::Inproc(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(unix)]
             Inner::Unix { stream, .. } => Pin::new(stream).poll_write(cx, buf),
@@ -163,6 +198,7 @@ impl AsyncWrite for Stream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.get_mut().0 {
             Inner::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            Inner::Tls { stream, .. } => Pin::new(stream.as_mut()).poll_flush(cx),
             Inner::Inproc(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(unix)]
             Inner::Unix { stream, .. } => Pin::new(stream).poll_flush(cx),
@@ -172,6 +208,7 @@ impl AsyncWrite for Stream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.get_mut().0 {
             Inner::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            Inner::Tls { stream, .. } => Pin::new(stream.as_mut()).poll_shutdown(cx),
             Inner::Inproc(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(unix)]
             Inner::Unix { stream, .. } => Pin::new(stream).poll_shutdown(cx),
