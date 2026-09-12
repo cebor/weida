@@ -75,7 +75,16 @@ pub fn errno_of(error: Error) -> Errno {
 
 /// Turns an [`Errno`] into this module's exception. The
 /// [`ErrnoMapper`](weida_py_core::ErrnoMapper) every [`Bridge`] here holds.
+///
+/// One name is not an errno and not an error: the marker
+/// [`STOP_ASYNC_ITERATION`](crate::monitor::STOP_ASYNC_ITERATION), which a
+/// monitor's end uses. An `async for` that ends is not a failure, and Python
+/// spells the end of an async iteration with an exception, so this is where
+/// the two meet. Every other name is looked up in the family.
 pub fn to_py(py: Python<'_>, errno: &Errno) -> PyErr {
+    if errno.name() == crate::monitor::STOP_ASYNC_ITERATION {
+        return pyo3::exceptions::PyStopAsyncIteration::new_err(errno.cause().to_owned());
+    }
     ERRORS.error(py, errno)
 }
 

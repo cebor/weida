@@ -71,18 +71,18 @@ pub const CONTROL_STATISTICS: &[u8] = b"STATISTICS";
 /// that cannot do one half reports `ENOTSUP` for it — a PULL socket does not
 /// send and a PUSH socket does not receive, which is `zmq_socket(3)`'s own
 /// table rather than a limitation here.
-#[expect(
-    async_fn_in_trait,
-    reason = "the implementors are this crate's own socket types, which are \
-              !Sync by libzmq's thread rule, so no caller can need a Send bound \
-              this trait does not have"
-)]
+/// The futures are **`Send`**, and that is written out rather than left to
+/// `async fn` in a trait: a socket is `!Sync` but it is `Send`, and a
+/// `&mut socket` future is therefore `Send` too, so a device may be driven on
+/// a multi-thread executor — which every caller outside `block_on` needs,
+/// `weida-zmq-py`'s `proxy` among them. An `async fn` in a trait promises no
+/// such bound and cannot be spawned at all.
 pub trait Device {
     /// Receives one whole message, waiting for one.
-    async fn recv(&mut self) -> Result<Multipart>;
+    fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send;
 
     /// Sends one whole message.
-    async fn send(&mut self, message: Multipart) -> Result<()>;
+    fn send(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// A socket type that receives but does not send, and one that sends but does
@@ -90,70 +90,70 @@ pub trait Device {
 macro_rules! one_way_device {
     ($socket:ty, recv_only) => {
         impl Device for $socket {
-            async fn recv(&mut self) -> Result<Multipart> {
-                <$socket>::recv(self).await
+            fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
+                <$socket>::recv(self)
             }
 
-            async fn send(&mut self, _message: Multipart) -> Result<()> {
-                Err(Error::ENOTSUP(
+            fn send(&mut self, _message: Multipart) -> impl Future<Output = Result<()>> + Send {
+                std::future::ready(Err(Error::ENOTSUP(
                     concat!(
                         "a ",
                         stringify!($socket),
                         " does not send, so it can only be the frontend a device reads"
                     )
                     .into(),
-                ))
+                )))
             }
         }
     };
     ($socket:ty, publish_only) => {
         impl Device for $socket {
-            async fn recv(&mut self) -> Result<Multipart> {
-                Err(Error::ENOTSUP(
+            fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
+                std::future::ready(Err(Error::ENOTSUP(
                     concat!(
                         "a ",
                         stringify!($socket),
                         " does not receive, so it can only be the backend a device writes"
                     )
                     .into(),
-                ))
+                )))
             }
 
-            async fn send(&mut self, message: Multipart) -> Result<()> {
+            fn send(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send {
                 // A publisher drops at the high-water mark rather than
                 // blocking, which 29/PUBSUB requires; the report says how
                 // many peers took it and the proxy does not turn a drop into
                 // an error.
                 <$socket>::publish(self, message);
-                Ok(())
+                std::future::ready(Ok(()))
             }
         }
     };
 }
 
 impl Device for PairSocket {
-    async fn recv(&mut self) -> Result<Multipart> {
-        PairSocket::recv(self).await
+    fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
+        PairSocket::recv(self)
     }
 
-    async fn send(&mut self, message: Multipart) -> Result<()> {
-        PairSocket::send(self, message).await
+    fn send(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send {
+        PairSocket::send(self, message)
     }
 }
 
 impl Device for DealerSocket {
-    async fn recv(&mut self) -> Result<Multipart> {
-        DealerSocket::recv(self).await
+    fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
+        DealerSocket::recv(self)
     }
 
-    async fn send(&mut self, message: Multipart) -> Result<()> {
-        DealerSocket::send(self, message).await
+    fn send(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send {
+        DealerSocket::send(self, message)
     }
 }
 
 impl Device for RouterSocket {
-    async fn recv(&mut self) -> Result<Multipart> {
-        RouterSocket::recv(self).await
+    fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
+        RouterSocket::recv(self)
     }
 
     /// The routing id is the first frame, which is exactly what a ROUTER's
@@ -165,26 +165,26 @@ impl Device for RouterSocket {
 }
 
 impl Device for XSubSocket {
-    async fn recv(&mut self) -> Result<Multipart> {
-        XSubSocket::recv(self).await
+    fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
+        XSubSocket::recv(self)
     }
 
     /// An XSUB sends subscriptions upstream, and a pub-sub proxy's XSUB is
     /// where the subscriptions its XPUB read are forwarded.
-    async fn send(&mut self, message: Multipart) -> Result<()> {
+    fn send(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send {
         XSubSocket::send(self, message);
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 
 impl Device for XPubSocket {
-    async fn recv(&mut self) -> Result<Multipart> {
-        XPubSocket::recv(self).await
+    fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
+        XPubSocket::recv(self)
     }
 
-    async fn send(&mut self, message: Multipart) -> Result<()> {
+    fn send(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send {
         XPubSocket::publish(self, message);
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
 
@@ -193,14 +193,14 @@ one_way_device!(SubSocket, recv_only);
 one_way_device!(PubSocket, publish_only);
 
 impl Device for PushSocket {
-    async fn recv(&mut self) -> Result<Multipart> {
-        Err(Error::ENOTSUP(
+    fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
+        std::future::ready(Err(Error::ENOTSUP(
             "a PUSH socket does not receive, so it can only be the backend a device writes".into(),
-        ))
+        )))
     }
 
-    async fn send(&mut self, message: Multipart) -> Result<()> {
-        PushSocket::send(self, message).await
+    fn send(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send {
+        PushSocket::send(self, message)
     }
 }
 

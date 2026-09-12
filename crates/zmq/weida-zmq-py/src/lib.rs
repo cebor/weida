@@ -61,9 +61,11 @@
 use pyo3::prelude::*;
 
 mod context;
+mod devices;
 mod errors;
 mod identity;
 mod lease;
+mod monitor;
 mod ops;
 mod options;
 mod sockets;
@@ -95,6 +97,12 @@ fn weida_zmq(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<identity::PyPeer>()?;
     module.add_function(pyo3::wrap_pyfunction!(identity::curve_keypair, module)?)?;
     module.add("ZAP_ENDPOINT", ::weida_zmq::ZAP_ENDPOINT)?;
+    module.add_class::<monitor::PyMonitor>()?;
+    module.add_class::<monitor::PyMonitorEvent>()?;
+    module.add_class::<devices::PyProxyStatistics>()?;
+    module.add_function(pyo3::wrap_pyfunction!(devices::proxy, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(devices::proxy_steerable, module)?)?;
+    devices::controls(module)?;
     module.add("DEFAULT_MAX_SOCKETS", ::weida_zmq::DEFAULT_MAX_SOCKETS)?;
     module.add_class::<sockets::Discarded>()?;
     module.add_class::<values::PyMultipart>()?;
@@ -149,6 +157,15 @@ fn every_name() -> Vec<&'static str> {
         "Peer",
         "curve_keypair",
         "ZAP_ENDPOINT",
+        "Monitor",
+        "MonitorEvent",
+        "ProxyStatistics",
+        "proxy",
+        "proxy_steerable",
+        "CONTROL_PAUSE",
+        "CONTROL_RESUME",
+        "CONTROL_TERMINATE",
+        "CONTROL_STATISTICS",
         "ZmqOption",
         "SocketOptions",
         "ContextOptions",

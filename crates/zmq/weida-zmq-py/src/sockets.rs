@@ -72,6 +72,38 @@ impl Discarded {
     }
 }
 
+/// The bridge a socket of this module was opened with.
+///
+/// [`crate::devices`]'s functions take sockets as `PyAny` — a device end is
+/// any of the eleven classes — and still need a reactor to run on. Every
+/// socket of one context carries the same bridge, so the first argument's is
+/// the proxy's.
+pub fn bridge_of(object: &Bound<'_, PyAny>) -> PyResult<weida_py_core::Bridge> {
+    macro_rules! any_of {
+        ($($class:ident),+ $(,)?) => {
+            $(if let Ok(socket) = object.extract::<PyRef<'_, $class>>() {
+                return Ok(socket.bridge().clone());
+            })+
+        };
+    }
+    any_of!(
+        PyReqSocket,
+        PyRepSocket,
+        PyDealerSocket,
+        PyRouterSocket,
+        PyPubSocket,
+        PySubSocket,
+        PyXPubSocket,
+        PyXSubSocket,
+        PyPushSocket,
+        PyPullSocket,
+        PyPairSocket,
+    );
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "expected a socket of this module",
+    ))
+}
+
 /// Builds one socket class: the endpoint surface every socket type has, plus
 /// the methods its pattern adds.
 ///
@@ -247,6 +279,23 @@ macro_rules! python_socket {
             bridge: weida_py_core::Bridge,
         }
 
+        impl $class {
+            /// This socket's slot, for the calls that need the socket itself
+            /// rather than an operation on it — `serve_pair` takes a PAIR,
+            /// which is why only one socket type's copy of this is used.
+            #[allow(dead_code)]
+            pub(crate) fn slot(&self) -> &Arc<Slot<weida_zmq::$rust>> {
+                &self.socket
+            }
+
+            /// The reactor and errno mapping this socket was opened with.
+            pub(crate) fn bridge(&self) -> &weida_py_core::Bridge {
+                &self.bridge
+            }
+
+        }
+
+
         #[pymethods]
         impl $class {
             /// Opens the socket on `context`, against its `ZMQ_MAX_SOCKETS`
@@ -388,6 +437,29 @@ macro_rules! python_socket {
                 })
             }
 
+            /// `zmq_socket_monitor`: this socket's connection lifecycle as an
+            /// async iterator of typed events, replacing any monitor
+            /// installed before.
+            ///
+            /// `events` is libzmq's bit mask of `ZMQ_EVENT_*`; every event by
+            /// default.
+            #[pyo3(signature = (events=None))]
+            fn monitor<'py>(
+                &self,
+                py: Python<'py>,
+                events: Option<u16>,
+            ) -> PyResult<Bound<'py, PyAny>> {
+                let slot = Arc::clone(&self.socket);
+                let bridge = self.bridge.clone();
+                let events = crate::monitor::PyMonitor::events(events);
+                self.bridge.awaitable(py, async move {
+                    let installed = slot.acquire().await.monitor(events);
+                    Ok::<crate::monitor::PyMonitor, Errno>(crate::monitor::PyMonitor::new(
+                        installed, bridge,
+                    ))
+                })
+            }
+
             /// `zmq_close`: stops accepting and dialling, and destroys every
             /// queue. The socket's slot under `ZMQ_MAX_SOCKETS` is returned
             /// when Python collects the object.
@@ -405,6 +477,22 @@ macro_rules! python_socket {
 
             $($pattern)*
         }
+    };
+}
+
+/// The socket types a device end may be, which is `weida_zmq::Device`'s own
+/// list: REQ and REP are absent because a proxy between them would drive two
+/// state machines that 28/REQREP requires the *application* to drive, and
+/// libzmq's own devices do not accept them either.
+macro_rules! device_ends {
+    ($($class:ident),+ $(,)?) => {
+        $(impl $class {
+            /// A future that leases this socket as a device end, for
+            /// [`crate::devices`].
+            pub(crate) fn leasing(&self) -> crate::devices::Leasing {
+                crate::devices::leasing(&self.socket)
+            }
+        })+
     };
 }
 
@@ -495,4 +583,16 @@ python_socket!(
     "PAIR",
     "A PAIR socket: exactly one peer, no reconnection, no routing.",
     [send recv]
+);
+
+device_ends!(
+    PyDealerSocket,
+    PyRouterSocket,
+    PyPubSocket,
+    PySubSocket,
+    PyXPubSocket,
+    PyXSubSocket,
+    PyPushSocket,
+    PyPullSocket,
+    PyPairSocket,
 );
