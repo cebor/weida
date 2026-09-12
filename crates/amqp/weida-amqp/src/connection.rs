@@ -56,12 +56,12 @@
 //!   which is what Part 2 §2.4.5 says a peer SHOULD do, and only then drops
 //!   the transport.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
 use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
-use weida_amqp_codec::performative::{Close, Open, Performative};
+use weida_amqp_codec::performative::{Close, End, Open, Performative};
 use weida_amqp_codec::protocol_header::{ProtocolHeader, ProtocolId};
 use weida_amqp_codec::types::condition;
 use weida_amqp_codec::{Limits, Multiple};
@@ -70,7 +70,11 @@ use weida_runtime::Exec;
 use crate::error::{Condition, Error, Result};
 use crate::options::{ConnectionOptions, Sasl, TlsMode};
 use crate::sasl;
+use crate::session::{
+    self, Entry, SESSION_QUEUE, Session, SessionEvent, SessionOptions, SessionState, Shared, Table,
+};
 use crate::transport::{self, FrameReader, FrameWriter, Wire};
+use crate::window::Windows;
 
 /// How many outgoing frames may be queued for the driver before a sender
 /// waits.
@@ -170,11 +174,14 @@ impl State {
 }
 
 /// What the driver accepts from a handle.
-///
-/// One variant, because a connection with no sessions has exactly one thing
-/// a handle can ask it to do. The frame-writing variant the sessions need
-/// arrives with the sessions rather than sitting here unused.
 enum Command {
+    /// Begin a session on the lowest free outgoing channel, and report the
+    /// handle once the answering `begin` has tied the two channel numberings
+    /// together.
+    Begin {
+        options: SessionOptions,
+        reply: oneshot::Sender<Result<Session>>,
+    },
     /// `close`, with an optional condition, and a channel to report on.
     Close {
         error: Option<Condition>,
@@ -190,6 +197,17 @@ enum Command {
 #[derive(Clone, Debug)]
 pub struct Connection {
     inner: Arc<Inner>,
+}
+
+/// A frame a session has built and wants written.
+///
+/// Sessions do not own the transport: everything they send goes through the
+/// driver, which is what keeps `close` the last thing ever written and what
+/// lets the driver refuse a frame once it has sent one.
+#[derive(Debug)]
+pub(crate) enum Outbound {
+    /// A whole frame, channel already in its header.
+    Frame(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -361,13 +379,17 @@ impl Connection {
         writer.negotiated(remote.outgoing_frame_size());
 
         let (commands, rx) = mpsc::channel(OUTGOING_QUEUE);
+        let (outbound, outbound_rx) = mpsc::channel(OUTGOING_QUEUE);
         let (state_tx, state) = watch::channel(State::Open);
         let driver = Driver {
             exec: exec.clone(),
             options: Arc::clone(&options),
             remote: remote.clone(),
             rx,
+            outbound_rx,
+            outbound: outbound.clone(),
             state: state_tx,
+            sessions: Table::default(),
         };
         exec.spawn(driver.run(reader, writer));
 
@@ -380,6 +402,38 @@ impl Connection {
                 state,
             }),
         })
+    }
+
+    /// Begins a session on the lowest free outgoing channel.
+    ///
+    /// Returns once the answering `begin` has arrived, because until then
+    /// there is no incoming channel to route the peer's frames by and
+    /// therefore nothing a caller could do with the handle. The channel is
+    /// the lowest free one, as Part 2 §2.5.1 recommends, and the bound on how
+    /// many sessions there can be is the *peer's* `channel-max` — the number
+    /// that says which channels it will accept.
+    pub async fn begin(&self, options: SessionOptions) -> Result<Session> {
+        if !self.state().is_usable() {
+            return Err(Error::ConnectionGone);
+        }
+        let (reply, wait) = oneshot::channel();
+        self.inner
+            .commands
+            .send(Command::Begin { options, reply })
+            .await
+            .map_err(|_| Error::ConnectionGone)?;
+        match self
+            .inner
+            .exec
+            .within(self.inner.options.handshake_timeout, wait)
+            .await
+        {
+            Some(Ok(result)) => result,
+            Some(Err(_)) => Err(Error::ConnectionGone),
+            None => Err(Error::HandshakeTimeout {
+                step: "the answering begin",
+            }),
+        }
     }
 
     /// What the peer said in its `open`.
@@ -525,7 +579,12 @@ struct Driver {
     options: Arc<ConnectionOptions>,
     remote: RemoteOpen,
     rx: mpsc::Receiver<Command>,
+    outbound_rx: mpsc::Receiver<Outbound>,
+    /// Kept so that a `Session` handed to a caller can be given a sender
+    /// without the driver having to clone one out of thin air.
+    outbound: mpsc::Sender<Outbound>,
     state: watch::Sender<State>,
+    sessions: Table,
 }
 
 impl Driver {
@@ -573,6 +632,17 @@ impl Driver {
                 biased;
 
                 command = self.rx.recv() => match command {
+                    Some(Command::Begin { options, reply }) => {
+                        if closing {
+                            let _ = reply.send(Err(Error::ConnectionGone));
+                            continue;
+                        }
+                        if let Err(error) = self.begin(options, reply, &mut writer).await {
+                            outcome = State::Failed(error.to_string());
+                            break;
+                        }
+                    }
+
                     Some(Command::Close { error, done }) => {
                         let result = write_close(&mut writer, error.as_ref()).await;
                         closing = true;
@@ -596,6 +666,24 @@ impl Driver {
                         outcome = State::Closed(None);
                         break;
                     }
+                },
+
+                out = self.outbound_rx.recv() => match out {
+                    Some(Outbound::Frame(bytes)) => {
+                        // `close` MUST be the last thing ever written, so a
+                        // session frame that raced the close is dropped
+                        // rather than written after it.
+                        if closing {
+                            continue;
+                        }
+                        if let Err(error) = writer.send(&bytes).await {
+                            outcome = State::Failed(error.to_string());
+                            break;
+                        }
+                    }
+                    // Only the driver's own clone is left, which cannot
+                    // happen while the driver runs.
+                    None => continue,
                 },
 
                 incoming = frames.recv() => match incoming {
@@ -671,6 +759,22 @@ impl Driver {
             }
         }
 
+        // "Sessions also end automatically when the connection closes or is
+        // interrupted" (Part 2 §2.5.2). Telling each one is what lets a
+        // caller holding a `Session` find out, rather than waiting on a
+        // channel nobody will ever send on.
+        let ended = match &outcome {
+            State::Closed(condition) => condition.clone(),
+            State::Failed(why) => Some(Condition::described(
+                condition::CONNECTION_FORCED,
+                why.clone(),
+            )),
+            _ => None,
+        };
+        for entry in self.sessions.drain() {
+            *entry.shared.state.lock().expect("not poisoned") = SessionState::Ended(ended.clone());
+            let _ = entry.events.send(SessionEvent::Ended(ended.clone())).await;
+        }
         let _ = writer.shutdown().await;
         self.state.send_replace(outcome);
     }
@@ -714,23 +818,253 @@ impl Driver {
                 );
                 Ok(None)
             }
-            other => {
-                // Sessions arrive in B-158. Until then a frame on any channel
-                // is a frame for a session that was never begun, and the
-                // honest answer is to say so rather than ignore it.
-                let condition = Condition::described(
-                    condition::NOT_ALLOWED,
-                    format!(
-                        "{} arrived on channel {} and this connection has no sessions",
-                        other.name(),
-                        frame.header.channel
-                    ),
-                );
-                let _ = write_close(writer, Some(&condition)).await;
-                Ok(Some(State::Closed(Some(condition))))
-            }
+            other => self.route(frame.header.channel, other, bytes, writer).await,
         }
     }
+
+    /// Begins a session: lowest free outgoing channel, `begin` on the wire,
+    /// and the caller parked until the answer ties the two numberings
+    /// together.
+    async fn begin(
+        &mut self,
+        options: SessionOptions,
+        reply: oneshot::Sender<Result<Session>>,
+        writer: &mut FrameWriter,
+    ) -> Result<()> {
+        // The bound is the peer's `channel-max`: it is the number that says
+        // which channels the peer will accept, and ours says nothing about
+        // what we may use.
+        let Some(channel) = self.sessions.lowest_free(self.remote.channel_max) else {
+            let _ = reply.send(Err(Error::Local(Condition::described(
+                condition::RESOURCE_LIMIT_EXCEEDED,
+                format!(
+                    "every channel up to the peer's channel-max of {} is in use",
+                    self.remote.channel_max
+                ),
+            ))));
+            return Ok(());
+        };
+
+        let windows = Windows::new(0, options.incoming_window, options.outgoing_window);
+        let bytes = match session::begin_frame(channel, &options, &windows) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return Ok(());
+            }
+        };
+
+        let (events, rx) = mpsc::channel(SESSION_QUEUE);
+        self.sessions.insert(
+            channel,
+            Entry {
+                shared: Arc::new(Shared {
+                    outgoing_channel: channel,
+                    incoming_channel: Mutex::new(None),
+                    windows: Mutex::new(windows),
+                    state: Mutex::new(SessionState::Beginning),
+                    options,
+                }),
+                events,
+                pending: Some(reply),
+                outbound: self.outbound.clone(),
+                rx: Some(rx),
+            },
+        );
+        writer.send(&bytes).await
+    }
+
+    /// One frame for a session, or for a channel that has none.
+    async fn route(
+        &mut self,
+        channel: u16,
+        performative: Performative<'_>,
+        bytes: &[u8],
+        writer: &mut FrameWriter,
+    ) -> Result<Option<State>> {
+        // A channel above what we advertised is a framing error and the
+        // specification says so: "out-of-range channel MUST close the
+        // connection with amqp:connection:framing-error" (Part 2 §2.7.1).
+        if channel > self.options.channel_max {
+            let condition = Condition::described(
+                condition::CONNECTION_FRAMING_ERROR,
+                format!(
+                    "channel {channel} is above the channel-max of {} this connection advertised",
+                    self.options.channel_max
+                ),
+            );
+            let _ = write_close(writer, Some(&condition)).await;
+            return Ok(Some(State::Closed(Some(condition))));
+        }
+
+        // The answering `begin` is the one frame that arrives on a channel
+        // with no mapping yet, and its `remote-channel` is what creates the
+        // mapping.
+        if let Performative::Begin(begin) = &performative
+            && let Some(ours) = begin.remote_channel
+            && !self.sessions.is_mapped(channel)
+        {
+            return self.complete_begin(channel, ours, begin);
+        }
+
+        let Some(entry) = self.sessions.by_incoming(channel) else {
+            // In range, but no session was ever begun on it. The
+            // specification names no condition for this case - it covers
+            // only the out-of-range one above - so the condition is ours and
+            // the description says which channel it was.
+            let condition = Condition::described(
+                session::UNMAPPED_CHANNEL_CONDITION,
+                format!(
+                    "{} arrived on channel {channel}, which is not mapped to a session",
+                    performative.name()
+                ),
+            );
+            let _ = write_close(writer, Some(&condition)).await;
+            return Ok(Some(State::Closed(Some(condition))));
+        };
+
+        // A session that sent or received `end(error=...)` discards
+        // everything until the partner's `end`. Counted and logged, never
+        // acted upon.
+        let discarding = entry
+            .shared
+            .state
+            .lock()
+            .expect("not poisoned")
+            .is_discarding();
+        if discarding && !matches!(performative, Performative::End(_)) {
+            tracing::debug!(
+                channel,
+                performative = performative.name(),
+                "discarding a frame for a session in DISCARDING"
+            );
+            return Ok(None);
+        }
+
+        match &performative {
+            Performative::Flow(flow) => {
+                let mut windows = entry.shared.windows.lock().expect("not poisoned");
+                windows.apply_flow(session::remote_flow_of_flow(flow));
+            }
+            Performative::Transfer(_) => {
+                let id = {
+                    let windows = entry.shared.windows.lock().expect("not poisoned");
+                    windows.next_incoming_id
+                };
+                let violation = entry
+                    .shared
+                    .windows
+                    .lock()
+                    .expect("not poisoned")
+                    .record_received(id);
+                if let Err(violation) = violation {
+                    // Part 2 §2.8.17: `end` the session with
+                    // `amqp:session:window-violation`.
+                    let condition = Condition::described(
+                        condition::SESSION_WINDOW_VIOLATION,
+                        violation.to_string(),
+                    );
+                    let outgoing = entry.shared.outgoing_channel;
+                    *entry.shared.state.lock().expect("not poisoned") =
+                        SessionState::Discarding(condition.clone());
+                    let _ = write_end(writer, outgoing, Some(&condition)).await;
+                    return Ok(None);
+                }
+            }
+            Performative::End(End { error }) => {
+                let condition = error.as_ref().map(Condition::from_codec);
+                let outgoing = entry.shared.outgoing_channel;
+                let answered = matches!(
+                    *entry.shared.state.lock().expect("not poisoned"),
+                    SessionState::Ending | SessionState::Discarding(_)
+                );
+                *entry.shared.state.lock().expect("not poisoned") =
+                    SessionState::Ended(condition.clone());
+                let events = entry.events.clone();
+                if !answered {
+                    // Answering is what makes it orderly; simultaneous `end`
+                    // is legal and the only difference is which condition
+                    // each side reports.
+                    let _ = write_end(writer, outgoing, None).await;
+                }
+                let _ = events.send(SessionEvent::Ended(condition)).await;
+                self.sessions.remove(outgoing);
+                return Ok(None);
+            }
+            _ => {}
+        }
+
+        // Everything else is for the layer above: the link frames of B-159
+        // on, handed over whole because only a link can read them.
+        let _ = entry.events.send(SessionEvent::Frame(bytes.to_vec())).await;
+        Ok(None)
+    }
+
+    /// The answering `begin`: tie the peer's outgoing channel to ours and
+    /// hand the caller its handle.
+    fn complete_begin(
+        &mut self,
+        incoming: u16,
+        ours: u16,
+        begin: &weida_amqp_codec::performative::Begin<'_>,
+    ) -> Result<Option<State>> {
+        let Some(entry) = self.sessions.get_mut(ours) else {
+            // A `remote-channel` naming a session we never begun. Nothing to
+            // attach it to, and inventing one would be inventing state.
+            tracing::warn!(
+                incoming,
+                remote_channel = ours,
+                "an answering begin named a channel with no session"
+            );
+            return Ok(None);
+        };
+        *entry.shared.incoming_channel.lock().expect("not poisoned") = Some(incoming);
+        entry
+            .shared
+            .windows
+            .lock()
+            .expect("not poisoned")
+            .apply_begin(session::remote_flow_of_begin(begin));
+        *entry.shared.state.lock().expect("not poisoned") = SessionState::Begun;
+        let handle = match (entry.pending.take(), entry.rx.take()) {
+            (Some(reply), Some(rx)) => {
+                let session = Session::new(Arc::clone(&entry.shared), entry.outbound.clone(), rx);
+                let _ = reply.send(Ok(session));
+                true
+            }
+            // A second `begin` for a session already answered. The peer is
+            // confused; the mapping is already right and there is nobody
+            // waiting.
+            _ => false,
+        };
+        self.sessions.map_incoming(incoming, ours);
+        tracing::debug!(
+            outgoing = ours,
+            incoming,
+            handed_over = handle,
+            sessions = self.sessions.len(),
+            "session begun"
+        );
+        Ok(None)
+    }
+}
+
+/// Writes `end` on one session's outgoing channel.
+async fn write_end(
+    writer: &mut FrameWriter,
+    channel: u16,
+    error: Option<&Condition>,
+) -> Result<()> {
+    let mut out = Vec::new();
+    let codec = error.map(Condition::as_codec);
+    frame::write(
+        &mut out,
+        FrameKind::Amqp,
+        channel,
+        writer.max_frame_size(),
+        |body| Performative::End(End { error: codec }).encode(body),
+    )?;
+    writer.send(&out).await
 }
 
 /// Writes `close`, which is the last thing ever written on a connection.
