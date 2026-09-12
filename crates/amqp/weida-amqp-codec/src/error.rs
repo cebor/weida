@@ -208,6 +208,59 @@ pub enum DecodeError {
     /// A protocol header naming a layer this codec does not implement. Part 5
     /// assigns `0` (AMQP), `2` (TLS) and `3` (SASL).
     UnknownProtocolId(u8),
+
+    /// A message section in a position Part 3 §3.2 does not put it in: a
+    /// `properties` section after the body, a `header` after an annotation.
+    /// The order is fixed, not conventional.
+    SectionOutOfOrder {
+        /// The section that arrived.
+        section: &'static str,
+        /// The section it arrived after.
+        after: &'static str,
+    },
+
+    /// A second copy of a section Part 3 §3.2 permits "zero or one" of.
+    DuplicateSection(&'static str),
+
+    /// A body that is not one of the three choices Part 3 §3.2 allows: a
+    /// `data` section beside an `amqp-sequence`, or a second `amqp-value`.
+    MixedBodySections {
+        /// The body form already seen.
+        had: &'static str,
+        /// The section that cannot join it.
+        found: &'static str,
+    },
+
+    /// A reassembled message larger than the link's `max-message-size`.
+    ///
+    /// Checked against the accumulated length *before* the fragment is
+    /// appended, which is the only place it can be: `max-frame-size` bounds
+    /// one frame, and without this bound a peer can send unboundedly many of
+    /// them under one delivery-tag. The peer's answer is
+    /// `amqp:link:message-size-exceeded` (Part 2 §2.7.3).
+    MessageTooLarge {
+        /// What the message would have reached.
+        size: u64,
+        /// The link's limit.
+        max: u64,
+    },
+
+    /// A continuation `transfer` whose `delivery-id`, `delivery-tag` or
+    /// `message-format` differs from the first frame's.
+    ///
+    /// Part 2 §2.7.5 lets a continuation omit all three but says they "MUST
+    /// NOT be inconsistent" where present, so a difference is a violation
+    /// rather than an update.
+    ContinuationMismatch {
+        /// Which field disagreed.
+        field: &'static str,
+    },
+
+    /// A `transfer` continuing a delivery when no delivery is in progress,
+    /// or starting one while another is incomplete on the same link.
+    ///
+    /// Part 2 §2.6.14: deliveries on one link MUST NOT interleave.
+    InterleavedDelivery,
 }
 
 impl DecodeError {
@@ -315,6 +368,25 @@ impl fmt::Display for DecodeError {
             Self::UnknownProtocolId(id) => {
                 write!(f, "protocol id {id} is not AMQP (0), TLS (2) or SASL (3)")
             }
+            Self::SectionOutOfOrder { section, after } => {
+                write!(f, "a {section} section cannot follow {after}")
+            }
+            Self::DuplicateSection(section) => {
+                write!(f, "a second {section} section")
+            }
+            Self::MixedBodySections { had, found } => {
+                write!(f, "a body of {had} cannot also hold {found}")
+            }
+            Self::MessageTooLarge { size, max } => {
+                write!(
+                    f,
+                    "a message reaching {size} octets is above the agreed {max}"
+                )
+            }
+            Self::ContinuationMismatch { field } => {
+                write!(f, "a continuation transfer changed {field}")
+            }
+            Self::InterleavedDelivery => f.write_str("deliveries on one link may not interleave"),
         }
     }
 }

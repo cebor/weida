@@ -65,6 +65,20 @@ impl<'a> Fields<'a> {
         }
     }
 
+    /// Reads the fields of `composite` from an already-decoded field list.
+    ///
+    /// For a composite that arrived as a section rather than as a frame
+    /// body: [`crate::decode::described`] hands back the descriptor and the
+    /// list together, and the descriptor has already been dispatched on by
+    /// the time the fields are wanted.
+    #[must_use]
+    pub const fn from_values(items: Vec<Value<'a>>, composite: &'static str) -> Self {
+        Self {
+            source: Source::Decoded { items, next: 0 },
+            composite,
+        }
+    }
+
     /// Reads the fields of `composite` from a decoded described value,
     /// checking the descriptor first.
     ///
