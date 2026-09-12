@@ -33,13 +33,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
-use weida_mqtt_codec::{Disconnect, DisconnectReasonCode, Packet, PacketType, Properties};
+use weida_mqtt_codec::{Disconnect, DisconnectReasonCode, Packet, PacketType, Properties, Pubrel};
 use weida_runtime::{Exec, OwnedReactor};
 
 use crate::connection::{Authenticator, NoAuthenticator, Reader, Writer, handshake};
 use crate::error::{Error, Result};
 use crate::limits::ServerLimits;
 use crate::options::{ConnectOptions, interval_seconds};
+use crate::session::{Resend, Resumption, Session, expiry_seconds};
 
 /// The reactor every client of this context runs on.
 ///
@@ -142,7 +143,11 @@ enum Command {
 pub struct Client {
     commands: mpsc::Sender<Command>,
     limits: Arc<ServerLimits>,
+    /// The client half of the session. A clone, so it outlives this handle:
+    /// the application's copy is what makes a reconnect a *resumption*.
+    session: Session,
     session_present: bool,
+    resumption: Resumption,
     client_id: String,
     keep_alive: Option<Duration>,
 }
@@ -163,7 +168,13 @@ impl Events {
 
 impl Client {
     /// Connects to `address` (`host:port`, or `[v6]:port`), sends CONNECT and
-    /// awaits CONNACK.
+    /// awaits CONNACK, on a session of its own.
+    ///
+    /// For a caller that does not intend to reconnect: the session is created
+    /// here and dies with the returned handle, so nothing is carried across
+    /// connections. A caller that *does* intend to reconnect holds its own
+    /// [`Session`] and uses [`Client::connect_session`], because the session
+    /// is what outlives the connection.
     ///
     /// # Errors
     ///
@@ -175,7 +186,34 @@ impl Client {
         address: &str,
         options: ConnectOptions,
     ) -> Result<(Client, Events)> {
-        Client::connect_with(context, address, options, &NoAuthenticator).await
+        let session = Session::new(options.client_id.clone(), &options.limits);
+        Client::connect_session(context, address, options, &session).await
+    }
+
+    /// The same, on a session the caller owns and reuses.
+    ///
+    /// This is the reconnect path, and it is where the three rules of
+    /// 3.2.2.1.1 are applied: Clean Start 1 discards the session before
+    /// connecting ([MQTT-3.1.2-4]), `Session Present` 0 with local state
+    /// discards it on arrival ([MQTT-3.2.2-5]), and `Session Present` 1 with
+    /// no local state refuses the connection ([MQTT-3.2.2-4]).
+    ///
+    /// It is also the **only** place retransmission happens: on
+    /// [`Resumption::Resumed`] the unacknowledged exchanges of
+    /// [`Session::resend`] go back on the wire with their original Packet
+    /// Identifiers and DUP 1, in the order the originals were sent
+    /// ([MQTT-4.6.0-1]), before the connection task starts.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::connect`], plus [`Error::SessionPresentWithoutState`].
+    pub async fn connect_session(
+        context: &Context,
+        address: &str,
+        options: ConnectOptions,
+        session: &Session,
+    ) -> Result<(Client, Events)> {
+        Client::connect_full(context, address, options, session, &NoAuthenticator).await
     }
 
     /// The same, answering the server's AUTH challenges through
@@ -192,7 +230,47 @@ impl Client {
         options: ConnectOptions,
         authenticator: &dyn Authenticator,
     ) -> Result<(Client, Events)> {
-        let handshake = handshake(&context.exec, address, &options, authenticator).await?;
+        let session = Session::new(options.client_id.clone(), &options.limits);
+        Client::connect_full(context, address, options, &session, authenticator).await
+    }
+
+    /// The one implementation the four constructors funnel through.
+    ///
+    /// # Errors
+    ///
+    /// The union of what the other three report.
+    pub async fn connect_full(
+        context: &Context,
+        address: &str,
+        options: ConnectOptions,
+        session: &Session,
+        authenticator: &dyn Authenticator,
+    ) -> Result<(Client, Events)> {
+        options.validate()?;
+
+        // "Clean Start 1 discards any existing Session" ([MQTT-3.1.2-4]), so
+        // the client's half goes before the CONNECT rather than after the
+        // CONNACK: a resumed identifier space in a session the server threw
+        // away would collide with nothing and confuse everything.
+        if options.clean_start {
+            session.clear();
+        }
+        // Recorded now because the DISCONNECT rule of 3.14.2.2.2 needs to
+        // know what this CONNECT declared, and after the handshake there is
+        // nothing left to read it from.
+        session.declare_expiry(expiry_seconds(options.session_expiry));
+
+        let mut handshake = handshake(&context.exec, address, &options, authenticator).await?;
+
+        // "The sender sets an initial send quota, non-zero and not exceeding
+        // the peer's Receive Maximum" ([MQTT-4.9.0-1]): the server's number
+        // replaces the client's placeholder here and nowhere else.
+        session.set_quota(handshake.limits.receive_maximum);
+
+        let resumption = session.accept_connack(handshake.session_present)?;
+        if resumption == Resumption::Resumed {
+            retransmit(&mut handshake.writer, session).await?;
+        }
 
         let limits = Arc::new(handshake.limits);
         let (commands_tx, commands_rx) = mpsc::channel(options.limits.incoming_queue);
@@ -214,7 +292,9 @@ impl Client {
             Client {
                 commands: commands_tx,
                 limits,
+                session: session.clone(),
                 session_present: handshake.session_present,
+                resumption,
                 client_id: handshake.client_id,
                 keep_alive: handshake.keep_alive,
             },
@@ -255,6 +335,25 @@ impl Client {
         self.keep_alive
     }
 
+    /// The session this connection runs on. Cloning it is how an application
+    /// keeps it across a reconnect.
+    #[must_use]
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    /// What `Session Present` obliged this client to do: resume, start
+    /// fresh, or discard what it held (3.2.2.1.1) [mqtt5 §1].
+    ///
+    /// The fourth case — `Session Present` 1 with no local state — is not a
+    /// value here because it is [`Error::SessionPresentWithoutState`]:
+    /// [MQTT-3.2.2-4] obliges the client to close, so there is no connection
+    /// to report it on.
+    #[must_use]
+    pub const fn resumption(&self) -> Resumption {
+        self.resumption
+    }
+
     /// Sends DISCONNECT and closes.
     ///
     /// `DisconnectReasonCode::NormalDisconnection` makes the server discard
@@ -270,21 +369,30 @@ impl Client {
     }
 
     /// The same, revising the `Session Expiry Interval` at close, which a
-    /// client MAY do (3.14.2.2.2) [mqtt5 §1].
+    /// client MAY do — "so a session's lifetime can be shortened or extended
+    /// at close" (3.14.2.2.2) [mqtt5 §1].
     ///
-    /// "Zero then non-zero is a Protocol Error" needs the CONNECT that came
-    /// before and is enforced by the session of B-142, not here.
+    /// **The rule the codec deferred is enforced here, before sending**: "a
+    /// non-zero value when CONNECT carried zero is a Protocol Error"
+    /// (3.14.2.2.2) [mqtt5 §1], which needs the CONNECT that came before and
+    /// therefore needs the session. Shortening to zero is always permitted,
+    /// and is what the specification advises a client that is finished to do
+    /// so that a session it will never return to is not orphaned
+    /// (3.1.2.11.2) [mqtt5 §9].
     ///
     /// # Errors
     ///
     /// As [`Client::disconnect`], plus [`Error::Configuration`] for an
-    /// interval a Four Byte Integer cannot carry.
+    /// interval a Four Byte Integer cannot carry or for the zero-then-non-zero
+    /// Protocol Error.
     pub async fn disconnect_with(
         &self,
         reason_code: DisconnectReasonCode,
         session_expiry: Option<Duration>,
     ) -> Result<()> {
         interval_seconds("session_expiry", session_expiry)?;
+        self.session
+            .revise_expiry_on_disconnect(expiry_seconds(session_expiry))?;
         let (done, wait) = oneshot::channel();
         self.commands
             .send(Command::Disconnect {
@@ -483,6 +591,34 @@ impl Task {
             }))
             .await
     }
+}
+
+/// Puts the session's unacknowledged exchanges back on the wire.
+///
+/// **The only retransmission in this crate**, called from exactly one place:
+/// just after a CONNACK with `Session Present` 1. "This is the only
+/// circumstance where a Client or Server is REQUIRED to resend messages.
+/// Clients and Servers MUST NOT resend messages at any other time"
+/// ([MQTT-4.4.0-1]) [mqtt5 §6].
+///
+/// The order is the order the originals were sent ([MQTT-4.6.0-1]), the
+/// identifiers are the originals, and every resent PUBLISH carries DUP 1
+/// ([MQTT-3.3.1-1]) — while a PUBREL, which has no DUP flag, carries nothing
+/// extra.
+async fn retransmit(writer: &mut Writer, session: &Session) -> Result<()> {
+    for item in session.resend() {
+        match item {
+            Resend::Publish { packet_id, message } => {
+                let pairs = message.borrowed_user_properties();
+                let publish = message.to_publish(packet_id, true, &pairs);
+                writer.send(&Packet::Publish(publish)).await?;
+            }
+            Resend::Pubrel { packet_id } => {
+                writer.send(&Packet::Pubrel(Pubrel::new(packet_id))).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What woke the connection task.
