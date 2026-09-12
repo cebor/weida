@@ -1,0 +1,13 @@
+# The plugin that makes rmqtt declare `Retain Available` 1: without it the
+# default handler reports disabled and the CONNACK says 0, which is a
+# **declaration** and is what the refusal half of this run measures against
+# the `restricted` listener.
+#
+# RAM rather than sled or redis: a test must not leave a database behind, and
+# retained messages surviving a broker restart is not what B-149 measures.
+[storage]
+type = "ram"
+
+# Well above anything these tests store.
+max_retained_messages = 0
+retained_message_ttl = "0s"

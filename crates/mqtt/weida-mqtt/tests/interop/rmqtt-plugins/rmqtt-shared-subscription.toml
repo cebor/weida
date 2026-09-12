@@ -1,0 +1,12 @@
+# The plugin that makes rmqtt declare `Shared Subscription Available` 1:
+# without it the default handler reports unsupported and the CONNACK says 0,
+# which is a **declaration** and is what the refusal half of this run
+# measures against the `restricted` listener.
+#
+# "random" rather than the default "round_robin", because the specification
+# says nothing about selection and the sheet records that implementations
+# disagree substantively - EMQX defaults to round-robin, HiveMQ is random and
+# explicitly not round-robin. A test that depended on which member received a
+# publication would be depending on that disagreement, so this file picks the
+# strategy that makes such a test obviously wrong to write.
+strategy = "random"

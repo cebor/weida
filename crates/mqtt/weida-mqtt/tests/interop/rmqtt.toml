@@ -1,0 +1,78 @@
+# rmqtt 0.23.1 for the B-149 interop run: a broker that **declares** its
+# 5.0 capabilities, which is the thing rumqttd 0.20.0 does not do and the
+# whole reason for a second broker.
+#
+# One TCP listener and no plugins. The port is deliberately unusual, for the
+# same reason B-148's is: an interop test that silently measured against a
+# developer's own broker would be the worst possible outcome.
+
+##--------------------------------------------------------------------
+## Node
+##--------------------------------------------------------------------
+[node]
+id = 1
+cookie = "weida-b149"
+busy.check_enable = false
+
+##--------------------------------------------------------------------
+## RPC — required by the configuration schema, bound to a free port and
+## never used: this run has one node.
+##--------------------------------------------------------------------
+[rpc]
+server_addr = "0.0.0.0:5463"
+
+##--------------------------------------------------------------------
+## Log
+##--------------------------------------------------------------------
+[log]
+to = "console"
+level = "warn"
+
+##--------------------------------------------------------------------
+## Plugins. Two, and both are load-bearing: rmqtt reports `Retain
+## Available` 0 and `Shared Subscription Available` 0 in CONNACK unless
+## the corresponding plugin is started, because both capabilities live
+## in a plugin rather than in the listener. The HTTP API and the auth
+## plugins are deliberately left out — they bind further ports, and a
+## test that binds four ports fails on a machine where any one is busy.
+##--------------------------------------------------------------------
+[plugins]
+dir = "crates/mqtt/weida-mqtt/tests/interop/rmqtt-plugins/"
+default_startups = ["rmqtt-retainer", "rmqtt-shared-subscription"]
+
+##--------------------------------------------------------------------
+## The MQTT listener under test.
+##--------------------------------------------------------------------
+[listener.tcp.external]
+addr = "127.0.0.1:21885"
+# The declarations this run exists to measure. Every one of them is a
+# CONNACK property that rumqttd 0.20.0 leaves absent, and absence is the
+# default rather than a refusal — so only a broker that states them can
+# exercise a client's refusal paths.
+max_qos_allowed = 2
+max_topic_aliases = 16
+limit_subscription = false
+# 3.1.2.11.3: what the **server** will accept in flight from one client.
+max_inflight = 8
+# Session Expiry as a timer needs a ceiling the broker will honour.
+session_expiry_interval = "2h"
+max_mqueue_len = 1000
+max_clientid_len = 65535
+
+##--------------------------------------------------------------------
+## A second listener that declares **less**, which is the only way to
+## reach a client's refusal paths against a real declaration.
+##
+## `Maximum QoS` 1 and no shared subscriptions here; `Retain Available`
+## and `Shared Subscription Available` are global to the broker in this
+## implementation — they come from whether a plugin is running — so the
+## flags this listener can vary are the per-listener ones.
+##--------------------------------------------------------------------
+[listener.tcp.restricted]
+addr = "127.0.0.1:21887"
+max_qos_allowed = 1
+max_topic_aliases = 0
+limit_subscription = false
+max_inflight = 8
+max_mqueue_len = 1000
+max_clientid_len = 65535

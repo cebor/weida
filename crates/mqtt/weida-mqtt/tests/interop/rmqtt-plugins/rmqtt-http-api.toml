@@ -1,0 +1,8 @@
+# rmqtt 0.23.1 registers every compiled-in plugin at startup and panics when
+# a plugin's configuration file is missing, whether or not the plugin is in
+# `plugins.default_startups`. So this file exists to be found, not to be used:
+# the plugin is never started, and the port below is never bound.
+http_laddr = "127.0.0.1:21886"
+workers = 1
+max_row_limit = 100
+http_request_default_timeout = "5s"
