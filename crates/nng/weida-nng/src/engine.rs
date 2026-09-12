@@ -323,9 +323,9 @@ struct EngineInner {
     ///
     /// The socket's own receive buffer, in miniature and only for the one
     /// case that needs it: a peer that answers and then closes. Bounded by
-    /// what its pipes' queues could hold, which is `max_pipes ×
-    /// NNG_OPT_RECVBUF` and therefore already bounded
-    /// (`docs/INVARIANTS.md`).
+    /// [`Engine::store_arrived`], which is where the ceiling and the
+    /// full-queue policy are, because the pipe it came from is gone by
+    /// then and its bound went with it.
     leftovers: Mutex<std::collections::VecDeque<(PipeId, Message)>>,
     /// Holds this socket's slot under its context's ceiling for as long as
     /// the engine lives.
@@ -780,16 +780,67 @@ impl Engine {
                 arrived.push(message);
             }
             entry.pipe.close();
-            if !arrived.is_empty() {
-                let mut leftovers = self.inner.leftovers.lock().expect("leftovers poisoned");
-                for message in arrived {
-                    leftovers.push_back((id, message));
-                }
-            }
+            self.store_arrived(id, arrived);
             if entry.admitted {
                 self.fire(PipeEvent::RemPost, &entry.info);
                 self.inner.changed.notify_waiters();
             }
+        }
+    }
+
+    /// Puts what a retired pipe had already received into the socket's
+    /// buffer, under that buffer's own ceiling.
+    ///
+    /// **The ceiling is the point.** Retiring the pipe frees its slot
+    /// before this runs, so a stranger can connect, fill a queue,
+    /// disconnect and do it again: the pipe set is bounded and the number
+    /// of pipes over time is not. Nothing drains this buffer unless the
+    /// application receives, so without a bound of its own a peer that
+    /// reconnects in a loop would grow it without limit
+    /// (`docs/INVARIANTS.md`).
+    ///
+    /// The bound is [`PipeConfig::incoming`]'s depth — one pipe's worth of
+    /// messages, not one per pipe — because this is the socket's receive
+    /// buffer and not a per-pipe queue, and at least one, because holding
+    /// the last answer is the whole reason the buffer exists.
+    ///
+    /// Full, and the policy is the socket's rather than the pipe's:
+    /// [`FullAction::receiving`] is `Block` for every protocol and blocking
+    /// is not available here — the pipe is gone and no reader can push back
+    /// on a peer that has left. So the choice is the one `SUB_PREFNEW`
+    /// makes at this same layer: the oldest goes for a SUB that prefers new
+    /// publications, and for everyone else the **newest is refused**,
+    /// because the oldest is the answer somebody is already waiting for.
+    fn store_arrived(&self, id: PipeId, arrived: Vec<Message>) {
+        if arrived.is_empty() {
+            return;
+        }
+        let options = &self.inner.options;
+        let ceiling = options
+            .pipe_config(self.inner.protocol)
+            .incoming
+            .depth
+            .max(1);
+        let prefer_new = self.inner.protocol == EndpointType::Sub && options.sub_prefer_new;
+        let mut refused = 0usize;
+        let mut leftovers = self.inner.leftovers.lock().expect("leftovers poisoned");
+        for message in arrived {
+            if leftovers.len() >= ceiling {
+                if prefer_new {
+                    leftovers.pop_front();
+                } else {
+                    refused += 1;
+                    continue;
+                }
+            }
+            leftovers.push_back((id, message));
+        }
+        if refused > 0 {
+            tracing::debug!(
+                refused,
+                ceiling,
+                "the socket's buffer is full of messages from pipes that have gone"
+            );
         }
     }
 
