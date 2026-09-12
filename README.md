@@ -47,9 +47,12 @@ and its bridge; its library is next.
 
 This repository holds **two kinds of product**: weida itself, and standalone implementations
 of foreign protocols that are usable with no weida in the picture — with a forwarder beside
-each one for the deployments that want both networks joined. The `kind` column says which is
-which, and no row calls a library an adapter or a bridge a library
-([decisions/0013](docs/decisions/0013-competitor-libraries.md) §5.5).
+some of them for the deployments that want both networks joined, and a Python binding beside
+each finished library. The `kind` column says which is which, and no row calls a library an
+adapter, a bridge a library or a binding either
+([decisions/0013](docs/decisions/0013-competitor-libraries.md) §5.5). The table lists **every
+one of the twenty-three `[workspace] members`** and is read off `cargo metadata`, not kept by
+hand.
 
 | Path | Package | kind | Responsibility |
 | --- | --- | --- | --- |
@@ -57,11 +60,24 @@ which, and no row calls a library an adapter or a bridge a library
 | `crates/protocol` | `weida-protocol` | weida | wire codec, no I/O: varints, framing, CBOR headers, negotiation, error codes |
 | `crates/runtime` | `weida-runtime` | weida | the reactor and the OS plumbing, with no protocol in it: tasks, timers, DNS with a capped resolver, the three reactor-ownership constructors, a bounded close budget, an in-process name registry and `AF_UNIX` bind hygiene with peer credentials |
 | `crates/weida` | `weida` | weida | runtime, the QUIC and in-process transports, the raw stream core, and the Req/Rep, Push/Pull and Pub/Sub patterns |
-| `crates/zmq/weida-zmtp` | `weida-zmtp` | library | ZMTP 3.1 codec — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |
+| `crates/py/weida-py-core` | `weida-py-core` | foundation | the shared PyO3 foundation under every binding, with nothing protocol-specific in it: errno exception families, the asyncio bridge that drives a Rust future on the caller's loop, and the bytes boundary ([0014](docs/decisions/0014-parallel-libraries.md) §2) |
+| `crates/zmq/weida-zmtp` | `weida-zmtp` | codec | ZMTP 3.1 — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |
 | `crates/zmq/weida-zmq` | `weida-zmq` | library | the ZeroMQ implementation: every socket type of `zmq_socket(3)` bar `ZMQ_STREAM`, `tcp`/`ipc`/`inproc`, NULL/PLAIN/CURVE with ZAP, the option table, the monitor and the devices, interop-tested against libzmq 4.3.5 in both roles ([docs/libraries/zmq.md](docs/libraries/zmq.md)) |
 | `crates/zmq/weida-zmq-bridge` | `weida-zmq-bridge` | bridge | joins ZeroMQ peers and weida endpoints in both directions, terminating both protocols; the ZeroMQ half is `weida-zmq`'s sockets and what is here is the mapping |
-| `crates/nng/weida-sp` | `weida-sp` | library | nanomsg/NNG Scalability Protocols codec — the eight-octet header, the 64-bit framing, the REQ/REP tag stacks — with no I/O and no dependency on weida |
-| `crates/nng/weida-nng-bridge` | `weida-nng-bridge` | bridge | joins NNG peers and weida endpoints in both directions |
+| `crates/zmq/weida-zmq-py` | `weida-zmq-py` | binding | the Python ZeroMQ surface: all eleven socket types, the three transports, the option table, PLAIN/CURVE/ZAP with a handler in Python, and a synchronous surface beside the asyncio one ([docs/libraries/zmq-py.md](docs/libraries/zmq-py.md)) |
+| `crates/nng/weida-sp` | `weida-sp` | codec | nanomsg/NNG Scalability Protocols — the eight-octet header, the 64-bit framing, the REQ/REP tag stacks — with no I/O and no dependency on weida |
+| `crates/nng/weida-nng` | `weida-nng` | library | the SP implementation: one socket type per protocol, endpoints and pipes, the option table, TLS and IPC credentials, interop-tested against NNG 1.4.0-rc.0 in both roles ([docs/libraries/nng.md](docs/libraries/nng.md)) |
+| `crates/nng/weida-nng-bridge` | `weida-nng-bridge` | bridge | joins NNG peers and weida endpoints in both directions, built **on** `weida-nng`'s sockets rather than on a second implementation |
+| `crates/nng/weida-nng-py` | `weida-nng-py` | binding | the Python SP surface: one class per protocol, contexts as objects, asyncio and synchronous |
+| `crates/mqtt/weida-mqtt-codec` | `weida-mqtt-codec` | codec | MQTT 5.0 — the fixed header, Variable Byte Integers, the property framework and every control packet — sans-I/O |
+| `crates/mqtt/weida-mqtt` | `weida-mqtt` | library | the MQTT 5.0 **client**: connection, session, both QoS machines, subscriptions, retain and Will, aliases, TLS and AUTH, interop-tested against `rumqttd` 0.20.0 and `rmqtt` 0.23.1 ([docs/libraries/mqtt.md](docs/libraries/mqtt.md)) |
+| `crates/mqtt/weida-mqtt-py` | `weida-mqtt-py` | binding | the Python MQTT surface: publish, subscribe and an iterator of deliveries, 51 exception classes, asyncio and synchronous |
+| `crates/amqp/weida-amqp-codec` | `weida-amqp-codec` | codec | AMQP 1.0 — the Part 1 type system, frames, performatives and message sections — sans-I/O |
+| `crates/amqp/weida-amqp` | `weida-amqp` | library | the AMQP 1.0 client: connection, session and link with both credit schemes, the settle modes, dispositions and SASL, interop-tested against `fe2o3-amqp` 0.17.0 in both roles ([docs/libraries/amqp.md](docs/libraries/amqp.md)) |
+| `crates/amqp/weida-amqp-py` | `weida-amqp-py` | binding | the Python AMQP surface: connection, session and link as objects, `send` returning the delivery's terminal state, asyncio and synchronous |
+| `crates/nats/weida-nats-codec` | `weida-nats-codec` | codec | the NATS client protocol — twelve control-line verbs and the `NATS/1.0` header block — sans-I/O |
+| `crates/nats/weida-nats` | `weida-nats` | library | the Core NATS client: subjects and wildcards, queue groups, request-reply over an inbox, five credential forms and TLS; interop is written and **not run**, because no `nats-server` was available ([docs/libraries/nats.md](docs/libraries/nats.md)) |
+| `crates/nats/weida-nats-py` | `weida-nats-py` | binding | the Python NATS surface: publish with headers, subscriptions as iterators, queue groups, `request` with a mandatory timeout, asyncio and synchronous |
 | `crates/interop/cross-tests` | `weida-cross-tests` | weida | no library code: one message in through one foreign protocol and out through the other, which belongs to neither family |
 
 ## Identity in one line

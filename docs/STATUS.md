@@ -6,13 +6,22 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `742d905`, 2026-09-11 ~23:34 UTC. Tree clean, gate green, **764 tests**
-(218 at the start of the session), plus 228 under `weida-zmq`'s non-default `blocking` feature
-and 18 in the libzmq interop matrix that runs `#[ignore]`d against the system library.
-Thirteen decision notes (0001–0013), all `accepted`. Eleven crates in one directory per
-protocol family: `weida-core`, `weida-protocol`, `weida-runtime`, `weida`, then
-`crates/zmq/{weida-zmtp, weida-zmq, weida-zmq-bridge}`,
-`crates/nng/{weida-sp, weida-nng-bridge}` and `crates/interop/cross-tests`.
+**Snapshot:** main `5ca1329`, 2026-09-12 ~10:05 UTC. Tree clean, gate green, **1678 tests**
+(218 at the start of the session, 764 before the four parallel workstreams), with 37 ignored —
+the interop suites that need a library or a broker this machine does not have — plus the
+non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s `blocking`
+and `nng-interop`) and the four bindings' Python suites: **45** (MQTT), **36** (NATS) and
+**17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own items, and **every one of
+the four wheels built and smoke-tested with no Rust toolchain on `PATH`**. Fourteen decision
+notes (0001–0014), all
+`accepted`. **Twenty-three `[workspace] members`**, one directory per protocol family, read off
+`cargo metadata` rather than a hand-kept list: `weida-core`, `weida-protocol`,
+`weida-runtime`, `weida`, `crates/py/weida-py-core`, then
+`crates/zmq/{weida-zmtp, weida-zmq, weida-zmq-bridge, weida-zmq-py}`,
+`crates/nng/{weida-sp, weida-nng, weida-nng-bridge, weida-nng-py}`,
+`crates/mqtt/{weida-mqtt-codec, weida-mqtt, weida-mqtt-py}`,
+`crates/amqp/{weida-amqp-codec, weida-amqp, weida-amqp-py}`,
+`crates/nats/{weida-nats-codec, weida-nats, weida-nats-py}` and `crates/interop/cross-tests`.
 
 ## 1. The roadmap
 
