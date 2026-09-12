@@ -62,6 +62,7 @@ use pyo3::prelude::*;
 
 mod context;
 mod errors;
+mod identity;
 mod lease;
 mod ops;
 mod options;
@@ -88,6 +89,12 @@ fn weida_zmq(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "DEFAULT_MAX_MESSAGE_SIZE",
         ::weida_zmq::DEFAULT_MAX_MESSAGE_SIZE,
     )?;
+    module.add_class::<identity::PyCurveKey>()?;
+    module.add_class::<identity::PyRoutingId>()?;
+    module.add_class::<identity::PyZapUserId>()?;
+    module.add_class::<identity::PyPeer>()?;
+    module.add_function(pyo3::wrap_pyfunction!(identity::curve_keypair, module)?)?;
+    module.add("ZAP_ENDPOINT", ::weida_zmq::ZAP_ENDPOINT)?;
     module.add("DEFAULT_MAX_SOCKETS", ::weida_zmq::DEFAULT_MAX_SOCKETS)?;
     module.add_class::<sockets::Discarded>()?;
     module.add_class::<values::PyMultipart>()?;
@@ -136,6 +143,12 @@ fn every_name() -> Vec<&'static str> {
         "PullSocket",
         "PairSocket",
         "ZmqError",
+        "CurveKey",
+        "RoutingId",
+        "ZapUserId",
+        "Peer",
+        "curve_keypair",
+        "ZAP_ENDPOINT",
         "ZmqOption",
         "SocketOptions",
         "ContextOptions",
