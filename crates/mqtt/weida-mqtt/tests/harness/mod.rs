@@ -9,8 +9,19 @@
 //! What it is for is the half of the client's behaviour a real broker cannot
 //! be made to exhibit on demand: a CONNACK with one particular availability
 //! flag clear, a `Server Keep Alive` that overrides, a PINGREQ deliberately
-//! left unanswered, a DISCONNECT with a chosen reason code. A script says what
-//! the server does; the test says what the client must then do.
+//! left unanswered, a DISCONNECT with a chosen reason code, a connection
+//! dropped mid-exchange so a session has something to resume.
+//!
+//! It records the **bytes** of everything the client sent, not just the packet
+//! types, because some of what the client must get right is inside the packet:
+//! a retransmission carries DUP 1 and its original Packet Identifier
+//! ([MQTT-3.3.1-1], [MQTT-4.6.0-1]), and asserting that needs the packet.
+
+// The harness is compiled separately into every integration-test binary, and
+// no single one of them uses all of it: `connection.rs` never looks inside a
+// packet, `session.rs` never needs an idle step. Without this each binary
+// reports the other's half as dead.
+#![allow(dead_code)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,47 +33,67 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use weida_mqtt_codec::{FixedHeader, Packet, PacketType, varint};
 
+/// The ceiling every harness decode is done under: the largest packet the
+/// encoding can express (2.1.4). The harness is not the thing under test, so
+/// it declines nothing.
+const CAP: u32 = varint::MAX + 5;
+
 /// What the scripted server does after the CONNECT arrives.
 #[derive(Clone, Debug)]
 pub enum Act {
     /// Send this packet's bytes.
     Send(Vec<u8>),
-    /// Read one packet and record its type.
+    /// Read one packet and record it.
     Expect,
     /// Wait, so a client timer can expire.
     Idle(Duration),
     /// Drop the connection with no DISCONNECT, which is always available to a
-    /// server and is what 3.1.1 did for every error [mqtt5 §1.9].
+    /// server and is what 3.1.1 did for every error [mqtt5 §1.9]. Also how a
+    /// test leaves a session with something to resume.
     Close,
 }
 
-/// A server that runs one script against one connection.
+/// A server that runs one script per connection, in order.
+///
+/// A reconnect test hands it two scripts: the first connection gets the first,
+/// the second the second.
 pub struct Server {
     address: SocketAddr,
-    seen: Arc<Mutex<Vec<PacketType>>>,
+    seen: Arc<Mutex<Vec<Vec<u8>>>>,
     connects: Arc<AtomicUsize>,
     done: mpsc::Receiver<()>,
 }
 
 impl Server {
     /// Binds an ephemeral port and runs `script` against the first client.
-    ///
-    /// The CONNECT is read before the script starts, so a script's first
-    /// `Send` is the answer to it.
     pub async fn start(script: Vec<Act>) -> Server {
+        Server::start_all(vec![script]).await
+    }
+
+    /// The same for several consecutive connections, one script each.
+    ///
+    /// The CONNECT is read before each script starts, so a script's first
+    /// `Send` is the answer to it.
+    pub async fn start_all(scripts: Vec<Vec<Act>>) -> Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("local addr");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let connects = Arc::new(AtomicUsize::new(0));
-        let (finished, done) = mpsc::channel(1);
+        let (finished, done) = mpsc::channel(scripts.len().max(1));
 
         let task_seen = Arc::clone(&seen);
         let task_connects = Arc::clone(&connects);
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
-            task_connects.fetch_add(1, Ordering::SeqCst);
-            run(stream, script, task_seen).await;
-            let _ = finished.send(()).await;
+            for script in scripts {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                task_connects.fetch_add(1, Ordering::SeqCst);
+                run(stream, script, Arc::clone(&task_seen)).await;
+                if finished.send(()).await.is_err() {
+                    return;
+                }
+            }
         });
 
         Server {
@@ -78,9 +109,24 @@ impl Server {
         self.address.to_string()
     }
 
-    /// The packet types the script's `Expect` steps read, in order. The
-    /// CONNECT is always the first.
+    /// The packet types received, in order, across every connection. Each
+    /// connection's CONNECT is included.
     pub async fn seen(&self) -> Vec<PacketType> {
+        self.seen
+            .lock()
+            .await
+            .iter()
+            .map(|bytes| {
+                Packet::decode(bytes, CAP)
+                    .map(|(packet, _)| packet.packet_type())
+                    .unwrap_or_else(|error| panic!("the harness received {error}"))
+            })
+            .collect()
+    }
+
+    /// The bytes of every packet received, in order, for a test that must look
+    /// inside one.
+    pub async fn seen_bytes(&self) -> Vec<Vec<u8>> {
         self.seen.lock().await.clone()
     }
 
@@ -89,18 +135,18 @@ impl Server {
         self.connects.load(Ordering::SeqCst)
     }
 
-    /// Waits for the script to finish.
+    /// Waits for one script to finish.
     pub async fn finished(&mut self) {
         let _ = self.done.recv().await;
     }
 }
 
-async fn run(mut stream: TcpStream, script: Vec<Act>, seen: Arc<Mutex<Vec<PacketType>>>) {
+async fn run(mut stream: TcpStream, script: Vec<Act>, seen: Arc<Mutex<Vec<Vec<u8>>>>) {
     // The client's first packet MUST be CONNECT ([MQTT-3.1.0-1]), so reading
     // it unconditionally is not an assumption but the protocol.
     let mut buf = Vec::new();
     match read_packet(&mut stream, &mut buf).await {
-        Some(packet_type) => seen.lock().await.push(packet_type),
+        Some(packet) => seen.lock().await.push(packet),
         None => return,
     }
 
@@ -113,7 +159,7 @@ async fn run(mut stream: TcpStream, script: Vec<Act>, seen: Arc<Mutex<Vec<Packet
                 let _ = stream.flush().await;
             }
             Act::Expect => match read_packet(&mut stream, &mut buf).await {
-                Some(packet_type) => seen.lock().await.push(packet_type),
+                Some(packet) => seen.lock().await.push(packet),
                 None => return,
             },
             Act::Idle(duration) => tokio::time::sleep(duration).await,
@@ -130,18 +176,15 @@ async fn run(mut stream: TcpStream, script: Vec<Act>, seen: Arc<Mutex<Vec<Packet
     }
 }
 
-/// Reads exactly one packet, returning its type.
-async fn read_packet(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Option<PacketType> {
-    buf.clear();
+/// Reads exactly one packet, returning its bytes.
+async fn read_packet(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     loop {
-        if let Ok((header, header_len)) = FixedHeader::decode(buf, varint::MAX + 5) {
+        if let Ok((header, header_len)) = FixedHeader::decode(buf, CAP) {
             let total = header_len + header.remaining_length as usize;
             if buf.len() >= total {
-                let packet_type = Packet::decode(&buf[..total], varint::MAX + 5)
-                    .map(|(packet, _)| packet.packet_type())
-                    .unwrap_or(header.packet_type);
+                let packet = buf[..total].to_vec();
                 buf.drain(..total);
-                return Some(packet_type);
+                return Some(packet);
             }
         }
         let before = buf.len();
@@ -159,4 +202,11 @@ pub fn bytes(packet: &Packet<'_>) -> Vec<u8> {
     let mut out = Vec::new();
     packet.encode(&mut out).expect("a script packet encodes");
     out
+}
+
+/// Decodes one of [`Server::seen_bytes`]'s entries.
+pub fn decode(bytes: &[u8]) -> Packet<'_> {
+    Packet::decode(bytes, CAP)
+        .map(|(packet, _)| packet)
+        .expect("a recorded packet decodes")
 }

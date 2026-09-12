@@ -121,6 +121,31 @@ pub enum Error {
     /// any successful CONNACK MUST repeat the same method"
     /// ([MQTT-4.12.0-5]) (4.12) [mqtt5 §10].
     AuthenticationMethodMismatch,
+    /// The CONNACK said `Session Present` 1 and this client holds no session
+    /// state. "A Client that receives Session Present 1 where it has no
+    /// Session State MUST close the Network Connection"
+    /// ([MQTT-3.2.2-4]) (3.2.2.1.1) [mqtt5 §1] — believing it would mean
+    /// answering acknowledgements for exchanges this client has no record of.
+    SessionPresentWithoutState,
+    /// As many QoS 1 and 2 messages are unacknowledged as the server's
+    /// `Receive Maximum` permits, so no Packet Identifier may be spent.
+    ///
+    /// "At zero the sender MUST NOT send further QoS > 0 PUBLISH packets"
+    /// ([MQTT-4.9.0-2]) [mqtt5 §5]. Exhaustion "stalls the sender rather than
+    /// exceeding it", so a publish path waits for room; this variant is for a
+    /// caller that asked not to wait.
+    QuotaExhausted {
+        /// The ceiling in force: the server's `Receive Maximum`.
+        quota: u16,
+    },
+    /// The server has more unacknowledged QoS 2 messages in flight toward
+    /// this client than the `Receive Maximum` it was told, which "earns
+    /// DISCONNECT 0x93 (Receive Maximum exceeded)" [mqtt5 §5]. Reported here
+    /// rather than letting the receive table grow.
+    ReceiveMaximumExceeded {
+        /// The ceiling this client declared.
+        quota: u16,
+    },
     /// The server broke the protocol. The client's own answer is to close,
     /// which "a Client SHOULD" do ([MQTT-4.13.1-1]) (4.13.1) [mqtt5 §1].
     Protocol(DecodeError),
@@ -151,6 +176,8 @@ impl Error {
             Error::ServerDisconnected(code) => Some(code.as_byte()),
             Error::Unavailable { reason_code, .. } => Some(*reason_code),
             Error::Protocol(error) => error.reason_code(),
+            // 0x93 is the code a peer that broke the quota earns [mqtt5 §5].
+            Error::ReceiveMaximumExceeded { .. } => Some(0x93),
             _ => None,
         }
     }
@@ -185,6 +212,19 @@ impl fmt::Display for Error {
             ),
             Error::AuthenticationMethodMismatch => f.write_str(
                 "the server named a different authentication method than the CONNECT did",
+            ),
+            Error::SessionPresentWithoutState => f.write_str(
+                "the server resumed a session this client has no state for, so the connection \
+                 must close ([MQTT-3.2.2-4])",
+            ),
+            Error::QuotaExhausted { quota } => write!(
+                f,
+                "{quota} QoS 1 or 2 messages are already unacknowledged, which is the server's \
+                 Receive Maximum"
+            ),
+            Error::ReceiveMaximumExceeded { quota } => write!(
+                f,
+                "the server exceeded the Receive Maximum of {quota} this client declared"
             ),
             Error::Protocol(error) => write!(f, "the server broke the protocol: {error}"),
             Error::Encode(error) => write!(f, "cannot send this packet: {error}"),

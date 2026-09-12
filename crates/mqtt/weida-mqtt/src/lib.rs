@@ -101,6 +101,27 @@
 //! ([`ConnectOptions::connect_timeout`],
 //! [`ConnectOptions::effective_ping_timeout`]), because an unbounded wait is a
 //! hang with a rationale ([LOOP.md] §2).
+//!
+//! # The session, and the one place retransmission happens
+//!
+//! A [`Session`] is the client half of MQTT's session state and is held by
+//! the **application**, not by the connection: that is what makes it outlive
+//! the connection, which is the whole difference between the two. weida
+//! deliberately has no counterpart — "there is no L0 session state, nothing
+//! is retained across a connection"
+//! ([0008](../../../docs/decisions/0008-session-identity.md) §4.5) — so the
+//! state has an
+//! owner here rather than being smuggled into a runtime that declined it.
+//!
+//! [`Session::resend`] is the only retransmission in this crate, and it is
+//! called in exactly one place: just after a CONNACK whose `Session Present`
+//! is set. "This is the only circumstance where a Client or Server is
+//! REQUIRED to resend messages. Clients and Servers MUST NOT resend messages
+//! at any other time" ([MQTT-4.4.0-1]) [mqtt5 §6]. There is no retry timer
+//! anywhere, and that absence is the behaviour — the ecosystem disagrees
+//! loudly enough (EMQX's 30-second `retry_interval`, Paho Python's
+//! self-declared non-compliant republish [mqtt5 §6]) to make it worth a test
+//! that asserts nothing is resent inside a live connection.
 
 #![warn(missing_docs)]
 
@@ -109,16 +130,18 @@ pub mod connection;
 pub mod error;
 pub mod limits;
 pub mod options;
+pub mod session;
 
 pub use client::{Client, Context, Event, Events};
 pub use connection::Authenticator;
 pub use error::{Error, Feature, Result};
 pub use limits::{DEFAULT_RECEIVE_MAXIMUM, DEFAULT_TOPIC_ALIAS_MAXIMUM, Limits, ServerLimits};
 pub use options::{ConnectOptions, MAX_INTERVAL, MAX_KEEP_ALIVE, WillMessage};
+pub use session::{InFlight, Resend, Resumption, Session, Stage, StoredPublish};
 
 // The protocol vocabulary a caller needs in order to talk to this client at
 // all, re-exported so that `weida-mqtt` is one dependency rather than two.
 pub use weida_mqtt_codec::{
-    ConnectReasonCode, DisconnectReasonCode, PacketType, PayloadFormat, QoS, RetainHandling,
-    SubackReasonCode, SubscriptionOptions, UnsubackReasonCode,
+    ConnectReasonCode, DisconnectReasonCode, Packet, PacketType, PayloadFormat, QoS,
+    RetainHandling, SubackReasonCode, SubscriptionOptions, UnsubackReasonCode,
 };
