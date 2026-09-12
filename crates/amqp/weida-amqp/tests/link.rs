@@ -654,6 +654,21 @@ async fn an_errored_detach_poisons_its_handle_for_the_life_of_the_session() {
             weida_amqp_codec::AmqpError::new(condition::LINK_DETACH_FORCED).described("evicted");
         detach.error = Some(error);
         server.send(4, Performative::Detach(detach)).await;
+        // A link endpoint is destroyed only when both ends have detached, so
+        // the answer comes first — with the peer's `closed` flag and none of
+        // our own error, because the error was the broker's statement and not
+        // ours.
+        let (_, bytes) = server.read_frame().await;
+        let frame = frame::decode(&bytes, u32::MAX).unwrap();
+        let (performative, _) = Performative::decode(frame.body, Limits::DEFAULT).unwrap();
+        match performative {
+            Performative::Detach(answer) => {
+                assert_eq!(answer.handle, 0, "our handle, not the broker's");
+                assert!(answer.closed);
+                assert!(answer.error.is_none());
+            }
+            other => panic!("expected the answering detach, got {}", other.name()),
+        }
 
         // The next link must not be given handle 0: the broker is entitled
         // to still be sending frames for the dead one.
@@ -975,4 +990,193 @@ async fn a_detach_we_send_is_answered_and_the_handle_comes_back() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// A `flow` naming `handle`, with the session fields every `flow` must carry.
+fn flow_for(handle: u32) -> weida_amqp_codec::performative::Flow<'static> {
+    weida_amqp_codec::performative::Flow {
+        next_incoming_id: Some(0),
+        incoming_window: 400,
+        next_outgoing_id: 0,
+        outgoing_window: 400,
+        handle: Some(handle),
+        delivery_count: Some(0),
+        link_credit: Some(1),
+        available: Some(0),
+        drain: false,
+        echo: false,
+        properties: None,
+    }
+}
+
+#[tokio::test]
+async fn a_frame_for_a_cleanly_detached_handle_is_discarded_rather_than_ending_the_session() {
+    let exec = Exec::current().unwrap();
+    let (listener, port) = scripted().await;
+
+    let server = tokio::spawn(async move {
+        let mut server = accept(&listener).await;
+        let empty_source = Source::default();
+        let queue = Target::at("q");
+        server.handshake().await;
+        let (_, name, _) = server.read_named().await;
+        assert_eq!(name, "begin");
+        server.answer_begin(4, 0, 255).await;
+        let attach = server.read_attach().await;
+        server
+            .answer_attach(
+                4,
+                Answer::to(&attach.name, 11, Role::Receiver)
+                    .source(&empty_source)
+                    .target(&queue),
+            )
+            .await;
+
+        // The client detaches; the broker answers.
+        let (_, name, _) = server.read_named().await;
+        assert_eq!(name, "detach");
+        let mut detach = Detach::new(11);
+        detach.closed = true;
+        server.send(4, Performative::Detach(detach)).await;
+
+        // And then a `flow` for the handle that has just gone, which is the
+        // race a real peer produces: its frame was already in flight when the
+        // two detaches crossed.
+        server.send(4, Performative::Flow(flow_for(11))).await;
+
+        // The session must still be alive. A `begin` for a second session is
+        // answered, and the proof is that the client's `close` arrives rather
+        // than an `end`.
+        loop {
+            let (_, name, _) = server.read_named().await;
+            assert_ne!(
+                name, "end",
+                "a late flow for a detached link is not a session error"
+            );
+            if name == "close" {
+                break;
+            }
+        }
+        server
+            .send(0, Performative::Close(Close { error: None }))
+            .await;
+    });
+
+    let connection = tokio::time::timeout(
+        DEADLINE,
+        Connection::connect(&exec, "127.0.0.1", port, options()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+        .await
+        .unwrap()
+        .unwrap();
+    let link = tokio::time::timeout(
+        DEADLINE,
+        session.attach(LinkOptions::sender("orders", Target::at("q"))),
+    )
+    .await
+    .unwrap()
+    .expect("attached");
+    tokio::time::timeout(DEADLINE, link.detach())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The session survives the late frame, which is what the assertion in the
+    // server half is about; here it is enough that a clean close still works.
+    tokio::time::timeout(DEADLINE, connection.close())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(DEADLINE, server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_frame_for_an_errored_handle_ends_the_session_with_errant_link() {
+    let exec = Exec::current().unwrap();
+    let (listener, port) = scripted().await;
+
+    let server = tokio::spawn(async move {
+        let mut server = accept(&listener).await;
+        let empty_source = Source::default();
+        let queue = Target::at("q");
+        server.handshake().await;
+        let (_, name, _) = server.read_named().await;
+        assert_eq!(name, "begin");
+        server.answer_begin(4, 0, 255).await;
+        let attach = server.read_attach().await;
+        server
+            .answer_attach(
+                4,
+                Answer::to(&attach.name, 11, Role::Receiver)
+                    .source(&empty_source)
+                    .target(&queue),
+            )
+            .await;
+
+        // The broker destroys the endpoint **with an error**, which is the
+        // case Part 2 §2.6.5 names.
+        let mut detach = Detach::new(11);
+        detach.closed = true;
+        detach.error =
+            Some(weida_amqp_codec::AmqpError::new(condition::LINK_DETACH_FORCED).described("gone"));
+        server.send(4, Performative::Detach(detach)).await;
+        let (_, name, _) = server.read_named().await;
+        assert_eq!(name, "detach", "answered first");
+
+        // Later input on that handle: "MUST end the session with
+        // amqp:session:errant-link".
+        server.send(4, Performative::Flow(flow_for(11))).await;
+        let (_, bytes) = server.read_frame().await;
+        let frame = frame::decode(&bytes, u32::MAX).unwrap();
+        let (performative, _) = Performative::decode(frame.body, Limits::DEFAULT).unwrap();
+        match performative {
+            Performative::End(end) => {
+                let error = end.error.expect("with a condition");
+                assert_eq!(error.condition, condition::SESSION_ERRANT_LINK);
+            }
+            other => panic!("expected end, got {}", other.name()),
+        }
+    });
+
+    let connection = tokio::time::timeout(
+        DEADLINE,
+        Connection::connect(&exec, "127.0.0.1", port, options()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let session = tokio::time::timeout(DEADLINE, connection.begin(SessionOptions::default()))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut link = tokio::time::timeout(
+        DEADLINE,
+        session.attach(LinkOptions::sender("orders", Target::at("q"))),
+    )
+    .await
+    .unwrap()
+    .expect("attached");
+    // The errored detach reaches the application with its condition.
+    match tokio::time::timeout(DEADLINE, link.next_event())
+        .await
+        .unwrap()
+    {
+        Some(LinkEvent::Detached(Some(condition))) => {
+            assert_eq!(condition.condition, condition::LINK_DETACH_FORCED);
+        }
+        other => panic!("expected a Detached with its error, got {other:?}"),
+    }
+
+    tokio::time::timeout(DEADLINE, server)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(connection);
 }

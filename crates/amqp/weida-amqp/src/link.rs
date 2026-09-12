@@ -996,6 +996,13 @@ pub(crate) struct Links {
     /// Handles that were detached with an error, never reused for the life
     /// of the session.
     errored: HashSet<u32>,
+    /// The **peer's** handles for links cleanly detached on this session. A
+    /// frame naming one is a race with the `detach` and is discarded.
+    detached: HashSet<u32>,
+    /// The **peer's** handles for links detached with an error. Part 2 §2.6.5
+    /// requires later input on one to end the session with
+    /// `amqp:session:errant-link`, which is the opposite treatment.
+    errant: HashSet<u32>,
 }
 
 #[derive(Debug)]
@@ -1252,15 +1259,32 @@ impl Links {
             .find(|handle| !self.by_output.contains_key(handle) && !self.errored.contains(handle))
     }
 
-    /// The link of this name and direction, if one is attached.
+    /// The link of this name and direction that a second `attach` would
+    /// steal.
     ///
     /// The uniqueness scope of Part 2 §2.6.1: among links of the *same
     /// direction* between the two containers, so a sender and a receiver may
     /// share a name.
+    ///
+    /// A link this end is already **detaching** is not a candidate. It is on
+    /// its way out, its name is being given up, and stealing it would send
+    /// `amqp:link:stolen` for a link the application closed itself and poison
+    /// the handle for the rest of the session. The case is not hypothetical:
+    /// a peer that does not answer a `detach` until its own application lets
+    /// go — `fe2o3-amqp`'s acceptor is one — leaves the entry in this table
+    /// for exactly as long as it takes a client to detach and re-attach the
+    /// same name.
     pub(crate) fn by_name(&self, name: &str, role: Role) -> Option<u32> {
         self.by_output
             .iter()
-            .find(|(_, entry)| entry.shared.name == name && entry.shared.role == role)
+            .find(|(_, entry)| {
+                entry.shared.name == name
+                    && entry.shared.role == role
+                    && !matches!(
+                        *entry.shared.state.lock().expect("not poisoned"),
+                        LinkState::Detaching | LinkState::Detached(_)
+                    )
+            })
             .map(|(handle, _)| *handle)
     }
 
@@ -1290,12 +1314,51 @@ impl Links {
 
     /// Forgets a link. `errored` poisons its handle for the life of the
     /// session.
+    ///
+    /// The **peer's** handle is remembered either way, because a frame for a
+    /// link that has just gone is a race and not a fault: see
+    /// [`Links::was_detached`].
     pub(crate) fn remove(&mut self, output: u32, errored: bool) -> Option<Entry> {
-        self.input_to_output.retain(|_, mapped| *mapped != output);
+        let inputs: Vec<u32> = self
+            .input_to_output
+            .iter()
+            .filter(|(_, mapped)| **mapped == output)
+            .map(|(input, _)| *input)
+            .collect();
+        for input in inputs {
+            self.input_to_output.remove(&input);
+            if errored {
+                self.errant.insert(input);
+            } else {
+                self.detached.insert(input);
+            }
+        }
         if errored {
             self.errored.insert(output);
         }
         self.by_output.remove(&output)
+    }
+
+    /// Whether the peer's handle names a link that was attached on this
+    /// session and has since been **cleanly** detached.
+    ///
+    /// A frame naming such a handle is a race, not a fault: the peer's
+    /// `flow`, `transfer` or `disposition` may already have been in flight
+    /// when the `detach` crossed it. Ending the session over one would make
+    /// every orderly link close a coin toss, and `fe2o3-amqp`'s acceptor
+    /// really does send a `flow` for a handle it has just detached.
+    pub(crate) fn was_detached(&self, input: u32) -> bool {
+        self.detached.contains(&input)
+    }
+
+    /// Whether the peer's handle names a link that was detached **with an
+    /// error**.
+    ///
+    /// Part 2 §2.6.5 is explicit about this one and it is the opposite case:
+    /// "any later input on that handle or its delivery-ids MUST end the
+    /// session with `amqp:session:errant-link`".
+    pub(crate) fn was_errant(&self, input: u32) -> bool {
+        self.errant.contains(&input)
     }
 
     /// Wakes everything parked on any link of this session, which is what a
