@@ -18,6 +18,7 @@ members = [
     "crates/nng/weida-nng-bridge",
     "crates/mqtt/weida-mqtt-codec",
     "crates/amqp/weida-amqp-codec",
+    "crates/amqp/weida-amqp",
     # The shared PyO3 foundation every Python binding sits on, with nothing
     # protocol-specific in it (0014 §2).
     "crates/py/weida-py-core",
@@ -43,6 +44,7 @@ weida-py-core = { path = "crates/py/weida-py-core", version = "0.1.0" }
 weida-amqp-codec = { path = "crates/amqp/weida-amqp-codec", version = "0.1.0" }
 weida-zmq-py = { path = "crates/zmq/weida-zmq-py", version = "0.1.0" }
 weida-mqtt-codec = { path = "crates/mqtt/weida-mqtt-codec", version = "0.1.0" }
+weida-amqp = { path = "crates/amqp/weida-amqp", version = "0.1.0" }
 
 quinn = "0.11"
 tokio = { version = "1", features = [
@@ -52,6 +54,17 @@ tokio = { version = "1", features = [
     "io-util",
     "time",
     "net",
+] }
+# The TLS layer AMQP reaches either by protocol-id %d2 or as a bare `amqps`
+# listener (Part 5 §5.2). `rustls` 0.23 is already in this workspace's graph
+# through quinn, so this adds the tokio adapter and no second TLS stack. The
+# trust anchors are **not** here: `weida-amqp` takes the caller's
+# `rustls::ClientConfig`, because which certificates an application trusts is
+# the application's decision and not a messaging library's.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "logging",
+    "tls12",
 ] }
 bytes = "1"
 # The caller's executor need not be tokio: transfers implement both trait

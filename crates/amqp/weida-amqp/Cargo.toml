@@ -1,0 +1,46 @@
+[package]
+name = "weida-amqp"
+description = "An AMQP 1.0 client in Rust: connections, sessions and links, usable with no weida in the picture"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+# The machine room only: the reactor, the resolver and the close budget, plus
+# one OS-error vocabulary at the boundary. `weida` and `weida-protocol` MUST
+# NOT appear here (`docs/decisions/0013-competitor-libraries.md` §4.2): an
+# AMQP user must not link quinn, rustls and weida's pattern layer to open a
+# `tcp://` connection.
+weida-core.workspace = true
+weida-runtime.workspace = true
+tokio.workspace = true
+# The sans-I/O AMQP 1.0 codec: the type system, the frame header, the nine
+# performatives, the five SASL bodies, the message sections and the delivery
+# states. Reused rather than reimplemented; its own manifest stays empty
+# (0013 §4.3).
+weida-amqp-codec.workspace = true
+# Connection lifecycle logging: a handshake that says nothing is a handshake
+# nobody can debug, and AMQP's negotiation has four failure modes that look
+# alike from the outside.
+tracing.workspace = true
+# The TLS layer, on by default. Part 5 §5.2 makes TLS one of the two security
+# layers AMQP defines and Service Bus requires it on every path, so a client
+# without it is a client that cannot reach a large share of the deployed
+# brokers. `--no-default-features` turns it off for a build that has no
+# business linking a TLS stack.
+tokio-rustls = { workspace = true, optional = true }
+
+[dev-dependencies]
+# A certificate for the TLS tests. The trust anchors are the caller's
+# everywhere else; here the test is the caller.
+rcgen.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+
+[features]
+default = ["tls"]
+# `AMQP %d2 1.0.0`, the TLS handshake, and `AMQP %d0 1.0.0` inside it; plus
+# the bare `amqps` listener on 5671, which needs no protocol header at all.
+tls = ["dep:tokio-rustls"]
+
+[lints.rust]
+unsafe_code = "forbid"
