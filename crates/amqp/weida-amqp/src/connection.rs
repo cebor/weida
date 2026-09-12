@@ -76,6 +76,7 @@ use crate::sasl;
 use crate::session::{
     self, Entry, SESSION_QUEUE, Session, SessionEvent, SessionOptions, SessionState, Shared, Table,
 };
+use crate::settlement::{DEFAULT_MAX_UNSETTLED, Outcome, Settlement, Unsettled};
 use crate::transport::{self, FrameReader, FrameWriter, Wire};
 use crate::window::Windows;
 
@@ -1027,6 +1028,7 @@ impl Driver {
                     flow: Notify::new(),
                     max_frame_size: outgoing_frame_size,
                     next_tag: Mutex::new(0),
+                    unsettled: Mutex::new(Unsettled::new(DEFAULT_MAX_UNSETTLED)),
                 }),
                 events,
                 pending: Some(reply),
@@ -1120,15 +1122,20 @@ impl Driver {
             return Ok(None);
         }
 
-        // `attach` and `detach` belong to the link layer, and they are taken
-        // first because they change a table the session's own bookkeeping
-        // does not touch.
+        // `attach`, `detach` and `disposition` belong to the link layer, and
+        // they are taken first because they change tables the session's own
+        // bookkeeping does not touch. A `disposition` names no handle at all
+        // — it names a range of delivery-ids and a role — so it is the one
+        // frame that has to be offered to every link of the session.
         match &performative {
             Performative::Attach(attach) => {
                 return self.route_attach(channel, attach, writer).await;
             }
             Performative::Detach(detach) => {
                 return self.route_detach(channel, detach).await;
+            }
+            Performative::Disposition(disposition) => {
+                return self.route_disposition(channel, disposition, writer).await;
             }
             _ => {}
         }
@@ -1240,6 +1247,103 @@ impl Driver {
         Ok(None)
     }
 
+    /// A `disposition` from the peer.
+    ///
+    /// It names no handle. `role` names the *speaker*, so a receiver's
+    /// `disposition` is about deliveries this end sent and a sender's is
+    /// about deliveries this end received; the frame is offered to every link
+    /// of the session in the addressed direction, and a link that holds none
+    /// of the ids simply does nothing. That is also where idempotence comes
+    /// from: a repeated `disposition` finds nothing to change.
+    async fn route_disposition(
+        &mut self,
+        channel: u16,
+        disposition: &weida_amqp_codec::performative::Disposition<'_>,
+        writer: &mut FrameWriter,
+    ) -> Result<Option<State>> {
+        let first = disposition.first;
+        // "The highest delivery-id covered; unset means `first` alone."
+        let last = disposition.last.unwrap_or(first);
+        let state = match &disposition.state {
+            Some(value) => Some(weida_amqp_codec::state::DeliveryState::from_value(
+                value.clone(),
+            )?),
+            None => None,
+        };
+        let outcome = match &state {
+            Some(state) => Outcome::of(state)?,
+            None => None,
+        };
+
+        let Some(session) = self.sessions.by_incoming(channel) else {
+            return Ok(None);
+        };
+        let outgoing = session.shared.outgoing_channel;
+        let mut owed: Vec<(u32, u32, Outcome)> = Vec::new();
+        let mut reports: Vec<(mpsc::Sender<crate::link::LinkEvent>, u32, Outcome, bool)> =
+            Vec::new();
+        for link in session.links.addressed(disposition.role) {
+            let second = link.second_mode();
+            let events = link.events.clone();
+            let handle = link.shared.output_handle;
+            for (delivery_id, settlement) in
+                link.accept_disposition(first, last, outcome.as_ref(), disposition.settled)
+            {
+                match settlement {
+                    Settlement::Nothing | Settlement::Progress => {}
+                    Settlement::Settled(outcome) => {
+                        reports.push((events.clone(), delivery_id, outcome, true));
+                    }
+                    Settlement::Provisional(outcome) => {
+                        // `rcv-settle-mode=second`: the receiver published an
+                        // outcome and is waiting for this end to settle
+                        // before it settles itself. Owed by the driver,
+                        // because the application has nothing left to decide
+                        // — and once written, the delivery is over here, so
+                        // the report is final.
+                        let final_here = second && link.shared.role == Role::Sender;
+                        if final_here {
+                            owed.push((handle, delivery_id, outcome.clone()));
+                        }
+                        reports.push((events.clone(), delivery_id, outcome, final_here));
+                    }
+                }
+            }
+        }
+
+        for (_, delivery_id, outcome) in &owed {
+            write_disposition(
+                writer,
+                outgoing,
+                Role::Sender,
+                *delivery_id,
+                Some(outcome),
+                true,
+            )
+            .await?;
+        }
+        if !owed.is_empty() {
+            // Settled here as well now, so the delivery is over at this end.
+            if let Some(session) = self.sessions.by_incoming(channel) {
+                for (handle, delivery_id, _) in &owed {
+                    if let Some(link) = session.links.get_mut(*handle) {
+                        link.settle_here(*delivery_id);
+                    }
+                }
+            }
+        }
+        for (events, delivery_id, outcome, settled) in reports {
+            let _ = events
+                .send(crate::link::LinkEvent::Outcome {
+                    delivery_id,
+                    outcome,
+                    settled,
+                })
+                .await;
+        }
+        Ok(None)
+    }
+
     /// One frame for a link that is attached: a `transfer`, a `flow` naming a
     /// handle, or anything else this layer does not read.
     ///
@@ -1282,6 +1386,18 @@ impl Driver {
         match decision {
             Decision::Incoming(Incoming::Nothing) => {}
             Decision::Incoming(Incoming::Delivery(delivery)) => {
+                if !delivery.settled {
+                    // The sender has not settled, so this end keeps state for
+                    // the delivery until the application says what happened.
+                    // A delivery that arrived settled is recorded nowhere:
+                    // there is nothing to answer and nothing the answer could
+                    // change.
+                    if let Some(session) = self.sessions.by_incoming(channel)
+                        && let Some(link) = session.links.by_input(handle)
+                    {
+                        link.arrived(delivery.delivery_id, delivery.delivery_tag.clone());
+                    }
+                }
                 let _ = events
                     .send(crate::link::LinkEvent::Delivery(delivery))
                     .await;
@@ -1622,6 +1738,36 @@ async fn write_flow(
         channel,
         writer.max_frame_size(),
         |body| Performative::Flow(flow).encode(body),
+    )?;
+    writer.send(&out).await
+}
+
+/// Writes `disposition` on one session's outgoing channel.
+///
+/// The driver writes this one because the case that produces it is not the
+/// application's: under `rcv-settle-mode=second` the sender MUST settle once
+/// the receiver has published its outcome, and nothing is left to decide.
+async fn write_disposition(
+    writer: &mut FrameWriter,
+    channel: u16,
+    role: Role,
+    delivery_id: u32,
+    outcome: Option<&Outcome>,
+    settled: bool,
+) -> Result<()> {
+    let state = outcome.map(Outcome::to_state);
+    let mut disposition = weida_amqp_codec::performative::Disposition::new(role, delivery_id);
+    disposition.settled = settled;
+    disposition.state = state
+        .as_ref()
+        .map(weida_amqp_codec::state::DeliveryState::to_value);
+    let mut out = Vec::new();
+    frame::write(
+        &mut out,
+        FrameKind::Amqp,
+        channel,
+        writer.max_frame_size(),
+        |body| Performative::Disposition(disposition).encode(body),
     )?;
     writer.send(&out).await
 }

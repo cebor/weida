@@ -74,7 +74,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Notify, mpsc, oneshot};
 use weida_amqp_codec::message::{Message, Progress, Reassembly};
-use weida_amqp_codec::performative::{Attach, Detach, Flow, Performative, Transfer};
+use weida_amqp_codec::performative::{Attach, Detach, Disposition, Flow, Performative, Transfer};
+use weida_amqp_codec::state::DeliveryState;
 use weida_amqp_codec::types::condition;
 use weida_amqp_codec::{ReceiverSettleMode, Role, SenderSettleMode};
 
@@ -82,6 +83,7 @@ use crate::credit::Credit;
 use crate::delivery::{Delivery, Sent};
 use crate::error::{Condition, Error, Result};
 use crate::options::multiple;
+use crate::settlement::{Outcome, Pending, Settlement, Unsettled};
 use crate::terminus::{Source, Target};
 use crate::window::Windows;
 
@@ -259,8 +261,20 @@ pub enum LinkEvent {
     /// A whole message, reassembled from however many `transfer` frames it
     /// took.
     Delivery(Delivery),
-    /// A frame for this link that is neither a `transfer` nor a `flow`: a
-    /// `disposition`, whole and undecoded.
+    /// A delivery's state changed, because a `disposition` said so.
+    ///
+    /// `settled` is the difference between a provisional answer and a final
+    /// one: `false` means the peer published the outcome but has not settled,
+    /// which under `rcv-settle-mode=second` is the middle of the dance.
+    Outcome {
+        /// Which delivery.
+        delivery_id: u32,
+        /// What the peer committed to.
+        outcome: Outcome,
+        /// Whether the delivery is now settled at both ends.
+        settled: bool,
+    },
+    /// A frame for this link this layer does not read.
     Frame(Vec<u8>),
     /// The peer's `flow` changed this link's credit state, and the new state
     /// is the one [`Link::credit`] reports.
@@ -301,6 +315,12 @@ pub(crate) struct Shared {
     pub(crate) max_frame_size: u32,
     /// The next delivery-tag this end will choose.
     pub(crate) next_tag: Mutex<u64>,
+    /// The deliveries this end still holds state for.
+    ///
+    /// Shared with the driver because both write it: a sender records a
+    /// delivery here as it sends, and the driver retires it when the
+    /// receiver's `disposition` arrives.
+    pub(crate) unsettled: Mutex<Unsettled>,
 }
 
 /// An AMQP 1.0 link.
@@ -393,7 +413,7 @@ impl Link {
             match self.events.recv().await? {
                 LinkEvent::Delivery(delivery) => return Some(delivery),
                 LinkEvent::Detached(_) => return None,
-                LinkEvent::Frame(_) | LinkEvent::Flow(_) => {}
+                LinkEvent::Frame(_) | LinkEvent::Flow(_) | LinkEvent::Outcome { .. } => {}
             }
         }
     }
@@ -492,6 +512,164 @@ impl Link {
         self.send_flow(false).await
     }
 
+    /// The deliveries this end still holds state for, in delivery-id order.
+    ///
+    /// Empty is the answer an application usually wants: it means nothing is
+    /// outstanding in either direction.
+    #[must_use]
+    pub fn unsettled(&self) -> Vec<Pending> {
+        self.shared
+            .unsettled
+            .lock()
+            .expect("not poisoned")
+            .pending()
+    }
+
+    /// A **receiver**: accepts a delivery.
+    ///
+    /// What it commits to: the message was processed and the sender may
+    /// retire it at the source. It does **not** say "on disk" — durability is
+    /// asserted by `header.durable` on the way in, and a target that cannot
+    /// honour it MUST refuse the message rather than accept it.
+    pub async fn accept(&self, delivery_id: u32) -> Result<()> {
+        self.settle(delivery_id, delivery_id, &Outcome::Accepted)
+            .await
+    }
+
+    /// A **receiver**: rejects a delivery as invalid and unprocessable.
+    ///
+    /// What it commits to: this node will not redeliver it, and the message's
+    /// `delivery-count` goes up — so a redelivery limit counts this attempt.
+    pub async fn reject(&self, delivery_id: u32, error: Option<Condition>) -> Result<()> {
+        self.settle(delivery_id, delivery_id, &Outcome::Rejected { error })
+            .await
+    }
+
+    /// A **receiver**: releases a delivery, unchanged and available again.
+    ///
+    /// What it commits to: nothing was acted upon and `delivery-count` is
+    /// **not** incremented, which makes a released message indistinguishable
+    /// from one that was never delivered.
+    pub async fn release(&self, delivery_id: u32) -> Result<()> {
+        self.settle(delivery_id, delivery_id, &Outcome::Released)
+            .await
+    }
+
+    /// A **receiver**: makes a delivery available again, with a note.
+    ///
+    /// `delivery_failed` increments `delivery-count`;
+    /// `undeliverable_here` says this link endpoint MUST NOT see it again.
+    /// Both are `Option` because the specification gives them no defaults,
+    /// and unset leaves the node's own policy in charge.
+    pub async fn modify(
+        &self,
+        delivery_id: u32,
+        delivery_failed: Option<bool>,
+        undeliverable_here: Option<bool>,
+    ) -> Result<()> {
+        self.settle(
+            delivery_id,
+            delivery_id,
+            &Outcome::Modified {
+                delivery_failed,
+                undeliverable_here,
+                message_annotations: None,
+            },
+        )
+        .await
+    }
+
+    /// Settles every delivery this end holds in `first..=last` with one
+    /// `disposition`.
+    ///
+    /// One frame for a range is the point of the range: "a disposition MAY
+    /// cover deliveries from many links of the session provided they all have
+    /// this role", and a receiver acknowledging a batch writes one frame
+    /// rather than one per message. Deliveries in the range that this end no
+    /// longer holds are simply not there — that is idempotence, not an error.
+    pub async fn settle(&self, first: u32, last: u32, outcome: &Outcome) -> Result<()> {
+        // A sender may also publish a state — that is the `second` dance's
+        // second half — but naming an outcome is the receiver's move.
+        let second = matches!(
+            self.negotiated().map(|n| n.rcv_settle_mode),
+            Some(ReceiverSettleMode::Second)
+        );
+        let covered = {
+            let mut map = self.shared.unsettled.lock().expect("not poisoned");
+            let covered = map.ids_in(first, last);
+            for id in &covered {
+                // Under `second` this end does *not* settle yet: it publishes
+                // the outcome and waits for the sender to settle first, which
+                // is the whole difference between the two modes.
+                map.record_ours(*id, outcome, !second);
+            }
+            covered
+        };
+        if covered.is_empty() {
+            // Nothing here to settle. Writing the frame anyway would be
+            // harmless for the peer and a lie to a reader of the log.
+            return Ok(());
+        }
+        // The map made room, so a sender parked on it can go.
+        self.shared.flow.notify_waiters();
+        self.send_disposition(first, last, Some(outcome), !second)
+            .await
+    }
+
+    /// The outcome of one delivery, waited for.
+    ///
+    /// Returns when the delivery is settled at both ends, which is the only
+    /// point at which the answer cannot change. Under
+    /// `rcv-settle-mode=first` that is the receiver's single `disposition`;
+    /// under `second` it is the end of the three-frame dance.
+    pub async fn settled(&mut self, delivery_id: u32) -> Result<Outcome> {
+        if self
+            .shared
+            .unsettled
+            .lock()
+            .expect("not poisoned")
+            .get(delivery_id)
+            .is_none()
+        {
+            return Err(Error::Configuration(format!(
+                "delivery {delivery_id} is not unsettled on link {}: it was \
+                 settled on send, already settled, or never sent from here",
+                self.shared.name
+            )));
+        }
+        loop {
+            match self.events.recv().await {
+                Some(LinkEvent::Outcome {
+                    delivery_id: id,
+                    outcome,
+                    settled: true,
+                }) if id == delivery_id => return Ok(outcome),
+                Some(LinkEvent::Detached(condition)) => return Err(Error::Closed(condition)),
+                Some(_) => {}
+                None => return Err(Error::ConnectionGone),
+            }
+        }
+    }
+
+    /// Writes one `disposition` covering `first..=last`.
+    async fn send_disposition(
+        &self,
+        first: u32,
+        last: u32,
+        outcome: Option<&Outcome>,
+        settled: bool,
+    ) -> Result<()> {
+        let state = outcome.map(Outcome::to_state);
+        let mut disposition = Disposition::new(self.shared.role, first);
+        // `last` unset means `first` alone, so a single delivery is the
+        // shorter frame rather than a range of one.
+        disposition.last = (last != first).then_some(last);
+        disposition.settled = settled;
+        disposition.state = state.as_ref().map(DeliveryState::to_value);
+        self.send_performative(Performative::Disposition(disposition))
+            .await
+    }
+
     /// A **sender**: sends one message, stalling until both schemes permit
     /// it.
     ///
@@ -530,9 +708,15 @@ impl Link {
                 Ok(id) => id,
                 Err(error) => {
                     // Half a delivery on the wire is worse than none: `abort`
-                    // tells the receiver to discard what it has and settles
-                    // the delivery implicitly (Part 2 §2.7.5).
+                    // tells the receiver to discard what it has, and an
+                    // aborted delivery is implicitly settled, so this end
+                    // forgets it too (Part 2 §2.7.5).
                     self.abort(delivery_id, &tag, frames).await;
+                    self.shared
+                        .unsettled
+                        .lock()
+                        .expect("not poisoned")
+                        .settle_here(delivery_id);
                     return Err(error);
                 }
             };
@@ -543,6 +727,18 @@ impl Link {
                 // counter, and a peer that expected otherwise would have no
                 // way to say so.
                 delivery_id = id;
+                if !settled {
+                    // Unsettled: this end keeps state for the delivery until
+                    // the receiver's `disposition` retires it. A settled
+                    // transfer is recorded nowhere, because the sender has
+                    // already forgotten it — which is what "settled on send"
+                    // means and why it proves nothing about the message.
+                    self.shared
+                        .unsettled
+                        .lock()
+                        .expect("not poisoned")
+                        .insert(delivery_id, tag.clone());
+                }
             }
             let fragment = &payload[offset..end];
             let mut transfer = Transfer::new(self.shared.output_handle);
@@ -558,6 +754,11 @@ impl Link {
                 Ok(bytes) => self.write(bytes).await?,
                 Err(error) => {
                     self.abort(delivery_id, &tag, frames).await;
+                    self.shared
+                        .unsettled
+                        .lock()
+                        .expect("not poisoned")
+                        .settle_here(delivery_id);
                     return Err(error);
                 }
             }
@@ -967,6 +1168,77 @@ impl Entry {
     pub(crate) fn wake(&self) {
         self.shared.flow.notify_waiters();
     }
+
+    /// Records a delivery that arrived unsettled, so that the application's
+    /// `disposition` has something to name.
+    pub(crate) fn arrived(&self, delivery_id: u32, tag: Vec<u8>) {
+        self.shared
+            .unsettled
+            .lock()
+            .expect("not poisoned")
+            .insert(delivery_id, tag);
+    }
+
+    /// Applies a `disposition` covering `first..=last` to this link.
+    ///
+    /// Returns what each delivery amounted to, paired with its id, so that
+    /// the driver can answer and report without holding the map.
+    pub(crate) fn accept_disposition(
+        &mut self,
+        first: u32,
+        last: u32,
+        outcome: Option<&Outcome>,
+        settled: bool,
+    ) -> Vec<(u32, Settlement)> {
+        let mut map = self.shared.unsettled.lock().expect("not poisoned");
+        let covered = map.ids_in(first, last);
+        let applied = covered
+            .into_iter()
+            .map(|id| {
+                let settlement = map.record_theirs(id, outcome, settled);
+                (id, settlement)
+            })
+            .collect::<Vec<_>>();
+        drop(map);
+        // The map may have made room, and a sender parked on it is parked on
+        // the same waker as one parked on credit.
+        self.shared.flow.notify_waiters();
+        applied
+    }
+
+    /// Whether this link is the end a `disposition` with this role is about.
+    ///
+    /// "One `disposition` MAY cover deliveries from many links of the session
+    /// provided they all have this role" — the role names the *speaker*, so a
+    /// receiver's `disposition` is about deliveries this end sent.
+    pub(crate) fn addressed_by(&self, role: Role) -> bool {
+        match role {
+            Role::Receiver => self.shared.role == Role::Sender,
+            Role::Sender => self.shared.role == Role::Receiver,
+        }
+    }
+
+    /// Whether this end must settle before the peer's outcome is final.
+    pub(crate) fn second_mode(&self) -> bool {
+        matches!(
+            self.shared
+                .negotiated
+                .lock()
+                .expect("not poisoned")
+                .as_ref()
+                .map(|n| n.rcv_settle_mode),
+            Some(ReceiverSettleMode::Second)
+        )
+    }
+
+    /// Settles a delivery at this end after the peer has settled it.
+    pub(crate) fn settle_here(&self, delivery_id: u32) {
+        self.shared
+            .unsettled
+            .lock()
+            .expect("not poisoned")
+            .settle_here(delivery_id);
+    }
 }
 
 impl Links {
@@ -1041,6 +1313,18 @@ impl Links {
     pub(crate) fn drain(&mut self) -> Vec<Entry> {
         self.input_to_output.clear();
         self.by_output.drain().map(|(_, entry)| entry).collect()
+    }
+
+    /// Every link a `disposition` spoken by `role` is about.
+    ///
+    /// The role names the speaker, so a receiver's `disposition` addresses
+    /// this end's *senders*. One frame covering many links of a session is
+    /// legal and is the point of the range, which is why this is an iterator
+    /// and not a lookup.
+    pub(crate) fn addressed(&mut self, role: Role) -> impl Iterator<Item = &mut Entry> {
+        self.by_output
+            .values_mut()
+            .filter(move |entry| entry.addressed_by(role))
     }
 }
 
@@ -1171,6 +1455,7 @@ mod tests {
                 flow: Notify::new(),
                 max_frame_size: weida_amqp_codec::frame::MIN_MAX_FRAME_SIZE,
                 next_tag: Mutex::new(0),
+                unsettled: Mutex::new(Unsettled::new(crate::settlement::DEFAULT_MAX_UNSETTLED)),
             }),
             events,
             pending: None,
