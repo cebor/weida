@@ -749,12 +749,14 @@ acceptance: `maturin build` produces an abi3 wheel for CPython on Linux carrying
 note: workstream W1, worktree ../weida-w1, branch b118-zmq-py-packaging
 
 ### B-119 — `weida-nng`: context, sockets, endpoints and the error vocabulary
-kind: code | size: 90 | status: in_progress (delegated) 2026-09-12T02:18Z | needs: []
+kind: code | size: 90 | status: done cdc3561 | needs: []
 acceptance: `crates/nng/weida-nng` with one socket type per SP protocol on `weida-runtime`'s `Exec`, dialers and listeners as named endpoint objects that create pipes, URLs parsed for `tcp://`, `ipc://`, `inproc://` and `tls+tcp://` under `NNG_MAXADDRLEN` and the 122-byte legacy IPC path bound, and an error enum carrying NNG's own names (`NNG_ESTATE`, `NNG_ETIMEDOUT`, `NNG_ECLOSED`, `NNG_EMSGSIZE`, `NNG_ECONNREFUSED`); no dependency on `weida` or `weida-protocol`, and the sans-I/O `weida-sp` keeps its empty `[dependencies]`.
 note: workstream W2, worktree ../weida-w2, branch b119-nng-context
+note: merged `--no-ff` as cdc3561, no conflicts, gate green here: **785 tests** (764 + 21), 0 failed, 1 ignored, fmt clean, clippy in both feature configurations, rustdoc with `-D warnings`. Both dependency rules verified with `cargo tree` rather than read off the manifest: `weida-nng`'s normal-edge tree is `weida-core`, `weida-runtime`, `weida-sp`, `tokio`, `tracing` and their transitives with no `weida` and no `weida-protocol` (0013 §4.2), and `weida-sp`'s tree is `weida-sp` alone, so the codec's empty `[dependencies]` survived the library being built on it (0013 §4.3). The acceptance line's "one socket type per SP protocol" is **not** in this item: the worker delivered `protocol.rs` — one row per SP protocol with its direction and context support — and deferred the socket types to B-123..B-128, because a socket that creates pipes needs B-120's messages and B-121's engine first. Accepted as the honest slice; the socket-type half is already filed as those items and the acceptance is read as satisfied by the shape decision plus the deferral, not by a stub.
+note: the worker reports one pre-existing flake under whole-workspace load, `weida --test drain a_draining_runtime_refuses_a_late_stream_on_an_open_connection`, which this branch does not touch and which passed in this tree's merge gate. Already known here (the nightlog names it under the five small ready items); not re-filed.
 
 ### B-120 — The message, the per-socket queues and `RECVMAXSZ`
-kind: code | size: 90 | status: ready | needs: [B-119]
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-12T02:50Z | needs: [B-119]
 acceptance: a message with protocol header and application body in separate storage, delivered wholly or not at all with no streaming body; `SENDBUF`/`RECVBUF` as message depths 0-8192 with PUSH's documented default of 0 and the protocols that permit neither (REQ, one transaction per context) refusing them by name; `RECVMAXSZ` checked from the 64-bit declared length **before** any allocation; and the per-protocol full-queue action — PUSH and PAIR block or `NNG_ETIMEDOUT`, BUS drops, SUB drops oldest or rejects newest per `SUB_PREFNEW` — with one test per action.
 note: workstream W2, worktree ../weida-w2, branch b120-nng-message-queues
 
