@@ -1,0 +1,30 @@
+[package]
+name = "weida-mqtt"
+description = "An MQTT 5.0 client in Rust: connection, session, QoS and subscriptions, usable with no weida in the picture"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+# The machine room only: the reactor, the resolver and one OS-error vocabulary
+# at the boundary. `weida` and `weida-protocol` MUST NOT appear here
+# (`docs/decisions/0013-competitor-libraries.md` §4.2).
+weida-core.workspace = true
+weida-runtime.workspace = true
+tokio.workspace = true
+# The sans-I/O MQTT 5.0 codec: the fixed header, the property framework and
+# all fifteen packets, with the declared-length check that makes `Maximum
+# Packet Size` enforceable before a body is allocated. Reused rather than
+# reimplemented; its own manifest stays empty (0013 §4.3).
+weida-mqtt-codec.workspace = true
+# Connection lifecycle logging: a keep-alive loop that says nothing is a
+# keep-alive loop nobody can debug.
+tracing.workspace = true
+
+[dev-dependencies]
+# Drives the owned-context tests from an executor that is not tokio, which is
+# what `Context::owned` exists for.
+futures.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
