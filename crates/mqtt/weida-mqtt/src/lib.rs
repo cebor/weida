@@ -125,6 +125,7 @@
 
 #![warn(missing_docs)]
 
+pub mod alias;
 pub mod client;
 pub mod connection;
 pub mod error;
@@ -134,6 +135,7 @@ pub mod message;
 pub mod options;
 pub mod session;
 
+pub use alias::{Aliased, InboundAliases, OutboundAliases};
 pub use client::{Client, Context, Event, Events};
 pub use connection::Authenticator;
 pub use error::{Error, Feature, Result};
