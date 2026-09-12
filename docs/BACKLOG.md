@@ -1235,26 +1235,32 @@ note: two rows are judgement rather than transcription and both are right. **Jet
 note: **this closes W4 — B-154..B-169, sixteen items: two codecs, two client libraries, two interop harnesses and two parity tables.** Its bindings (B-170..B-173) remain `ready` and depend only on `weida-py-core`, which is on main from W1's B-111.
 
 ### B-170 — `weida-amqp-py`: the asyncio surface
-kind: code | size: 90 | status: ready | needs: [B-111, B-162]
+kind: code | size: 90 | status: done 0d625ed | needs: [B-111, B-162]
 acceptance: `crates/amqp/weida-amqp-py` on `weida-py-core`: connection, session and link as Python objects, `await send` returning the delivery's terminal state rather than a boolean, an async iterator of received deliveries with their sections and annotations, credit granted explicitly from Python, and AMQP error conditions as distinct exception classes; a send awaited to `accepted` and a receive settled from Python both run against the peer of B-162.
 note: workstream W4, worktree ../weida-w4, branch b170-amqp-py-asyncio
+note: merged `--no-ff` as 0d625ed together with B-171 — one branch, two commits, because both surfaces live in one crate and neither compiles without the other. Gate green here: **1678 tests**, 0 failed, 37 ignored; fmt; clippy workspace, `-p weida --no-default-features`, `-p weida-amqp --no-default-features`; rustdoc with `-D warnings` both `--workspace` and `-p weida-amqp --no-default-features` (B-184's configuration, run because this crate has a default-off feature and B-152 proved the workspace run cannot see a `cfg`-ed doc link). Python ran here: `develop.sh` → **17 passed**, `package.sh` built `weida_amqp-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl` and ran one accepted transfer from a fresh venv with cargo, rustc and maturin off `PATH`. No index conflict: the `amqp-py.md` row landed after `amqp.md` in the table I had just reordered by Phase B, which is where it belongs.
+note: **the acceptance said "against the peer of B-162", and W4 made that literal rather than convenient**: `crates/amqp/weida-amqp/examples/fe2o3_peer.rs` runs `fe2o3-amqp` 0.17 as a child process, so three of the seventeen Python tests exchange with a **foreign implementation** — send-to-`accepted` on both surfaces and a delivery settled from Python — rather than with a script of ours. A binding tested only against its own library proves the argument conversion; this proves the protocol.
+note: **two library changes came with it, and the first is a public-API decision worth reading.** `weida_amqp::Error` **drops `#[non_exhaustive]`**, with the reasoning written at the type: a binding that maps every variant onto its own vocabulary can only be checked for drift if a new variant is a compile error downstream, and `#[non_exhaustive]` forces a wildcard arm that would swallow it into the base class. The cost — adding a variant becomes a breaking change — is the honest description of adding a failure a caller may have to handle. Verified at `error.rs:94-102`. Second, `connection::State::refusal()` is new and `Connection::begin` uses it, so a connection the peer closed with `amqp:resource-limit-exceeded` reports **that condition** instead of "the connection is gone" — which is what let the condition-as-a-class test fail honestly instead of passing for the wrong reason.
+note: **`weida_nats::Error` is still `#[non_exhaustive]` on main** (`crates/nats/weida-nats/src/error.rs:43`), so the two libraries disagree until B-172 lands the same change. I checked rather than took the announcement's word for it; flagged to W4, and it resolves itself with the NATS binding.
 
 ### B-171 — `weida-amqp-py`: the sync surface
-kind: code | size: 45 | status: ready | needs: [B-170]
+kind: code | size: 45 | status: done 0d625ed | needs: [B-170]
 acceptance: the synchronous Python surface over the same client with no asyncio loop required in the process and no second implementation of any protocol behaviour, a receive timeout where the async surface has cancellation; B-170's send-to-`accepted` runs unchanged in synchronous form.
 note: workstream W4, worktree ../weida-w4, branch b171-amqp-py-sync
+note: merged with B-170 in 0d625ed; see B-170's notes for the gate, the Python runs and the two library changes. The acceptance's "no second implementation of any protocol behaviour" holds the same way B-152's did: one surface over one client, the sync side differing only where it must — a receive timeout where the async side has cancellation.
 
 ### B-172 — `weida-nats-py`: the asyncio surface
-kind: code | size: 90 | status: ready | needs: [B-111, B-168]
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-12T09:25Z | needs: [B-111, B-168]
 acceptance: `crates/nats/weida-nats-py` on `weida-py-core`: connect, publish with optional headers, subscribe returning an async iterator of messages with subject, `sid`, reply-to and payload, queue-group membership, `unsubscribe` with a message count, and `request` with a mandatory timeout that raises rather than hangs — the no-responder status among the exception classes; the round trip runs against the server B-168 supervises.
 note: workstream W4, worktree ../weida-w4, branch b172-nats-py-asyncio
+note: in flight beside B-174 rather than after it: W4's announcement of B-170 cited "the same decision the NATS binding made for `weida_nats::Error`", which is work on `b172-nats-py`, so both are running and B-174 is W4's own. Confirmed with W4 on merging B-170.
 
 ### B-173 — `weida-nats-py`: the sync surface
-kind: code | size: 45 | status: ready | needs: [B-172]
+kind: code | size: 45 | status: in_progress (delegated) 2026-09-12T09:25Z | needs: [B-172]
 acceptance: the synchronous Python surface over the same client with no asyncio loop required and no second implementation of any protocol behaviour, subscriptions drained by a blocking `next_msg(timeout)`; B-172's request-reply runs unchanged in synchronous form.
 note: workstream W4, worktree ../weida-w4, branch b173-nats-py-sync
 
 ### B-174 — Research: what the AMQP and NATS implementations taught their sheets
-kind: research | size: 45 | status: ready | needs: [B-162, B-168]
+kind: research | size: 45 | status: in_progress (delegated) 2026-09-12T09:25Z | needs: [B-162, B-168]
 acceptance: [research/amqp10.md](research/amqp10.md) and [research/nats.md](research/nats.md) updated with what building the two clients and running them against foreign peers established, each in its own sheet's protocol-native vocabulary and with no sentence mentioning weida ([research/README.md](research/README.md) rule 1), every addition attributed to a new numbered source naming the peer versions and what was observed; the AMQP sheet's "known incompatibilities" list gains what the RabbitMQ run measured, and every claim the runs could **not** settle is left standing as an open question rather than quietly resolved.
 note: workstream W4, worktree ../weida-w4, branch b174-amqp-nats-sheet-update
