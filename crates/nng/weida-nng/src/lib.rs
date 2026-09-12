@@ -57,6 +57,15 @@
 //!   PAIR v1 initial hop count and the `MAXTTL` ceiling are the two the
 //!   sheet records (§3, §11); this crate says which it sends and accepts
 //!   both, rather than choosing silently.
+//! - [`Engine`], [`Dialer`] and [`Listener`] — one socket's dialling and
+//!   listening endpoints, the pipes they create, the reconnect backoff of
+//!   `NNG_OPT_RECONNMINT`/`RECONNMAXT`, and the three pipe events, with a
+//!   synchronous dial that waits for the peer's protocol header without
+//!   costing a thread and a named ceiling on how many pipes a socket
+//!   admits ([`DEFAULT_MAX_PIPES`]).
+//! - [`SocketOptions`] — every option under NNG's own name, honoured or
+//!   refused where it is set, plus the three bounds SP leaves open and this
+//!   library closes.
 //!
 //! # Sources
 //!
@@ -69,10 +78,13 @@
 
 pub mod context;
 pub mod endpoint;
+pub mod engine;
 pub mod error;
 pub mod message;
+pub mod options;
 pub mod pipe;
 pub mod protocol;
+pub mod transport;
 
 pub use context::{
     Closed, Context, ContextConfig, DEFAULT_CLOSE_BUDGET, DEFAULT_MAX_SOCKETS, SocketId, SocketSlot,
@@ -80,10 +92,20 @@ pub use context::{
 pub use endpoint::{
     Endpoint, MAX_INPROC_NAME_BYTES, MAX_LEGACY_IPC_PATH_BYTES, NNG_MAXADDRLEN, TcpHost,
 };
+pub use engine::{
+    Admission, Connection, Dialer, DialerId, Engine, HandshakeGate, Listener, ListenerId,
+    PipeCallback, PipeEvent, PipeInfo, Role, Session, SessionFuture,
+};
 pub use error::{Cause, Error, Result};
 pub use message::{DEFAULT_RECV_MAX_SIZE, Message, RECV_MAX_SIZE_UNLIMITED};
+pub use options::{
+    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_ADDRESSES, DEFAULT_MAX_PIPES, DEFAULT_RECONNECT_MAX,
+    DEFAULT_RECONNECT_MIN, SocketOptions,
+};
 pub use pipe::{
     DEFAULT_RECV_DEPTH, DEFAULT_SEND_DEPTH, FullAction, MAX_QUEUE_DEPTH, PipeId, Queue,
     QueueConfig, Sent,
 };
+pub use pipe::{Discarded, Pipe, PipeConfig};
 pub use protocol::{PROTOCOLS, Protocol, protocol};
+pub use transport::Stream;
