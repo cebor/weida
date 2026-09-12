@@ -81,6 +81,9 @@ pub const SPEC_MAX_TTL: usize = 255;
 /// rather than discovered when a node drops the message.
 pub const NNG_MAX_TTL: usize = 15;
 
+/// Default `NNG_OPT_SURVEYOR_SURVEYTIME`: NNG's own one second.
+pub const DEFAULT_SURVEY_TIME: Duration = Duration::from_secs(1);
+
 /// One socket's configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SocketOptions {
@@ -146,6 +149,9 @@ pub struct SocketOptions {
     /// a stack of 16 (§11). Both numbers are published rather than one
     /// chosen silently.
     pub max_ttl: usize,
+    /// `NNG_OPT_SURVEYOR_SURVEYTIME`: how long a surveyor collects
+    /// responses, counted **from the send** (§4).
+    pub survey_time: Duration,
 }
 
 impl Default for SocketOptions {
@@ -159,6 +165,7 @@ impl Default for SocketOptions {
             reconnect_min: DEFAULT_RECONNECT_MIN,
             reconnect_max: DEFAULT_RECONNECT_MAX,
             max_pipes: DEFAULT_MAX_PIPES,
+            survey_time: DEFAULT_SURVEY_TIME,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             max_addresses: DEFAULT_MAX_ADDRESSES,
             sub_prefer_new: true,
