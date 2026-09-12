@@ -218,8 +218,22 @@ fn text(name: &str, value: &Bound<'_, PyAny>) -> Result<String> {
         .map_err(|_| Error::EINVAL(format!("{name} takes a str").into()))
 }
 
-/// Octets.
+/// Octets, from `bytes`, from a `bytearray`, or from the identity type the
+/// option's own row is about — `CurveKey` for the four CURVE options,
+/// `RoutingId` for `ZMQ_ROUTING_ID`. A key that is already a `CurveKey` is
+/// not re-parsed and not re-validated: it was checked when it was made.
 fn octets(name: &str, value: &Bound<'_, PyAny>) -> Result<Vec<u8>> {
+    if let Ok(key) = value.extract::<PyRef<'_, crate::identity::PyCurveKey>>() {
+        return Ok(key.octets().to_vec());
+    }
+    if let Ok(id) = value.extract::<PyRef<'_, crate::identity::PyRoutingId>>() {
+        return Ok(id.octets().to_vec());
+    }
+    if let Ok(text) = value.extract::<String>() {
+        // A 40-character Z85 key is the form a configuration file holds, and
+        // `str` is how Python holds it.
+        return Ok(text.into_bytes());
+    }
     weida_py_core::payload_of(value)
         .map_err(|_| Error::EINVAL(format!("{name} takes bytes").into()))
 }

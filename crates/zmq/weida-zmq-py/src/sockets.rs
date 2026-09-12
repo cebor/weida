@@ -371,6 +371,23 @@ macro_rules! python_socket {
                 })
             }
 
+            /// Every connection this socket has, connected or not, as a
+            /// snapshot: what the peer announced, what a ZAP handler said
+            /// about it, and what the kernel says about a local one.
+            fn peers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+                let slot = Arc::clone(&self.socket);
+                self.bridge.awaitable(py, async move {
+                    Ok::<Vec<crate::identity::PyPeer>, Errno>(
+                        slot.acquire()
+                            .await
+                            .connections()
+                            .iter()
+                            .map(crate::identity::PyPeer::of)
+                            .collect(),
+                    )
+                })
+            }
+
             /// `zmq_close`: stops accepting and dialling, and destroys every
             /// queue. The socket's slot under `ZMQ_MAX_SOCKETS` is returned
             /// when Python collects the object.
