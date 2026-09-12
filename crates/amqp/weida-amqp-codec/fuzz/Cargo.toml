@@ -1,0 +1,33 @@
+[package]
+name = "weida-amqp-codec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+weida-amqp-codec = { path = ".." }
+
+# Deliberately its own workspace: the fuzz crate needs nightly and must not
+# affect `cargo build --workspace` or the lockfile of the library crates.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "value"
+path = "fuzz_targets/value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "composite"
+path = "fuzz_targets/composite.rs"
+test = false
+doc = false
+bench = false
