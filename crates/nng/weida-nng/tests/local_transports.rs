@@ -1,13 +1,16 @@
 //! `inproc://` and `ipc://`, end to end, with the protocols that run over
 //! them.
 
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[cfg(unix)]
+use weida_nng::{Admission, PipeEvent, PipeInfo};
 use weida_nng::{
-    Admission, Context, ContextConfig, Error, PipeEvent, PipeInfo, PullSocket, PushSocket,
-    RepSocket, ReqSocket, SocketOptions,
+    Context, ContextConfig, Error, PullSocket, PushSocket, RepSocket, ReqSocket, SocketOptions,
 };
 
 fn options() -> SocketOptions {
@@ -20,6 +23,7 @@ fn options() -> SocketOptions {
     }
 }
 
+#[cfg(unix)]
 fn temp_socket(name: &str) -> std::path::PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
@@ -147,6 +151,7 @@ async fn tcp_enforces_the_limit_inproc_ignores() {
 /// Claim: `ipc://` carries the protocol, and the kernel's UID, GID and PID
 /// reach the pipe-add-pre callback — which is where an allow-list runs, as
 /// application policy rather than SP authorization (§10).
+#[cfg(unix)]
 #[tokio::test]
 async fn ipc_hands_the_kernels_credentials_to_the_add_pre_hook() {
     let ctx = Context::new(ContextConfig::default()).expect("context");
@@ -186,6 +191,7 @@ async fn ipc_hands_the_kernels_credentials_to_the_add_pre_hook() {
 
 /// Claim: an allow-list at the add-pre hook refuses a peer, and the
 /// refusal is a close with nothing sent back (§6, §10).
+#[cfg(unix)]
 #[tokio::test]
 async fn an_allow_list_at_the_hook_refuses_an_ipc_peer() {
     let ctx = Context::new(ContextConfig::default()).expect("context");
@@ -225,6 +231,7 @@ async fn an_allow_list_at_the_hook_refuses_an_ipc_peer() {
 
 /// Claim: the socket file is removed when the listener goes, so the next
 /// bind of the same path is not a stale-node race.
+#[cfg(unix)]
 #[tokio::test]
 async fn closing_an_ipc_listener_removes_its_node() {
     let ctx = Context::new(ContextConfig::default()).expect("context");

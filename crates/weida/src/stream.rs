@@ -230,7 +230,7 @@ impl Peer {
                 // transport [0010 §4.6].
                 return Err(Error::InvalidAddress(format!(
                     "{}: AF_UNIX is not available on this platform",
-                    addr.socket.display()
+                    addr.socket
                 )));
             }
         };

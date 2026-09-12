@@ -16,6 +16,7 @@
 //! therefore the comparison, and Push/Pull is reported beside it with that
 //! caveat rather than left out.
 
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
