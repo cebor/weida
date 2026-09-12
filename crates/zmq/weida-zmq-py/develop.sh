@@ -27,6 +27,9 @@ export CARGO_TARGET_DIR
 
 uv venv --allow-existing "$venv"
 uv pip install --python "$venv" maturin pytest
+# The interop peer of B-117: libzmq through pyzmq. Absent, every interop test
+# skips with this command in its skip message.
+uv pip install --python "$venv" pyzmq
 
 cd "$here"
 VIRTUAL_ENV="$venv" "$venv/bin/maturin" develop
