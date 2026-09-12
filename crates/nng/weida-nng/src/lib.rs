@@ -102,6 +102,11 @@
 //!   peer and nobody else, a discarded copy that the send still calls a
 //!   success, and the ingress pipe carried so a re-broadcast can exclude
 //!   it.
+//! - [`RawSocket`] and [`raw::device`] — the wire with the pattern
+//!   taken out: headers preserved verbatim, no state machine, no retry, no
+//!   matching, contexts refused in the type, and forwarding between two
+//!   raw sockets that pushes and pops the tag stack and bounds the PAIR v1
+//!   hop count.
 
 #![warn(missing_docs)]
 
@@ -117,6 +122,7 @@ pub mod pipe;
 pub mod pipeline;
 pub mod protocol;
 pub mod pubsub;
+pub mod raw;
 pub mod replier;
 pub mod reqrep;
 pub mod session;
@@ -150,6 +156,7 @@ pub use pipe::{Discarded, Pipe, PipeConfig};
 pub use pipeline::{PullSocket, PushSocket};
 pub use protocol::{PROTOCOLS, Protocol, protocol};
 pub use pubsub::{PubSocket, SubSocket};
+pub use raw::{Forwarded, RawSocket, device};
 pub use replier::{CtxId, Replier, ReplierCtx};
 pub use reqrep::{RepCtx, RepSocket, ReqCtx, ReqSocket};
 pub use session::SpSession;
