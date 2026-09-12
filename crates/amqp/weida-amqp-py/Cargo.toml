@@ -1,0 +1,63 @@
+[package]
+name = "weida-amqp-py"
+description = "The Python binding of weida-amqp: asyncio AMQP 1.0 connections, sessions and links on the Rust client, with the specification's error conditions as exception classes"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+# The Python module is `weida_amqp` — that is what `#[pymodule] fn weida_amqp`
+# and therefore the `PyInit_weida_amqp` symbol say, and what `module-name` in
+# pyproject.toml names the file maturin writes into the wheel. The *crate*
+# cannot be called that as well: rustdoc writes one directory per lib name and
+# `weida-amqp` already owns `weida_amqp`, so `cargo doc --workspace` would
+# refuse the collision.
+name = "weida_amqp_py"
+crate-type = ["cdylib"]
+# A cdylib has no rlib for rustdoc to link a doctest against, so the examples
+# in this crate's documentation are Python rather than Rust and are run by
+# `pytest`, not by `cargo test`.
+doctest = false
+
+[dependencies]
+# The shared foundation: exception families, the asyncio bridge, the bytes
+# boundary. Every binding in this workspace sits on it and none re-derives it
+# (`docs/decisions/0014-parallel-libraries.md` §2).
+weida-py-core.workspace = true
+pyo3.workspace = true
+# The library being bound. Nothing of weida is reachable through it, which is
+# the dependency direction 0013 §4.2 fixed. Default features carry `tls`,
+# because a Python caller reaching a cloud broker needs it and the binding has
+# no way to ask for it later.
+weida-amqp.workspace = true
+# The wire types a Python object has to carry: `Message` and its sections for
+# a delivery, `Role` and the two settle modes for an attach, `DeliveryState`
+# for an outcome. The binding converts them; it decides nothing about them.
+weida-amqp-codec.workspace = true
+# The reactor a connection owns, because `Exec::owned` is what makes a plain
+# Python process able to open one at all: there is no ambient Tokio runtime in
+# `python main.py`.
+weida-runtime.workspace = true
+# Two things and no more: `tokio::sync::Notify`, which is what makes the lease
+# in `lease.rs` wake a waiting coroutine, and nothing else — the reactor is
+# `weida-runtime`'s and is reached through `Exec`.
+tokio.workspace = true
+# The synchronous surface drives the client's own futures on the calling
+# thread. Not the reactor's `block_on`: `weida-runtime`'s contract is that "the
+# caller may drive the returned futures on any executor", and this is that
+# sentence used — see `sync.rs`.
+futures.workspace = true
+
+[features]
+# Off by default, and enabled by maturin through `pyproject.toml`. With it on,
+# the extension does not link libpython — which is right for a wheel and wrong
+# for `cargo test`, because a test binary is an executable and would be left
+# with undefined symbols. Cargo unifies features across a workspace build, so a
+# default-on `extension-module` here would break `cargo test --workspace` for
+# `weida-py-core` as well.
+extension-module = ["pyo3/extension-module"]
+
+[lints.rust]
+# As in `weida-py-core`: PyO3's macros expand to `unsafe impl`s, so `forbid` is
+# not available. No `unsafe` is written by hand in this crate.
+unsafe_code = "allow"
