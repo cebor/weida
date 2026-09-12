@@ -41,6 +41,13 @@
 //! * [`transport::Wire`] — protocol headers and frames over one buffer, with
 //!   the 512-octet pre-negotiation ceiling in force until `open` has been
 //!   read.
+//! * [`Session`] — `begin` and `end`, the two channel numberings, and the six
+//!   flow-control variables of [`Windows`], counted in `transfer` **frames**.
+//! * [`Link`] — `attach` and `detach`, the two independent handle spaces, the
+//!   termini of [`Source`] and [`Target`], the steal, and the credit of
+//!   [`Credit`], counted in **messages**.
+//! * [`Delivery`] and [`Sent`] — a message, however many `transfer` frames it
+//!   took, reassembled under the link's `max-message-size`.
 //!
 //! # Rules this crate keeps
 //!
@@ -54,12 +61,15 @@
 //!   three are settable back; none is silent. See [`options`].
 //! * **Every remote-influenced table has a named bound.** Where the protocol
 //!   supplies one this crate uses it — the session table is bounded by
-//!   `channel-max` ([`ConnectionOptions::max_sessions`]) — and where it does
-//!   not, the bound is ours and says so:
-//!   [`connection::OUTGOING_QUEUE`] for frames queued for the driver,
-//!   [`sasl::MAX_ROUNDS`] for the challenge/response loop Part 5 leaves
-//!   unbounded, and [`ConnectionOptions::max_resolved_addresses`] for the
-//!   resolver's answer.
+//!   `channel-max` ([`ConnectionOptions::max_sessions`]), the link table by
+//!   the peer's `handle-max`, a link's messages by its credit and a session's
+//!   frames by its window — and where it does not, the bound is ours and says
+//!   so: [`connection::OUTGOING_QUEUE`] for frames queued for the driver,
+//!   [`link::LINK_QUEUE`] for frames queued for one link,
+//!   [`link::DEFAULT_MAX_MESSAGE_SIZE`] for a message a peer would otherwise
+//!   send one bounded frame at a time, [`sasl::MAX_ROUNDS`] for the
+//!   challenge/response loop Part 5 leaves unbounded, and
+//!   [`ConnectionOptions::max_resolved_addresses`] for the resolver's answer.
 //! * **Identity types stay apart** [0013 §4.4 item 6]. A SASL identity and
 //!   weida's proved `Fingerprint` are different claims about different
 //!   things, and no conversion between them exists in this workspace.
@@ -74,6 +84,8 @@
 #![warn(missing_docs)]
 
 pub mod connection;
+pub mod credit;
+pub mod delivery;
 pub mod error;
 pub mod link;
 pub mod options;
@@ -85,6 +97,8 @@ pub mod transport;
 pub mod window;
 
 pub use connection::{Connection, RemoteOpen, State};
+pub use credit::Credit;
+pub use delivery::{Delivery, Sent};
 pub use error::{Condition, Error, Result};
 pub use link::{Link, LinkEvent, LinkOptions, LinkState, Negotiated};
 pub use options::{ConnectionOptions, Sasl, TlsMode};

@@ -59,16 +59,18 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot, watch};
-use weida_amqp_codec::Limits;
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
+use weida_amqp_codec::message::Reassembly;
 use weida_amqp_codec::performative::{Close, End, Open, Performative};
 use weida_amqp_codec::protocol_header::{ProtocolHeader, ProtocolId};
 use weida_amqp_codec::types::condition;
+use weida_amqp_codec::{Limits, Role};
 use weida_runtime::Exec;
 
+use crate::credit::Credit;
 use crate::error::{Condition, Error, Result};
-use crate::link::{self, Link, LinkOptions, Links};
+use crate::link::{self, Incoming, Link, LinkOptions, Links};
 use crate::options::{ConnectionOptions, Sasl, TlsMode, multiple};
 use crate::sasl;
 use crate::session::{
@@ -649,6 +651,16 @@ impl Driver {
                     }
 
                     Some(Command::Close { error, done }) => {
+                        // Everything already handed to the driver is written
+                        // first. "`close` MUST be the last frame ever
+                        // written" makes it *last*; it is not a licence to
+                        // drop a transfer a sender had already completed
+                        // (Part 2 §2.4.3).
+                        if let Err(error) = self.flush_outbound(&mut writer).await {
+                            let _ = done.send(Err(error));
+                            outcome = State::Closed(None);
+                            break;
+                        }
                         let result = write_close(&mut writer, error.as_ref()).await;
                         closing = true;
                         self.state.send_replace(State::Closing);
@@ -665,6 +677,7 @@ impl Driver {
                     // loss by timeout.
                     None => {
                         if !closing {
+                            let _ = self.flush_outbound(&mut writer).await;
                             let _ = write_close(&mut writer, None).await;
                         }
                         let _ = writer.shutdown().await;
@@ -800,6 +813,24 @@ impl Driver {
         self.state.send_replace(outcome);
     }
 
+    /// Writes everything already queued, without waiting for more.
+    ///
+    /// Called before `close` so that a frame a caller had already handed
+    /// over is not overtaken by it. Only what is queued *now* is written: a
+    /// frame offered after the close was asked for is still dropped, because
+    /// by then `close` is the last frame and that is the whole rule.
+    async fn flush_outbound(&mut self, writer: &mut FrameWriter) -> Result<()> {
+        while let Ok(out) = self.outbound_rx.try_recv() {
+            match out {
+                Outbound::Frame(bytes) => writer.send(&bytes).await?,
+                Outbound::Attach { reply, .. } => {
+                    let _ = reply.send(Err(Error::ConnectionGone));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// One incoming frame. `Ok(Some(state))` ends the connection.
     async fn handle(
         &mut self,
@@ -816,7 +847,11 @@ impl Driver {
             // idle deadline already noticed by being reset.
             return Ok(None);
         }
-        let (performative, _used) = Performative::decode(frame.body, Limits::DEFAULT)?;
+        let (performative, used) = Performative::decode(frame.body, Limits::DEFAULT)?;
+        // Everything after the performative in the same body is the
+        // `transfer` payload, byte for byte — Part 2 §2.7.5 defines it as
+        // exactly that and nothing parses it here.
+        let payload = &frame.body[used..];
         match performative {
             Performative::Close(Close { error }) => {
                 let condition = error.as_ref().map(Condition::from_codec);
@@ -839,7 +874,10 @@ impl Driver {
                 );
                 Ok(None)
             }
-            other => self.route(frame.header.channel, other, bytes, writer).await,
+            other => {
+                self.route(frame.header.channel, other, payload, bytes, writer)
+                    .await
+            }
         }
     }
 
@@ -911,8 +949,11 @@ impl Driver {
         writer: &mut FrameWriter,
     ) -> Result<()> {
         // Read before the table is borrowed: the bound is the peer's
-        // `handle-max` from its answering `begin`.
+        // `handle-max` from its answering `begin`, and the frame ceiling is
+        // the peer's `max-frame-size` from its `open` — a message is split on
+        // what the *peer* will accept, never on what we would.
         let handle_max = self.remote_handle_max(channel);
+        let outgoing_frame_size = self.remote.outgoing_frame_size();
         let Some(entry) = self.sessions.get_mut(channel) else {
             let _ = reply.send(Err(Error::ConnectionGone));
             return Ok(());
@@ -958,6 +999,18 @@ impl Driver {
         };
 
         let (events, rx) = mpsc::channel(link::LINK_QUEUE);
+        let credit = match options.role {
+            // A sender starts where its own `attach.initial-delivery-count`
+            // said and with no credit at all: nothing may go out until the
+            // receiver grants.
+            Role::Sender => Credit::sender(options.initial_delivery_count),
+            Role::Receiver => Credit::receiver(),
+        };
+        // Our own `max-message-size` bounds what may land in our buffer; the
+        // peer's bounds what we may send, and that one arrives in the
+        // answering `attach`.
+        let ours = options.max_message_size.unwrap_or(0);
+        let session = Arc::clone(&entry.shared);
         entry.links.insert(
             handle,
             crate::link::Entry {
@@ -969,12 +1022,18 @@ impl Driver {
                     state: Mutex::new(crate::link::LinkState::Attaching),
                     negotiated: Mutex::new(None),
                     input_handle: Mutex::new(None),
+                    credit: Mutex::new(credit),
+                    session,
+                    flow: Notify::new(),
+                    max_frame_size: outgoing_frame_size,
+                    next_tag: Mutex::new(0),
                 }),
                 events,
                 pending: Some(reply),
                 outbound: self.outbound.clone(),
                 rx: Some(rx),
                 options: Box::new(options),
+                reassembly: Reassembly::new(ours),
             },
         );
         writer.send(&bytes).await
@@ -996,6 +1055,7 @@ impl Driver {
         &mut self,
         channel: u16,
         performative: Performative<'_>,
+        payload: &[u8],
         bytes: &[u8],
         writer: &mut FrameWriter,
     ) -> Result<Option<State>> {
@@ -1085,6 +1145,11 @@ impl Driver {
                     .lock()
                     .expect("not poisoned")
                     .apply_flow(session::remote_flow_of_flow(flow));
+                // The session window may have grown, and a sender parked on
+                // it is parked on its link. Every `flow` refreshes session
+                // state whether or not it names a handle, so every `flow`
+                // wakes them.
+                entry.links.wake_all();
             }
             Performative::Transfer(_) => {
                 let violation = {
@@ -1137,16 +1202,18 @@ impl Driver {
         // A frame naming a handle goes to the link; anything else goes to
         // the session.
         if let Some(handle) = addressed_handle(&performative) {
+            let attached = self
+                .sessions
+                .by_incoming(channel)
+                .is_some_and(|entry| entry.links.by_input(handle).is_some());
+            if attached {
+                return self
+                    .route_to_link(channel, handle, &performative, payload, bytes, writer)
+                    .await;
+            }
             let Some(entry) = self.sessions.by_incoming(channel) else {
                 return Ok(None);
             };
-            if let Some(link) = entry.links.by_input(handle) {
-                let _ = link
-                    .events
-                    .send(crate::link::LinkEvent::Frame(bytes.to_vec()))
-                    .await;
-                return Ok(None);
-            }
             // "A frame (other than attach) was received referencing a handle
             // which is not currently in use of an attached link" is exactly
             // what `amqp:session:unattached-handle` names (Part 2 §2.8.17),
@@ -1170,6 +1237,83 @@ impl Driver {
             .by_incoming(channel)
             .expect("checked just above");
         let _ = entry.events.send(SessionEvent::Frame(bytes.to_vec())).await;
+        Ok(None)
+    }
+
+    /// One frame for a link that is attached: a `transfer`, a `flow` naming a
+    /// handle, or anything else this layer does not read.
+    ///
+    /// The work is done in two halves on purpose. The first borrows the link
+    /// out of the session table and decides; the second writes and, where the
+    /// link must go, takes it out of the table — which cannot happen while
+    /// the borrow is alive.
+    async fn route_to_link(
+        &mut self,
+        channel: u16,
+        handle: u32,
+        performative: &Performative<'_>,
+        payload: &[u8],
+        bytes: &[u8],
+        writer: &mut FrameWriter,
+    ) -> Result<Option<State>> {
+        let Some(session) = self.sessions.by_incoming(channel) else {
+            return Ok(None);
+        };
+        let outgoing = session.shared.outgoing_channel;
+        // A snapshot, because an answering `flow` carries the session's three
+        // mandatory fields and the link must not hold the window lock while
+        // it builds one.
+        let windows = *session.shared.windows.lock().expect("not poisoned");
+        let Some(link) = session.links.by_input(handle) else {
+            return Ok(None);
+        };
+        let events = link.events.clone();
+        let output = link.shared.output_handle;
+        let decision = match performative {
+            Performative::Transfer(transfer) => {
+                Decision::Incoming(link.accept_transfer(transfer, payload))
+            }
+            Performative::Flow(flow) => {
+                Decision::Flow(link.accept_flow(flow, &windows), link.credit())
+            }
+            _ => Decision::Frame,
+        };
+
+        match decision {
+            Decision::Incoming(Incoming::Nothing) => {}
+            Decision::Incoming(Incoming::Delivery(delivery)) => {
+                let _ = events
+                    .send(crate::link::LinkEvent::Delivery(delivery))
+                    .await;
+            }
+            Decision::Incoming(Incoming::Refused(condition)) => {
+                // "An errored link endpoint MUST be detached with
+                // detach(error=...) and destroyed", and its handle is
+                // poisoned for the life of the session so that a late frame
+                // for the dead link cannot land on a live one.
+                let _ = write_detach(writer, outgoing, output, true, Some(&condition)).await;
+                if let Some(session) = self.sessions.by_incoming(channel)
+                    && let Some(link) = session.links.remove(output, true)
+                {
+                    *link.shared.state.lock().expect("not poisoned") =
+                        crate::link::LinkState::Detached(Some(condition.clone()));
+                }
+                let _ = events
+                    .send(crate::link::LinkEvent::Detached(Some(condition)))
+                    .await;
+            }
+            Decision::Flow(answer, credit) => {
+                let _ = events.send(crate::link::LinkEvent::Flow(credit)).await;
+                if let Some(answer) = answer {
+                    write_flow(writer, outgoing, answer).await?;
+                }
+            }
+            Decision::Frame => {
+                let _ = events
+                    .send(crate::link::LinkEvent::Frame(bytes.to_vec()))
+                    .await;
+            }
+        }
         Ok(None)
     }
 
@@ -1234,6 +1378,17 @@ impl Driver {
         };
         *link.shared.input_handle.lock().expect("not poisoned") = Some(attach.handle);
         *link.shared.negotiated.lock().expect("not poisoned") = Some(negotiated);
+        if link.shared.role == Role::Receiver {
+            // Where the sender's sequence starts. A receiver's credit is a
+            // distance from a `delivery-count` it does not choose, so until
+            // this arrives it cannot name one in a `flow` — and MUST NOT
+            // (Part 2 §2.7.4).
+            link.shared
+                .credit
+                .lock()
+                .expect("not poisoned")
+                .seen_sender_attach(attach.initial_delivery_count.unwrap_or_default());
+        }
         *link.shared.state.lock().expect("not poisoned") = crate::link::LinkState::Attached;
         let handed = match (link.pending.take(), link.rx.take()) {
             (Some(reply), Some(rx)) => {
@@ -1347,11 +1502,27 @@ impl Driver {
     }
 }
 
+/// What the driver decided about one frame while it held the link, so that
+/// the writing and the table surgery happen after the borrow has ended.
+#[derive(Debug)]
+enum Decision {
+    /// A `transfer`, accounted for and reassembled as far as it goes.
+    Incoming(Incoming),
+    /// A `flow`: the answer this end owes, if any, and the credit state the
+    /// application should see.
+    Flow(
+        Option<weida_amqp_codec::performative::Flow<'static>>,
+        Credit,
+    ),
+    /// Anything else naming a handle, handed over whole.
+    Frame,
+}
+
 /// The handle a frame names, where it names one.
 ///
 /// `flow` may carry link state on top of session state and may not, which is
-/// why its handle is an `Option` and `transfer` and `disposition` are not
-/// treated alike: a `disposition` names no handle at all, it names a range of
+/// why its handle is an `Option` and `transfer` and `flow` are not treated
+/// alike: a `disposition` names no handle at all, it names a range of
 /// delivery-ids on the session.
 const fn addressed_handle(performative: &Performative<'_>) -> Option<u32> {
     match performative {
@@ -1429,6 +1600,28 @@ async fn write_detach(
             })
             .encode(body)
         },
+    )?;
+    writer.send(&out).await
+}
+
+/// Writes `flow` on one session's outgoing channel.
+///
+/// The driver writes this one rather than the link handle, because the two
+/// cases that produce it are answers the *driver* owes: an `echo` asking for
+/// our state, and the report a drained sender MUST send. Neither waits for an
+/// application to notice.
+async fn write_flow(
+    writer: &mut FrameWriter,
+    channel: u16,
+    flow: weida_amqp_codec::performative::Flow<'_>,
+) -> Result<()> {
+    let mut out = Vec::new();
+    frame::write(
+        &mut out,
+        FrameKind::Amqp,
+        channel,
+        writer.max_frame_size(),
+        |body| Performative::Flow(flow).encode(body),
     )?;
     writer.send(&out).await
 }

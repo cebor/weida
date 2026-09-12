@@ -212,6 +212,18 @@ impl Windows {
         true
     }
 
+    /// Accounts for one `transfer` frame and reports the transfer-id it
+    /// carries, or `None` where there was no room.
+    ///
+    /// The id is read *before* the increment because a frame's transfer-id is
+    /// the value `next-outgoing-id` had when it was sent — and for the first
+    /// frame of a delivery that number is also the delivery-id, which is the
+    /// only tie the two sequences have.
+    pub fn reserve(&mut self) -> Option<u32> {
+        let id = self.next_outgoing_id;
+        self.record_sent().then_some(id)
+    }
+
     /// Accounts for one `transfer` frame that arrived.
     ///
     /// `Err` is a window violation: the peer sent more than we said we could
