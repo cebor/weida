@@ -1,0 +1,47 @@
+[package]
+name = "weida-nats-codec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+weida-nats-codec = { path = ".." }
+
+# Deliberately its own workspace: the fuzz crate needs nightly and must not
+# affect `cargo build --workspace` or the lockfile of the library crates.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "op"
+path = "fuzz_targets/op.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "op_stream"
+path = "fuzz_targets/op_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "headers"
+path = "fuzz_targets/headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "info"
+path = "fuzz_targets/info.rs"
+test = false
+doc = false
+bench = false
