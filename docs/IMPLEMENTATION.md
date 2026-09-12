@@ -1404,6 +1404,43 @@ cancelled by dropping the future and bounded by the caller's own deadline;
 `push_pull_waits_for_a_slot_over_{inproc,unix}` pins it and fails on the old code at the
 256th send.
 
+### Verified results — what a payload costs crossing into Python (B-112)
+
+The number [0014](decisions/0014-parallel-libraries.md) §2 asks for by name: the `bytes`
+boundary of `weida-py-core` "avoids a copy where PyO3 allows it and measures the copy where
+it does not". Same machine as the runs above, release profile, `bytes` objects of four sizes,
+the GIL held throughout as it is during a real conversion.
+
+`cargo bench -p weida-py-core --bench bytes_boundary -- --warm-up-time 1 --measurement-time 3`
+
+| Direction | 0 B | 64 B | 1 KiB | 1 MiB |
+| --- | --- | --- | --- | --- |
+| Python → Rust, **borrowed** (`payload`) | **16.5 ns** | **16.7 ns** | **17.0 ns** | **16.9 ns** |
+| Python → Rust, owned (`payload_of`) | **11.0 ns** | **18.7 ns** | **28.9 ns** | **19.19 µs** |
+| Rust → Python (`py_bytes`) | **6.5 ns** | **14.3 ns** | **42.8 ns** | **18.93 µs** |
+
+**The borrowed row is flat, and that is the proof rather than the claim.** 16.5 ns at zero
+bytes and 16.9 ns at a mebibyte is a reference count and a type check; nothing is copied, so
+nothing grows with the payload. That is the path a binding takes when it only *reads* a
+payload — a subscription prefix, a key, a length — and `weida-zmq-py` takes it for every
+`subscribe`.
+
+**The two copies that remain are forced, one by each language.** A `weida_zmq::Message` owns
+a `Vec<u8>` because a frame outlives the call that queued it and is written by a reactor
+thread long after, and CPython's allocation cannot become a Rust one: that is the owned row.
+A CPython `bytes` object owns its storage inside its own allocation and no API — limited or
+otherwise — adopts a foreign buffer: that is the Rust → Python row. At 1 MiB both are
+~19 µs, i.e. **~55 GiB/s**, which is a `memcpy` and an allocation and nothing else; the
+small sizes are the object, not the bytes.
+
+**What was deliberately not done.** A `memoryview` over Rust-owned bytes would make the
+Rust → Python direction zero-copy, and it is not used: the buffer protocol entered CPython's
+limited API in 3.11 while B-058's wheel is `abi3` from 3.9, so it would be a zero-copy path
+that exists on some interpreters and not others — a performance cliff rather than a feature.
+The cost of not having it is the last column, 19 µs per mebibyte, against a 1 MiB local
+round trip that the table above measures at 144 µs *inproc*: **about 13 %** of the cheapest
+transport weida has, and proportionally less on anything that crosses a socket.
+
 ---
 
 ## 5. Decisions
