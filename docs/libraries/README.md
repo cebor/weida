@@ -90,7 +90,7 @@ Two rules keep these documents honest:
 | --- | --- | --- | --- | --- |
 | [`zmq.md`](zmq.md) | `weida-zmtp` (codec), `weida-zmq` (implementation) | libzmq 4.3.5, plus the pure-Rust `zeromq` 0.6.0 | [`zeromq.md`](../research/zeromq.md) | complete against 0013 §4.7's six clauses |
 | [`zmq-py.md`](zmq-py.md) | `weida-py-core` (the shared PyO3 foundation), `weida-zmq-py` (the binding) | pyzmq 27.2.0 over libzmq 4.3.5 | [`zeromq.md`](../research/zeromq.md) | covers: all eleven socket types, the three transports, the 98-row option table, PLAIN/CURVE/ZAP with a handler in Python, the monitor, the devices, and a synchronous surface beside the asyncio one. Does not cover: `zmq.STREAM` and the DRAFT socket types, `zmq.Poller`/`sock.fd`, `send_string`/`send_json`/`Frame`, pyzmq's `zmq.auth` policy framework, and **concurrent send and recv on one socket** — see §9.1, which is the library's `&mut self` and is filed against `weida-zmq` |
+| [`nng.md`](nng.md) | `weida-sp` (codec), `weida-nng` (implementation) | NNG 1.4.0-rc.0, through the `nng` crate 1.0.1 | [`nanomsg-nng.md`](../research/nanomsg-nng.md) | complete against 0013 §4.7's six clauses, read for SP |
 
-Planned: `nng.md`, when `weida-nng` exists beside the `weida-sp` codec (0013 §4.1). It gets
-its document in this shape, and the SP research sheet
-([`nanomsg-nng.md`](../research/nanomsg-nng.md)) is what it cites.
+Planned: a `nng-py.md` when the Python binding on `weida-py-core` lands beside
+[`zmq-py.md`](zmq-py.md), in the same shape.
