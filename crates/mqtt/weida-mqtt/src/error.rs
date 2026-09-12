@@ -146,6 +146,17 @@ pub enum Error {
         /// The ceiling this client declared.
         quota: u16,
     },
+    /// A delivery carried more Subscription Identifiers than
+    /// [`crate::Limits::max_subscription_identifiers`].
+    ///
+    /// **The protocol has no ceiling for this.** A server MAY send one copy
+    /// carrying every matching identifier ([MQTT-3.3.4-4]) [mqtt5 §4.1] and
+    /// the only limit on the wire is the packet size, so the number is this
+    /// client's and is named in [`crate::Limits`].
+    TooManySubscriptionIdentifiers {
+        /// The ceiling this client set.
+        max: usize,
+    },
     /// The server broke the protocol. The client's own answer is to close,
     /// which "a Client SHOULD" do ([MQTT-4.13.1-1]) (4.13.1) [mqtt5 §1].
     Protocol(DecodeError),
@@ -225,6 +236,11 @@ impl fmt::Display for Error {
             Error::ReceiveMaximumExceeded { quota } => write!(
                 f,
                 "the server exceeded the Receive Maximum of {quota} this client declared"
+            ),
+            Error::TooManySubscriptionIdentifiers { max } => write!(
+                f,
+                "a delivery carried more than {max} subscription identifiers, which is this \
+                 client's ceiling because the protocol has none"
             ),
             Error::Protocol(error) => write!(f, "the server broke the protocol: {error}"),
             Error::Encode(error) => write!(f, "cannot send this packet: {error}"),

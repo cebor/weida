@@ -29,16 +29,21 @@
 //! [`crate::ConnectOptions::effective_ping_timeout`] here, because an
 //! unbounded wait is a hang with a rationale ([LOOP.md] §2).
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
-use weida_mqtt_codec::{Disconnect, DisconnectReasonCode, Packet, PacketType, Properties, Pubrel};
+use weida_mqtt_codec::{
+    DecodeError, Disconnect, DisconnectReasonCode, Packet, PacketType, Properties, Puback, Pubcomp,
+    PubcompReasonCode, Publish, Pubrec, PubrecReasonCode, Pubrel, QoS,
+};
 use weida_runtime::{Exec, OwnedReactor};
 
 use crate::connection::{Authenticator, NoAuthenticator, Reader, Writer, handshake};
 use crate::error::{Error, Result};
-use crate::limits::ServerLimits;
+use crate::limits::{Limits, ServerLimits};
+use crate::message::{Completion, Delivery, Message};
 use crate::options::{ConnectOptions, interval_seconds};
 use crate::session::{Resend, Resumption, Session, expiry_seconds};
 
@@ -122,6 +127,30 @@ pub enum Event {
     /// whole of B-141's "surfaced as a named error rather than as a closed
     /// socket".
     Disconnected(Error),
+    /// The server delivered a message.
+    ///
+    /// At QoS 1 and 2 the acknowledgement has **already been sent** when this
+    /// arrives, which is what the protocol requires and not an optimization:
+    /// the receiver responds "having accepted ownership of the Application
+    /// Message" and "does not need to complete delivery before sending the
+    /// PUBACK" ([MQTT-4.3.2-4]) [mqtt5 §6]. So this event is a delivery, not
+    /// a request for one, and dropping it loses the message — which is
+    /// exactly what `Deduplication = None` means on the weida side of a
+    /// forwarder (`docs/adapters/mqtt5.md` §7).
+    Delivered(Delivery),
+    /// An exchange that outlived the connection it started on completed.
+    ///
+    /// The future [`Client::publish`] returns belongs to one connection; the
+    /// session
+    /// belongs to the application. So an exchange resumed by
+    /// [`Client::connect_session`] has no handle left to resolve, and its
+    /// completion is reported here instead of being dropped on the floor.
+    Completed {
+        /// The original Packet Identifier.
+        packet_id: u16,
+        /// What the hop certified.
+        completion: Completion,
+    },
 }
 
 /// A command for the connection task.
@@ -136,6 +165,15 @@ enum Command {
     },
     /// Send PINGREQ now, whatever the timer thinks.
     Ping { done: oneshot::Sender<Result<()>> },
+    /// Publish one message.
+    ///
+    /// `done` resolves when the hop has certified what it is going to: at
+    /// once for QoS 0, on the PUBACK for QoS 1, on the PUBCOMP — or an
+    /// early PUBREC of 0x80 or above — for QoS 2.
+    Publish {
+        message: Box<Message>,
+        done: oneshot::Sender<Result<Completion>>,
+    },
 }
 
 /// The application's end of one connection.
@@ -265,7 +303,7 @@ impl Client {
         // "The sender sets an initial send quota, non-zero and not exceeding
         // the peer's Receive Maximum" ([MQTT-4.9.0-1]): the server's number
         // replaces the client's placeholder here and nowhere else.
-        session.set_quota(handshake.limits.receive_maximum);
+        session.set_send_quota(handshake.limits.receive_maximum);
 
         let resumption = session.accept_connack(handshake.session_present)?;
         if resumption == Resumption::Resumed {
@@ -285,6 +323,10 @@ impl Client {
             ping_timeout: options.effective_ping_timeout(),
             max_packet_size: options.limits.maximum_packet_size,
             exec: context.exec.clone(),
+            session: session.clone(),
+            limits: options.limits,
+            waiters: HashMap::new(),
+            stalled: VecDeque::new(),
         };
         context.exec.spawn(task.run());
 
@@ -422,6 +464,41 @@ impl Client {
             .map_err(|_| Error::NotConnected)?;
         wait.await.map_err(|_| Error::NotConnected)?
     }
+
+    /// Publishes `message`, resolving when the hop has certified what it is
+    /// going to.
+    ///
+    /// QoS 0 resolves at once with [`Completion::Sent`]; QoS 1 on the PUBACK;
+    /// QoS 2 on the PUBCOMP, or early with [`Completion::Refused`] on a
+    /// PUBREC of 0x80 or above. See [`Completion`] for what each of those
+    /// does and does not certify — none of them certifies durability, and
+    /// none reaches past this hop.
+    ///
+    /// **The send quota stalls this call rather than being exceeded.** The
+    /// quota is the server's `Receive Maximum` counted in QoS 1 and 2 PUBLISH
+    /// packets and nothing else ([MQTT-4.9.0-1], 4.9) [mqtt5 §5]; with it
+    /// spent, the message waits here until an exchange completes. QoS 0 is
+    /// never counted and never waits, which is the same asymmetry that leaves
+    /// QoS 0 with no flow control at all.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unavailable`] where the server declined the QoS or RETAIN,
+    /// refused before the packet reaches the wire; [`Error::NotConnected`]
+    /// where the connection ended; and whatever the write or the encode
+    /// reported.
+    pub async fn publish(&self, message: Message) -> Result<Completion> {
+        message.check(&self.limits)?;
+        let (done, wait) = oneshot::channel();
+        self.commands
+            .send(Command::Publish {
+                message: Box::new(message),
+                done,
+            })
+            .await
+            .map_err(|_| Error::NotConnected)?;
+        wait.await.map_err(|_| Error::NotConnected)?
+    }
 }
 
 /// The task that owns the socket.
@@ -434,6 +511,24 @@ struct Task {
     ping_timeout: Option<Duration>,
     max_packet_size: u32,
     exec: Exec,
+    /// The session, shared with the application's handle.
+    session: Session,
+    /// This client's own declared limits, for reading a delivery under the
+    /// Subscription Identifier ceiling the protocol does not provide.
+    limits: Limits,
+    /// Who is waiting for each in-flight exchange to complete, keyed by
+    /// Packet Identifier. An exchange resumed from a previous connection has
+    /// no entry, and its completion becomes [`Event::Completed`].
+    waiters: HashMap<u16, oneshot::Sender<Result<Completion>>>,
+    /// Publishes that arrived with the send quota already spent.
+    ///
+    /// "At zero the sender MUST NOT send further QoS > 0 PUBLISH packets"
+    /// ([MQTT-4.9.0-2]) and exhaustion "stalls the sender rather than
+    /// exceeding it" [mqtt5 §5]. This queue **is** that stall: the caller's
+    /// future is still pending, the packet is not on the wire, and the moment
+    /// an identifier frees the oldest waiting publish takes it. Bounded by
+    /// the command channel, which is `Limits::incoming_queue` deep.
+    stalled: VecDeque<(Box<Message>, oneshot::Sender<Result<Completion>>)>,
 }
 
 impl Task {
@@ -519,15 +614,44 @@ impl Task {
                                 packet_type: PacketType::Connack,
                             });
                         }
-                        // The delivery and subscription packets are B-143's
-                        // and B-144's; until those items land, a server that
-                        // sends one is sending something this connection never
-                        // asked for, so saying so beats discarding it.
+                        Packet::Publish(publish) => {
+                            self.receive(&publish).await?;
+                            last_write = std::time::Instant::now();
+                        }
+                        Packet::Puback(puback) => {
+                            self.settle(
+                                puback.packet_id,
+                                Completion::Acknowledged(puback.reason_code),
+                            )
+                            .await;
+                        }
+                        Packet::Pubrec(pubrec) => {
+                            self.pubrec(pubrec.packet_id, pubrec.reason_code).await?;
+                            last_write = std::time::Instant::now();
+                        }
+                        Packet::Pubcomp(pubcomp) => {
+                            self.settle(
+                                pubcomp.packet_id,
+                                Completion::Complete(pubcomp.reason_code),
+                            )
+                            .await;
+                        }
+                        Packet::Pubrel(pubrel) => {
+                            self.pubrel(pubrel.packet_id).await?;
+                            last_write = std::time::Instant::now();
+                        }
+                        // The subscription acknowledgements are B-144's.
                         other => {
                             return Err(Error::UnexpectedPacket {
                                 packet_type: other.packet_type(),
                             });
                         }
+                    }
+
+                    // Something may have freed an identifier, so the oldest
+                    // stalled publish can go.
+                    if self.drain_stalled().await? {
+                        last_write = std::time::Instant::now();
                     }
                 }
                 Step::Command(None) => {
@@ -536,6 +660,10 @@ impl Task {
                     // Will [mqtt5 §4.5], and inventing an orderly close on the
                     // application's behalf would suppress it.
                     return Ok(());
+                }
+                Step::Command(Some(Command::Publish { message, done })) => {
+                    self.publish(message, done).await?;
+                    last_write = std::time::Instant::now();
                 }
                 Step::Command(Some(Command::Ping { done })) => {
                     let sent = self.writer.send(&Packet::Pingreq).await;
@@ -591,6 +719,239 @@ impl Task {
             }))
             .await
     }
+
+    /// Sends one message, or stalls it if the quota is spent.
+    ///
+    /// QoS 0 goes straight out and resolves at once: it is "not any other
+    /// packet type" in the quota's unit, so it is never counted and never
+    /// waits [mqtt5 §5].
+    async fn publish(
+        &mut self,
+        message: Box<Message>,
+        done: oneshot::Sender<Result<Completion>>,
+    ) -> Result<()> {
+        if message.qos == QoS::AtMostOnce {
+            let pairs = borrowed(&message.user_properties);
+            let publish = qos0_publish(&message, &pairs)?;
+            let sent = self.writer.send(&Packet::Publish(publish)).await;
+            let failed = sent.is_err();
+            let _ = done.send(sent.map(|()| Completion::Sent));
+            return if failed {
+                Err(Error::ConnectionClosed)
+            } else {
+                Ok(())
+            };
+        }
+
+        let stored = match message.as_ref().clone().into_stored() {
+            Ok(stored) => stored,
+            Err(error) => {
+                let _ = done.send(Err(error));
+                return Ok(());
+            }
+        };
+        match self.session.allocate(stored.clone()) {
+            Ok(packet_id) => {
+                let pairs = stored.borrowed_user_properties();
+                // First attempt, so DUP is 0 ([MQTT-4.3.2-2],
+                // [MQTT-4.3.3-2]).
+                let publish = stored.to_publish(packet_id, false, &pairs);
+                if let Err(error) = self.writer.send(&Packet::Publish(publish)).await {
+                    self.session.release(packet_id);
+                    let _ = done.send(Err(error));
+                    return Err(Error::ConnectionClosed);
+                }
+                self.waiters.insert(packet_id, done);
+                Ok(())
+            }
+            Err(Error::QuotaExhausted { .. }) => {
+                // The stall of [MQTT-4.9.0-2]: the caller's future stays
+                // pending and the packet stays off the wire.
+                self.stalled.push_back((message, done));
+                Ok(())
+            }
+            Err(error) => {
+                let _ = done.send(Err(error));
+                Ok(())
+            }
+        }
+    }
+
+    /// Sends as many stalled publishes as the quota now admits.
+    ///
+    /// Returns whether anything went out, so the caller can reset the
+    /// keep-alive timer.
+    async fn drain_stalled(&mut self) -> Result<bool> {
+        let mut sent_any = false;
+        while let Some((message, done)) = self.stalled.pop_front() {
+            let before = self.stalled.len();
+            self.publish(message, done).await?;
+            if self.stalled.len() > before {
+                // It stalled again: the quota is spent, so stop.
+                break;
+            }
+            sent_any = true;
+        }
+        Ok(sent_any)
+    }
+
+    /// Resolves an exchange and releases its identifier.
+    ///
+    /// An identifier frees "on PUBACK, PUBCOMP, a PUBREC with code >= 0x80,
+    /// or SUBACK/UNSUBACK" [mqtt5 §2]. An acknowledgement for an identifier
+    /// this client is not holding is not an error: it is the recovery case
+    /// 0x92 describes, which "is not an error during recovery, but at other
+    /// times indicates a mismatch" (3.6.2.1) [mqtt5 §6], and a client cannot
+    /// tell the two apart.
+    async fn settle(&mut self, packet_id: u16, completion: Completion) {
+        self.session.release(packet_id);
+        match self.waiters.remove(&packet_id) {
+            Some(done) => {
+                let _ = done.send(Ok(completion));
+            }
+            // No waiter: the exchange was resumed from a previous connection,
+            // so its completion goes to the events rather than nowhere.
+            None => {
+                let _ = self
+                    .events
+                    .send(Event::Completed {
+                        packet_id,
+                        completion,
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// QoS 2, part two: answer a PUBREC.
+    ///
+    /// "On a PUBREC with code < 0x80 send PUBREL with the same identifier"
+    /// ([MQTT-4.3.3-4]); at 0x80 or above the message "counts as acknowledged
+    /// and MUST NOT be retransmitted" ([MQTT-4.4.0-2]) and the identifier
+    /// frees [mqtt5 §6]. Those are two different outcomes, and conflating
+    /// them would either leak an identifier or resend a dead message.
+    async fn pubrec(&mut self, packet_id: u16, reason_code: PubrecReasonCode) -> Result<()> {
+        if reason_code.is_error() {
+            self.settle(packet_id, Completion::Refused(reason_code))
+                .await;
+            return Ok(());
+        }
+        // False means this client was not awaiting a PUBREC for it — a
+        // duplicate PUBREC after the PUBREL went out, which the specification
+        // expects during recovery. The PUBREL is sent again either way,
+        // because the server is still waiting for one.
+        self.session.pubrec_received(packet_id);
+        self.writer
+            .send(&Packet::Pubrel(Pubrel::new(packet_id)))
+            .await
+    }
+
+    /// QoS 2 inbound, part three: answer a PUBREL with a PUBCOMP.
+    ///
+    /// "Respond to PUBREL with PUBCOMP" ([MQTT-4.3.3-11]) and "after PUBCOMP
+    /// treat the identifier as free and a later PUBLISH with it as new"
+    /// ([MQTT-4.3.3-12]) [mqtt5 §6]. A PUBREL for an identifier this client
+    /// does not hold is answered 0x92, which the specification explicitly
+    /// declines to call an error during recovery (3.6.2.1).
+    async fn pubrel(&mut self, packet_id: u16) -> Result<()> {
+        let held = self.session.inbound_qos2_released(packet_id);
+        let reason_code = if held {
+            PubcompReasonCode::Success
+        } else {
+            PubcompReasonCode::PacketIdentifierNotFound
+        };
+        self.writer
+            .send(&Packet::Pubcomp(Pubcomp {
+                packet_id,
+                reason_code,
+                properties: Properties::new(),
+            }))
+            .await
+    }
+
+    /// A received PUBLISH: deliver it, and acknowledge it at QoS 1 and 2.
+    ///
+    /// The order is the protocol's. At QoS 1 the receiver responds "having
+    /// accepted ownership" and "need not have completed onward delivery
+    /// first" ([MQTT-4.3.2-4]); at QoS 2 the PUBREC follows "all checks for
+    /// conditions which might result in a forwarding failure" [mqtt5 §6],
+    /// and the check this client can make is the Subscription Identifier
+    /// ceiling — so the delivery is *read* before the acknowledgement is
+    /// sent, and a delivery that cannot be read is not acknowledged.
+    ///
+    /// **QoS 2's duplicate suppression is here and only here.** A repeat of a
+    /// Packet Identifier already awaiting its PUBREL is answered with another
+    /// PUBREC and MUST NOT be delivered again ([MQTT-4.3.3-10]) [mqtt5 §6].
+    async fn receive(&mut self, publish: &Publish<'_>) -> Result<()> {
+        let delivery = Delivery::read(publish, &self.limits)?;
+
+        match (publish.qos, publish.packet_id) {
+            (QoS::AtMostOnce, _) => {
+                self.deliver(delivery).await;
+            }
+            (QoS::AtLeastOnce, Some(packet_id)) => {
+                self.deliver(delivery).await;
+                self.writer
+                    .send(&Packet::Puback(Puback::new(packet_id)))
+                    .await?;
+            }
+            (QoS::ExactlyOnce, Some(packet_id)) => {
+                let first_sight = self.session.inbound_qos2_received(packet_id)?;
+                if first_sight {
+                    self.deliver(delivery).await;
+                }
+                self.writer
+                    .send(&Packet::Pubrec(Pubrec::new(packet_id)))
+                    .await?;
+            }
+            // The codec refuses a QoS > 0 PUBLISH without an identifier
+            // ([MQTT-2.2.1-3]), so this is unreachable from the wire.
+            (_, None) => return Err(Error::Protocol(DecodeError::InvalidPacketIdentifier)),
+        }
+        Ok(())
+    }
+
+    async fn deliver(&mut self, delivery: Delivery) {
+        let _ = self.events.send(Event::Delivered(delivery)).await;
+    }
+}
+
+/// The borrowed pairs the codec takes.
+fn borrowed(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
+}
+
+/// A QoS 0 PUBLISH.
+///
+/// Never stored and never given a Packet Identifier: "the Packet Identifier
+/// field is only present in PUBLISH packets where the QoS level is 1 or 2"
+/// (3.3.2.2), and DUP "MUST be set to 0 for all QoS 0 messages"
+/// ([MQTT-3.3.1-2]) [mqtt5 §6] — there is nothing at QoS 0 that could be a
+/// retransmission.
+fn qos0_publish<'a>(
+    message: &'a Message,
+    user_properties: &'a [(&'a str, &'a str)],
+) -> Result<Publish<'a>> {
+    Ok(Publish {
+        topic: &message.topic,
+        payload: &message.payload,
+        qos: QoS::AtMostOnce,
+        dup: false,
+        retain: message.retain,
+        packet_id: None,
+        properties: Properties {
+            payload_format_indicator: message.payload_format_indicator,
+            message_expiry_interval: interval_seconds("message_expiry", message.message_expiry)?,
+            content_type: message.content_type.as_deref(),
+            response_topic: message.response_topic.as_deref(),
+            correlation_data: message.correlation_data.as_deref(),
+            ..Properties::new()
+        }
+        .with_user_properties(user_properties),
+    })
 }
 
 /// Puts the session's unacknowledged exchanges back on the wire.
