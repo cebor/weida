@@ -2367,6 +2367,19 @@ name = "weida-mqtt-codec"
 version = "0.1.0"
 
 [[package]]
+name = "weida-nats"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "weida-core",
+ "weida-nats-codec",
+ "weida-runtime",
+]
+
+[[package]]
 name = "weida-nats-codec"
 version = "0.1.0"
 
