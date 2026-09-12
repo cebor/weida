@@ -19,12 +19,17 @@
 //!
 //! # Where the trust anchors are not
 //!
-//! They are the caller's. [`TlsOptions`] takes a `rustls::ClientConfig` the
+//! They are the caller's. `TlsOptions` takes a `rustls::ClientConfig` the
 //! application built, because which certificates an application trusts is the
 //! application's decision and a messaging library that picked for it is one
 //! that cannot be audited. This crate adds the tokio adapter over the rustls
 //! already in this workspace's graph and **no second TLS stack and no second
 //! cryptographic backend**.
+//!
+//! `TlsOptions` is named in backticks rather than linked because it exists
+//! only with the `tls` feature on, and an intra-doc link to a `cfg`-ed item
+//! breaks `cargo doc --no-default-features` — which is a configuration this
+//! crate supports and therefore documents.
 
 use std::net::SocketAddr;
 use std::pin::Pin;

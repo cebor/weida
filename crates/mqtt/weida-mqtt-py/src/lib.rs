@@ -97,7 +97,13 @@ use pyo3::prelude::*;
 mod client;
 mod errors;
 mod options;
-mod sync;
+// Public where the other four are not, and the reason is the documentation
+// rather than the code: `sync`'s module doc is the argument for having a
+// second surface at all — why it implements nothing, where the deadline goes
+// and why `publish` has no timeout — and a reader of this crate's docs should
+// be able to reach it. The other modules are plumbing whose public face is
+// the Python classes they register.
+pub mod sync;
 mod values;
 
 /// `weida_mqtt`, as Python sees it.
