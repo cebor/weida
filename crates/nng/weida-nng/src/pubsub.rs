@@ -75,9 +75,7 @@ impl PubSocket {
     ///
     /// Fails with `NNG_ECLOSED` once the socket is closed.
     pub fn send(&self, body: impl Into<Vec<u8>>) -> Result<Broadcast> {
-        if self.core.engine().is_closed() {
-            return Err(Error::ECLOSED("this socket is closed".into()));
-        }
+        self.core.ensure_open()?;
         Ok(self.core.send_to_all(&Message::from_body(body.into())))
     }
 }

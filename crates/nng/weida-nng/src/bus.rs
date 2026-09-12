@@ -103,9 +103,7 @@ impl BusSocket {
     }
 
     fn broadcast(&self, message: &Message, exclude: Option<PipeId>) -> Result<Broadcast> {
-        if self.core.engine().is_closed() {
-            return Err(Error::ECLOSED("this socket is closed".into()));
-        }
+        self.core.ensure_open()?;
         let mut broadcast = Broadcast::default();
         for pipe in self.core.pipes() {
             if exclude == Some(pipe.id()) {

@@ -183,15 +183,33 @@ impl SocketCore {
             .map_err(|_| nowhere_to_send())
     }
 
+    /// `NNG_ECLOSED` once this socket is closed.
+    ///
+    /// Every waiting operation checks it on each turn of its loop, and
+    /// [`Engine::close`](crate::Engine::close) wakes the waiters, so a
+    /// close ends a parked send or receive **at the close** rather than at
+    /// the far end of the operation's timeout. NNG's own rule is that an
+    /// operation on a closed socket is `NNG_ECLOSED`, and a socket that
+    /// answered `NNG_ETIMEDOUT` a minute later would be telling the caller
+    /// the wrong thing about the wrong moment.
+    pub fn ensure_open(&self) -> Result<()> {
+        if self.engine.is_closed() {
+            return Err(Error::ECLOSED("this socket is closed".into()));
+        }
+        Ok(())
+    }
+
     /// Sends `message` to the next pipe that can accept it, waiting for one
     /// under `NNG_OPT_SENDTIMEO`.
     ///
-    /// "With no eligible peer, the send waits or times out" (§4).
+    /// "With no eligible peer, the send waits or times out" (§4), and a
+    /// close ends the wait with `NNG_ECLOSED`.
     pub async fn send_round_robin(&self, message: Message) -> Result<PipeId> {
         let limit = self.options().send_timeout;
         within(&self.exec, limit, async {
             let mut message = message;
             loop {
+                self.ensure_open()?;
                 match self.offer_round_robin(message) {
                     Ok(id) => return Ok(id),
                     Err(returned) => message = returned,
@@ -248,6 +266,7 @@ impl SocketCore {
         let limit = self.options().recv_timeout;
         within(&self.exec, limit, async {
             loop {
+                self.ensure_open()?;
                 if let Some(taken) = self.try_take_any() {
                     return Ok(taken);
                 }
