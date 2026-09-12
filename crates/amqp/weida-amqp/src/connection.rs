@@ -1132,7 +1132,7 @@ impl Driver {
                 return self.route_attach(channel, attach, writer).await;
             }
             Performative::Detach(detach) => {
-                return self.route_detach(channel, detach).await;
+                return self.route_detach(channel, detach, writer).await;
             }
             Performative::Disposition(disposition) => {
                 return self.route_disposition(channel, disposition, writer).await;
@@ -1221,17 +1221,42 @@ impl Driver {
             let Some(entry) = self.sessions.by_incoming(channel) else {
                 return Ok(None);
             };
-            // "A frame (other than attach) was received referencing a handle
-            // which is not currently in use of an attached link" is exactly
-            // what `amqp:session:unattached-handle` names (Part 2 §2.8.17),
-            // and the remedy is to end the session.
-            let condition = Condition::described(
-                condition::SESSION_UNATTACHED_HANDLE,
-                format!(
-                    "{} arrived on handle {handle}, which is not an attached link",
-                    performative.name()
-                ),
-            );
+            if entry.links.was_detached(handle) {
+                // A frame for a link that was cleanly detached is a race with
+                // the `detach`, not a fault: the peer's frame may already have
+                // been in flight when the two crossed. `fe2o3-amqp`'s
+                // acceptor really does send a `flow` for a handle it has just
+                // detached, and ending the session over it would make every
+                // orderly link close a coin toss.
+                tracing::debug!(
+                    handle,
+                    performative = performative.name(),
+                    "discarding a frame for a link that was already detached"
+                );
+                return Ok(None);
+            }
+            // Two different conditions, and the specification distinguishes
+            // them. A handle detached **with an error**: "any later input on
+            // that handle or its delivery-ids MUST end the session with
+            // `amqp:session:errant-link`" (Part 2 §2.6.5). A handle never
+            // attached at all: `amqp:session:unattached-handle` (§2.8.17).
+            let condition = if entry.links.was_errant(handle) {
+                Condition::described(
+                    condition::SESSION_ERRANT_LINK,
+                    format!(
+                        "{} arrived on handle {handle}, whose link was detached with an error",
+                        performative.name()
+                    ),
+                )
+            } else {
+                Condition::described(
+                    condition::SESSION_UNATTACHED_HANDLE,
+                    format!(
+                        "{} arrived on handle {handle}, which is not an attached link",
+                        performative.name()
+                    ),
+                )
+            };
             let outgoing = entry.shared.outgoing_channel;
             *entry.shared.state.lock().expect("not poisoned") =
                 SessionState::Discarding(condition.clone());
@@ -1527,15 +1552,24 @@ impl Driver {
     }
 
     /// A `detach` from the peer.
+    ///
+    /// Answered, unless this end sent one first. A link endpoint is destroyed
+    /// only when **both** ends have detached (Part 2 §2.6.4), so a peer that
+    /// initiated the detach is waiting for this frame — and a peer whose
+    /// application holds the link until it arrives waits forever without it.
+    /// `fe2o3-amqp`'s acceptor is such a peer: its `close()` does not return
+    /// until the answering `detach` lands.
     async fn route_detach(
         &mut self,
         channel: u16,
         detach: &weida_amqp_codec::performative::Detach<'_>,
+        writer: &mut FrameWriter,
     ) -> Result<Option<State>> {
         let entry = self
             .sessions
             .by_incoming(channel)
             .expect("the caller checked the channel");
+        let outgoing = entry.shared.outgoing_channel;
         let condition = detach.error.as_ref().map(Condition::from_codec);
         let Some(link) = entry.links.by_input(detach.handle) else {
             tracing::debug!(
@@ -1545,6 +1579,12 @@ impl Driver {
             return Ok(None);
         };
         let output = link.shared.output_handle;
+        // Whether this end had already sent its own `detach`; answering twice
+        // would be a frame for a link that no longer exists at the peer.
+        let answered = matches!(
+            *link.shared.state.lock().expect("not poisoned"),
+            crate::link::LinkState::Detaching | crate::link::LinkState::Detached(_)
+        );
         *link.shared.state.lock().expect("not poisoned") =
             crate::link::LinkState::Detached(condition.clone());
         let events = link.events.clone();
@@ -1552,6 +1592,11 @@ impl Driver {
         // entitled to still be sending frames for it.
         let errored = condition.is_some();
         entry.links.remove(output, errored);
+        if !answered {
+            // The same `closed` flag the peer used: answering `closed=true`
+            // with `closed=false` would claim the deliveries are still live.
+            let _ = write_detach(writer, outgoing, output, detach.closed, None).await;
+        }
         let _ = events
             .send(crate::link::LinkEvent::Detached(condition))
             .await;
