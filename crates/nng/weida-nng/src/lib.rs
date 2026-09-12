@@ -91,6 +91,9 @@
 //!   receiver: every publication is offered to every subscriber, each one
 //!   matches an arbitrary byte prefix locally, and
 //!   [`SubSocket::discarded`] counts what that costs.
+//! - [`Pair0Socket`] and [`Pair1Socket`] — the exclusive pair: one peer
+//!   at a time refused at the pipe-add-pre hook, PAIR v0 with no header
+//!   and PAIR v1 with its hop-count word under `NNG_OPT_MAXTTL`.
 
 #![warn(missing_docs)]
 
@@ -100,6 +103,7 @@ pub mod engine;
 pub mod error;
 pub mod message;
 pub mod options;
+pub mod pair;
 pub mod pipe;
 pub mod pipeline;
 pub mod protocol;
@@ -125,6 +129,7 @@ pub use options::{
     DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_ADDRESSES, DEFAULT_MAX_PIPES, DEFAULT_RECONNECT_MAX,
     DEFAULT_RECONNECT_MIN, SocketOptions,
 };
+pub use pair::{POLYAMOROUS_ABSENT, Pair0Socket, Pair1Socket};
 pub use pipe::{
     DEFAULT_RECV_DEPTH, DEFAULT_SEND_DEPTH, FullAction, MAX_QUEUE_DEPTH, PipeId, Queue,
     QueueConfig, Sent,
