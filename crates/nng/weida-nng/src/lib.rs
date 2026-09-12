@@ -98,9 +98,14 @@
 //!   deadline that starts at the send, at most one response per
 //!   respondent, late responses discarded, and silence indistinguishable
 //!   from slowness.
+//! - [`BusSocket`] — one hop and best effort: every directly connected
+//!   peer and nobody else, a discarded copy that the send still calls a
+//!   success, and the ingress pipe carried so a re-broadcast can exclude
+//!   it.
 
 #![warn(missing_docs)]
 
+pub mod bus;
 pub mod context;
 pub mod endpoint;
 pub mod engine;
@@ -119,6 +124,7 @@ pub mod socket;
 pub mod survey;
 pub mod transport;
 
+pub use bus::BusSocket;
 pub use context::{
     Closed, Context, ContextConfig, DEFAULT_CLOSE_BUDGET, DEFAULT_MAX_SOCKETS, SocketId, SocketSlot,
 };
