@@ -14,14 +14,17 @@
 //! there is nothing to encode: they are bytes a peer may send and this codec
 //! must refuse.
 //!
-//! Vectors 5 to 19 cover the thirteen packet types B-140 adds, and are
-//! asserted there. What is in this file is vectors 1 to 4 and 20 to 23, plus
-//! the two CONNECT payload-order cases §10.1's row 2 exists for.
+//! All twenty-three rows of §10.1 are here: the nineteen that carry bytes are
+//! asserted in both directions except row 9, which is the long spelling of
+//! row 8 and therefore decode-only, and the four malformed rows are asserted
+//! on the decoder alone.
 
 use weida_mqtt_codec::error::{MALFORMED_PACKET, PROTOCOL_ERROR};
 use weida_mqtt_codec::{
-    Connack, Connect, ConnectReasonCode, DecodeError, Packet, PayloadFormat, Properties, QoS, Will,
-    varint,
+    Auth, AuthReasonCode, Connack, Connect, ConnectReasonCode, DecodeError, Disconnect,
+    DisconnectReasonCode, Packet, PayloadFormat, PayloadList, Properties, Puback, Pubcomp, Publish,
+    Pubrec, Pubrel, QoS, Suback, SubackReasonCode, Subscribe, Subscription, Unsuback,
+    UnsubackReasonCode, Unsubscribe, Will, varint,
 };
 
 /// The ceiling every vector is decoded under. The protocol's own is
@@ -139,6 +142,239 @@ fn vector_4_connack_with_session_present_and_receive_maximum() {
             },
         }),
         &[0x20, 0x06, 0x01, 0x00, 0x03, 0x21, 0x00, 0x0A],
+    );
+}
+
+/// Vector 5: PUBLISH at QoS 0 — no Packet Identifier at all, and the property
+/// length byte still present.
+#[test]
+fn vector_5_publish_qos_0() {
+    assert_vector(
+        &Packet::Publish(Publish {
+            topic: "a/b",
+            payload: b"hi",
+            ..Publish::default()
+        }),
+        &[0x30, 0x08, 0x00, 0x03, 0x61, 0x2F, 0x62, 0x00, 0x68, 0x69],
+    );
+}
+
+/// Vector 6: PUBLISH at QoS 1 — the identifier sits after the Topic Name and
+/// before the properties (3.3.2.2).
+#[test]
+fn vector_6_publish_qos_1() {
+    assert_vector(
+        &Packet::Publish(Publish {
+            topic: "a/b",
+            payload: b"hi",
+            qos: QoS::AtLeastOnce,
+            packet_id: Some(10),
+            ..Publish::default()
+        }),
+        &[
+            0x32, 0x0A, 0x00, 0x03, 0x61, 0x2F, 0x62, 0x00, 0x0A, 0x00, 0x68, 0x69,
+        ],
+    );
+}
+
+/// Vector 7: a zero-length Topic Name with Topic Alias 1, which is the only
+/// shape in which a zero-length Topic Name is legal (3.3.2.1). The codec
+/// accepts it because the alias table is per connection and belongs to the
+/// client, not to a sans-I/O codec.
+#[test]
+fn vector_7_publish_with_a_topic_alias() {
+    assert_vector(
+        &Packet::Publish(Publish {
+            topic: "",
+            payload: b"hi",
+            properties: Properties {
+                topic_alias: Some(1),
+                ..Properties::new()
+            },
+            ..Publish::default()
+        }),
+        &[0x30, 0x08, 0x00, 0x00, 0x03, 0x23, 0x00, 0x01, 0x68, 0x69],
+    );
+}
+
+/// Vector 8: PUBACK in the short form. "The Reason Code and Property Length
+/// can be omitted if the Reason Code is 0x00 (Success) and there are no
+/// Properties" (3.4.1).
+#[test]
+fn vector_8_puback_short_form() {
+    assert_vector(&Packet::Puback(Puback::new(10)), &[0x40, 0x02, 0x00, 0x0A]);
+}
+
+/// Vector 9: the long form of vector 8. Decode-only, because both spellings
+/// are legal and the encoder emits one — which is the whole reason this row
+/// exists separately from row 8.
+#[test]
+fn vector_9_puback_long_form_decodes_to_the_same_value() {
+    let (long, used) =
+        Packet::decode(&[0x40, 0x04, 0x00, 0x0A, 0x00, 0x00], CAP).expect("the long form");
+    assert_eq!(used, 6);
+    assert_eq!(long, Packet::Puback(Puback::new(10)));
+
+    // And the three-byte middle form: a reason code with no property length.
+    let (middle, used) =
+        Packet::decode(&[0x40, 0x03, 0x00, 0x0A, 0x00], CAP).expect("the middle form");
+    assert_eq!(used, 5);
+    assert_eq!(middle, long);
+
+    let mut out = Vec::new();
+    long.encode(&mut out).expect("encodes");
+    assert_eq!(
+        out,
+        [0x40, 0x02, 0x00, 0x0A],
+        "canonicalised to the short form"
+    );
+}
+
+/// Vector 10: PUBREC, PUBREL and PUBCOMP in their short forms. PUBREL's
+/// reserved fixed-header flags `0010` are part of the vector and are not
+/// optional ([MQTT-2.1.3-1]).
+#[test]
+fn vector_10_pubrec_pubrel_pubcomp_short_form() {
+    assert_vector(&Packet::Pubrec(Pubrec::new(10)), &[0x50, 0x02, 0x00, 0x0A]);
+    assert_vector(&Packet::Pubrel(Pubrel::new(10)), &[0x62, 0x02, 0x00, 0x0A]);
+    assert_vector(
+        &Packet::Pubcomp(Pubcomp::new(10)),
+        &[0x70, 0x02, 0x00, 0x0A],
+    );
+
+    // The reserved flags are checked, so PUBREL with a zero nibble is refused
+    // rather than accepted and ignored.
+    assert!(Packet::decode(&[0x60, 0x02, 0x00, 0x0A], CAP).is_err());
+}
+
+/// Vector 11: SUBSCRIBE with one filter at maximum QoS 1 and no options set.
+/// The reserved flags `0010` and the per-filter options byte are both part of
+/// it.
+#[test]
+fn vector_11_subscribe_one_filter() {
+    let filters = [Subscription::new("a/+", QoS::AtLeastOnce)];
+    assert_vector(
+        &Packet::Subscribe(Subscribe {
+            packet_id: 1,
+            properties: Properties::new(),
+            filters: PayloadList::new(&filters),
+        }),
+        &[
+            0x82, 0x09, 0x00, 0x01, 0x00, 0x00, 0x03, 0x61, 0x2F, 0x2B, 0x01,
+        ],
+    );
+}
+
+/// Vector 12: SUBSCRIBE carrying a Subscription Identifier, which is a
+/// Variable Byte Integer in 1..=268,435,455 (3.8.2.1.2).
+#[test]
+fn vector_12_subscribe_with_a_subscription_identifier() {
+    let filters = [Subscription::new("a/+", QoS::AtLeastOnce)];
+    let ids = [5u32];
+    assert_vector(
+        &Packet::Subscribe(Subscribe {
+            packet_id: 1,
+            properties: Properties::new().with_subscription_identifiers(&ids),
+            filters: PayloadList::new(&filters),
+        }),
+        &[
+            0x82, 0x0B, 0x00, 0x01, 0x02, 0x0B, 0x05, 0x00, 0x03, 0x61, 0x2F, 0x2B, 0x01,
+        ],
+    );
+}
+
+/// Vector 13: SUBACK with one granted QoS, one code per filter in request
+/// order (3.9.3).
+#[test]
+fn vector_13_suback_granted_qos_1() {
+    let codes = [SubackReasonCode::GrantedQos1];
+    assert_vector(
+        &Packet::Suback(Suback {
+            packet_id: 1,
+            properties: Properties::new(),
+            reason_codes: PayloadList::new(&codes),
+        }),
+        &[0x90, 0x04, 0x00, 0x01, 0x00, 0x01],
+    );
+}
+
+/// Vector 14: UNSUBSCRIBE, which has **no** options byte — the asymmetry with
+/// SUBSCRIBE that a shared payload decoder would get wrong.
+#[test]
+fn vector_14_unsubscribe_one_filter() {
+    let filters = ["a/+"];
+    assert_vector(
+        &Packet::Unsubscribe(Unsubscribe {
+            packet_id: 2,
+            properties: Properties::new(),
+            filters: PayloadList::new(&filters),
+        }),
+        &[0xA2, 0x08, 0x00, 0x02, 0x00, 0x00, 0x03, 0x61, 0x2F, 0x2B],
+    );
+}
+
+/// Vector 15: UNSUBACK, which carries reason codes where 3.1.1 carried no
+/// status at all [mqtt5 §1.9].
+#[test]
+fn vector_15_unsuback_success() {
+    let codes = [UnsubackReasonCode::Success];
+    assert_vector(
+        &Packet::Unsuback(Unsuback {
+            packet_id: 2,
+            properties: Properties::new(),
+            reason_codes: PayloadList::new(&codes),
+        }),
+        &[0xB0, 0x04, 0x00, 0x02, 0x00, 0x00],
+    );
+}
+
+/// Vector 16: the two pings — no variable header, no properties, no payload.
+#[test]
+fn vector_16_pingreq_and_pingresp() {
+    assert_vector(&Packet::Pingreq, &[0xC0, 0x00]);
+    assert_vector(&Packet::Pingresp, &[0xD0, 0x00]);
+}
+
+/// Vector 17: DISCONNECT 0x00 in the empty form, which is the packet that
+/// makes the server discard the Will without publishing it ([MQTT-3.14.4-3]).
+#[test]
+fn vector_17_normal_disconnect() {
+    assert_vector(&Packet::Disconnect(Disconnect::default()), &[0xE0, 0x00]);
+}
+
+/// Vector 18: DISCONNECT 0x04 asks for the Will anyway, and the Session
+/// Expiry Interval revises the session's lifetime at close (3.14.2.2.2).
+#[test]
+fn vector_18_disconnect_with_will_and_revised_expiry() {
+    assert_vector(
+        &Packet::Disconnect(Disconnect {
+            reason_code: DisconnectReasonCode::DisconnectWithWillMessage,
+            properties: Properties {
+                session_expiry_interval: Some(30),
+                ..Properties::new()
+            },
+        }),
+        &[0xE0, 0x07, 0x04, 0x05, 0x11, 0x00, 0x00, 0x00, 0x1E],
+    );
+}
+
+/// Vector 19: AUTH — packet type 15, Reserved and Forbidden in 3.1.1
+/// [mqtt5 §1.9] — carrying the Authentication Method every AUTH must repeat
+/// ([MQTT-4.12.0-5]).
+#[test]
+fn vector_19_auth_continue_authentication() {
+    assert_vector(
+        &Packet::Auth(Auth {
+            reason_code: AuthReasonCode::ContinueAuthentication,
+            properties: Properties {
+                authentication_method: Some("SCRAM-SHA-1"),
+                ..Properties::new()
+            },
+        }),
+        &[
+            0xF0, 0x10, 0x18, 0x0E, 0x15, 0x00, 0x0B, 0x53, 0x43, 0x52, 0x41, 0x4D, 0x2D, 0x53,
+            0x48, 0x41, 0x2D, 0x31,
+        ],
     );
 }
 

@@ -262,7 +262,7 @@ mod tests {
     /// packet, not just through `from_byte`.
     #[test]
     fn every_reason_code_survives_a_packet_round_trip() {
-        for reason_code in reason::CONNECT_REASON_CODES {
+        for &reason_code in reason::CONNECT_REASON_CODES {
             round_trip(&Connack {
                 session_present: false,
                 reason_code,
