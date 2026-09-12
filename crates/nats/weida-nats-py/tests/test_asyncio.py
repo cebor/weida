@@ -389,6 +389,27 @@ def test_a_connection_option_reaches_the_connect_line(server):
     assert server.connect["echo"] is False
 
 
+def test_a_later_info_carries_the_lame_duck_notice(server):
+    async def exchange():
+        nats = await connected(server)
+        assert not nats.is_lame_duck()
+        notified = asyncio.create_task(nats.lame_duck_notice())
+        await asyncio.sleep(0.05)
+
+        # An asynchronous INFO, which is how a draining server says so. It
+        # mentions nothing else, and nothing else changes: a topology notice
+        # that omitted `headers` must not revoke header support.
+        server.send_info({"ldm": True})
+        assert await notified
+        assert nats.is_lame_duck()
+        assert nats.headers_supported()
+        assert nats.max_payload() == 1048576
+        assert nats.info().lame_duck
+        await nats.close()
+
+    run(exchange())
+
+
 # --------------------------------------------------------------------------
 # The reactor, three ways
 

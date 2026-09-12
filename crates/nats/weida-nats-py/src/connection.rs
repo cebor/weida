@@ -14,7 +14,7 @@
 //! | --- | --- | --- |
 //! | `await weida_nats.connect(host, port)` | `Exec::owned` | The default, and the only one a plain Python program can use: the connection owns a reactor of `worker_threads` threads, and no asyncio loop drives it. |
 //! | `await Connection.connect_current(host, port)` | `Exec::current` | The *ambient* Tokio reactor. A plain Python process has none, so this raises `weida_nats.Runtime` — the honest answer rather than a hidden second reactor. It is reachable when this module is imported into a process a Rust host already runs a reactor in. |
-//! | `await Connection.connect_sharing(other, host, port)` | `Exec::from_handle` | A second connection on the first one's reactor. Two connections to two clusters over one thread pool, which is what a program with several connections wants and what ten `connect` calls would not give it. |
+//! | `await Connection.connect_sharing(other, host, port)` | `other`'s `Exec`, cloned | A second connection on the first one's reactor, holding the same `OwnedReactor` alive. Two connections to two clusters over one thread pool, which is what a program with several connections wants and what ten `connect` calls would not give it. |
 //!
 //! There is no fourth, and in particular there is no `Connection()`
 //! constructor: connecting reads the server's `INFO` and answers it, so it is
@@ -93,13 +93,6 @@ pub struct PyConnection {
     inner: Connection,
     bridge: Bridge,
     reactor: Reactor,
-}
-
-impl PyConnection {
-    /// The reactor this connection's subscriptions inherit.
-    pub fn reactor(&self) -> &Reactor {
-        &self.reactor
-    }
 }
 
 /// Runs the handshake on `reactor` and wraps what comes back.

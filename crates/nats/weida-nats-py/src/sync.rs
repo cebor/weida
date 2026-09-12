@@ -34,6 +34,12 @@
 //! the operation's future is polled on the thread that asked, while the
 //! socket and the timers it waits on run on the reactor the connection owns.
 //!
+//! The one thing [`drive`] does beyond polling is enter the runtime context
+//! for the duration, which is not the same as running on it: `tokio::net`
+//! and `tokio::time` look for the ambient runtime of the thread that
+//! *creates* a socket or a timer, and `weida-nats` creates both inside the
+//! future this drives.
+//!
 //! Each of those calls happens inside [`Python::detach`], so other Python
 //! threads run while one is parked in `next_msg`. A blocking binding that
 //! held the GIL would make a second thread pointless, and the usual shape of
