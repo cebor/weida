@@ -77,9 +77,13 @@ pub mod connection;
 pub mod error;
 pub mod options;
 pub mod sasl;
+pub mod session;
 pub mod transport;
+pub mod window;
 
 pub use connection::{Connection, RemoteOpen, State};
 pub use error::{Condition, Error, Result};
 pub use options::{ConnectionOptions, Sasl, TlsMode};
+pub use session::{Session, SessionOptions};
 pub use transport::{Stream, Wire};
+pub use window::Windows;
