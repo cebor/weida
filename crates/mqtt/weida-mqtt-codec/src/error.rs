@@ -192,6 +192,40 @@ pub enum DecodeError {
         /// The byte that was found.
         code: u8,
     },
+    /// A Packet Identifier of 0. "A Packet Identifier cannot have a value of
+    /// 0" and each identifier "MUST be non-zero" ([MQTT-2.2.1-3]) (2.2.1)
+    /// [mqtt5 §2].
+    InvalidPacketIdentifier,
+    /// A payload list with no entries. "A SUBSCRIBE packet with no Payload is
+    /// a Protocol Error" ([MQTT-3.8.3-2]), and the same for UNSUBSCRIBE
+    /// ([MQTT-3.10.3-2]) [mqtt5 §3]. SUBACK and UNSUBACK inherit it, because
+    /// one reason code per filter over zero filters answers nothing.
+    EmptyPayload {
+        /// The packet type whose payload was empty.
+        packet_type: PacketType,
+    },
+    /// DUP set on a QoS 0 PUBLISH. "The DUP flag MUST be set to 0 for all QoS
+    /// 0 messages" ([MQTT-3.3.1-2]) (3.3.1.1) [mqtt5 §6], because there is
+    /// nothing at QoS 0 that could be a retransmission.
+    DupOnQos0,
+    /// Bits 6 or 7 of a Subscription Options byte were set. "Bits 6 and 7 ...
+    /// are reserved for future use. The Server MUST treat a SUBSCRIBE packet
+    /// as malformed if any of Reserved bits in the Payload are non-zero"
+    /// ([MQTT-3.8.3-5]) (3.8.3.1) [mqtt5 §3].
+    ReservedSubscriptionOptionBits {
+        /// The options byte that was found.
+        bits: u8,
+    },
+    /// A Retain Handling value of 3. "It is a Protocol Error to send a Retain
+    /// Handling value of 3" (3.8.3.1) [mqtt5 §4.4].
+    InvalidRetainHandling {
+        /// The two bits that were found.
+        value: u8,
+    },
+    /// No Local set on a `$share/` filter. "It is a Protocol Error to set the
+    /// No Local bit to 1 on a Shared Subscription" ([MQTT-3.8.3-4]) (3.8.3.1)
+    /// [mqtt5 §4.2].
+    NoLocalOnSharedSubscription,
 }
 
 impl DecodeError {
@@ -232,6 +266,11 @@ impl DecodeError {
             | DecodeError::AuthenticationDataWithoutMethod
             | DecodeError::SessionPresentWithError { .. }
             | DecodeError::ReservedConnackFlag { .. } => Some(PROTOCOL_ERROR),
+            DecodeError::InvalidPacketIdentifier
+            | DecodeError::EmptyPayload { .. }
+            | DecodeError::DupOnQos0
+            | DecodeError::InvalidRetainHandling { .. }
+            | DecodeError::NoLocalOnSharedSubscription => Some(PROTOCOL_ERROR),
 
             // Cannot be parsed as this specification describes.
             _ => Some(MALFORMED_PACKET),
@@ -304,6 +343,20 @@ impl fmt::Display for DecodeError {
             DecodeError::InvalidReasonCode { packet_type, code } => {
                 write!(f, "0x{code:02X} is not a {packet_type} reason code")
             }
+            DecodeError::InvalidPacketIdentifier => f.write_str("packet identifier 0 is not valid"),
+            DecodeError::EmptyPayload { packet_type } => {
+                write!(f, "{packet_type} carries no payload entries")
+            }
+            DecodeError::DupOnQos0 => f.write_str("DUP set on a QoS 0 publish"),
+            DecodeError::ReservedSubscriptionOptionBits { bits } => {
+                write!(f, "reserved subscription option bits set in 0x{bits:02X}")
+            }
+            DecodeError::InvalidRetainHandling { value } => {
+                write!(f, "retain handling {value} is not 0, 1 or 2")
+            }
+            DecodeError::NoLocalOnSharedSubscription => {
+                f.write_str("no local set on a shared subscription")
+            }
         }
     }
 }
@@ -361,6 +414,18 @@ pub enum EncodeError {
         /// The value that was offered.
         value: u32,
     },
+    /// A Packet Identifier of 0, which is not a valid identifier
+    /// ([MQTT-2.2.1-3]) (2.2.1) [mqtt5 §2].
+    InvalidPacketIdentifier,
+    /// A payload list with no entries, for one of the four packets that
+    /// require at least one ([MQTT-3.8.3-2], [MQTT-3.10.3-2]) [mqtt5 §3].
+    EmptyPayload {
+        /// The packet type whose payload was empty.
+        packet_type: PacketType,
+    },
+    /// DUP set on a QoS 0 PUBLISH. "The DUP flag MUST be set to 0 for all QoS
+    /// 0 messages" ([MQTT-3.3.1-2]) (3.3.1.1) [mqtt5 §6].
+    DupOnQos0,
 }
 
 impl fmt::Display for EncodeError {
@@ -390,6 +455,11 @@ impl fmt::Display for EncodeError {
             EncodeError::InvalidSubscriptionIdentifier { value } => {
                 write!(f, "subscription identifier {value} is not in 1..=268435455")
             }
+            EncodeError::InvalidPacketIdentifier => f.write_str("packet identifier 0 is not valid"),
+            EncodeError::EmptyPayload { packet_type } => {
+                write!(f, "{packet_type} needs at least one payload entry")
+            }
+            EncodeError::DupOnQos0 => f.write_str("DUP set on a QoS 0 publish"),
         }
     }
 }

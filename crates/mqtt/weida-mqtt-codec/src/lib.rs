@@ -22,11 +22,21 @@
 //!   where the maximum-packet-size check lives.
 //! * [`property`] — the twenty-seven property identifiers of table 2-4, which
 //!   packet carries which, and the two that may repeat.
-//! * [`reason`] — reason codes; the CONNACK subset today.
+//! * [`reason`] — a reason-code type per packet, each a closed subset, with
+//!   PUBREC's list shared with PUBACK's and PUBCOMP's with PUBREL's.
+//! * [`list`] — the payload of the four packets that carry a homogeneous
+//!   list: SUBSCRIBE's filters, UNSUBSCRIBE's, and SUBACK's and UNSUBACK's
+//!   per-filter verdicts.
 //! * [`connect`] / [`connack`] — CONNECT with its Will, and CONNACK with the
 //!   whole of what a server declares about itself.
-//! * [`packet`] — [`Packet`], one enum per packet type, and the stream entry
-//!   points [`Packet::decode`] and [`Packet::encode`].
+//! * [`publish`] — the only packet carrying an Application Message, and the
+//!   only one that uses its fixed-header flags.
+//! * [`ack`] — PUBACK, PUBREC, PUBREL and PUBCOMP: two shapes, four packets.
+//! * [`subscribe`] / [`unsubscribe`] — the filters and their per-filter
+//!   options and verdicts.
+//! * [`control`] — PINGREQ, PINGRESP, DISCONNECT and AUTH.
+//! * [`packet`] — [`Packet`], one variant per packet type, and the stream
+//!   entry points [`Packet::decode`] and [`Packet::encode`].
 //!
 //! # Reading a connection
 //!
@@ -131,21 +141,36 @@
 
 #![warn(missing_docs)]
 
+pub mod ack;
 pub mod connack;
 pub mod connect;
+pub mod control;
 pub mod data;
 pub mod error;
+pub mod list;
 pub mod packet;
 pub mod property;
+pub mod publish;
 pub mod reason;
+pub mod subscribe;
 pub mod types;
+pub mod unsubscribe;
 pub mod varint;
 
+pub use ack::{Puback, Pubcomp, Pubrec, Pubrel};
 pub use connack::Connack;
 pub use connect::{Connect, PROTOCOL_NAME, PROTOCOL_VERSION, Will};
+pub use control::{Auth, Disconnect};
 pub use data::Reader;
 pub use error::{DecodeError, EncodeError};
+pub use list::{PayloadItem, PayloadList};
 pub use packet::Packet;
-pub use property::{PayloadFormat, Properties, PropertyId, PropertySet, ValueKind};
-pub use reason::ConnectReasonCode;
+pub use property::{PayloadFormat, Properties, PropertyId, PropertySet, Repeated, ValueKind};
+pub use publish::Publish;
+pub use reason::{
+    AuthReasonCode, ConnectReasonCode, DisconnectReasonCode, PubackReasonCode, PubcompReasonCode,
+    PubrecReasonCode, PubrelReasonCode, SubackReasonCode, UnsubackReasonCode,
+};
+pub use subscribe::{RetainHandling, Suback, Subscribe, Subscription, SubscriptionOptions};
 pub use types::{FixedHeader, PacketType, QoS};
+pub use unsubscribe::{Unsuback, Unsubscribe};

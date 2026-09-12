@@ -30,7 +30,12 @@
 //!    at least one packet or stops, never loops.
 
 use weida_mqtt_codec::property::{Properties, PropertySet};
-use weida_mqtt_codec::{DecodeError, Packet, Reader, data, varint};
+use weida_mqtt_codec::{
+    Auth, AuthReasonCode, Connack, Connect, ConnectReasonCode, DecodeError, Disconnect,
+    DisconnectReasonCode, Packet, PayloadList, Puback, Pubcomp, Publish, Pubrec, Pubrel, QoS,
+    Reader, Suback, SubackReasonCode, Subscribe, Subscription, SubscriptionOptions, Unsuback,
+    UnsubackReasonCode, Unsubscribe, Will, data, varint,
+};
 
 const ITERATIONS: usize = 100_000;
 
@@ -182,6 +187,14 @@ fn fuzz_smoke_properties_over_an_exact_block_never_ask_for_more() {
 
 /// The whole decoder against arbitrary bytes: nothing panics, an accepted
 /// packet fits the cap, and no rejection reserves memory.
+///
+/// `encoded_len` is compared against the **re-encoded** length and not against
+/// the bytes consumed, and the difference is the point. An acknowledgement's
+/// all-success tail is omissible (3.4.1) and properties may arrive in any
+/// order [mqtt5 §3], so a legal input may be longer than this codec's
+/// canonical spelling of the same value. `encoded_len <= used` is therefore
+/// the honest invariant: never longer than what arrived, and exactly what the
+/// encoder will write.
 #[test]
 fn fuzz_smoke_packets_never_panic_and_respect_the_cap() {
     let mut rng = Rng::new(0x5150_4D51_5454_0004);
@@ -193,12 +206,17 @@ fn fuzz_smoke_packets_never_panic_and_respect_the_cap() {
         if let Ok((packet, used)) = Packet::decode(&input, CAP) {
             assert!(used <= input.len());
             assert!(used as u32 <= CAP);
-            assert_eq!(packet.encoded_len(), Ok(used as u32));
 
             let mut out = Vec::new();
             packet
                 .encode(&mut out)
                 .expect("a decoded packet re-encodes");
+            assert_eq!(packet.encoded_len(), Ok(out.len() as u32));
+            assert!(
+                out.len() <= used,
+                "the canonical form is never longer than what arrived"
+            );
+
             let (again, used2) = Packet::decode(&out, CAP).expect("the canonical form");
             assert_eq!(again, packet);
             assert_eq!(used2, out.len());
@@ -210,35 +228,40 @@ fn fuzz_smoke_packets_never_panic_and_respect_the_cap() {
 /// fixed header at all.
 ///
 /// Uniformly random bytes almost never build a CONNECT: the four-byte protocol
-/// name alone is a 1-in-2^32 event. So the generator starts from a packet that
-/// is valid in every field — vectors 2 and 4 of `docs/adapters/mqtt5.md` §10.1
-/// — and flips bytes in the body, which lands the decoder in the property
-/// block, the Will Properties and the length-prefixed payload fields where the
+/// name alone is a 1-in-2^32 event. So the generator starts from packets that
+/// are valid in every field — one per packet type, the golden vectors of
+/// `docs/adapters/mqtt5.md` §10.1 among them — and flips bytes in the body,
+/// which lands the decoder in the property block, the Will Properties, the
+/// subscription options byte and the length-prefixed payload fields where the
 /// interesting faults live.
 ///
 /// Two counters are asserted rather than one. Without the accept counter the
 /// test could pass while rejecting everything, which proves nothing; without
 /// the reject counter it could pass while accepting everything, which proves
-/// less.
+/// less. A third assertion covers every seed, so a corpus entry that stopped
+/// being decodable — because a rule tightened — is caught rather than
+/// silently contributing nothing.
 #[test]
 fn fuzz_smoke_mutations_of_a_valid_packet() {
-    const CONNECT: [u8; 34] = [
-        0x10, 0x20, 0x00, 0x04, 0x4D, 0x51, 0x54, 0x54, 0x05, 0xCE, 0x00, 0x3C, 0x00, 0x00, 0x01,
-        0x63, 0x05, 0x18, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x01, 0x64, 0x00, 0x01, 0x01, 0x00, 0x01,
-        0x75, 0x00, 0x01, 0x70,
-    ];
-    const CONNACK: [u8; 8] = [0x20, 0x06, 0x01, 0x00, 0x03, 0x21, 0x00, 0x0A];
+    let corpus = one_of_each();
+    assert_eq!(corpus.len(), 15, "one seed per packet type");
+    for seed in &corpus {
+        Packet::decode(seed, CAP).unwrap_or_else(|error| {
+            panic!("the seed {seed:02X?} must decode, got {error}");
+        });
+    }
 
     let mut rng = Rng::new(0x5150_4D51_5454_0005);
     let mut accepted = 0usize;
     let mut rejected = 0usize;
 
     for _ in 0..ITERATIONS {
-        let mut input: Vec<u8> = if rng.below(2) == 0 {
-            CONNECT.to_vec()
-        } else {
-            CONNACK.to_vec()
-        };
+        let mut input = corpus[rng.below(corpus.len())].clone();
+        if input.len() <= 2 {
+            // PINGREQ and PINGRESP have no body to mutate; mutating their
+            // fixed header is the `packets_never_panic` target's job.
+            continue;
+        }
 
         // Never the Remaining Length byte at index 1: the property this test
         // asserts is that a *complete* packet is never `Incomplete`, and
@@ -270,6 +293,142 @@ fn fuzz_smoke_mutations_of_a_valid_packet() {
 
     assert!(accepted > 0, "no mutation was ever harmless");
     assert!(rejected > 0, "no mutation was ever caught");
+}
+
+/// One valid packet of every type, as wire bytes.
+fn one_of_each() -> Vec<Vec<u8>> {
+    let filters = [Subscription::new("a/+", QoS::AtLeastOnce)];
+    let names = ["a/+"];
+    let sub_codes = [SubackReasonCode::GrantedQos1];
+    let unsub_codes = [UnsubackReasonCode::Success];
+    let pairs = [("k", "v")];
+
+    let packets = [
+        Packet::Connect(Connect {
+            client_id: "c",
+            clean_start: true,
+            keep_alive: 60,
+            will: Some(Box::new(Will {
+                topic: "d",
+                payload: &[0x01],
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                properties: Properties {
+                    will_delay_interval: Some(10),
+                    ..Properties::new()
+                },
+            })),
+            user_name: Some("u"),
+            password: Some(&[0x70]),
+            properties: Properties::new().with_user_properties(&pairs),
+        }),
+        Packet::Connack(Connack {
+            session_present: true,
+            reason_code: ConnectReasonCode::Success,
+            properties: Properties {
+                receive_maximum: Some(10),
+                maximum_qos: Some(QoS::AtLeastOnce),
+                ..Properties::new()
+            },
+        }),
+        Packet::Publish(Publish {
+            topic: "a/b",
+            payload: b"hi",
+            qos: QoS::ExactlyOnce,
+            dup: true,
+            retain: true,
+            packet_id: Some(10),
+            properties: Properties {
+                content_type: Some("text/plain"),
+                topic_alias: Some(3),
+                ..Properties::new()
+            },
+        }),
+        Packet::Puback(Puback::new(10)),
+        Packet::Pubrec(Pubrec::new(10)),
+        Packet::Pubrel(Pubrel::new(10)),
+        Packet::Pubcomp(Pubcomp::new(10)),
+        Packet::Subscribe(Subscribe {
+            packet_id: 1,
+            properties: Properties::new(),
+            filters: PayloadList::new(&filters),
+        }),
+        Packet::Suback(Suback {
+            packet_id: 1,
+            properties: Properties::new(),
+            reason_codes: PayloadList::new(&sub_codes),
+        }),
+        Packet::Unsubscribe(Unsubscribe {
+            packet_id: 2,
+            properties: Properties::new(),
+            filters: PayloadList::new(&names),
+        }),
+        Packet::Unsuback(Unsuback {
+            packet_id: 2,
+            properties: Properties::new(),
+            reason_codes: PayloadList::new(&unsub_codes),
+        }),
+        Packet::Pingreq,
+        Packet::Pingresp,
+        Packet::Disconnect(Disconnect {
+            reason_code: DisconnectReasonCode::SessionTakenOver,
+            properties: Properties {
+                reason_string: Some("taken"),
+                ..Properties::new()
+            },
+        }),
+        Packet::Auth(Auth {
+            reason_code: AuthReasonCode::ContinueAuthentication,
+            properties: Properties {
+                authentication_method: Some("SCRAM-SHA-1"),
+                authentication_data: Some(&[0x01, 0x02]),
+                ..Properties::new()
+            },
+        }),
+    ];
+
+    packets
+        .iter()
+        .map(|packet| {
+            let mut out = Vec::new();
+            packet.encode(&mut out).expect("a seed encodes");
+            out
+        })
+        .collect()
+}
+
+/// Every one of the 256 subscription-options bytes is either accepted and
+/// round-trips, or refused with the verdict 3.8.3.1 gives it.
+///
+/// Exhaustive rather than sampled, because the byte is only eight bits wide
+/// and it carries three fields plus two reserved bits with three *different*
+/// verdicts — malformed for the reserved bits and for QoS 3, a Protocol Error
+/// for Retain Handling 3.
+#[test]
+fn fuzz_smoke_every_subscription_options_byte() {
+    let mut accepted = 0usize;
+    for byte in 0u8..=255 {
+        match SubscriptionOptions::from_byte(byte) {
+            Ok(options) => {
+                accepted += 1;
+                assert_eq!(options.as_byte(), byte, "0x{byte:02X} round-trips");
+            }
+            Err(error) => {
+                assert!(error.is_violation());
+                assert!(
+                    matches!(
+                        error,
+                        DecodeError::ReservedSubscriptionOptionBits { .. }
+                            | DecodeError::InvalidQos { .. }
+                            | DecodeError::InvalidRetainHandling { .. }
+                    ),
+                    "0x{byte:02X}: {error}"
+                );
+            }
+        }
+    }
+    // 3 QoS levels x 2 No Local x 2 Retain As Published x 3 Retain Handling.
+    assert_eq!(accepted, 3 * 2 * 2 * 3);
 }
 
 /// A stream reader fed arbitrary bytes always terminates: each round either

@@ -54,6 +54,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "payload_list"
+path = "fuzz_targets/payload_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "packet_stream"
 path = "fuzz_targets/packet_stream.rs"
 test = false
