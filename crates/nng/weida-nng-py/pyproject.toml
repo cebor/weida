@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/tuco86/weida"
+Repository = "https://git.doodleshnookie.net/hannes/weida"
 
 [tool.maturin]
 module-name = "weida_nng"

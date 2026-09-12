@@ -14,7 +14,7 @@
 //! `GreetingError`, `FrameError` and `CommandError` — are gone with
 //! `wire.rs`: the greeting, the socket-type table and the framing are
 //! `weida-zmq`'s, so what they produce is a [`weida_zmq::Error`] carrying
-//! libzmq's own errno name ([0013](https://github.com/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! libzmq's own errno name ([0013](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
 //! §5.2). A bridge that kept its own names for them would be reporting a
 //! protocol it no longer speaks.
 
@@ -31,7 +31,7 @@ pub enum BridgeError {
     /// `docs/adapters/zmtp.md` §9 that can be decided before serving is one of
     /// these, which is the rule at an adapter edge: refuse at configuration
     /// time rather than degrade at run time
-    /// ([0006](https://github.com/tuco86/weida/blob/main/docs/decisions/0006-guarantee-sets.md)
+    /// ([0006](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0006-guarantee-sets.md)
     /// §4.7).
     Configuration(String),
     /// A message shape this bridge refuses: a multipart message where the

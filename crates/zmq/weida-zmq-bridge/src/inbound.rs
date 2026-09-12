@@ -2,7 +2,7 @@
 //!
 //! One `weida-zmq` socket bound on the ZeroMQ side, one weida endpoint, and
 //! one loop per socket type. **The protocol is not here any more**
-//! ([0013](https://github.com/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! ([0013](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
 //! §5.2): the greeting, the socket-type check, the framing, the envelope a
 //! pattern defines, `PING`/`PONG`, the subscription wire forms and their
 //! reference counting are `weida-zmq`'s, and what remains is the mapping.

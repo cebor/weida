@@ -48,7 +48,7 @@ pub struct RuntimeConfig {
     /// `docs/decisions/0008-session-identity.md` §4.2). A binding that wants
     /// this bound therefore requires a client identity.
     ///
-    /// [`PROTOCOL.md`]: https://github.com/tuco86/weida/blob/main/docs/PROTOCOL.md
+    /// [`PROTOCOL.md`]: https://git.doodleshnookie.net/hannes/weida/blob/main/docs/PROTOCOL.md
     pub max_connections_per_peer: usize,
     /// Depth of an endpoint's accept queue. Senders await a free slot, so QUIC
     /// flow control carries the backpressure to the peer.

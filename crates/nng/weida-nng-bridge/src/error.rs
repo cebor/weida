@@ -16,7 +16,7 @@
 //! failures — a wrong protocol header, a malformed frame, a bad tag stack —
 //! are gone, because the bridge no longer parses SP: the sockets of
 //! `weida-nng` do, and they report those in NNG's own `NNG_E*` vocabulary
-//! ([0013](https://github.com/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! ([0013](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
 //! §5.2). What arrives here is [`BridgeError::Sp`], one variant carrying
 //! that vocabulary unchanged, because an NNG code is exactly what happened.
 

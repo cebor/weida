@@ -8,7 +8,7 @@
 //! **The bridge no longer speaks SP.** The protocol header, the pairing
 //! check, the framing, the tag stack and the local prefix match are
 //! `weida-nng`'s sockets
-//! ([0013](https://github.com/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! ([0013](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
 //! §5.2). Three things remain this direction's own, and all three are the
 //! reason it is a bridge rather than a socket.
 //!

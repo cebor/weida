@@ -23,7 +23,7 @@
 //!   `ERROR{NoReply}` rather than left hanging.
 //!
 //! **What is not here any more**
-//! ([0013](https://github.com/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! ([0013](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
 //! §5.2): the greeting and the handshake, the framing, `PING`/`PONG` with its
 //! version gate — `Liveness` is `ZMQ_HEARTBEAT_IVL`/`_TIMEOUT`/`_TTL` on the
 //! socket now — and the choice of subscription wire form, which is

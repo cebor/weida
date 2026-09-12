@@ -93,7 +93,7 @@ pub struct IncomingMeta {
     ///
     /// Detect mode reports the gap and delivers the message that arrived;
     /// nothing is held back and nothing is refetched
-    /// ([decision 0001](https://github.com/tuco86/weida/blob/main/docs/decisions/0001-sequence-field.md)
+    /// ([decision 0001](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0001-sequence-field.md)
     /// §7.5). `None` means either that ordering is off or that nothing is
     /// missing.
     pub gap: Option<Gap>,
