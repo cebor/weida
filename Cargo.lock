@@ -2327,6 +2327,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "weida-mqtt"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "tokio",
+ "tracing",
+ "weida-core",
+ "weida-mqtt-codec",
+ "weida-runtime",
+]
+
+[[package]]
 name = "weida-mqtt-codec"
 version = "0.1.0"
 
