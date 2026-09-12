@@ -1441,6 +1441,54 @@ The cost of not having it is the last column, 19 µs per mebibyte, against a 1 M
 round trip that the table above measures at 144 µs *inproc*: **about 13 %** of the cheapest
 transport weida has, and proportionally less on anything that crosses a socket.
 
+### Verified results — what a Python round trip costs against the Rust one (B-117)
+
+The comparison B-117 asks for. Same machine as the runs above, release profile for both
+halves, and the same shape on each side so that the difference is the language boundary and
+not the measurement: one REQ/REP round trip — request out, reply back — over `inproc://` and
+over loopback `tcp://`, at an empty payload and at 1 KiB, median of 2000 round trips.
+
+```text
+cargo run -p weida-zmq --release --example roundtrip_cost
+.venv/bin/python crates/zmq/weida-zmq-py/roundtrip_cost.py
+```
+
+| Round trip | inproc, 0 B | inproc, 1 KiB | tcp, 0 B | tcp, 1 KiB |
+| --- | --- | --- | --- | --- |
+| `weida-zmq`, Rust | **16.5 µs** | **17.5 µs** | **32.4 µs** | **35.3 µs** |
+| `weida_zmq.sync`, Python | **67.7 µs** (4.1×) | **72.3 µs** (4.1×) | **111 µs** (3.4×) | **116 µs** (3.3×) |
+| `weida_zmq`, Python asyncio | **330 µs** (20×) | **334 µs** (19×) | **343 µs** (10.6×) | **346 µs** (9.8×) |
+| `pyzmq` (libzmq 4.3.5) | **5.7 µs** | **6.0 µs** | **45.8 µs** | **47.2 µs** |
+
+**The payload is not what costs.** 1 KiB adds 1-5 µs on every row, which is the copy
+measured in B-112 above. Everything else in the gap is per-*operation* overhead, and a round
+trip is four operations, so each row's excess divides by four for a per-call figure.
+
+**The synchronous surface costs ~13 µs per operation over Rust** (67.7 µs against 16.5 µs,
+four operations). That is a GIL release and re-acquire plus a thread handoff: the facade
+parks the calling thread in `futures::executor::block_on` and a reactor worker has to wake
+it. It is the price of a blocking API over an asynchronous library, and it is the same price
+`weida-zmq`'s own `blocking` facade pays in Rust.
+
+**The asyncio surface costs ~78 µs per operation, and the reason is one loop wakeup per
+`await`.** Each awaited call creates a future on the running loop, the operation completes
+on a reactor thread, and `loop.call_soon_threadsafe` writes to the loop's self-pipe so that
+`epoll` wakes and the callback runs. That wakeup — not the GIL, not the copy, not the
+protocol — is the 78 µs, and four of them are 313 µs of the 330. **There is a fast path this
+does not take**: an operation that can complete without waiting (a `recv` whose message is
+already queued, a `send` with room) could be polled once inline and hand back an
+already-resolved future, which `await` consumes without yielding to the loop at all. It is
+not implemented, it is filed rather than hinted at, and this table is the number that says
+what it would be worth.
+
+**Against `pyzmq` the honest reading has two halves.** Over `inproc://` libzmq is 12× faster
+than this binding's synchronous surface and 58× faster than its asyncio one, because libzmq's
+`inproc` is a memcpy between two threads of one process with no reactor in the middle. Over
+`tcp://` the gap closes and reverses on the synchronous surface at the top end — 111 µs
+against 45.8 µs — and the Rust library is *faster* than libzmq (32.4 µs against 45.8 µs),
+which is where the implementation actually competes. The binding's overhead is a Python
+problem to solve in the bridge, not a protocol one.
+
 ---
 
 ## 5. Decisions
