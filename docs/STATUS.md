@@ -23,6 +23,14 @@ notes (0001–0014), all
 `crates/amqp/{weida-amqp-codec, weida-amqp, weida-amqp-py}`,
 `crates/nats/{weida-nats-codec, weida-nats, weida-nats-py}` and `crates/interop/cross-tests`.
 
+![Product line](status/product-line.svg)
+
+The two halves of that picture are the two products of
+[0013](decisions/0013-competitor-libraries.md) §4: weida on the left, with the guarantee
+dimensions, transports and patterns it offers, and the five foreign-protocol libraries on the
+right, each with what was measured against a real peer and what is still pending — joined only
+by the two forwarders in the middle and by the shared foundation both stand on.
+
 ## 1. The roadmap
 
 ![Roadmap](status/roadmap.svg)

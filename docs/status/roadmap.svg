@@ -12,10 +12,10 @@
       .phase   { fill:#263238; font-size:14px; font-weight:bold; }
     </style>
   </defs>
-  <text x="20" y="28" class="phase">Roadmap (LOOP.md §9) — state at main 912d0c4, 1678 tests</text>
+  <text x="20" y="28" class="phase">Roadmap (LOOP.md §9) — state at main 5ca1329, 1678 tests</text>
 
   <!-- legend -->
-  <g transform="translate(560,14)">
+  <g transform="translate(500,14)">
     <rect x="0" y="0" width="14" height="14" class="done"/><text x="18" y="11" class="lbl">done</text>
     <rect x="60" y="0" width="14" height="14" class="partial"/><text x="78" y="11" class="lbl">partial</text>
     <rect x="130" y="0" width="14" height="14" class="ready"/><text x="148" y="11" class="lbl">ready</text>
@@ -27,28 +27,34 @@
   <!-- Phase A -->
   <text x="20" y="66" class="phase">Phase A — the decided spec, realized</text>
   <g transform="translate(20,76)">
-    <rect x="0"   y="0" width="96" height="46" rx="4" class="done"/>   <text x="8" y="18" class="lbl">A1 decisions</text><text x="8" y="34" class="sub">0004–0008 accepted</text>
+    <rect x="0"   y="0" width="96" height="46" rx="4" class="done"/>   <text x="8" y="18" class="lbl">A1 decisions</text><text x="8" y="34" class="sub">0004–0008</text>
     <rect x="102" y="0" width="96" height="46" rx="4" class="done"/>   <text x="110" y="18" class="lbl">A2 spec sync</text><text x="110" y="34" class="sub">5 documents</text>
-    <rect x="204" y="0" width="96" height="46" rx="4" class="done"/>   <text x="212" y="18" class="lbl">A3 measures</text><text x="212" y="34" class="sub">header, reorder, conn</text>
-    <rect x="306" y="0" width="96" height="46" rx="4" class="done"/>   <text x="314" y="18" class="lbl">A4 wire</text><text x="314" y="34" class="sub">keys 6/7, HELLO sets</text>
-    <rect x="408" y="0" width="96" height="46" rx="4" class="done"/><text x="416" y="18" class="lbl">A5 conn tiers</text><text x="416" y="34" class="sub">per path; control parked (0011)</text>
-    <rect x="510" y="0" width="96" height="46" rx="4" class="done"/>   <text x="518" y="18" class="lbl">A6 reassembly</text><text x="518" y="34" class="sub">capped hold, gaps</text>
+    <rect x="204" y="0" width="96" height="46" rx="4" class="done"/>   <text x="212" y="18" class="lbl">A3 measures</text><text x="212" y="34" class="sub">header · reorder</text>
+    <rect x="306" y="0" width="96" height="46" rx="4" class="done"/>   <text x="314" y="18" class="lbl">A4 wire</text><text x="314" y="34" class="sub">keys 6/7, HELLO</text>
+    <rect x="408" y="0" width="96" height="46" rx="4" class="done"/><text x="416" y="18" class="lbl">A5 conn tiers</text><text x="416" y="34" class="sub">per path (0011)</text>
+    <rect x="510" y="0" width="96" height="46" rx="4" class="done"/>   <text x="518" y="18" class="lbl">A6 reassembly</text><text x="518" y="34" class="sub">capped hold</text>
     <rect x="612" y="0" width="96" height="46" rx="4" class="done"/>   <text x="620" y="18" class="lbl">A7 topic filters</text><text x="620" y="34" class="sub">segmented * #</text>
-    <rect x="714" y="0" width="96" height="46" rx="4" class="done"/>   <text x="722" y="18" class="lbl">A8 runtime</text><text x="722" y="34" class="sub">owned, futures-io</text>
-    <rect x="816" y="0" width="120" height="46" rx="4" class="partial"/><text x="824" y="18" class="lbl">A9 local transports</text><text x="824" y="34" class="sub">inproc ✓ unix ✓ pipes ✗</text>
+    <rect x="714" y="0" width="96" height="46" rx="4" class="done"/>   <text x="722" y="18" class="lbl">A8 runtime</text><text x="722" y="34" class="sub">owned reactor</text>
+    <rect x="816" y="0" width="120" height="46" rx="4" class="partial"/><text x="824" y="18" class="lbl">A9 transports</text><text x="824" y="31" class="sub">inproc ✓ unix ✓</text><text x="824" y="42" class="sub">pipes ✗ (B-039)</text>
+  </g>
+
+  <!-- what Phase A still owes, in the two colours the legend promises -->
+  <g transform="translate(20,128)">
+    <rect x="0"   y="0" width="430" height="18" rx="3" class="blocked"/><text x="8" y="13" class="sub">B-039 named pipes — blocked on a Windows runner, not on a design (0012 §4.6)</text>
+    <rect x="440" y="0" width="430" height="18" rx="3" class="parked"/> <text x="448" y="13" class="sub">A5's per-peer control connection — parked by 0011 §4.3, with a revival condition</text>
   </g>
 
   <!-- Phase B -->
-  <text x="20" y="160" class="phase">Phase B — libraries, forwarders and their bindings (6 slices each: codec, doc, library, forwarder, interop, cross)</text>
+  <text x="20" y="160" class="phase">Phase B — the competitor libraries and their bindings (0013 §4.7's six clauses)</text>
   <g transform="translate(20,170)">
     <rect x="0"   y="0" width="220" height="58" rx="4" class="done"/>
-    <text x="8" y="18" class="lbl">B1 ZMTP 3.1</text><text x="8" y="34" class="sub">library + forwarder + binding; vs libzmq 4.3.5</text><text x="8" y="48" class="sub">weida-zmq, weida-zmq-py: B-070..B-118</text>
+    <text x="8" y="18" class="lbl">B1 ZMTP 3.1</text><text x="8" y="34" class="sub">library + forwarder + binding</text><text x="8" y="48" class="sub">vs libzmq 4.3.5; B-070..B-118</text>
     <rect x="228" y="0" width="220" height="58" rx="4" class="done"/>
-    <text x="236" y="18" class="lbl">B2 NNG / SP</text><text x="236" y="34" class="sub">library + forwarder rebuilt on it + binding</text><text x="236" y="48" class="sub">weida-nng, weida-nng-py: B-119..B-138</text>
+    <text x="236" y="18" class="lbl">B2 NNG / SP</text><text x="236" y="34" class="sub">library + forwarder rebuilt on it</text><text x="236" y="48" class="sub">vs NNG 1.4.0-rc.0; B-119..B-138</text>
     <rect x="456" y="0" width="220" height="58" rx="4" class="done"/>
-    <text x="464" y="18" class="lbl">B3 MQTT 5</text><text x="464" y="34" class="sub">client library + binding; vs rumqttd, rmqtt</text><text x="464" y="48" class="sub">server half is Phase D (0014 §2)</text>
+    <text x="464" y="18" class="lbl">B3 MQTT 5</text><text x="464" y="34" class="sub">client + binding; server is Phase D</text><text x="464" y="48" class="sub">vs rumqttd + rmqtt; B-139..B-153</text>
     <rect x="684" y="0" width="220" height="58" rx="4" class="done"/>
-    <text x="692" y="18" class="lbl">B4 AMQP 1.0, NATS</text><text x="692" y="34" class="sub">both clients + both bindings; vs fe2o3-amqp</text><text x="692" y="48" class="sub">NATS interop written, no server: not run</text>
+    <text x="692" y="18" class="lbl">B4 AMQP 1.0, NATS</text><text x="692" y="34" class="sub">two clients + two bindings</text><text x="692" y="48" class="sub">vs fe2o3-amqp; NATS not run; B-154..B-174</text>
   </g>
 
   <!-- Phase C -->
@@ -64,8 +70,9 @@
   <g transform="translate(20,370)">
     <rect x="0" y="0" width="676" height="46" rx="4" class="todo"/>
     <text x="8" y="18" class="lbl">Broker, durable ACK vocabulary (Accepted / Stored / Replicated / Processed), L2 credit</text>
-    <text x="8" y="34" class="sub">gated on B1-B3 cross-adapter tests; AMQP 0-9-1 clients for RabbitMQ come with it (D2)</text>
+    <text x="8" y="34" class="sub">B1–B4 are done; MQTT's and AMQP's server halves live here, and AMQP 0-9-1 clients for RabbitMQ come with it (D2)</text>
   </g>
 
   <text x="20" y="450" class="sub">Boxes follow the roadmap lines A1–A9, B1–B4, C, D of docs/LOOP.md §9. Item ids refer to docs/BACKLOG.md.</text>
+  <text x="20" y="464" class="sub">A forwarder exists for ZeroMQ and NNG only; 0014 §3.4 files none for MQTT, AMQP or NATS, because a forwarder follows the library it forwards.</text>
 </svg>
