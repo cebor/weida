@@ -284,6 +284,14 @@ The spec's own guidance is thin: topics may be predefined by an administrator or
 value "applies only to the current Network Connection"; quota and Receive Maximum are re-initialised each connection and are explicitly
 not session state (3.1.2.11.3, 3.2.2.3.3, 4.9) [1].
 
+**The two values are two numbers, and an implementation that holds one field for both loses a bound.** The directions being independent
+means a client's own `Receive Maximum` from CONNECT and the server's from CONNACK are separate quantities that happen to share a name
+eleven pages apart; the first bounds what may arrive, the second is the sender's initial send quota by [MQTT-4.9.0-1]. Because absence
+means 65,535, a client that stored both in one field would silently raise its own inbound ceiling to 65,535 whenever a CONNACK merely
+omitted the property, and would then never earn the DISCONNECT 0x93 below for a server that exceeded what it had declared. Measured
+against a broker declaring 8 while the client declared 200: the send quota is 8 and the inbound ceiling stays 200 [66]. Section 13
+records this as a tension of the specification's own prose rather than of any implementation.
+
 **Default.** 65,535 when absent; 0 is a Protocol Error [1]. HiveMQ states the same default [13].
 
 **Mechanics** (4.9) [1]. The sender sets an initial send quota, non-zero and not exceeding the peer's Receive Maximum
@@ -519,7 +527,9 @@ discards the Will ([MQTT-3.14.4-3]), so `Offline` after a graceful exit must be 
 RETAIN = 1; delivery at subscribe; zero-byte retained publish clears. *Guarantee:* exactly one value per exact topic, delivered on
 subscribe. *Cost:* server storage outside any session, surviving session end (4.1) [1]. *Failure modes:* a wildcard subscription gets
 one retained message per matching topic, which can be a large burst; QoS 0 retained messages MAY be discarded at any time
-(3.3.1.3) [1]; retained messages are never sent to shared subscriptions (4.8.2) [1]; Retain As Published 0 hides from the subscriber
+(3.3.1.3) [1]; retained messages are never sent to shared subscriptions (4.8.2) [1] — a rule `rmqtt` 0.23.1 does **not** honour, so a
+`$share/` subscriber there receives the stored value at subscribe time with RETAIN 1 and a client cannot rely on the exclusion [66];
+Retain As Published 0 hides from the subscriber
 that a message was retained (3.8.3.1) [1]; AWS IoT Core stores per exact topic but does not deliver an existing retained message to a
 wildcard subscription [60], and Azure IoT Hub does not persist RETAIN at all, converting it to an `mqtt-retain` property [61].
 
@@ -743,15 +753,19 @@ Maximum Packet Size 256 KiB, Topic Alias Maximum 10, Receive Maximum 16, Keep Al
 | Crate | Latest | Role | MQTT | Notes |
 | --- | --- | --- | --- | --- |
 | `rumqttc` | 0.25.1, 2025-11-21 [43] | client | 3.1.1, 5 [42] | Tokio event loop behind sync and async APIs; the caller must keep polling `eventloop.poll()` or `connection.iter()` or the connection stops progressing, and outgoing-packet throttling is listed "todo" [44]. v5 grew over time: properties APIs in 0.21.0, AUTH packet and session-expiry options in 0.25.0, QoS 2 identifier tracking reworked onto `FixedBitSet` in 0.25.0 [43] |
-| `rumqttd` | 0.20.0 [42] | embeddable broker | 3.1.1 only | The workspace checklist marks MQTT 3.1.1, QoS 0/1/2, TLS, retransmission, will and retained messages complete and leaves **MQTT 5 unchecked** [42] |
+| `rumqttd` | 0.20.0 [42] | embeddable broker | 3.1.1 **and 5** [65] | The workspace checklist marks MQTT 3.1.1, QoS 0/1/2, TLS, retransmission, will and retained messages complete and leaves **MQTT 5 unchecked** [42] — but the checklist is out of date, and this is the one place in this sheet where a measurement overrides a project's own documentation. `rumqttd generate-config` enables a `[v5.1]` listener by default, and the build accepts a 5.0 CONNECT, answers a 5.0 CONNACK **with properties**, enforces a `Topic Alias Maximum` of 4096 and echoes `Subscription Identifier` on every delivery it causes; four rules it does not implement are in the incompatibility list below [65] |
 | `paho-mqtt` | 0.14.0, 2026-03-26 [46] | client | 5, 3.1.1, 3.1 [45] | Safe wrapper over Paho C >= 1.3.16, by default building the bundled C with a C compiler and CMake — not pure Rust [45]. Runtime-agnostic, tested with Tokio and smol; its futures start I/O when called rather than when awaited. Ships persistence, automatic reconnect and offline buffering |
 | `ntex-mqtt` | 8.2.1, 2026-06-19 [48] | client **and** server framework | 3.1.1, 5 [47] | Apache-2.0, separate codec/client/server modules per version [47]; a framework for building a broker, not a broker |
+| `rmqtt` | 0.23.1 [66] | broker | 3.1, 3.1.1, 5 [66] | Apache-2.0, plugin-based. The only broker in this table that **declares** a full capability set in CONNACK — `Maximum QoS` 2, `Retain Available`, `Receive Maximum`, `Maximum Packet Size`, `Topic Alias Maximum` and all three subscription-availability flags — which is what makes a client's refusal paths reachable at all. Two of those flags are plugin state rather than listener settings and so are global to the process; see the incompatibility list below for two rules it does not implement, and note that its plugin registry panics at startup if a compiled-in plugin's configuration file is absent [66] |
 | `rust-mqtt` | 0.5.1, 2026-04-10 [49] | client, `no_std` | 5.0 only [50] | On `embedded_io_async`; deliberately omits automatic reconnect, keep-alive loops, retry policy and background tasks, leaving session and QoS delivery control to the caller [50] |
 | `mqtt-protocol` | 0.12.0, 2024-03-13 [51] | codec | not established by the crate page | Protocol library, neither client nor broker; the stale release date is the maintenance signal |
 | `mqtt5-protocol` | 0.15.0, 2026-09-06 [52] | codec | 5 [52] | Packets, encoding and validation |
 
-The practical consequence for Rust: a mature MQTT 5 *client* story (rumqttc, paho-mqtt, rust-mqtt for embedded) and no pure-Rust MQTT 5
-broker among these — rumqttd is 3.1.1 and ntex-mqtt is a framework [42][47].
+The practical consequence for Rust: a mature MQTT 5 *client* story (rumqttc, paho-mqtt, rust-mqtt for embedded), and **two pure-Rust
+MQTT 5 brokers that a client can actually reach**, both measured rather than read off a checklist — `rumqttd` 0.20.0, whose checklist
+says otherwise, and `rmqtt` 0.23.1, which declares the full capability set [65][66]. `ntex-mqtt` remains a framework for building a
+broker rather than one [47]. What neither Rust broker offers is 4.12's AUTH exchange, so that part of the protocol has no pure-Rust
+peer to be measured against at all [65][66].
 
 **Brokers.**
 
@@ -797,6 +811,39 @@ IoT Core and Azure IoT Hub both expose MQTT endpoints [60][61].
   additionally needs `sendWhileDisconnected` plus a bounded `maxBufferedMessages` (default 100) [35] — a client that assumes buffering
   gets none.
 - **MQTT over QUIC is not interoperable across brokers** in any standard sense: an EMQX transport [21] and a NanoMQ bridge to EMQX [59].
+- **Two Rust brokers disagree with the specification in six measured places**, each observed on 2026-09-12 against a named version
+  over loopback TCP by a client written against [1] and exercising both roles [65][66]. `rumqttd` 0.20.0: (1) a delivery arrives at the
+  subscription's **granted maximum** rather than at the minimum of that and the publish's QoS, so a QoS 0 publication reaching a QoS 2
+  subscription arrives at QoS 2 — an *upgrade*, which [MQTT-3.8.4-8] forbids in either direction; the downgrade direction is correct,
+  which is what shows the implementation applies the granted value rather than taking a minimum [65]. (2) Retain Handling 2, "do not
+  send retained messages at the time of the subscribe" (3.8.3.1), sends them [65]. (3) DISCONNECT 0x04 (Disconnect with Will Message)
+  publishes nothing, while 0x00's discard works — so that build implements one half of [MQTT-3.14.4-3]'s pair [65]. (4) An UNSUBACK
+  carries **one** reason code however many Topic Filters the UNSUBSCRIBE carried, and none at all where nothing was removed, against
+  [MQTT-3.11.3-1]'s one per filter in the order sent; since the acknowledgement carries no filters, position is the only binding between
+  a code and a filter and a disagreeing count is unreadable rather than merely surprising [65]. `rmqtt` 0.23.1: (5) a retained message
+  **is** sent to a shared subscription, which 4.8.2 forbids [66]. (6) A Client Identifier takeover closes the older connection's
+  transport with no DISCONNECT at all, so the reason code [MQTT-3.1.4-3] exists to deliver — 0x8E, Session taken over — is exactly what
+  is missing; that is the 3.1.1 behaviour of section 1.9 from a broker claiming full 5.0 support [66].
+- **Capability declarations differ enormously between implementations claiming the same version.** `rumqttd` 0.20.0's CONNACK declares
+  `Topic Alias Maximum` 4096 and nothing else, so every other §11 default applies by absence; its own README checklist leaves MQTT 5
+  unchecked while its generated configuration enables a v5 listener by default and it honours `Subscription Identifier` on every
+  delivery [65]. `rmqtt` 0.23.1 declares `Maximum QoS` 2, `Retain Available` 1, `Receive Maximum` 8, `Maximum Packet Size` 1,048,576,
+  `Topic Alias Maximum` 16, all three subscription-availability flags and `Server Keep Alive` 30 s [66]. A client cannot tell an absent
+  property from one equal to its default, so the *refusal* paths of the availability flags are unreachable against a broker that
+  declares nothing — which makes the declarations themselves an interoperability surface rather than a formality [65][66].
+- **Two of `rmqtt` 0.23.1's availability flags are not listener settings but plugin state.** `Retain Available` and
+  `Shared Subscription Available` are reported 0 unless the `rmqtt-retainer` and `rmqtt-shared-subscription` plugins are started, so
+  they are global to the broker process rather than per listener and cannot differ between two listeners of one broker; `Maximum QoS`
+  and `Topic Alias Maximum` are per listener [66].
+- **Neither Rust broker offers an enhanced-authentication mechanism**, so 4.12's AUTH exchange is unexercised against both.
+  `rmqtt` 0.23.1 ships JWT and HTTP authentication plugins, and both authenticate the CONNECT's User Name and Password rather than
+  running the AUTH dialog [66]. Neither offers `Response Information`, so the Response Topic namespace of 4.10 is unmeasured against
+  either [65][66].
+- **Installing either broker from crates.io fails in opposite directions on rustc 1.98.** `cargo install rumqttd --version 0.20.0`
+  fails **with** `--locked`, because its `Cargo.lock` pins a `metrics` version whose registry accessor no longer passes borrow checking
+  (E0521); without `--locked` the resolver picks a newer `metrics` and it builds [65]. `cargo install rmqttd --version 0.23.1` fails
+  **without** `--locked`, because a resolved `pulsar` gained a field its egress-bridge plugin does not set (E0063); with `--locked` it
+  builds [66].
 
 **Two internal inconsistencies in [1] itself,** recorded because implementers hit them. First, Appendix B's restatement of
 [MQTT-3.3.1-10] inverts the Retain Handling = 1 rule: it says retained messages MUST be sent "if the subscription did already exist" and
@@ -806,6 +853,40 @@ Appendix B row is erroneous. Second, Appendix B's [MQTT-3.1.3-1] gives the CONNE
 Will Message, User Name, Password", omitting Will Properties, while section 3.1.3 requires "Client Identifier, Will Properties, Will
 Topic, Will Payload, User Name, Password" — the appendix retains 3.1.1 wording. Appendix B is labelled non-normative and chapter 7 is
 "a definitive list of conformance requirements", so both discrepancies resolve in favour of the body [1].
+
+**Both are now confirmed by an implementation that had to choose between the readings** [65][66]. A client written against the
+normative body sends CONNECT with the payload order of 3.1.3 — Client Identifier, Will Properties, Will Topic, Will Payload, User Name,
+Password — and both `rumqttd` 0.20.0 and `rmqtt` 0.23.1 accept it and answer CONNACK 0x00, including with a Will carrying all four of
+its properties; a CONNECT built to Appendix B's order would have placed the Will Topic where the Will Properties' length byte belongs
+and could not have been parsed [65][66]. And Retain Handling 1 read as the body reads it — send the retained message only if the
+subscription did *not* already exist — is what `rmqtt` 0.23.1 does: a first subscribe to a filter over a stored value delivers it and a
+second subscribe of the same filter on the same session delivers nothing [66]. Appendix B's inverted row would predict the opposite
+order of events. Neither discrepancy is therefore a live ambiguity in practice; both are appendix errata.
+
+**Two further tensions that only writing a client exposes**, both in the normative body rather than in an appendix.
+
+First, **[MQTT-3.2.2-4] is unusable read against 4.1's enumeration.** The conformance statement obliges a client that "receives Session
+Present 1 where it has no Session State" to close the connection, and 4.1's list of *client-side* session state is only the
+unacknowledged QoS 1 and 2 exchanges — the outbound ones awaiting acknowledgement and the inbound QoS 2 identifiers awaiting release.
+Read literally, a client that connected with Clean Start 0 and a non-zero Session Expiry Interval, published nothing, disconnected and
+reconnected receives Session Present 1 with no session state by 4.1's definition, and is obliged to close on its own correct
+resumption. An implementation must therefore track something 4.1 does not list — whether a session exists on the server at all, which
+follows from whether the last CONNECT declared a non-zero Session Expiry Interval — and only then does the statement discriminate: a
+session that declared no expiry ends with its connection (3.1.2.11.2), so Session Present 1 afterwards really is the forbidden row
+[65]. The practical consequence is not a corner case: a client process that restarts with no persisted session state and reconnects
+with Clean Start 0 finds the broker legitimately still holding its session, has nothing to match it against, and must close. Measured
+against `rumqttd` 0.20.0, which holds the session and reports Session Present 1 truthfully; the only available answer is Clean Start 1
+[65]. This is the client-side counterpart of the durability gap section 13 records for the Paho families [38][40][41].
+
+Second, **`Receive Maximum` is two independent numbers under one name, and reading it as one dissolves a bound.** 3.1.2.11.3's
+`Receive Maximum` in CONNECT is what the *server* may have in flight toward the client; 3.2.2.3.3's in CONNACK is what the *client* may
+have in flight toward the server, and [MQTT-4.9.0-1] makes only the second the sender's initial send quota. An implementation holding
+one field for both loses the inbound ceiling whenever a CONNACK merely omits the property: absence means 65,535 (3.2.2.3.3), so a
+client that declared 2 and received a CONNACK without the property would silently raise its own limit from 2 to 65,535 and no longer
+earn the DISCONNECT 0x93 of section 5 for a server that exceeded it. The two are measurably distinct against a broker that declares
+one: `rmqtt` 0.23.1 configured with `max_inflight` 8 declares `Receive Maximum` 8, and a client declaring 200 in its CONNECT ends the
+handshake with a send quota of 8 and an inbound ceiling of 200 [66]. Nothing in [1] flags the collision; the two uses are simply eleven
+pages apart.
 
 ## 14. Sources
 
@@ -876,3 +957,5 @@ maintainer-written vendor material and are marked as such where cited.
 62. Microsoft, *Azure IoT Hub MQTT 5 support (preview)*, version 2.0, dated 2024-04-08, archived, updated 2025-03-19. <https://learn.microsoft.com/en-us/previous-versions/azure/iot/iot-mqtt-5-preview> — deprecated preview; its declared limits and missing features.
 63. HiveMQ, *The Origin of MQTT* (history series, written by Eclipse Paho project lead Ian Craggs), 2024-06-20. <https://www.hivemq.com/blog/the-history-of-mqtt-part-1-the-origin/> — 1999 origin by Arlen Nipper and Andy Stanford-Clark; the poll/response replacement motivation; Facebook Messenger adoption.
 64. Eclipse Mosquitto blog, *Facebook using MQTT*, 2011-08-17. <https://mosquitto.org/blog/2011/08/facebook-using-mqtt/> — contemporaneous record of the Facebook Messenger announcement and its stated bandwidth and battery motivation.
+65. Measurement record, *MQTT 5.0 client against `rumqttd` 0.20.0*, 2026-09-12, Linux x86-64, rustc 1.98, loopback TCP. The broker is bytebeamio's `rumqttd` [42], installed from crates.io and configured with a single `[v5.1]` listener; the client is an independent MQTT 5.0 implementation written against [1], exercising publisher and subscriber roles simultaneously across thirteen scenarios. Used for: what that build declares in CONNACK; QoS 0, 1 and 2 completing end to end; the granted-maximum-versus-minimum delivery QoS; Retain Handling 0 and 2; retained storage and the zero-byte delete through all three states; the Will on an abnormal close and its discard on an orderly one; DISCONNECT 0x04; session resumption and Clean Start discard; `Subscription Identifier` echoed on deliveries; the `+` and `#` matching rules including `#` matching the parent level; the UNSUBACK reason-code count; the [MQTT-3.2.2-4] restart case; and the `--locked` build failure. Every claim attributed to this source was observed in that run and not inferred.
+66. Measurement record, *MQTT 5.0 client against `rmqtt` 0.23.1*, 2026-09-12, Linux x86-64, rustc 1.98, loopback TCP. The broker is rmqtt, installed from crates.io and configured with two TCP listeners declaring different capabilities plus the `rmqtt-retainer` and `rmqtt-shared-subscription` plugins; the client is the same implementation as [65], across twelve scenarios. Used for: the full set of CONNACK declarations; `Receive Maximum` as the send quota against a differing client declaration; shared subscriptions splitting deliveries between group members; a retained message reaching a shared subscription; Topic Aliases in both directions against a declared maximum; Retain Handling 1 separated from 0; Session Expiry as a timer; every PUBLISH property forwarded unaltered and in order including repeated User Property names; SUBACK and UNSUBACK per-filter codes; the availability flags as refusals against the second listener; the Client Identifier takeover closing without a DISCONNECT; the plugin-versus-listener scope of two flags; and the `--locked` build requirement. Every claim attributed to this source was observed in that run and not inferred.
