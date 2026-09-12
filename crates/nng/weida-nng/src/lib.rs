@@ -110,6 +110,8 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "blocking")]
+pub mod blocking;
 pub mod bus;
 pub mod context;
 pub mod endpoint;

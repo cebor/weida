@@ -58,6 +58,38 @@ asyncio.run(main())
 - **`NNG_OPT_PAIR1_POLY`**, which is refused by the library itself and for
   its reasons — see `docs/libraries/nng.md`.
 
+## No event loop? `weida_nng.sync`
+
+The same eleven protocols and the same contexts, blocking, for a process
+with no asyncio loop in it:
+
+```python
+from weida_nng import SocketOptions, sync
+
+# A timeout is what turns a stalled exchange into an exception rather than a
+# parked thread: NNG's default is to wait forever.
+options = SocketOptions(recv_timeout=5.0, send_timeout=5.0)
+
+context = sync.Context()
+server = sync.RepSocket(context, options)
+client = sync.ReqSocket(context, options)
+url = server.listen("tcp://127.0.0.1:0")
+client.dial(url)
+
+client.send(b"Hello")
+assert server.recv() == b"Hello"
+server.send(b"World")
+assert client.recv() == b"World"
+
+context.shutdown()
+```
+
+It is a facade over `weida-nng`'s own `blocking` module, which is `block_on`
+around the asynchronous sockets: **no protocol behaviour is implemented
+twice**, and the two surfaces interoperate because they are one
+implementation. The GIL is released while a call blocks, so one thread
+parked in `recv` does not stop another.
+
 ## Concurrency
 
 Two coroutines may use one socket at the same time: an SP socket's `send` and

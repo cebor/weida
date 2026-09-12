@@ -22,9 +22,14 @@ doctest = false
 # (`docs/decisions/0014-parallel-libraries.md` §2).
 weida-py-core.workspace = true
 pyo3.workspace = true
-# The library being bound. Nothing of weida is reachable through it, which is
-# the dependency direction 0013 §4.2 fixed.
-weida-nng.workspace = true
+# The library being bound. Nothing of weida is reachable through it, which
+# is the dependency direction 0013 §4.2 fixed.
+#
+# `blocking` is on because `weida_nng.sync` is the facade over it: one
+# wrapper per protocol over a context that owns its reactor, so a Python
+# program needs no event loop (0013 §4.4 item 3). It is the library's own
+# facade rather than a second implementation of anything.
+weida-nng = { workspace = true, features = ["blocking"] }
 # The endpoint-type enum, which is what a raw socket is opened with and what
 # a pairing refusal names. It is the codec's vocabulary and travels no
 # further than the raw socket's constructor.

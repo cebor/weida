@@ -45,6 +45,14 @@
 //! `socket.context()` exists and why concurrent requests are concurrent
 //! rather than queued.
 //!
+//! # And synchronous beside it
+//!
+//! `weida_nng.sync` is the same eleven protocols and the same contexts for
+//! a process with no loop at all, over `weida-nng`'s own `blocking` facade.
+//! It implements nothing: both surfaces drive one set of sockets, which is
+//! why they cannot disagree and why a `sync` socket and an asyncio socket
+//! exchange messages in the suite.
+//!
 //! # Errors
 //!
 //! Every failure is a class of this module, named for NNG's errno and
@@ -82,6 +90,7 @@ mod errors;
 mod options;
 mod sockets;
 mod subscriptions;
+mod sync;
 mod values;
 
 /// `weida_nng`, as Python sees it.
@@ -108,6 +117,7 @@ fn weida_nng(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<sockets::PySurveyorSocket>()?;
     module.add_class::<sockets::PyRespondentSocket>()?;
     module.add_class::<sockets::PyBusSocket>()?;
+    sync::install(module)?;
     // The numbers a caller compares a configuration against, from the
     // library rather than retyped here.
     // `::` because `#[pymodule]` puts a module of this function's name in
