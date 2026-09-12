@@ -49,6 +49,21 @@ impl Context {
     }
 }
 
+/// The same configuration, as a Python failure: what `weida_zmq.sync`'s
+/// context takes, so that the two contexts are configured by one function.
+pub(crate) fn configuration(
+    py: Python<'_>,
+    options: Option<&crate::options::PyContextOptions>,
+    max_sockets: Option<usize>,
+    worker_threads: Option<usize>,
+    close_budget: Option<f64>,
+) -> PyResult<ContextConfig> {
+    errors::raise(
+        py,
+        config(options, max_sockets, worker_threads, close_budget),
+    )
+}
+
 /// Builds the library's configuration, refusing a value at configuration time
 /// rather than rounding it into something usable.
 fn config(

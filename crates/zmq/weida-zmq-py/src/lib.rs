@@ -69,6 +69,7 @@ mod monitor;
 mod ops;
 mod options;
 mod sockets;
+mod sync;
 mod values;
 
 /// `weida_zmq`, as Python sees it.
@@ -119,6 +120,7 @@ fn weida_zmq(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<sockets::PyPushSocket>()?;
     module.add_class::<sockets::PyPullSocket>()?;
     module.add_class::<sockets::PyPairSocket>()?;
+    sync::install(module)?;
     module.add("__all__", every_name())?;
     Ok(())
 }
@@ -166,6 +168,7 @@ fn every_name() -> Vec<&'static str> {
         "CONTROL_RESUME",
         "CONTROL_TERMINATE",
         "CONTROL_STATISTICS",
+        "sync",
         "ZmqOption",
         "SocketOptions",
         "ContextOptions",
