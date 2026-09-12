@@ -33,8 +33,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use weida_mqtt_codec::{
-    FixedHeader, Packet, PacketType, Properties, Puback, PubackReasonCode, Pubcomp,
-    PubcompReasonCode, Pubrec, QoS, varint,
+    FixedHeader, Packet, PacketType, PayloadList, Properties, Puback, PubackReasonCode, Pubcomp,
+    PubcompReasonCode, Pubrec, QoS, Suback, SubackReasonCode, Unsuback, UnsubackReasonCode, varint,
 };
 
 /// The ceiling every harness decode is done under: the largest packet the
@@ -86,6 +86,14 @@ pub enum Act {
     /// it has already released the identifier. "Not an error during recovery"
     /// (3.6.2.1) [mqtt5 §6].
     ForgetPubrel,
+    /// Read one SUBSCRIBE and answer SUBACK with these codes, in this order.
+    ///
+    /// The codes are bytes rather than a typed list so a script can name a
+    /// count that disagrees with the filters it was sent, which is the
+    /// [MQTT-3.9.3-1] fault a client has to report rather than guess at.
+    Suback(Vec<u8>),
+    /// Read one UNSUBSCRIBE and answer UNSUBACK with these codes.
+    Unsuback(Vec<u8>),
     /// Wait, so a client timer can expire.
     Idle(Duration),
     /// Drop the connection with no DISCONNECT, which is always available to a
@@ -288,6 +296,61 @@ async fn run(mut stream: TcpStream, script: Vec<Act>, shared: Shared) {
                     packet_id: pubrel.packet_id,
                     reason_code,
                     properties: Properties::new(),
+                }));
+                if stream.write_all(&answer).await.is_err() {
+                    return;
+                }
+                let _ = stream.flush().await;
+            }
+            Act::Suback(codes) => {
+                let Some(raw) = read_packet(&mut stream, &mut buf).await else {
+                    return;
+                };
+                shared.seen.lock().await.push(raw.clone());
+                let Packet::Subscribe(subscribe) = decode(&raw) else {
+                    panic!(
+                        "the script expected a SUBSCRIBE, got {}",
+                        decode(&raw).packet_type()
+                    );
+                };
+                let codes: Vec<SubackReasonCode> = codes
+                    .iter()
+                    .map(|code| {
+                        SubackReasonCode::from_byte(*code).expect("a SUBACK code the script names")
+                    })
+                    .collect();
+                let answer = bytes(&Packet::Suback(Suback {
+                    packet_id: subscribe.packet_id,
+                    properties: Properties::new(),
+                    reason_codes: PayloadList::new(&codes),
+                }));
+                if stream.write_all(&answer).await.is_err() {
+                    return;
+                }
+                let _ = stream.flush().await;
+            }
+            Act::Unsuback(codes) => {
+                let Some(raw) = read_packet(&mut stream, &mut buf).await else {
+                    return;
+                };
+                shared.seen.lock().await.push(raw.clone());
+                let Packet::Unsubscribe(unsubscribe) = decode(&raw) else {
+                    panic!(
+                        "the script expected an UNSUBSCRIBE, got {}",
+                        decode(&raw).packet_type()
+                    );
+                };
+                let codes: Vec<UnsubackReasonCode> = codes
+                    .iter()
+                    .map(|code| {
+                        UnsubackReasonCode::from_byte(*code)
+                            .expect("an UNSUBACK code the script names")
+                    })
+                    .collect();
+                let answer = bytes(&Packet::Unsuback(Unsuback {
+                    packet_id: unsubscribe.packet_id,
+                    properties: Properties::new(),
+                    reason_codes: PayloadList::new(&codes),
                 }));
                 if stream.write_all(&answer).await.is_err() {
                     return;

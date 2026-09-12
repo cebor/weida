@@ -128,6 +128,7 @@
 pub mod client;
 pub mod connection;
 pub mod error;
+pub mod filter;
 pub mod limits;
 pub mod message;
 pub mod options;
@@ -136,6 +137,10 @@ pub mod session;
 pub use client::{Client, Context, Event, Events};
 pub use connection::Authenticator;
 pub use error::{Error, Feature, Result};
+pub use filter::{
+    MAX_TOPIC_BYTES, SHARE_PREFIX, Shared, Subscription, SubscriptionRecord, Subscriptions,
+    check_topic_filter, check_topic_name, matches, split_shared,
+};
 pub use limits::{DEFAULT_RECEIVE_MAXIMUM, DEFAULT_TOPIC_ALIAS_MAXIMUM, Limits, ServerLimits};
 pub use message::{Completion, Delivery, DeliveryProperties, Message};
 pub use options::{ConnectOptions, MAX_INTERVAL, MAX_KEEP_ALIVE, WillMessage};

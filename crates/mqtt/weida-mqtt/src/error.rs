@@ -20,7 +20,9 @@
 use std::fmt;
 use std::io;
 
-use weida_mqtt_codec::{ConnectReasonCode, DecodeError, DisconnectReasonCode, EncodeError, QoS};
+use weida_mqtt_codec::{
+    ConnectReasonCode, DecodeError, DisconnectReasonCode, EncodeError, PacketType, QoS,
+};
 
 /// A feature whose availability the server declares in CONNACK (3.2.2.3)
 /// [mqtt5 §11].
@@ -157,6 +159,37 @@ pub enum Error {
         /// The ceiling this client set.
         max: usize,
     },
+    /// A Topic Name or Topic Filter breaks the grammar of 4.7 [mqtt5 §4.1],
+    /// refused before the packet reaches the wire.
+    ///
+    /// **On the wire this would be a Malformed Packet or a SUBACK 0x8F**
+    /// ([MQTT-4.7.1-1], [MQTT-4.7.1-2], [MQTT-4.7.3-1], [MQTT-3.3.2-2]), so
+    /// refusing it locally costs a round trip less and names which rule was
+    /// broken rather than handing back one code for every fault.
+    InvalidTopic {
+        /// What was offered.
+        topic: String,
+        /// Which rule it broke, with the conformance statement.
+        reason: &'static str,
+    },
+    /// A SUBACK or UNSUBACK carried a different number of reason codes than
+    /// the packet it answers carried filters.
+    ///
+    /// "The SUBACK MUST contain one reason code for each Topic Filter, in the
+    /// same order" ([MQTT-3.9.3-1], [MQTT-3.9.3-2]), and the same for
+    /// UNSUBACK ([MQTT-3.11.3-1]) [mqtt5 §8]. **Position is the only binding
+    /// between a code and a filter** - there is no filter in the
+    /// acknowledgement - so a different count leaves no way to say which
+    /// filter each code is about, and reporting that is the only honest
+    /// answer.
+    AcknowledgementLengthMismatch {
+        /// Which acknowledgement.
+        packet_type: PacketType,
+        /// How many filters were sent.
+        sent: usize,
+        /// How many codes came back.
+        received: usize,
+    },
     /// The server broke the protocol. The client's own answer is to close,
     /// which "a Client SHOULD" do ([MQTT-4.13.1-1]) (4.13.1) [mqtt5 §1].
     Protocol(DecodeError),
@@ -236,6 +269,18 @@ impl fmt::Display for Error {
             Error::ReceiveMaximumExceeded { quota } => write!(
                 f,
                 "the server exceeded the Receive Maximum of {quota} this client declared"
+            ),
+            Error::InvalidTopic { topic, reason } => {
+                write!(f, "the topic or filter {topic:?} is not valid: {reason}")
+            }
+            Error::AcknowledgementLengthMismatch {
+                packet_type,
+                sent,
+                received,
+            } => write!(
+                f,
+                "the {packet_type} carried {received} reason codes for {sent} filters, so no \
+                 code can be matched to a filter ([MQTT-3.9.3-1])"
             ),
             Error::TooManySubscriptionIdentifiers { max } => write!(
                 f,
