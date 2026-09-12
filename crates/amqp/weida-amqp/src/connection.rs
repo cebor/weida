@@ -175,6 +175,27 @@ impl State {
     pub const fn is_usable(&self) -> bool {
         matches!(self, Self::Open)
     }
+
+    /// Why nothing further can be sent, as the error a caller gets.
+    ///
+    /// `None` while the connection is usable. The peer's own condition is
+    /// kept rather than replaced by "the connection is gone": the condition
+    /// is the only explanation the protocol carries, and a caller that asked
+    /// for a session on a connection the peer refused wants to read
+    /// `amqp:resource-limit-exceeded`, not a synonym for silence.
+    #[must_use]
+    pub fn refusal(&self) -> Option<Error> {
+        match self {
+            Self::Open => None,
+            Self::Closing | Self::Closed(None) => Some(Error::ConnectionGone),
+            Self::Closed(Some(condition)) => Some(Error::Closed(Some(condition.clone()))),
+            // The reason a connection failed went to whoever was waiting on
+            // the operation that failed; it stays readable through
+            // [`Connection::state`]. A caller arriving afterwards is told the
+            // connection is gone, which is all its own call can act on.
+            Self::Failed(_) => Some(Error::ConnectionGone),
+        }
+    }
 }
 
 /// What the driver accepts from a handle.
@@ -429,8 +450,8 @@ impl Connection {
     /// many sessions there can be is the *peer's* `channel-max` — the number
     /// that says which channels it will accept.
     pub async fn begin(&self, options: SessionOptions) -> Result<Session> {
-        if !self.state().is_usable() {
-            return Err(Error::ConnectionGone);
+        if let Some(refusal) = self.state().refusal() {
+            return Err(refusal);
         }
         let (reply, wait) = oneshot::channel();
         self.inner

@@ -91,8 +91,16 @@ impl fmt::Display for Condition {
 }
 
 /// Why an AMQP operation failed.
+///
+/// Deliberately **not** `#[non_exhaustive]`. A binding or a forwarder that
+/// maps every variant onto its own vocabulary - `weida-amqp-py` turns each
+/// one into an exception class - can only be checked for drift if a variant
+/// added here is a compile error there; a wildcard arm, which
+/// `#[non_exhaustive]` forces on every downstream match, would swallow the
+/// new failure and report it as the base class instead. The cost is that
+/// adding a variant is a breaking change, which is the honest description of
+/// adding a failure a caller may have to handle.
 #[derive(Debug)]
-#[non_exhaustive]
 pub enum Error {
     /// The transport failed: a refused connect, a reset, a closed socket.
     Io(io::Error),

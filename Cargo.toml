@@ -20,6 +20,7 @@ members = [
     "crates/mqtt/weida-mqtt",
     "crates/amqp/weida-amqp-codec",
     "crates/amqp/weida-amqp",
+    "crates/amqp/weida-amqp-py",
     "crates/nats/weida-nats-codec",
     "crates/nats/weida-nats",
     # The shared PyO3 foundation every Python binding sits on, with nothing
@@ -49,6 +50,7 @@ weida-zmq-py = { path = "crates/zmq/weida-zmq-py", version = "0.1.0" }
 weida-mqtt-codec = { path = "crates/mqtt/weida-mqtt-codec", version = "0.1.0" }
 weida-mqtt = { path = "crates/mqtt/weida-mqtt", version = "0.1.0" }
 weida-amqp = { path = "crates/amqp/weida-amqp", version = "0.1.0" }
+weida-amqp-py = { path = "crates/amqp/weida-amqp-py", version = "0.1.0" }
 weida-nats-codec = { path = "crates/nats/weida-nats-codec", version = "0.1.0" }
 weida-nats = { path = "crates/nats/weida-nats", version = "0.1.0" }
 

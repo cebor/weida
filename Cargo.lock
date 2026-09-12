@@ -3001,6 +3001,19 @@ name = "weida-amqp-codec"
 version = "0.1.0"
 
 [[package]]
+name = "weida-amqp-py"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "pyo3",
+ "tokio",
+ "weida-amqp",
+ "weida-amqp-codec",
+ "weida-py-core",
+ "weida-runtime",
+]
+
+[[package]]
 name = "weida-core"
 version = "0.1.0"
 
