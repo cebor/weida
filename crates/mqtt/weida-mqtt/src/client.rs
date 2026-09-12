@@ -41,6 +41,7 @@ use weida_mqtt_codec::{
 };
 use weida_runtime::{Exec, OwnedReactor};
 
+use crate::alias::{Aliased, InboundAliases, OutboundAliases};
 use crate::connection::{Authenticator, NoAuthenticator, Reader, Writer, handshake};
 use crate::error::{Error, Feature, Result};
 use crate::filter::{Subscription, Subscriptions, check_topic_filter};
@@ -344,6 +345,10 @@ impl Client {
             session: session.clone(),
             limits: options.limits,
             waiters: HashMap::new(),
+            // Two bounds, two directions: what the server said it accepts,
+            // and what this client said it accepts ([MQTT-3.3.2-8]).
+            outbound_aliases: OutboundAliases::new(limits.topic_alias_maximum),
+            inbound_aliases: InboundAliases::new(options.limits.topic_alias_maximum),
             subscribe_waiters: HashMap::new(),
             unsubscribe_waiters: HashMap::new(),
             stalled: VecDeque::new(),
@@ -387,6 +392,53 @@ impl Client {
     #[must_use]
     pub fn client_id(&self) -> &str {
         &self.client_id
+    }
+
+    /// `Response Information` from CONNACK (3.2.2.3.15), where the server
+    /// offered one.
+    ///
+    /// A client sets [`ConnectOptions::request_response_information`] to ask
+    /// for it, and a server MAY answer with one anyway or refuse even when
+    /// asked ([MQTT-3.1.2-28]) [mqtt5 §4.3]. It is "used as the basis for
+    /// creating a Response Topic" and its contents are the server's to
+    /// define - the specification "does not define how it is used", only that
+    /// a common pattern is to use it as a topic prefix.
+    #[must_use]
+    pub fn response_information(&self) -> Option<&str> {
+        self.limits.response_information.as_deref()
+    }
+
+    /// A Response Topic under the namespace the server offered, or `None`
+    /// where it offered none.
+    ///
+    /// `None` is the answer and not an omission: **there is no fallback that
+    /// would be honest.** Without `Response Information` a client has no
+    /// protocol-level way to learn which topics it may publish replies on,
+    /// and inventing one - `$response/{client_id}`, say - would be inventing
+    /// a namespace the server never granted and that its authorization rules
+    /// will very likely refuse. A caller in that position knows its reply
+    /// topic out of band and sets [`Message::response_topic`] directly.
+    ///
+    /// Where the server did offer one, this joins it to `suffix` with a
+    /// single `/`, which is the pattern 4.10's non-normative text describes,
+    /// and checks the result is a Topic Name: the join is where a suffix
+    /// containing `+` or `#` would otherwise become an unusable Response
+    /// Topic that only the responder's publish would reject.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidTopic`] where the joined topic is not a Topic Name.
+    pub fn response_topic(&self, suffix: &str) -> Result<Option<String>> {
+        let Some(base) = self.response_information() else {
+            return Ok(None);
+        };
+        let topic = if suffix.is_empty() {
+            base.to_owned()
+        } else {
+            format!("{}/{suffix}", base.trim_end_matches('/'))
+        };
+        crate::filter::check_topic_name(&topic, false)?;
+        Ok(Some(topic))
     }
 
     /// The Keep Alive in force: the client's, or `Server Keep Alive` where
@@ -655,6 +707,13 @@ struct Task {
     writer: Writer,
     commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
+    /// The aliases this client hands out, bounded by the server's `Topic
+    /// Alias Maximum`. Per connection: this field's lifetime *is* the
+    /// mapping's lifetime ([MQTT-3.3.2-7]).
+    outbound_aliases: OutboundAliases,
+    /// The aliases the server establishes toward this client, bounded by the
+    /// `Topic Alias Maximum` this client declared.
+    inbound_aliases: InboundAliases,
     keep_alive: Option<Duration>,
     ping_timeout: Option<Duration>,
     max_packet_size: u32,
@@ -1032,7 +1091,8 @@ impl Task {
     ) -> Result<()> {
         if message.qos == QoS::AtMostOnce {
             let pairs = borrowed(&message.user_properties);
-            let publish = qos0_publish(&message, &pairs)?;
+            let mut publish = qos0_publish(&message, &pairs)?;
+            alias(&mut self.outbound_aliases, &mut publish);
             let sent = self.writer.send(&Packet::Publish(publish)).await;
             let failed = sent.is_err();
             let _ = done.send(sent.map(|()| Completion::Sent));
@@ -1055,7 +1115,12 @@ impl Task {
                 let pairs = stored.borrowed_user_properties();
                 // First attempt, so DUP is 0 ([MQTT-4.3.2-2],
                 // [MQTT-4.3.3-2]).
-                let publish = stored.to_publish(packet_id, false, &pairs);
+                let mut publish = stored.to_publish(packet_id, false, &pairs);
+                // The wire copy may be aliased; the **stored** copy keeps its
+                // full Topic Name, because a mapping "MUST NOT be carried
+                // across Network Connections" ([MQTT-3.3.2-7]) and a
+                // retransmission happens on the next one.
+                alias(&mut self.outbound_aliases, &mut publish);
                 if let Err(error) = self.writer.send(&Packet::Publish(publish)).await {
                     self.session.release(packet_id);
                     let _ = done.send(Err(error));
@@ -1183,7 +1248,15 @@ impl Task {
     /// Packet Identifier already awaiting its PUBREL is answered with another
     /// PUBREC and MUST NOT be delivered again ([MQTT-4.3.3-10]) [mqtt5 §6].
     async fn receive(&mut self, publish: &Publish<'_>) -> Result<()> {
-        let delivery = Delivery::read(publish, &self.limits)?;
+        let mut delivery = Delivery::read(publish, &self.limits)?;
+        // The Topic Alias is resolved **before** the delivery reaches the
+        // application, so nothing above this line ever sees a zero-length
+        // Topic Name or an alias number. The mapping is per connection and
+        // per direction, bounded by what this client declared in CONNECT
+        // ([MQTT-3.3.2-7], [MQTT-3.3.2-8]).
+        delivery.topic = self
+            .inbound_aliases
+            .resolve(publish.properties.topic_alias, publish.topic)?;
 
         match (publish.qos, publish.packet_id) {
             (QoS::AtMostOnce, _) => {
@@ -1213,6 +1286,23 @@ impl Task {
 
     async fn deliver(&mut self, delivery: Delivery) {
         let _ = self.events.send(Event::Delivered(delivery)).await;
+    }
+}
+
+/// Rewrites a PUBLISH to carry a Topic Alias, where the server accepts one.
+///
+/// Three outcomes, all of 3.3.2.3.4's: the Topic Name in full and no alias,
+/// the Topic Name in full **with** the alias that establishes it, or a
+/// zero-length Topic Name and the established alias - which is the only place
+/// a zero-length Topic Name is legal (3.3.2.1) [mqtt5 §3].
+fn alias(aliases: &mut OutboundAliases, publish: &mut Publish<'_>) {
+    match aliases.publish(publish.topic) {
+        Aliased::Full => {}
+        Aliased::Establish(alias) => publish.properties.topic_alias = Some(alias),
+        Aliased::Use(alias) => {
+            publish.properties.topic_alias = Some(alias);
+            publish.topic = "";
+        }
     }
 }
 
