@@ -5,38 +5,46 @@ first, then the numbers, then the chronology.
 
 ## Review needed
 
-**Four workstreams are in flight, and that is the change you are looking at**
-([0014](decisions/0014-parallel-libraries.md), accepted at your decision). W1 the Python
-binding of the finished ZeroMQ library (`weida-zmq-py`, worktree `../weida-w1`), W2 `weida-nng`
-on the existing SP codec with the forwarder rebuilt on it (`../weida-w2`), W3 the MQTT 5
-**client** `weida-mqtt` (`../weida-w3`), W4 `weida-amqp` and `weida-nats` (`../weida-w4`).
-**Sixty-six items, 88 hours**, filed in 0013 §5.3's template: B-111 + B-058 + B-112..B-118 for
-W1, B-119..B-138 for W2, B-062 + B-139..B-153 for W3, B-154..B-174 for W4. The first item of
-each is `in_progress (delegated)`: **B-111** (`weida-py-core`, the one PyO3 foundation every
-binding sits on), **B-119**, **B-062**, **B-154**. Each workstream owns its worktree and its
-`CARGO_TARGET_DIR` and none of them runs cargo in this tree — one build directory takes one
-cargo at a time, so a workstream gating here would serialize the other three. The gate runs
-here once, on merge.
+**All four workstreams are finished and merged, and that is the change you are looking at**
+([0014](decisions/0014-parallel-libraries.md), accepted at your decision). **Sixty-six filed
+items, sixty-eight merges, one night**: W1 nine (`weida-py-core` and `weida-zmq-py`, B-111 +
+B-058 + B-112..B-118), W2 twenty (`weida-nng`, the forwarder rebuilt on it, both Python
+surfaces, B-119..B-138), W3 sixteen (the MQTT 5 **client** `weida-mqtt`, two interop runs
+against two real brokers, both Python surfaces, B-062 + B-139..B-153), W4 twenty-one
+(`weida-amqp` and `weida-nats` with their codecs, their interop and four Python surfaces,
+B-154..B-174). main `cc04d6b`, tree clean, gate green here: **1678 tests**, 0 failed, 37
+ignored, fmt, clippy in every configuration the tree has, rustdoc with `-D warnings`. Each
+workstream owned its worktree and its `CARGO_TARGET_DIR` and none ran cargo in this tree; the
+gate ran here, once per merge, and every Python proof was re-run here rather than accepted on
+report.
 
-**Three things in that filing want your eye.** **Phase C is unparked and B-058 with it**: "Phase
-C waits for B3" was scarcity rather than dependency, so a binding now follows its own library —
-**asyncio first, sync second**, because the blocking facade exists in Rust and building sync
-first would build it twice. **`rumqttd` cannot be the whole MQTT interop story**: its own
-checklist leaves MQTT 5 unchecked, so B-148 uses it for what both speak and **B-149** carries
-properties, reason codes, session expiry and shared subscriptions against Mosquitto behind
-`#[ignore]` — two items rather than one that looks complete. And **NATS interop has no pure-Rust
-substitute**: `async-nats` is a client and needs the same `nats-server`, so B-168 is honest
-about absence meaning no interop rather than a weaker one.
+**The repository now ships five protocol libraries and four Python bindings**, none of which
+has weida in its picture: ZeroMQ (`weida-zmtp` + `weida-zmq` + `weida-zmq-py`), the nanomsg SP
+protocols (`weida-sp` + `weida-nng` + `weida-nng-py`), MQTT 5 (`weida-mqtt-codec` +
+`weida-mqtt` + `weida-mqtt-py`), AMQP 1.0 (`weida-amqp-codec` + `weida-amqp` +
+`weida-amqp-py`) and Core NATS (`weida-nats-codec` + `weida-nats` + `weida-nats-py`) — with a
+parity document per library and one shared PyO3 foundation, `weida-py-core`, under every
+binding.
 
-**The ZeroMQ library is done**, and it is what W1 binds and what the other three are measured
-against. main `742d905`, tree clean, gate green:
+**Six things are left standing, all filed, none of them hidden.** **B-186 is the tree's only
+known red**: two intra-doc links in `weida-nats` name `#[cfg(feature = "tls")]` items, so
+`cargo doc -p weida-nats --no-default-features` fails — broken since B-165 and invisible to
+every `--workspace` run. It is two lines, and it is the second sighting of the class **B-184**
+exists to close: the gate's doc step runs neither the per-crate `--no-default-features`
+configuration nor against a target that cannot be stale. **B-187**: `weida-nats-py` is the one
+binding of four whose wheel has never been built and run with the toolchain off `PATH`.
+**B-183 and B-185**: `weida-nng-py` and `weida-mqtt-py` have no parity document while the
+index's "Planned:" line names both. **B-182**: an NNG survey test asserts an exact count it
+only waited for approximately — a real flake, filed with both honest fixes named, and its
+workstream is gone, so it has no owner.
+
+**The ZeroMQ library, which the other four were measured against**, closed at main `742d905`
+with all twenty-six items of [decision 0013](decisions/0013-competitor-libraries.md) —
+B-070..B-095 — merged, so its definition of done is closed. Its numbers at that anchor:
 **764 tests** with one ignored, plus **228** under `weida-zmq`'s non-default `blocking` feature,
 **18** in the libzmq interop matrix run for real against this machine's 4.3.5, and the interop
-bench Success on all four cases. All twenty-six items of
-[decision 0013](decisions/0013-competitor-libraries.md) — B-070..B-095 — are merged, so its
-definition of done is closed and the repository ships two products: weida, and a ZeroMQ anybody
-can use with no weida in the picture. `crates/` reads `core interop nng protocol runtime weida
-zmq`: one directory per protocol family.
+bench Success on all four cases. The evidence below is that library's; the four that followed
+it are summarised per item in the chronology.
 
 **The evidence behind that sentence, one line each.** Every claim below is a test or a document
 in the tree, not a summary of intent:
@@ -88,19 +96,19 @@ line**, which is what your one-sentence change to LOOP §6 bought; a month ago i
 "one test failed of 75" with nothing to chase.
 
 **Decisions 0001-0014 are all `accepted`; nothing is provisional.** The four worktrees of 0014
-exist — `../weida-w1` … `../weida-w4`, created detached at main `184e439`, each workstream
-branching inside its own — and **four items have already merged here**: B-119 and B-120
-(`weida-nng`), B-062 (the MQTT mapping) and B-111 (`weida-py-core`). **No stash and no dirty
-tree.** There was one for about ten minutes and it is worth knowing why, because it is the
-failure mode the worktree rule exists to prevent: two workers resolved an edit against *this*
-tree instead of their own (W1 the workspace member and `pyo3` entry, W3 the adapters-index row),
-I stashed both rather than merge from a dirty tree, held B-062 `in_progress` rather than count an
-uncommitted file as done, and dropped the stash only after checking the re-landed branch text
-against the stashed text. Of **174 items filed**, 97 are `done`, 71 `ready`, 4
-`in_progress (delegated)` (B-058, B-121, B-139, B-154), 1 `blocked` (B-039) and 1 `parked`
-(B-045). What moves the roadmap now is the four workstreams above; the eleven older `ready`
-items behind them are the loose ends and the requirement-driven work (B-060, B-061, B-064..B-068,
-B-096, B-104, B-106, B-107, B-109, B-110), and none of them blocks a workstream.
+— `../weida-w1` … `../weida-w4`, created detached at main `184e439`, each workstream branching
+inside its own — have all been drained; nothing of any workstream is unmerged, checked branch
+by branch rather than taken on report. **No stash and no dirty tree.** There was one for about
+ten minutes early on and it is worth knowing why, because it is the failure mode the worktree
+rule exists to prevent: two workers resolved an edit against *this* tree instead of their own
+(W1 the workspace member and `pyo3` entry, W3 the adapters-index row), I stashed both rather
+than merge from a dirty tree, held B-062 `in_progress` rather than count an uncommitted file as
+done, and dropped the stash only after checking the re-landed branch text against the stashed
+text. Of **187 items filed**, **160 are `done`**, 25 `ready`, **none `in_progress`**, 1
+`blocked` (B-039) and 1 `parked` (B-045). The twenty-five `ready` items are the whole of what
+is left: the six named above, the older loose ends and the requirement-driven work (B-060,
+B-061, B-064..B-068, B-096, B-099, B-104, B-106, B-107, B-109, B-110, B-175..B-179), and
+nothing among them blocks anything else.
 
 ## Numbers
 
