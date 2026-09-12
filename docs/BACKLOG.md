@@ -1127,22 +1127,24 @@ note: three of this codec's bounds exist because **the protocol bounds nothing**
 note: one published disagreement is recorded rather than silently resolved, which is the right instinct: `max_control_line` is documented as 1024 in the client protocol reference's error table and compiled as **4096** in `nats-server`. The crate names the larger and says why in the constant's doc comment — this bound applies to lines a *server* sends us, so the implementation's number is the one that decides whether we can read a real server at all. It belongs in `docs/libraries/nats.md` (B-169) and possibly in the sheet (B-174), and both items now have it waiting.
 
 ### B-165 — The client: `INFO`, `CONNECT`, TLS and the pings
-kind: code | size: 90 | status: in_progress (delegated) 2026-09-12T05:55Z | needs: [B-164]
+kind: code | size: 90 | status: done fca6b72 | needs: [B-164]
 acceptance: `crates/nats/weida-nats` on `weida-runtime`: the server's `INFO` read first, `CONNECT` answered with the selected capabilities and one of token, user and password, JWT, or an NKey signature over the server's nonce; TLS completed before ordinary traffic where `INFO` requires it; `PING`/`PONG` in both directions with the number of unanswered pings bounded rather than infinite; later asynchronous `INFO` handled outside the handshake, including `connect_urls` and the `ldm: true` drain notice; and the server's `max_payload` enforced locally so an oversized publish fails before the wire.
 note: workstream W4, worktree ../weida-w4, branch b165-nats-connection
+note: merged `--no-ff` as fca6b72 — **one commit (6d70c00) carrying B-165, B-166 and B-167 together**, 7364 insertions over 16 files, and the workspace manifest is **in it**: `"crates/nats/weida-nats"` in `members` and `weida-nats` in `[workspace.dependencies]` land with the code, which is the rule this run set after the ungated-crate episode. Gate green here: **1573 tests** (1491 + 82), 0 failed, 1 ignored, fmt, clippy in both configurations, rustdoc with `-D warnings`; `weida-nats` itself is 40 lib + 18 handshake + 12 subscriptions + 10 request-reply + 2 doctests. `cargo tree -p weida-nats` reaches `weida-core`, `weida-nats-codec`, `weida-runtime`, `tokio`, `tokio-rustls` and **no `weida`, no `weida-protocol`**.
+note: three decisions worth keeping. **NKey and JWT nonce signing is a caller-supplied closure rather than a dependency**, so the crate has *no cryptographic dependency at all* — the same rule `weida-amqp` applied to trust anchors, and the right one: key material is the application's. **There is no reconnect loop**, for the reason the sheet gives rather than by omission. And **`NoResponders` (the 503) stays distinct from `RequestTimeout`**, because "nobody is listening" and "nobody answered in time" are different facts about the system and collapsing them is how a client teaches its users to retry the wrong thing.
 
 ### B-166 — Subscriptions, subject matching and queue groups
-kind: code | size: 90 | status: ready | needs: [B-165]
+kind: code | size: 90 | status: done fca6b72 | needs: [B-165]
 acceptance: `SUB` with a client-chosen `sid` and an optional queue group, `UNSUB` with and without a message count, `MSG`/`HMSG` dispatched to the subscription that asked for it, and subject matching where `*` is exactly one token and `>` is one or more trailing tokens and must be last — `orders.*` matching `orders.created` and not `orders.eu.created`, `orders.>` matching both; two subscribers in one queue group receive one copy between them per publication while an ordinary subscriber beside them receives its own, which is the test that separates a group from a subject.
 note: workstream W4, worktree ../weida-w4, branch b166-nats-subscriptions
 
 ### B-167 — Request-reply over an inbox
-kind: code | size: 60 | status: ready | needs: [B-166]
+kind: code | size: 60 | status: done fca6b72 | needs: [B-166]
 acceptance: a request publishes with a reply-to subject under a unique `_INBOX.` prefix and the responder answers on it by ordinary subject interest with no hidden correlation field, the requester's timeout is its own and always bounded, and the scatter-gather form collects several responses inside one window; with `no_responders` and headers negotiated, a request with no responder returns that status immediately instead of waiting out the timeout, and the test asserts the difference between the two outcomes rather than only the happy path.
 note: workstream W4, worktree ../weida-w4, branch b167-nats-request-reply
 
 ### B-168 — Interop against `nats-server`
-kind: adapter | size: 90 | status: ready | needs: [B-167]
+kind: adapter | size: 90 | status: in_progress (delegated) 2026-09-12T06:55Z | needs: [B-167]
 acceptance: publish, subscribe, queue groups and request-reply against `nats-server` started through the process supervisor with a `ready` condition and stopped in the same item on success and on failure alike, with an `async-nats` peer on the other side of that server for every case so the exchange is ours against an independent client rather than ours against ourselves; where the `nats-server` binary is absent the whole file is `#[ignore]` with the install command in its doc comment ([LOOP.md](LOOP.md) §2), and the item states plainly that there is no pure-Rust substitute — an `async-nats` peer is a client and needs the same server — so absence means no interop rather than a weaker one.
 note: workstream W4, worktree ../weida-w4, branch b168-nats-interop
 
