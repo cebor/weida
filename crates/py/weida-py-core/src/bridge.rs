@@ -13,17 +13,18 @@
 //! ```text
 //! Python thread                    reactor thread
 //! ─────────────                    ──────────────
-//! await sock.recv()
-//!   awaitable() ─ spawn ──────────▶ the Rust future runs, no GIL
-//!   returns a coroutine over               │
-//!   that future                            │
+//! sock.recv()        → a coroutine; nothing has happened yet
+//! await it
+//!   the coroutine starts ─ spawn ─▶ the Rust future runs, no GIL
+//!   and awaits the delivery                │
 //!   the loop runs other tasks              │ done
 //!   ◀── call_soon_threadsafe ───────────────┘ (GIL taken once, briefly)
 //!   set_result / set_exception
 //! ```
 //!
-//! The coroutine is the outer layer because `asyncio.create_task` and
-//! `TaskGroup.create_task` accept a coroutine and refuse a bare future; see
+//! The coroutine is the outer layer for two reasons: `asyncio.create_task`
+//! and `TaskGroup.create_task` accept a coroutine and refuse a bare future,
+//! and a coroutine is what defers the work to the first `await` — see
 //! [`Bridge::awaitable`].
 //!
 //! # Why not `pyo3-async-runtimes`
@@ -59,9 +60,9 @@
 //!   raises, and there is nothing left to tell: a closed loop has no task
 //!   awaiting anything. The error is dropped deliberately and the reason is
 //!   written down here rather than in a comment nobody reads.
-//! - **No running loop.** `awaitable` fails at the call, with asyncio's own
-//!   `RuntimeError`, instead of handing back an awaitable that never
-//!   completes.
+//! - **No running loop.** The coroutine's first step asks for one, so a
+//!   coroutine created outside a loop and awaited inside one is fine, and one
+//!   awaited nowhere never asks. Only `asyncio.run`'s own rules apply.
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
@@ -127,26 +128,25 @@ impl Bridge {
         self.errno
     }
 
-    /// Drives `future` on the library's reactor and hands Python a coroutine.
+    /// Hands Python a coroutine that drives `future` on the library's
+    /// reactor.
     ///
-    /// The value arrives on an `asyncio.Future` created by the **caller's
-    /// running loop**, so it is delivered on the thread that awaits it and no
-    /// second loop is invented. Fails immediately — with asyncio's
-    /// `RuntimeError` — when there is no running loop, because the alternative
-    /// is an awaitable that never completes.
-    ///
-    /// **A coroutine rather than that bare future**, because asyncio's own
-    /// entry points are not interchangeable: `await` and `asyncio.gather`
+    /// **A coroutine rather than a bare `asyncio.Future`**, because asyncio's
+    /// own entry points are not interchangeable: `await` and `asyncio.gather`
     /// take either, while `asyncio.create_task` and `TaskGroup.create_task`
     /// take a coroutine and nothing else. A binding whose calls cannot be
     /// handed to a `TaskGroup` would be excluded from the way Python 3.11
     /// onward writes concurrency, for the sake of one object allocation.
     ///
-    /// The Rust future starts at *this* call, not at the first `await`: an
-    /// operation with a side effect on the wire — a `send` that queued a
-    /// message — has already happened by the time the coroutine exists, which
-    /// is also how libzmq's own bindings behave. A coroutine that is dropped
-    /// unawaited therefore discards a result rather than cancelling the work.
+    /// **The Rust future starts at the first `await`, not at this call.** A
+    /// coroutine that is never awaited therefore does nothing at all, which
+    /// is what Python's own `async def` promises and what makes
+    /// `task = create_task(sock.recv()); task.cancel()` safe: with an eager
+    /// start, that pair cancels a `Task` that never ran while the receive it
+    /// already began takes the next message off the socket and throws it
+    /// away. The delivery future is created by the loop that runs the
+    /// coroutine, so it is also the loop that awaits it, and this call needs
+    /// no running loop of its own.
     ///
     /// The GIL is not held while the future runs, and the future holds no
     /// Python object, so a binding cannot accidentally touch the interpreter
@@ -156,30 +156,73 @@ impl Bridge {
         F: Future<Output = Result<T, Errno>> + Send + 'static,
         T: PyValue,
     {
-        let event_loop = py
-            .import(intern!(py, "asyncio"))?
-            .call_method0(intern!(py, "get_running_loop"))?;
-        let delivery = event_loop.call_method0(intern!(py, "create_future"))?;
-
-        let target = delivery.clone().unbind();
-        let notify = event_loop.unbind();
+        let exec = self.exec.clone();
         let errno = self.errno;
-        let task = self.exec.spawn(async move {
-            let outcome = Guarded::new(future).await;
-            deliver(notify, target, outcome, errno);
-        });
+        let start = Start {
+            begin: Mutex::new(Some(Box::new(move |py| start(py, &exec, errno, future)))),
+        };
+        wrapper(py)?.call1((Py::new(py, start)?,))
+    }
+}
 
-        // The done-callback fires for *any* completion; only a cancellation has
-        // anything to abort, and aborting a task that already finished is a
-        // no-op.
-        let cancellation = Py::new(
-            py,
-            Cancellation {
-                abort: Box::new(move || task.abort()),
-            },
-        )?;
-        delivery.call_method1(intern!(py, "add_done_callback"), (cancellation,))?;
-        wrapper(py)?.call1((delivery,))
+/// Creates the delivery future on the running loop and spawns the work.
+///
+/// Runs inside the coroutine, so "the running loop" is the loop that will
+/// await the result.
+fn start<F, T>(py: Python<'_>, exec: &Exec, errno: ErrnoMapper, future: F) -> PyResult<Py<PyAny>>
+where
+    F: Future<Output = Result<T, Errno>> + Send + 'static,
+    T: PyValue,
+{
+    let event_loop = py
+        .import(intern!(py, "asyncio"))?
+        .call_method0(intern!(py, "get_running_loop"))?;
+    let delivery = event_loop.call_method0(intern!(py, "create_future"))?;
+
+    let target = delivery.clone().unbind();
+    let notify = event_loop.unbind();
+    let task = exec.spawn(async move {
+        let outcome = Guarded::new(future).await;
+        deliver(notify, target, outcome, errno);
+    });
+
+    // The done-callback fires for *any* completion; only a cancellation has
+    // anything to abort, and aborting a task that already finished is a
+    // no-op.
+    let cancellation = Py::new(
+        py,
+        Cancellation {
+            abort: Box::new(move || task.abort()),
+        },
+    )?;
+    delivery.call_method1(intern!(py, "add_done_callback"), (cancellation,))?;
+    Ok(delivery.unbind())
+}
+
+/// The coroutine's first step: begin the operation, once.
+#[pyclass(frozen)]
+struct Start {
+    /// Taken by the first call. A second one cannot happen — a coroutine
+    /// cannot be awaited twice — but a `Mutex<Option<_>>` says so in the type
+    /// rather than in a comment.
+    #[allow(clippy::type_complexity)]
+    begin: Mutex<Option<Box<dyn for<'py> FnOnce(Python<'py>) -> PyResult<Py<PyAny>> + Send>>>,
+}
+
+#[pymethods]
+impl Start {
+    fn __call__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let begin = self
+            .begin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        match begin {
+            Some(begin) => begin(py),
+            None => Err(PyRuntimeError::new_err(
+                "this operation was already started; a coroutine is awaited once",
+            )),
+        }
     }
 }
 
@@ -189,7 +232,7 @@ impl std::fmt::Debug for Bridge {
     }
 }
 
-/// The one-line `async def` that makes a delivery future into a coroutine.
+/// The two-line `async def` that turns a [`Start`] into a coroutine.
 ///
 /// Compiled once per process, on the first `await` of any binding, and kept
 /// here rather than per [`Bridge`]: it closes over nothing, so one copy serves
@@ -204,7 +247,7 @@ fn wrapper(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     let wrapper = WRAPPER.get_or_try_init(py, || {
         let namespace = PyDict::new(py);
         py.run(
-            c"async def awaited(delivery):\n    return await delivery\n",
+            c"async def awaited(start):\n    return await start()\n",
             Some(&namespace),
             None,
         )?;

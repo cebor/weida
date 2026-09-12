@@ -63,7 +63,9 @@ use pyo3::prelude::*;
 mod context;
 mod errors;
 mod lease;
+mod ops;
 mod sockets;
+mod values;
 
 /// `weida_zmq`, as Python sees it.
 #[pymodule]
@@ -71,6 +73,9 @@ fn weida_zmq(module: &Bound<'_, PyModule>) -> PyResult<()> {
     errors::install(module)?;
     module.add_class::<context::Context>()?;
     module.add_class::<sockets::Discarded>()?;
+    module.add_class::<values::PyMultipart>()?;
+    module.add_class::<values::PySent>()?;
+    module.add_class::<values::PyPublished>()?;
     module.add_class::<sockets::PyReqSocket>()?;
     module.add_class::<sockets::PyRepSocket>()?;
     module.add_class::<sockets::PyDealerSocket>()?;
@@ -92,6 +97,9 @@ fn every_name() -> Vec<&'static str> {
     let mut names = vec![
         "Context",
         "Discarded",
+        "Multipart",
+        "Sent",
+        "Published",
         "ReqSocket",
         "RepSocket",
         "DealerSocket",

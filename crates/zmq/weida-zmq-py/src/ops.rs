@@ -1,0 +1,396 @@
+//! Sending and receiving, once, for whichever socket types have them.
+//!
+//! Eleven socket types do not have eleven sends. They have four shapes, and
+//! `zmq_socket(3)`'s "action in mute state" column is what tells them apart:
+//!
+//! | Shape | Socket types | What a full queue does |
+//! | --- | --- | --- |
+//! | [`Transmit`] | REQ, DEALER, PUSH, PAIR | Blocks, bounded by `ZMQ_SNDTIMEO`; never discards. |
+//! | [`Report`] | REP, ROUTER | Drops, and says so — the drop is the return value. |
+//! | [`Publish`] | PUB, XPUB, XSUB | Fans out to the matching subscribers, dropping for any whose queue is full. A publisher never blocks. |
+//! | [`Receive`] | everything except PUB and PUSH | Blocks, bounded by `ZMQ_RCVTIMEO`. |
+//!
+//! Each shape is a trait here and a generic function over it, so the eleven
+//! Python classes are eleven one-line delegations rather than eleven
+//! implementations that could disagree. **No protocol behaviour is decided in
+//! this file**: the mute actions, REQ's alternation, ROUTER's routing table
+//! and the timeouts are `weida-zmq`'s, called rather than re-derived.
+//!
+//! # `_nowait` is synchronous, and that is not a shortcut
+//!
+//! `ZMQ_DONTWAIT` means "do not wait", so `send_nowait` and `recv_nowait` are
+//! ordinary Python methods rather than coroutines: there is nothing to await,
+//! the library's `try_send`/`try_recv` do not touch the reactor, and making
+//! them coroutines would add a loop round trip to the one operation whose
+//! entire point is not to have one. They report `EAGAIN` when the socket is
+//! busy with another coroutine's operation, which is the same answer as a full
+//! queue and for the same reason: this call was told not to wait.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use pyo3::prelude::*;
+use weida_py_core::{Bridge, Errno};
+use weida_zmq::{Multipart, Published, Result, Sent};
+
+use crate::errors::{errno_of, to_py};
+use crate::lease::Slot;
+use crate::values::{PyMultipart, PyPublished, PySent, message_from};
+
+/// A socket type that receives: blocking, bounded, or not at all.
+pub trait Receive: Send + 'static {
+    /// `zmq_recv`, bounded by `ZMQ_RCVTIMEO`.
+    fn receive(&mut self) -> impl Future<Output = Result<Multipart>> + Send;
+    /// `zmq_recv` under an explicit bound.
+    fn receive_within(&mut self, limit: Duration)
+    -> impl Future<Output = Result<Multipart>> + Send;
+    /// `ZMQ_DONTWAIT`.
+    fn receive_now(&mut self) -> Result<Multipart>;
+}
+
+/// A socket type whose send blocks rather than discards.
+pub trait Transmit: Send + 'static {
+    /// `zmq_send`, bounded by `ZMQ_SNDTIMEO`.
+    fn transmit(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send;
+    /// `zmq_send` under an explicit bound.
+    fn transmit_within(
+        &mut self,
+        message: Multipart,
+        limit: Duration,
+    ) -> impl Future<Output = Result<()>> + Send;
+    /// `ZMQ_DONTWAIT`.
+    fn transmit_now(&mut self, message: Multipart) -> Result<()>;
+}
+
+/// A socket type whose send reports what became of the message.
+pub trait Report: Send + 'static {
+    /// `zmq_send`, whose drop is a return value here.
+    fn transmit(&mut self, message: Multipart) -> impl Future<Output = Result<Sent>> + Send;
+}
+
+/// A reporting socket type that also has libzmq's `ZMQ_DONTWAIT` form.
+///
+/// ROUTER has one and REP does not, and that asymmetry is the library's
+/// rather than an omission here: a REP reply is delivered to the peer that
+/// asked or discarded because that peer is gone, so its `send` never waits
+/// for room and a non-blocking variant of it would be the same call under a
+/// second name.
+pub trait ReportNow: Report {
+    /// `ZMQ_DONTWAIT`.
+    fn transmit_now(&mut self, message: Multipart) -> Result<Sent>;
+}
+
+/// A socket type that fans a message out to its subscribers.
+pub trait Publish: Send + 'static {
+    /// Never blocks, never fails: it reports what it reached.
+    fn publish(&mut self, message: Multipart) -> Published;
+}
+
+/// A socket type that keeps a subscription set.
+pub trait Subscribe: Send + 'static {
+    /// Adds a prefix. Subscriptions are additive and not idempotent: two
+    /// subscriptions to one prefix need two cancellations.
+    fn subscribe(&mut self, prefix: &[u8]) -> Result<()>;
+    /// Removes one subscription to a prefix.
+    fn unsubscribe(&mut self, prefix: &[u8]) -> Result<()>;
+}
+
+macro_rules! receives {
+    ($($socket:ident),+ $(,)?) => {
+        $(impl Receive for weida_zmq::$socket {
+            fn receive(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
+                self.recv()
+            }
+
+            fn receive_within(
+                &mut self,
+                limit: Duration,
+            ) -> impl Future<Output = Result<Multipart>> + Send {
+                self.recv_timeout(limit)
+            }
+
+            fn receive_now(&mut self) -> Result<Multipart> {
+                self.try_recv()
+            }
+        })+
+    };
+}
+
+receives!(
+    ReqSocket,
+    RepSocket,
+    DealerSocket,
+    RouterSocket,
+    SubSocket,
+    XPubSocket,
+    XSubSocket,
+    PullSocket,
+    PairSocket,
+);
+
+macro_rules! transmits {
+    ($($socket:ident),+ $(,)?) => {
+        $(impl Transmit for weida_zmq::$socket {
+            fn transmit(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send {
+                self.send(message)
+            }
+
+            fn transmit_within(
+                &mut self,
+                message: Multipart,
+                limit: Duration,
+            ) -> impl Future<Output = Result<()>> + Send {
+                self.send_timeout(message, limit)
+            }
+
+            fn transmit_now(&mut self, message: Multipart) -> Result<()> {
+                self.try_send(message)
+            }
+        })+
+    };
+}
+
+transmits!(ReqSocket, DealerSocket, PushSocket, PairSocket);
+
+macro_rules! reports {
+    ($($socket:ident),+ $(,)?) => {
+        $(impl Report for weida_zmq::$socket {
+            fn transmit(&mut self, message: Multipart) -> impl Future<Output = Result<Sent>> + Send {
+                self.send(message)
+            }
+        })+
+    };
+}
+
+reports!(RepSocket, RouterSocket);
+
+impl ReportNow for weida_zmq::RouterSocket {
+    fn transmit_now(&mut self, message: Multipart) -> Result<Sent> {
+        self.try_send(message)
+    }
+}
+
+impl Publish for weida_zmq::PubSocket {
+    fn publish(&mut self, message: Multipart) -> Published {
+        weida_zmq::PubSocket::publish(self, message)
+    }
+}
+
+impl Publish for weida_zmq::XPubSocket {
+    fn publish(&mut self, message: Multipart) -> Published {
+        weida_zmq::XPubSocket::publish(self, message)
+    }
+}
+
+impl Publish for weida_zmq::XSubSocket {
+    /// XSUB's own name for it is `send`, because what an XSUB sends upstream
+    /// is a subscription as often as a message; the shape is the publisher's.
+    fn publish(&mut self, message: Multipart) -> Published {
+        self.send(message)
+    }
+}
+
+macro_rules! subscribes {
+    ($($socket:ident),+ $(,)?) => {
+        $(impl Subscribe for weida_zmq::$socket {
+            fn subscribe(&mut self, prefix: &[u8]) -> Result<()> {
+                weida_zmq::$socket::subscribe(self, prefix)
+            }
+
+            fn unsubscribe(&mut self, prefix: &[u8]) -> Result<()> {
+                weida_zmq::$socket::unsubscribe(self, prefix)
+            }
+        })+
+    };
+}
+
+subscribes!(SubSocket, XSubSocket, XPubSocket);
+
+/// A timeout in seconds, as the library's `Duration`.
+///
+/// Refused where it is given rather than rounded: a negative or infinite
+/// number of seconds is not a bound, and libzmq's `-1` for "wait forever" is
+/// spelled `None` here because Python has a word for it.
+fn limit(py: Python<'_>, timeout: Option<f64>) -> PyResult<Option<Duration>> {
+    match timeout {
+        None => Ok(None),
+        Some(seconds) if seconds.is_finite() && seconds >= 0.0 => {
+            Ok(Some(Duration::from_secs_f64(seconds)))
+        }
+        Some(seconds) => Err(to_py(
+            py,
+            &Errno::new(
+                "EINVAL",
+                format!(
+                    "a timeout is a finite, non-negative number of seconds, not {seconds}; \
+                     omit it to wait as long as ZMQ_SNDTIMEO/ZMQ_RCVTIMEO allow"
+                ),
+            ),
+        )),
+    }
+}
+
+/// `EAGAIN` for a `_nowait` call that found the socket busy.
+fn busy(py: Python<'_>) -> PyErr {
+    to_py(
+        py,
+        &Errno::new(
+            "EAGAIN",
+            "another coroutine is using this socket, and this call was told not to wait",
+        ),
+    )
+}
+
+/// `await sock.recv(timeout=None)`.
+pub fn recv<'py, S: Receive>(
+    py: Python<'py>,
+    bridge: &Bridge,
+    socket: &Arc<Slot<S>>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let limit = limit(py, timeout)?;
+    let slot = Arc::clone(socket);
+    bridge.awaitable(py, async move {
+        let mut socket = slot.acquire().await;
+        let received = match limit {
+            Some(limit) => socket.receive_within(limit).await,
+            None => socket.receive().await,
+        };
+        received.map(PyMultipart::of).map_err(errno_of)
+    })
+}
+
+/// `sock.recv_nowait()`.
+pub fn recv_nowait<S: Receive>(py: Python<'_>, socket: &Arc<Slot<S>>) -> PyResult<PyMultipart> {
+    let Some(mut socket) = socket.try_acquire() else {
+        return Err(busy(py));
+    };
+    socket
+        .receive_now()
+        .map(PyMultipart::of)
+        .map_err(|error| to_py(py, &errno_of(error)))
+}
+
+/// `await sock.send(message, timeout=None)` for a socket type that blocks.
+pub fn send<'py, S: Transmit>(
+    py: Python<'py>,
+    bridge: &Bridge,
+    socket: &Arc<Slot<S>>,
+    message: &Bound<'py, PyAny>,
+    timeout: Option<f64>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let message = message_from(message)?;
+    let limit = limit(py, timeout)?;
+    let slot = Arc::clone(socket);
+    bridge.awaitable(py, async move {
+        let mut socket = slot.acquire().await;
+        match limit {
+            Some(limit) => socket.transmit_within(message, limit).await,
+            None => socket.transmit(message).await,
+        }
+        .map_err(errno_of)
+    })
+}
+
+/// `sock.send_nowait(message)` for a socket type that blocks.
+pub fn send_nowait<S: Transmit>(
+    py: Python<'_>,
+    socket: &Arc<Slot<S>>,
+    message: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let message = message_from(message)?;
+    let Some(mut socket) = socket.try_acquire() else {
+        return Err(busy(py));
+    };
+    socket
+        .transmit_now(message)
+        .map_err(|error| to_py(py, &errno_of(error)))
+}
+
+/// `await sock.send(message)` for a socket type that reports a drop.
+pub fn send_reporting<'py, S: Report>(
+    py: Python<'py>,
+    bridge: &Bridge,
+    socket: &Arc<Slot<S>>,
+    message: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let message = message_from(message)?;
+    let slot = Arc::clone(socket);
+    bridge.awaitable(py, async move {
+        slot.acquire()
+            .await
+            .transmit(message)
+            .await
+            .map(PySent::of)
+            .map_err(errno_of)
+    })
+}
+
+/// `sock.send_nowait(message)` for a socket type that reports a drop.
+pub fn send_reporting_nowait<S: ReportNow>(
+    py: Python<'_>,
+    socket: &Arc<Slot<S>>,
+    message: &Bound<'_, PyAny>,
+) -> PyResult<PySent> {
+    let message = message_from(message)?;
+    let Some(mut socket) = socket.try_acquire() else {
+        return Err(busy(py));
+    };
+    socket
+        .transmit_now(message)
+        .map(PySent::of)
+        .map_err(|error| to_py(py, &errno_of(error)))
+}
+
+/// `await sock.send(message)` for a publisher.
+pub fn publish<'py, S: Publish>(
+    py: Python<'py>,
+    bridge: &Bridge,
+    socket: &Arc<Slot<S>>,
+    message: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let message = message_from(message)?;
+    let slot = Arc::clone(socket);
+    bridge.awaitable(py, async move {
+        Ok::<PyPublished, Errno>(PyPublished::of(slot.acquire().await.publish(message)))
+    })
+}
+
+/// `sock.send_nowait(message)` for a publisher, which never waits anyway.
+pub fn publish_nowait<S: Publish>(
+    py: Python<'_>,
+    socket: &Arc<Slot<S>>,
+    message: &Bound<'_, PyAny>,
+) -> PyResult<PyPublished> {
+    let message = message_from(message)?;
+    let Some(mut socket) = socket.try_acquire() else {
+        return Err(busy(py));
+    };
+    Ok(PyPublished::of(socket.publish(message)))
+}
+
+/// `await sock.subscribe(prefix)`.
+pub fn subscribe<'py, S: Subscribe>(
+    py: Python<'py>,
+    bridge: &Bridge,
+    socket: &Arc<Slot<S>>,
+    prefix: Vec<u8>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let slot = Arc::clone(socket);
+    bridge.awaitable(py, async move {
+        slot.acquire().await.subscribe(&prefix).map_err(errno_of)
+    })
+}
+
+/// `await sock.unsubscribe(prefix)`.
+pub fn unsubscribe<'py, S: Subscribe>(
+    py: Python<'py>,
+    bridge: &Bridge,
+    socket: &Arc<Slot<S>>,
+    prefix: Vec<u8>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let slot = Arc::clone(socket);
+    bridge.awaitable(py, async move {
+        slot.acquire().await.unsubscribe(&prefix).map_err(errno_of)
+    })
+}

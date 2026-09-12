@@ -32,6 +32,11 @@ static ERRORS: ErrorClasses = ErrorClasses::new();
 /// Rust future increments this; one that was swallowed does not.
 static DROPPED: AtomicUsize = AtomicUsize::new(0);
 
+/// How many futures have begun running. A coroutine that was built and never
+/// awaited must leave this alone, which is what "the work starts at the first
+/// await" means.
+static STARTED: AtomicUsize = AtomicUsize::new(0);
+
 /// The one function a binding writes to join its error enum to its classes.
 fn to_py(py: Python<'_>, errno: &Errno) -> PyErr {
     ERRORS.error(py, errno)
@@ -59,9 +64,15 @@ impl Demo {
     fn echo<'py>(&self, py: Python<'py>, payload: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let exec = self.bridge.exec().clone();
         self.bridge.awaitable(py, async move {
+            STARTED.fetch_add(1, Ordering::SeqCst);
             exec.sleep(Duration::from_millis(10)).await;
             Ok(payload)
         })
+    }
+
+    /// How many futures have begun.
+    fn started(&self) -> usize {
+        STARTED.load(Ordering::SeqCst)
     }
 
     /// Fails with an errno the module has a class for.
@@ -103,13 +114,13 @@ impl Demo {
 const SCRIPT: &str = r#"
 import asyncio
 
-# No running loop: the call fails here rather than handing back an awaitable
-# that would never complete.
-try:
-    demo.echo(b"nowhere")
-    raise AssertionError("awaiting without a loop must fail at the call")
-except RuntimeError as no_loop:
-    assert "no running event loop" in str(no_loop), no_loop
+# Nothing happens before the first await: the call outside a loop builds a
+# coroutine and starts no work, so the operation is never half-begun behind a
+# task that was cancelled before it ran.
+pending = demo.echo(b"nowhere")
+assert demo.started() == 0, "the work must not begin until the coroutine runs"
+pending.close()
+assert demo.started() == 0
 
 async def main():
     # 1. An awaitable completing, with the payload it was given.
