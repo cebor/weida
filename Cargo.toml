@@ -57,10 +57,14 @@ tokio = { version = "1", features = [
     "time",
     "net",
 ] }
-# The TLS layer AMQP reaches either by protocol-id %d2 or as a bare `amqps`
-# listener (Part 5 §5.2). `rustls` 0.23 is already in this workspace's graph
-# through quinn, so this adds the tokio adapter and no second TLS stack. The
-# trust anchors are **not** here: `weida-amqp` takes the caller's
+# TLS for two libraries, one entry: the layer AMQP reaches either by
+# protocol-id %d2 or as a bare `amqps` listener (Part 5 §5.2), and the
+# `tls+tcp` transport of `weida-nng`. `rustls` 0.23 is already in this
+# workspace's graph through quinn and `ring` is the provider weida's QUIC
+# transport already uses, so this adds the tokio adapter and **no second TLS
+# stack and no second cryptographic backend**; pure Rust, so
+# `unsafe_code = "forbid"` survives it and no OpenSSL is linked. The trust
+# anchors are **not** here: `weida-amqp` takes the caller's
 # `rustls::ClientConfig`, because which certificates an application trusts is
 # the application's decision and not a messaging library's.
 tokio-rustls = { version = "0.26", default-features = false, features = [
@@ -79,11 +83,6 @@ minicbor = { version = "2", features = ["alloc"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
 ring = "0.17"
-# The `tls+tcp` transport of `weida-nng`: TLS over TCP, in pure Rust so that
-# `unsafe_code = "forbid"` survives it and no OpenSSL is linked. `ring` is
-# the provider, which is the one weida's QUIC transport already uses, so the
-# workspace has one cryptographic backend rather than two.
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 # The one cryptographic dependency of `weida-zmq`, for CURVE. RustCrypto's
 # NaCl-compatible `crypto_box`: X25519 key agreement, HSalsa20 to derive the
 # shared key, XSalsa20-Poly1305 for the box - which is exactly the
