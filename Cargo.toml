@@ -16,6 +16,7 @@ members = [
     "crates/nng/weida-sp",
     "crates/nng/weida-nng",
     "crates/nng/weida-nng-bridge",
+    "crates/nng/weida-nng-py",
     "crates/mqtt/weida-mqtt-codec",
     "crates/mqtt/weida-mqtt",
     "crates/amqp/weida-amqp-codec",
@@ -46,6 +47,7 @@ weida-nng = { path = "crates/nng/weida-nng", version = "0.1.0" }
 weida-py-core = { path = "crates/py/weida-py-core", version = "0.1.0" }
 weida-amqp-codec = { path = "crates/amqp/weida-amqp-codec", version = "0.1.0" }
 weida-zmq-py = { path = "crates/zmq/weida-zmq-py", version = "0.1.0" }
+weida-nng-py = { path = "crates/nng/weida-nng-py", version = "0.1.0" }
 weida-mqtt-codec = { path = "crates/mqtt/weida-mqtt-codec", version = "0.1.0" }
 weida-mqtt = { path = "crates/mqtt/weida-mqtt", version = "0.1.0" }
 weida-amqp = { path = "crates/amqp/weida-amqp", version = "0.1.0" }

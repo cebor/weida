@@ -2413,6 +2413,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "weida-nng-py"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "tokio",
+ "weida-nng",
+ "weida-py-core",
+ "weida-sp",
+]
+
+[[package]]
 name = "weida-protocol"
 version = "0.1.0"
 dependencies = [

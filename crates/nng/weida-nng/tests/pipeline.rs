@@ -359,3 +359,57 @@ async fn a_peer_that_reconnects_in_a_loop_cannot_grow_the_buffer() {
         "and it is the newest that are refused, not the oldest that are dropped"
     );
 }
+
+/// Claim: an operation on a closed socket is `NNG_ECLOSED`, at the close.
+///
+/// NNG's rule is that a closed socket answers `NNG_ECLOSED`; a receive that
+/// instead sat out `NNG_OPT_RECVTIMEO` and then said `NNG_ETIMEDOUT` would
+/// be telling the caller the wrong thing about the wrong moment - and with
+/// NNG's default of forever, would never answer at all.
+#[tokio::test]
+async fn a_closed_socket_answers_rather_than_waiting_out_its_timeout() {
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    let pull = PullSocket::with_options(&ctx, options()).expect("pull");
+    pull.listen("tcp://127.0.0.1:0").await.expect("listen");
+    let push = PushSocket::with_options(&ctx, options()).expect("push");
+
+    pull.close();
+    push.close();
+
+    let started = std::time::Instant::now();
+    let receiving = pull.recv().await.unwrap_err();
+    let sending = push.send(b"nowhere".to_vec()).await.unwrap_err();
+    assert!(
+        matches!(receiving, Error::ECLOSED(_)),
+        "a receive on a closed socket: {receiving:?}"
+    );
+    assert!(
+        matches!(sending, Error::ECLOSED(_)),
+        "a send on a closed socket: {sending:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "both answered at the close, not at the timeout"
+    );
+}
+
+/// Claim: a close ends a receive that is already parked.
+#[tokio::test]
+async fn closing_a_socket_ends_the_receive_already_waiting_on_it() {
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    let pull = Arc::new(PullSocket::with_options(&ctx, options()).expect("pull"));
+    pull.listen("tcp://127.0.0.1:0").await.expect("listen");
+
+    let waiting = tokio::spawn({
+        let pull = Arc::clone(&pull);
+        async move { pull.recv().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    pull.close();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("the parked receive ended at the close")
+        .expect("task");
+    assert!(matches!(outcome.unwrap_err(), Error::ECLOSED(_)));
+}

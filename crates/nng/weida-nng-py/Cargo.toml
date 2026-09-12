@@ -1,0 +1,46 @@
+[package]
+name = "weida-nng-py"
+description = "The Python binding of weida-nng: asyncio SP sockets on the Rust implementation, with NNG's errno vocabulary as exception classes"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+# The Python module is `weida_nng`, which is the name `#[pymodule]` and
+# therefore `PyInit_weida_nng` carry. The crate cannot also be called that:
+# rustdoc writes one directory per lib name and `weida-nng` already owns
+# `weida_nng`, so `cargo doc --workspace` would refuse the collision.
+name = "weida_nng_py"
+crate-type = ["cdylib"]
+# A cdylib has no rlib for rustdoc to link a doctest against, so the examples
+# in this crate's documentation are Python and are run by `pytest`.
+doctest = false
+
+[dependencies]
+# The shared foundation: exception families, the asyncio bridge, the bytes
+# boundary. Every binding in this workspace sits on it and none re-derives it
+# (`docs/decisions/0014-parallel-libraries.md` §2).
+weida-py-core.workspace = true
+pyo3.workspace = true
+# The library being bound. Nothing of weida is reachable through it, which is
+# the dependency direction 0013 §4.2 fixed.
+weida-nng.workspace = true
+# The endpoint-type enum, which is what a raw socket is opened with and what
+# a pairing refusal names. It is the codec's vocabulary and travels no
+# further than the raw socket's constructor.
+weida-sp.workspace = true
+# One value: `runtime::Handle`, which `Context.sharing` takes — the third of
+# the three constructors cannot be offered to Python without naming it.
+tokio.workspace = true
+
+[features]
+# Off by default, enabled by maturin through `pyproject.toml`. With it on the
+# extension does not link libpython, which is right for a wheel and wrong for
+# `cargo test`: cargo unifies features across a workspace build, so a
+# default-on `extension-module` here would break `cargo test --workspace`.
+extension-module = ["pyo3/extension-module"]
+
+[lints.rust]
+# As in `weida-py-core`: PyO3's macros expand to `unsafe impl`s, so `forbid`
+# is not available. No `unsafe` is written by hand in this crate.
+unsafe_code = "allow"
