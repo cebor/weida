@@ -37,6 +37,17 @@ tokio = { workspace = true, features = [
     "time",
     "sync",
 ] }
+# The interop peer, on the far side of a real `nats-server`. It is a
+# **client**, not a server, so it is no substitute for the binary: two clients
+# cannot talk to each other, and where `nats-server` is absent there is no
+# interop at all rather than a weaker one (see
+# `tests/interop_nats_server.rs`). A dev-dependency, so it appears in no build
+# of this library.
+async-nats = "0.50"
+# Only to reach `StreamExt::next` on the peer's `Subscriber`, which is a
+# `Stream` rather than carrying an inherent `next`. Nothing in this library
+# uses it: ours is an inherent method on purpose.
+futures-util = { version = "0.3", default-features = false }
 
 [features]
 default = ["tls"]
