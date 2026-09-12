@@ -127,11 +127,19 @@ macro_rules! socket_endpoints {
             /// Binds an endpoint and returns the one actually bound, which is
             /// what `ZMQ_LAST_ENDPOINT` reports and the only way to learn a
             /// wildcard port.
-            pub async fn bind(
+            ///
+            /// The returned future is `Send` and borrows nothing — see
+            /// [`SocketCore::bind`][$crate::socket::SocketCore::bind] — so
+            /// `socket.bind(endpoint).await` works on a multi-thread
+            /// executor as well as under `block_on`.
+            pub fn bind(
                 &self,
                 endpoint: &str,
-            ) -> $crate::error::Result<$crate::endpoint::Endpoint> {
-                self.core.bind(endpoint).await
+            ) -> impl ::std::future::Future<
+                Output = $crate::error::Result<$crate::endpoint::Endpoint>,
+            > + Send
+            + 'static {
+                self.core.bind(endpoint)
             }
 
             /// Stops accepting on an endpoint. Peers already accepted there
@@ -288,8 +296,18 @@ impl SocketCore {
 
     /// Binds an endpoint and returns the one actually bound
     /// (`ZMQ_LAST_ENDPOINT`).
-    pub async fn bind(&self, endpoint: &str) -> Result<Endpoint> {
-        self.engine.bind(&Endpoint::parse(endpoint)?).await
+    ///
+    /// Not an `async fn`, and that is load-bearing: an `async fn(&self)` on a
+    /// `!Sync` socket produces a future holding `&SocketCore`, which is not
+    /// `Send` and therefore cannot be driven on a multi-thread executor at
+    /// all. The future returned here owns an [`Engine`] handle — which *is*
+    /// `Sync` — and the parsed endpoint, so it is `Send` like every other
+    /// future this crate hands out, and `socket.bind(endpoint).await` reads
+    /// exactly as before.
+    pub fn bind(&self, endpoint: &str) -> impl Future<Output = Result<Endpoint>> + Send + 'static {
+        let engine = self.engine.clone();
+        let parsed = Endpoint::parse(endpoint);
+        async move { engine.bind(&parsed?).await }
     }
 
     /// Connects an endpoint, asynchronously, like `zmq_connect`.

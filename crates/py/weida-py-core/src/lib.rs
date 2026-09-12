@@ -62,9 +62,11 @@
 //! # }
 //! ```
 //!
-//! and then, per method:
+//! and then, per method — shown as text rather than as a doctest, because the
+//! socket in it belongs to a binding this crate must not depend on, and a
+//! doctest the gate never compiles is a claim nobody checks:
 //!
-//! ```ignore
+//! ```text
 //! fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
 //!     let socket = self.socket.clone();
 //!     self.bridge.awaitable(py, async move {

@@ -2409,6 +2409,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "weida-zmq-py"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "tokio",
+ "weida-py-core",
+ "weida-zmq",
+]
+
+[[package]]
 name = "weida-zmtp"
 version = "0.1.0"
 
