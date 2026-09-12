@@ -68,9 +68,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use weida_mqtt_codec::{PayloadFormat, Properties, Publish, QoS};
+use weida_mqtt_codec::{PayloadFormat, Properties, Publish, QoS, SubackReasonCode};
 
 use crate::error::{Error, Result};
+use crate::filter::{Subscription, Subscriptions};
 use crate::limits::Limits;
 
 /// A PUBLISH held for possible retransmission.
@@ -240,6 +241,14 @@ struct State {
     /// any repeat PUBLISH with the same identifier by another PUBREC and MUST
     /// NOT cause a duplicate onward delivery" ([MQTT-4.3.3-10]) [mqtt5 §6].
     inbound_qos2: BTreeSet<u16>,
+    /// Packet Identifiers spent on a SUBSCRIBE or UNSUBSCRIBE awaiting its
+    /// acknowledgement. They occupy the **same** space as the publish
+    /// identifiers ([MQTT-2.2.1-3]) and are never resent, because "SUBSCRIBE
+    /// and UNSUBSCRIBE are not in the retransmission list at all" (4.4)
+    /// [mqtt5 §6].
+    control: BTreeSet<u16>,
+    /// The client's mirror of the subscriptions the server holds.
+    subscriptions: Subscriptions,
     /// Where the next identifier search starts, so allocation walks the space
     /// rather than always offering the lowest free number.
     next_packet_id: u16,
@@ -272,6 +281,8 @@ impl Session {
             state: Arc::new(Mutex::new(State {
                 outbound: BTreeMap::new(),
                 inbound_qos2: BTreeSet::new(),
+                control: BTreeSet::new(),
+                subscriptions: Subscriptions::new(),
                 next_packet_id: 1,
                 sequence: 0,
                 declared_expiry: None,
@@ -330,6 +341,10 @@ impl Session {
         let mut state = self.lock();
         state.outbound.clear();
         state.inbound_qos2.clear();
+        state.control.clear();
+        // "Subscriptions do not survive Clean Start 1" [mqtt5 §1], so the
+        // mirror goes with the rest of the session.
+        state.subscriptions.clear();
         state.next_packet_id = 1;
         state.sequence = 0;
     }
@@ -481,6 +496,85 @@ impl Session {
         self.lock().receive_maximum
     }
 
+    /// Allocates a Packet Identifier for a SUBSCRIBE or UNSUBSCRIBE.
+    ///
+    /// **The identifier space is one unified space per session, "shared
+    /// across PUBLISH (QoS > 0), SUBSCRIBE and UNSUBSCRIBE"**
+    /// ([MQTT-2.2.1-3]) [mqtt5 §2], so this competes with
+    /// [`Session::allocate`] for the same 65,535 numbers and is not a second
+    /// counter beside it.
+    ///
+    /// Two things it does **not** do, and both are the specification's:
+    ///
+    /// * it does not count against the send quota, whose unit is "one QoS 1
+    ///   or QoS 2 PUBLISH packet — not bytes, not QoS 0, not any other packet
+    ///   type" (4.9) [mqtt5 §5];
+    /// * it stores nothing, because "SUBSCRIBE and UNSUBSCRIBE are not in the
+    ///   retransmission list at all" (4.4) [mqtt5 §6] — a subscription that
+    ///   goes unanswered is the caller's to retry, and retrying it is a new
+    ///   SUBSCRIBE with a new identifier rather than a resend.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::QuotaExhausted`] with the 65,535 hard ceiling once the whole
+    /// space is in use.
+    pub fn allocate_control(&self) -> Result<u16> {
+        let mut state = self.lock();
+        let packet_id = next_free(&state.outbound, &state.control, state.next_packet_id)
+            .ok_or(Error::QuotaExhausted { quota: u16::MAX })?;
+        state.next_packet_id = packet_id.wrapping_add(1).max(1);
+        state.control.insert(packet_id);
+        Ok(packet_id)
+    }
+
+    /// Releases a SUBSCRIBE or UNSUBSCRIBE identifier, which happens "on
+    /// SUBACK/UNSUBACK" [mqtt5 §2].
+    ///
+    /// Returns whether it was held.
+    pub fn release_control(&self, packet_id: u16) -> bool {
+        self.lock().control.remove(&packet_id)
+    }
+
+    /// The client's mirror of the subscriptions the server holds for this
+    /// session.
+    ///
+    /// 4.1 lists the subscriptions under the **server's** half of the session
+    /// state, not the client's [mqtt5 §2], so this is a mirror and not an
+    /// authority: the server is the one that replaces a re-subscribed filter
+    /// and grants a maximum QoS. The client keeps it for two things it cannot
+    /// otherwise do — telling which of its own filters a delivery matched
+    /// where the server sends no `Subscription Identifier`, and knowing what
+    /// to re-subscribe after a Clean Start — and it is discarded with the
+    /// session, because "subscriptions do not survive Clean Start 1"
+    /// [mqtt5 §1].
+    pub fn subscriptions(&self) -> Subscriptions {
+        self.lock().subscriptions.clone()
+    }
+
+    /// Records what a SUBACK granted, replacing any entry with the same
+    /// filter.
+    ///
+    /// "A session cannot hold two subscriptions with the same filter, so the
+    /// filter is the key", and re-subscribing "MUST replace the subscription
+    /// without losing messages" ([MQTT-3.8.4-3], [MQTT-3.8.4-4]) (3.8.4)
+    /// [mqtt5 §2]. The replacement is the server's to perform; this keeps the
+    /// mirror from growing a second entry for one subscription.
+    pub fn record_subscription(
+        &self,
+        subscription: Subscription,
+        identifier: Option<u32>,
+        granted: SubackReasonCode,
+    ) {
+        self.lock()
+            .subscriptions
+            .record(subscription, identifier, granted);
+    }
+
+    /// Forgets a filter, on an UNSUBACK that reported success.
+    pub fn forget_subscription(&self, filter: &str) -> bool {
+        self.lock().subscriptions.remove(filter)
+    }
+
     /// Allocates an unused Packet Identifier and stores `message` against it.
     ///
     /// The space is "a single unified space per session, shared across PUBLISH
@@ -504,7 +598,7 @@ impl Session {
             });
         }
 
-        let packet_id = next_free(&state.outbound, state.next_packet_id)
+        let packet_id = next_free(&state.outbound, &state.control, state.next_packet_id)
             .ok_or(Error::QuotaExhausted { quota: u16::MAX })?;
         state.next_packet_id = packet_id.wrapping_add(1).max(1);
 
@@ -613,14 +707,19 @@ impl Session {
     }
 }
 
-/// The first identifier at or after `from` that is not in use, wrapping once
-/// and skipping 0.
-fn next_free(outbound: &BTreeMap<u16, InFlight>, from: u16) -> Option<u16> {
+/// The first identifier at or after `from` that is in use by neither a stored
+/// publish nor an unacknowledged SUBSCRIBE or UNSUBSCRIBE, wrapping once and
+/// skipping 0. One space, three packet types ([MQTT-2.2.1-3]).
+fn next_free(
+    outbound: &BTreeMap<u16, InFlight>,
+    control: &BTreeSet<u16>,
+    from: u16,
+) -> Option<u16> {
     let start = from.max(1);
     for offset in 0..u32::from(u16::MAX) {
         let candidate = (u32::from(start - 1) + offset) % u32::from(u16::MAX) + 1;
         let candidate = candidate as u16;
-        if !outbound.contains_key(&candidate) {
+        if !outbound.contains_key(&candidate) && !control.contains(&candidate) {
             return Some(candidate);
         }
     }

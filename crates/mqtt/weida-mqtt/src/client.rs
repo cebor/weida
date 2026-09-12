@@ -35,17 +35,24 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use weida_mqtt_codec::{
-    DecodeError, Disconnect, DisconnectReasonCode, Packet, PacketType, Properties, Puback, Pubcomp,
-    PubcompReasonCode, Publish, Pubrec, PubrecReasonCode, Pubrel, QoS,
+    self as codec, DecodeError, Disconnect, DisconnectReasonCode, Packet, PacketType, PayloadList,
+    Properties, Puback, Pubcomp, PubcompReasonCode, Publish, Pubrec, PubrecReasonCode, Pubrel, QoS,
+    SubackReasonCode, UnsubackReasonCode, varint,
 };
 use weida_runtime::{Exec, OwnedReactor};
 
 use crate::connection::{Authenticator, NoAuthenticator, Reader, Writer, handshake};
-use crate::error::{Error, Result};
+use crate::error::{Error, Feature, Result};
+use crate::filter::{Subscription, Subscriptions, check_topic_filter};
 use crate::limits::{Limits, ServerLimits};
 use crate::message::{Completion, Delivery, Message};
 use crate::options::{ConnectOptions, interval_seconds};
 use crate::session::{Resend, Resumption, Session, expiry_seconds};
+
+/// Who is waiting for a SUBACK's per-filter verdicts.
+type SubackWaiter = oneshot::Sender<Result<Vec<SubackReasonCode>>>;
+/// Who is waiting for an UNSUBACK's.
+type UnsubackWaiter = oneshot::Sender<Result<Vec<UnsubackReasonCode>>>;
 
 /// The reactor every client of this context runs on.
 ///
@@ -173,6 +180,17 @@ enum Command {
     Publish {
         message: Box<Message>,
         done: oneshot::Sender<Result<Completion>>,
+    },
+    /// Send SUBSCRIBE, resolving on its SUBACK.
+    Subscribe {
+        subscriptions: Vec<Subscription>,
+        identifier: Option<u32>,
+        done: oneshot::Sender<Result<Vec<SubackReasonCode>>>,
+    },
+    /// Send UNSUBSCRIBE, resolving on its UNSUBACK.
+    Unsubscribe {
+        filters: Vec<String>,
+        done: oneshot::Sender<Result<Vec<UnsubackReasonCode>>>,
     },
 }
 
@@ -326,6 +344,8 @@ impl Client {
             session: session.clone(),
             limits: options.limits,
             waiters: HashMap::new(),
+            subscribe_waiters: HashMap::new(),
+            unsubscribe_waiters: HashMap::new(),
             stalled: VecDeque::new(),
         };
         context.exec.spawn(task.run());
@@ -499,6 +519,134 @@ impl Client {
             .map_err(|_| Error::NotConnected)?;
         wait.await.map_err(|_| Error::NotConnected)?
     }
+
+    /// Subscribes to `subscriptions`, resolving on the SUBACK.
+    ///
+    /// **One SUBACK reason code per filter, in the order the filters were
+    /// sent** ([MQTT-3.9.3-1], [MQTT-3.9.3-2]) (3.9.3) [mqtt5 §8], and the
+    /// returned vector is exactly that list: a failure for one filter leaves
+    /// the others granted, so the call as a whole does **not** fail when one
+    /// filter is refused. A granted maximum QoS may be lower than what was
+    /// asked for — "the minimum of the QoS of the originally published
+    /// message and the Maximum QoS granted" ([MQTT-3.8.4-8]) [mqtt5 §6] — and
+    /// each code is recorded against its filter in the session's mirror
+    /// ([`Session::subscriptions`]), where a refused one is not recorded at
+    /// all.
+    ///
+    /// **Re-subscribing a filter replaces the subscription without losing
+    /// messages** ([MQTT-3.8.4-3]): the server performs the replacement and
+    /// "any existing retained messages matching the filter are sent again
+    /// unless Retain Handling says otherwise" ([MQTT-3.8.4-4]) (3.8.4)
+    /// [mqtt5 §2]. So changing one filter's options is one SUBSCRIBE and not
+    /// an UNSUBSCRIBE followed by a SUBSCRIBE, which would open a window in
+    /// which messages are lost.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Configuration`] for an empty list — "a SUBSCRIBE with no
+    /// payload entry is a Protocol Error" ([MQTT-3.8.3-2]);
+    /// [`Error::InvalidTopic`] for a filter that breaks the grammar of 4.7.1;
+    /// [`Error::Unavailable`] where the server declined wildcards, shared
+    /// subscriptions or subscription identifiers; and
+    /// [`Error::NotConnected`] where the connection ended.
+    pub async fn subscribe(
+        &self,
+        subscriptions: Vec<Subscription>,
+    ) -> Result<Vec<SubackReasonCode>> {
+        self.subscribe_with(subscriptions, None).await
+    }
+
+    /// The same, with a `Subscription Identifier` the server reports back "on
+    /// every delivery it caused" ([MQTT-3.3.4-4]) [mqtt5 §4.1].
+    ///
+    /// The identifier is one per SUBSCRIBE packet, not per filter (3.8.2.1.2)
+    /// [mqtt5 §4.1], so every filter in this call shares it. It ranges from 1
+    /// to 268,435,455 — a Variable Byte Integer, and 0 "is a Protocol Error"
+    /// ([MQTT-3.8.3-4]).
+    ///
+    /// **A server may decline the whole feature** with `Subscription
+    /// Identifiers Available` 0 (3.2.2.3.12) [mqtt5 §11], which is refused
+    /// here with 0xA1 rather than being sent and rejected. Against such a
+    /// server the way to tell which filter matched a delivery is
+    /// [`Subscriptions::matching`], which is why that exists.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::subscribe`], plus [`Error::Configuration`] for an
+    /// identifier of 0 or above 268,435,455.
+    pub async fn subscribe_with(
+        &self,
+        subscriptions: Vec<Subscription>,
+        identifier: Option<u32>,
+    ) -> Result<Vec<SubackReasonCode>> {
+        if subscriptions.is_empty() {
+            return Err(Error::Configuration(
+                "a SUBSCRIBE must carry at least one filter ([MQTT-3.8.3-2])".into(),
+            ));
+        }
+        for subscription in &subscriptions {
+            subscription.check(&self.limits)?;
+        }
+        if let Some(identifier) = identifier {
+            self.limits.require(Feature::SubscriptionIdentifier)?;
+            if identifier == 0 || identifier > varint::MAX {
+                return Err(Error::Configuration(format!(
+                    "a Subscription Identifier is 1 to 268,435,455; {identifier} is not \
+                     ([MQTT-3.8.3-4])"
+                )));
+            }
+        }
+        let (done, wait) = oneshot::channel();
+        self.commands
+            .send(Command::Subscribe {
+                subscriptions,
+                identifier,
+                done,
+            })
+            .await
+            .map_err(|_| Error::NotConnected)?;
+        wait.await.map_err(|_| Error::NotConnected)?
+    }
+
+    /// Unsubscribes from `filters`, resolving on the UNSUBACK.
+    ///
+    /// One reason code per filter again ([MQTT-3.11.3-1]) (3.11.3), and
+    /// [`UnsubackReasonCode::NoSubscriptionExisted`] is a **success**: the end
+    /// state the client asked for holds either way, and 3.1.1's UNSUBACK
+    /// carried no status at all [mqtt5 §1.9]. Each filter reported success is
+    /// dropped from the session's mirror.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Configuration`] for an empty list — "an UNSUBSCRIBE with no
+    /// payload entry is a Protocol Error" ([MQTT-3.10.3-2]);
+    /// [`Error::InvalidTopic`] for a filter that breaks the grammar; and
+    /// [`Error::NotConnected`] where the connection ended.
+    pub async fn unsubscribe(&self, filters: Vec<String>) -> Result<Vec<UnsubackReasonCode>> {
+        if filters.is_empty() {
+            return Err(Error::Configuration(
+                "an UNSUBSCRIBE must carry at least one filter ([MQTT-3.10.3-2])".into(),
+            ));
+        }
+        for filter in &filters {
+            check_topic_filter(filter)?;
+        }
+        let (done, wait) = oneshot::channel();
+        self.commands
+            .send(Command::Unsubscribe { filters, done })
+            .await
+            .map_err(|_| Error::NotConnected)?;
+        wait.await.map_err(|_| Error::NotConnected)?
+    }
+
+    /// This client's own view of what it is subscribed to.
+    ///
+    /// A mirror of the server's state and not an authority; see
+    /// [`Session::subscriptions`].
+    #[must_use]
+    pub fn subscriptions(&self) -> Subscriptions {
+        self.session.subscriptions()
+    }
 }
 
 /// The task that owns the socket.
@@ -510,6 +658,12 @@ struct Task {
     keep_alive: Option<Duration>,
     ping_timeout: Option<Duration>,
     max_packet_size: u32,
+    /// Who is waiting for each SUBACK, with the filters the SUBSCRIBE
+    /// carried: the codes are matched to filters by position (3.9.3), so the
+    /// list has to be kept to read the answer.
+    subscribe_waiters: HashMap<u16, (Vec<Subscription>, Option<u32>, SubackWaiter)>,
+    /// The same for UNSUBACK.
+    unsubscribe_waiters: HashMap<u16, (Vec<String>, UnsubackWaiter)>,
     exec: Exec,
     /// The session, shared with the application's handle.
     session: Session,
@@ -640,10 +794,13 @@ impl Task {
                             self.pubrel(pubrel.packet_id).await?;
                             last_write = std::time::Instant::now();
                         }
-                        // The subscription acknowledgements are B-144's.
-                        other => {
+                        Packet::Suback(suback) => self.suback(&suback),
+                        Packet::Unsuback(unsuback) => self.unsuback(&unsuback),
+                        Packet::Auth(_) => {
+                            // Re-authentication is B-146's; until then an AUTH
+                            // after the handshake is unasked-for.
                             return Err(Error::UnexpectedPacket {
-                                packet_type: other.packet_type(),
+                                packet_type: PacketType::Auth,
                             });
                         }
                     }
@@ -675,6 +832,18 @@ impl Task {
                     last_write = std::time::Instant::now();
                     awaiting_pingresp = true;
                 }
+                Step::Command(Some(Command::Subscribe {
+                    subscriptions,
+                    identifier,
+                    done,
+                })) => {
+                    self.send_subscribe(subscriptions, identifier, done).await?;
+                    last_write = std::time::Instant::now();
+                }
+                Step::Command(Some(Command::Unsubscribe { filters, done })) => {
+                    self.send_unsubscribe(filters, done).await?;
+                    last_write = std::time::Instant::now();
+                }
                 Step::Command(Some(Command::Disconnect {
                     reason_code,
                     session_expiry,
@@ -701,6 +870,137 @@ impl Task {
                 }
             }
         }
+    }
+
+    /// Sends SUBSCRIBE and remembers who is waiting for its SUBACK.
+    ///
+    /// The identifier comes from the session's **one** space, shared with
+    /// PUBLISH ([MQTT-2.2.1-3]), and is released when the SUBACK arrives.
+    /// Nothing is stored for retransmission: "SUBSCRIBE and UNSUBSCRIBE are
+    /// not in the retransmission list at all" (4.4) [mqtt5 §6].
+    async fn send_subscribe(
+        &mut self,
+        subscriptions: Vec<Subscription>,
+        identifier: Option<u32>,
+        done: oneshot::Sender<Result<Vec<SubackReasonCode>>>,
+    ) -> Result<()> {
+        let packet_id = match self.session.allocate_control() {
+            Ok(packet_id) => packet_id,
+            Err(error) => {
+                let _ = done.send(Err(error));
+                return Ok(());
+            }
+        };
+        let filters: Vec<codec::Subscription<'_>> = subscriptions
+            .iter()
+            .map(|subscription| codec::Subscription {
+                filter: &subscription.filter,
+                options: subscription.options,
+            })
+            .collect();
+        // The property is repeatable on the wire, but SUBSCRIBE carries "at
+        // most one" (3.8.2.1.2) [mqtt5 §4.1], so the slice is zero or one
+        // long and its bound is the option's.
+        let ids: Vec<u32> = identifier.into_iter().collect();
+        let packet = Packet::Subscribe(codec::Subscribe {
+            packet_id,
+            properties: Properties::new().with_subscription_identifiers(&ids),
+            filters: PayloadList::new(&filters),
+        });
+        if let Err(error) = self.writer.send(&packet).await {
+            self.session.release_control(packet_id);
+            let _ = done.send(Err(error));
+            return Err(Error::ConnectionClosed);
+        }
+        self.subscribe_waiters
+            .insert(packet_id, (subscriptions, identifier, done));
+        Ok(())
+    }
+
+    /// Sends UNSUBSCRIBE and remembers who is waiting for its UNSUBACK.
+    async fn send_unsubscribe(
+        &mut self,
+        filters: Vec<String>,
+        done: oneshot::Sender<Result<Vec<UnsubackReasonCode>>>,
+    ) -> Result<()> {
+        let packet_id = match self.session.allocate_control() {
+            Ok(packet_id) => packet_id,
+            Err(error) => {
+                let _ = done.send(Err(error));
+                return Ok(());
+            }
+        };
+        let borrowed: Vec<&str> = filters.iter().map(String::as_str).collect();
+        let packet = Packet::Unsubscribe(codec::Unsubscribe {
+            packet_id,
+            properties: Properties::new(),
+            filters: PayloadList::new(&borrowed),
+        });
+        if let Err(error) = self.writer.send(&packet).await {
+            self.session.release_control(packet_id);
+            let _ = done.send(Err(error));
+            return Err(Error::ConnectionClosed);
+        }
+        self.unsubscribe_waiters.insert(packet_id, (filters, done));
+        Ok(())
+    }
+
+    /// Resolves a SUBSCRIBE with its per-filter verdicts, recording the
+    /// granted ones in the session's mirror.
+    fn suback(&mut self, suback: &codec::Suback<'_>) {
+        self.session.release_control(suback.packet_id);
+        let Some((subscriptions, identifier, done)) =
+            self.subscribe_waiters.remove(&suback.packet_id)
+        else {
+            // A SUBACK for an identifier this client never sent. Dropped
+            // rather than fatal: the identifier is free either way, and
+            // closing the connection over a stray acknowledgement would lose
+            // every other subscription with it.
+            return;
+        };
+        let codes: Vec<SubackReasonCode> = suback.reason_codes.iter().collect();
+        if codes.len() != subscriptions.len() {
+            // "The SUBACK MUST contain one reason code for each filter, in
+            // the same order" ([MQTT-3.9.3-1], [MQTT-3.9.3-2]). A different
+            // count leaves no way to say which filter each code is about, so
+            // it is reported rather than guessed at.
+            let _ = done.send(Err(Error::AcknowledgementLengthMismatch {
+                packet_type: PacketType::Suback,
+                sent: subscriptions.len(),
+                received: codes.len(),
+            }));
+            return;
+        }
+        for (subscription, granted) in subscriptions.into_iter().zip(codes.iter().copied()) {
+            self.session
+                .record_subscription(subscription, identifier, granted);
+        }
+        let _ = done.send(Ok(codes));
+    }
+
+    /// Resolves an UNSUBSCRIBE, forgetting every filter it reported gone.
+    fn unsuback(&mut self, unsuback: &codec::Unsuback<'_>) {
+        self.session.release_control(unsuback.packet_id);
+        let Some((filters, done)) = self.unsubscribe_waiters.remove(&unsuback.packet_id) else {
+            return;
+        };
+        let codes: Vec<UnsubackReasonCode> = unsuback.reason_codes.iter().collect();
+        if codes.len() != filters.len() {
+            let _ = done.send(Err(Error::AcknowledgementLengthMismatch {
+                packet_type: PacketType::Unsuback,
+                sent: filters.len(),
+                received: codes.len(),
+            }));
+            return;
+        }
+        for (filter, code) in filters.iter().zip(codes.iter()) {
+            // `NoSubscriptionExisted` is a success: the end state the caller
+            // asked for holds [mqtt5 §1.9].
+            if !code.is_error() {
+                self.session.forget_subscription(filter);
+            }
+        }
+        let _ = done.send(Ok(codes));
     }
 
     async fn send_disconnect(
