@@ -31,3 +31,17 @@ path = "fuzz_targets/composite.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "performative"
+path = "fuzz_targets/performative.rs"
+test = false
+doc = false
+bench = false

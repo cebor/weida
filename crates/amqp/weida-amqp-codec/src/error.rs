@@ -3,15 +3,16 @@
 //! Two types, split by direction, because the directions disagree about what
 //! "not enough bytes" means.
 //!
-//! * [`DecodeError`] comes from bytes a peer sent. Exactly one of its variants
-//!   — [`DecodeError::Incomplete`] — is *not* a protocol violation: a value
-//!   may be split across reads, and asking for more octets is the normal
-//!   answer. Everything else is a violation, and
+//! * [`DecodeError`] comes from bytes a peer sent. Exactly one of its
+//!   variants — [`DecodeError::Incomplete`] — is *not* a protocol violation:
+//!   a value may be split across reads, and asking for more octets is the
+//!   normal answer. Everything else is a violation, and
 //!   [`DecodeError::is_violation`] says so, because the remedy differs: more
 //!   reading versus a `close` carrying `amqp:decode-error`.
 //! * [`EncodeError`] comes from our own side, and every variant is a bug or a
-//!   value the wire cannot carry (a symbol longer than a 32-bit size, a
-//!   delivery-tag over 32 octets). There is no "incomplete" on the way out.
+//!   value the wire cannot carry: a symbol beyond a 32-bit size, a
+//!   delivery-tag over 32 octets, a frame beyond the size the partner
+//!   negotiated. There is no "incomplete" on the way out.
 //!
 //! The vocabulary is shared between the type system and the layers above it,
 //! so a length rule the decoder enforces is a rule the encoder cannot break
@@ -54,9 +55,7 @@ pub enum DecodeError {
     },
 
     /// A compound's declared size was not exactly consumed by the declared
-    /// number of elements. Either the elements ran past the end or they
-    /// stopped short, and both mean the sender and this decoder disagree
-    /// about the encoding.
+    /// number of elements: the elements stopped short of it.
     CompoundSizeMismatch {
         /// The constructor that declared it.
         code: u8,
@@ -99,8 +98,8 @@ pub enum DecodeError {
     /// one.
     InvalidChar(u32),
 
-    /// A descriptor that is neither a `symbol` nor a `ulong`. See
-    /// [`Descriptor`](crate::Descriptor) for why this codec refuses the rest.
+    /// A descriptor that is neither a `symbol` nor a `ulong` — the forms
+    /// Part 1 §1.5 reserves. See [`Descriptor`](crate::Descriptor).
     DescriptorNotSymbolicOrNumeric(u8),
 
     /// An `array` element constructor this codec cannot use: `0x00` nested
@@ -123,6 +122,17 @@ pub enum DecodeError {
         found: Option<u64>,
     },
 
+    /// A descriptor in a position this codec dispatches on, naming nothing it
+    /// knows: a tenth performative, a sixth SASL body, a delivery state from
+    /// an extension.
+    UnknownComposite {
+        /// What was being decoded, as the specification names the family.
+        kind: &'static str,
+        /// The numeric descriptor, or `None` where the descriptor was a
+        /// symbol this codec could not resolve to one.
+        descriptor: Option<u64>,
+    },
+
     /// A value of the wrong type in a typed position: a `string` where the
     /// field is a `ulong`, for instance.
     WrongType {
@@ -141,8 +151,8 @@ pub enum DecodeError {
         field: &'static str,
     },
 
-    /// A value whose length exceeds the restriction its type carries: a
-    /// `delivery-tag` over 32 octets, a `sasl-code` outside 0..=4.
+    /// A value outside the restriction its type carries: a `delivery-tag`
+    /// over 32 octets, a `sasl-code` above 4, a `role` that is not a boolean.
     RestrictionViolated {
         /// The restricted type, as the specification names it.
         restriction: &'static str,
@@ -151,6 +161,53 @@ pub enum DecodeError {
         /// The largest value the restriction permits.
         limit: u64,
     },
+
+    /// A frame header declaring fewer than the eight octets it occupies.
+    /// Part 2 §2.3: "SIZE ... MUST be greater than or equal to 8".
+    FrameTooSmall {
+        /// What the header declared.
+        size: u32,
+    },
+
+    /// A frame larger than the partner was told it could send.
+    ///
+    /// Before `open` has been read the bound is
+    /// [`MIN_MAX_FRAME_SIZE`](crate::frame::MIN_MAX_FRAME_SIZE) = 512, which
+    /// is the whole reason the bound is an argument: a peer that pipelined a
+    /// 4 GiB frame ahead of its `open` must be refused on the header alone.
+    FrameTooLarge {
+        /// What the header declared.
+        size: u32,
+        /// The bound in force.
+        max: u32,
+    },
+
+    /// A frame whose data offset is below two, i.e. which claims its body
+    /// starts inside its own fixed header. Part 2 §2.3 makes this malformed.
+    DataOffsetTooSmall {
+        /// What the header declared, in four-octet words.
+        doff: u8,
+    },
+
+    /// A frame whose extended header runs past the end of the frame itself.
+    ExtendedHeaderOverrunsFrame {
+        /// The data offset, in four-octet words.
+        doff: u8,
+        /// The declared frame size, in octets.
+        size: u32,
+    },
+
+    /// A frame type this codec does not implement. Part 2 defines `0x00`
+    /// (AMQP) and Part 5 defines `0x01` (SASL); nothing else is assigned.
+    UnknownFrameType(u8),
+
+    /// Eight octets that are not a protocol header: the first four were not
+    /// `AMQP`.
+    NotAProtocolHeader,
+
+    /// A protocol header naming a layer this codec does not implement. Part 5
+    /// assigns `0` (AMQP), `2` (TLS) and `3` (SASL).
+    UnknownProtocolId(u8),
 }
 
 impl DecodeError {
@@ -217,8 +274,14 @@ impl fmt::Display for DecodeError {
                     "expected descriptor 0x{expected:016x}, found a symbolic one"
                 ),
             },
+            Self::UnknownComposite { kind, descriptor } => match descriptor {
+                Some(descriptor) => {
+                    write!(f, "0x{descriptor:016x} is not a {kind} this codec knows")
+                }
+                None => write!(f, "that symbol is not a {kind} this codec knows"),
+            },
             Self::WrongType { field, code } => {
-                write!(f, "{field} cannot be a 0x{code:02x}")
+                write!(f, "{field} cannot be a {}", described(*code))
             }
             Self::MissingMandatoryField { composite, field } => {
                 write!(f, "{composite} requires {field}")
@@ -228,6 +291,30 @@ impl fmt::Display for DecodeError {
                 value,
                 limit,
             } => write!(f, "{restriction} bounds {value} at {limit}"),
+            Self::FrameTooSmall { size } => {
+                write!(f, "a frame declared {size} octets, below the 8 it occupies")
+            }
+            Self::FrameTooLarge { size, max } => {
+                write!(f, "a frame declared {size} octets, above the agreed {max}")
+            }
+            Self::DataOffsetTooSmall { doff } => write!(
+                f,
+                "a frame put its body at word {doff}, inside its own header"
+            ),
+            Self::ExtendedHeaderOverrunsFrame { doff, size } => write!(
+                f,
+                "an extended header reaching word {doff} does not fit {size} octets"
+            ),
+            Self::UnknownFrameType(kind) => {
+                write!(
+                    f,
+                    "frame type 0x{kind:02x} is not AMQP (0x00) or SASL (0x01)"
+                )
+            }
+            Self::NotAProtocolHeader => f.write_str("eight octets not beginning with AMQP"),
+            Self::UnknownProtocolId(id) => {
+                write!(f, "protocol id {id} is not AMQP (0), TLS (2) or SASL (3)")
+            }
         }
     }
 }
@@ -266,7 +353,7 @@ pub enum EncodeError {
         found: u8,
     },
 
-    /// A value whose length exceeds the restriction its type carries.
+    /// A value outside the restriction its type carries.
     RestrictionViolated {
         /// The restricted type, as the specification names it.
         restriction: &'static str,
@@ -274,6 +361,28 @@ pub enum EncodeError {
         value: u64,
         /// The largest value the restriction permits.
         limit: u64,
+    },
+
+    /// A mandatory field left unset by the caller. Caught here rather than on
+    /// the wire, because a peer's answer to a missing mandatory field is to
+    /// close the connection.
+    MissingMandatoryField {
+        /// The composite type, as the specification names it.
+        composite: &'static str,
+        /// The field, as the specification names it.
+        field: &'static str,
+    },
+
+    /// A frame larger than the partner said it would accept.
+    ///
+    /// Part 2 §2.7.1: "a peer MUST NOT send frames larger than its partner
+    /// can handle", and the partner's answer is
+    /// `amqp:connection:framing-error`. Refused before the octets leave.
+    FrameTooLarge {
+        /// The whole frame, header included.
+        size: usize,
+        /// What the partner advertised.
+        max: u32,
     },
 }
 
@@ -295,6 +404,12 @@ impl fmt::Display for EncodeError {
                 value,
                 limit,
             } => write!(f, "{restriction} bounds {value} at {limit}"),
+            Self::MissingMandatoryField { composite, field } => {
+                write!(f, "{composite} requires {field}")
+            }
+            Self::FrameTooLarge { size, max } => {
+                write!(f, "a {size}-octet frame is above the agreed {max}")
+            }
         }
     }
 }
@@ -319,6 +434,13 @@ mod tests {
         assert!(!DecodeError::Incomplete { needed: 3 }.is_violation());
         assert!(DecodeError::UnknownFormatCode(0x57).is_violation());
         assert!(DecodeError::DepthExceeded { cap: 8 }.is_violation());
+        assert!(
+            DecodeError::FrameTooLarge {
+                size: 4096,
+                max: 512
+            }
+            .is_violation()
+        );
     }
 
     #[test]
@@ -334,6 +456,14 @@ mod tests {
         assert_eq!(
             DecodeError::UnknownFormatCode(0x57).to_string(),
             "format code 0x57 is not implemented"
+        );
+        assert_eq!(
+            DecodeError::FrameTooLarge {
+                size: 131_072,
+                max: 512
+            }
+            .to_string(),
+            "a frame declared 131072 octets, above the agreed 512"
         );
     }
 }
