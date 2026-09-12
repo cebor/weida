@@ -2355,7 +2355,9 @@ name = "weida-mqtt"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "rcgen",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "weida-core",
  "weida-mqtt-codec",
