@@ -66,6 +66,11 @@
 //! - [`SocketOptions`] — every option under NNG's own name, honoured or
 //!   refused where it is set, plus the three bounds SP leaves open and this
 //!   library closes.
+//! - [`SpSession`] — the protocol itself over one connection: the 8-octet
+//!   header out before anything arrives, the peer's read and its endpoint
+//!   type checked against the pairing rule before any traffic, a refusal
+//!   that is a close and nothing else, and `weida-sp`'s 64-bit framing in
+//!   both directions.
 //!
 //! # Sources
 //!
@@ -84,6 +89,7 @@ pub mod message;
 pub mod options;
 pub mod pipe;
 pub mod protocol;
+pub mod session;
 pub mod transport;
 
 pub use context::{
@@ -108,4 +114,5 @@ pub use pipe::{
 };
 pub use pipe::{Discarded, Pipe, PipeConfig};
 pub use protocol::{PROTOCOLS, Protocol, protocol};
+pub use session::SpSession;
 pub use transport::Stream;
