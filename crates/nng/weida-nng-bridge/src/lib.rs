@@ -1,10 +1,13 @@
 //! Bridges foreign nanomsg/NNG SP peers onto weida endpoints.
 //!
-//! This is Phase B slice 2 of `docs/adapters/nng.md`: the **inbound**
-//! direction, where SP peers speak the TCP mapping to the bridge and the
-//! bridge speaks weida onward. The codec it drives is [`weida_sp`], which has
-//! no I/O and no weida dependency; everything protocol-shaped is decided
-//! there and everything here is the hop.
+//! This is the forwarder of
+//! [0013](https://github.com/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! §4.5: **configuration plus mapping plus refusal, and no protocol**. The
+//! SP side is `weida-nng`'s sockets — the protocol header, the pairing
+//! check, the 64-bit framing, the REQ tag stack, the pipe ceiling and the
+//! local prefix match are all theirs — and the weida side is `weida`'s
+//! patterns. What is left in this crate is which socket type faces which
+//! weida pattern, what the bridge will hold, and what it refuses.
 //!
 //! # A hop, not a tunnel
 //!
@@ -99,19 +102,24 @@
 //!
 //! # What is not here
 //!
-//! The interop bench against a real NNG peer is slice 5
-//! (`docs/adapters/nng.md` §10). Everything in this crate is tested against
-//! an SP peer built on [`weida_sp`] itself: byte-exact against the golden
-//! vectors of §10.1, and therefore faithful on the wire - and not an
-//! independent implementation, which is exactly why §10's `nng` run is still
-//! owed.
+//! **SP itself.** `wire.rs` is gone: the handshake driving, the framing,
+//! the tag-stack bookkeeping and the prefix matching moved into
+//! `weida-nng`, where they are a library's behaviour rather than a
+//! bridge's private code (0013 §5.2). `max_message_bytes` is
+//! `NNG_OPT_RECVMAXSZ` on the socket, `max_hops` is `NNG_OPT_MAXTTL`, and
+//! `max_connections` is the socket's pipe ceiling; this crate keeps its own
+//! weida-side cap, which is the same number applied where a weida payload
+//! is buffered whole.
+//!
+//! **The interop bench** is `weida-nng`'s, against the vendored C library,
+//! and it runs there rather than here: a bridge test against a peer built
+//! from the same codec would only ever agree with itself.
 
 #![warn(missing_docs)]
 
 mod error;
 mod inbound;
 mod outbound;
-mod wire;
 
 pub use error::BridgeError;
 pub use inbound::{Inbound, InboundConfig, Presenting};

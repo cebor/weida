@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use weida_nng::{Context, ContextConfig, Error, PullSocket, PushSocket, SocketOptions};
+use weida_sp::header::{EndpointType, HEADER_LEN, ProtocolHeader};
+use weida_sp::message;
 
 fn options() -> SocketOptions {
     SocketOptions {
@@ -247,4 +250,47 @@ async fn a_send_after_the_last_puller_leaves_waits_rather_than_discarding() {
         matches!(err, Error::ETIMEDOUT(_)),
         "a PUSH never discards; it waits and then times out: {err:?}"
     );
+}
+
+/// Claim: a message that crossed the wire is delivered even when the peer
+/// closes immediately behind it.
+///
+/// NNG holds received messages in the socket's own receive buffer, not in
+/// the pipe (§5), so losing the pipe does not lose them. Without that a
+/// REP peer that answers and hangs up - which is every short-lived
+/// responder - would have its answer thrown away in the race between the
+/// last read and the close. The peer is driven by hand because the point
+/// is the ordering: the whole message, then the close, with nothing in
+/// between that could be mistaken for linger.
+#[tokio::test]
+async fn a_message_survives_the_sender_closing_right_behind_it() {
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    let pull = PullSocket::with_options(&ctx, options()).expect("pull");
+    let url = pull
+        .listen("tcp://127.0.0.1:0")
+        .await
+        .expect("listen")
+        .url()
+        .to_string();
+    let addr = url.trim_start_matches("tcp://").to_owned();
+
+    let mut peer = tokio::net::TcpStream::connect(&addr)
+        .await
+        .expect("connect");
+    peer.write_all(&ProtocolHeader::new(EndpointType::Push).encode())
+        .await
+        .expect("our header");
+    let mut theirs = [0u8; HEADER_LEN];
+    peer.read_exact(&mut theirs).await.expect("their header");
+    peer.write_all(&message::encode(b"last words"))
+        .await
+        .expect("the message");
+    peer.shutdown().await.expect("close");
+    drop(peer);
+
+    let received = pull
+        .recv()
+        .await
+        .expect("the message arrived before the close");
+    assert_eq!(received.body(), b"last words");
 }

@@ -5,14 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-# A separate crate from `weida-sp` on purpose: that one depends on nothing at
-# all, which is what lets its codec be checked against the SP RFCs rather than
-# against weida's reading of them (`docs/ARCHITECTURE.md` §4). A bridge is the
-# other half - it necessarily depends on both sides - so it gets its own crate
-# instead of a feature that would put a weida dependency in the codec's
-# manifest.
+# A forwarder necessarily depends on both sides: `weida` for the patterns
+# and `weida-nng` for the SP sockets. It depends on `weida-sp` too, but only
+# for the tag stack and the endpoint-type names its configuration surface
+# speaks in - the parsing is the library's
+# (`docs/decisions/0013-competitor-libraries.md` §5.2).
 [dependencies]
 weida.workspace = true
+weida-nng.workspace = true
 weida-sp.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "macros", "time"] }
 tracing.workspace = true

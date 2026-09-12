@@ -2366,6 +2366,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "weida",
+ "weida-nng",
  "weida-sp",
 ]
 

@@ -49,6 +49,7 @@ use weida_sp::EndpointType;
 use crate::context::{Context, SocketSlot};
 use crate::endpoint::{Endpoint, TcpHost};
 use crate::error::{Cause, Error, Result};
+use crate::message::Message;
 use crate::options::{EndpointOptions, SocketOptions};
 use crate::pipe::{Discarded, Pipe, PipeId};
 use crate::transport::Stream;
@@ -315,9 +316,17 @@ struct EngineInner {
     session: Arc<dyn Session>,
     notify: Mutex<Option<PipeCallback>>,
     state: Mutex<EngineState>,
-    /// Woken whenever the admitted pipe set changes, so a socket waiting for
-    /// a peer does not poll.
+    /// Woken whenever the admitted pipe set changes, so a socket waiting
+    /// for a peer does not poll.
     changed: Notify,
+    /// Messages that arrived on a pipe which has since been retired.
+    ///
+    /// The socket's own receive buffer, in miniature and only for the one
+    /// case that needs it: a peer that answers and then closes. Bounded by
+    /// what its pipes' queues could hold, which is `max_pipes ×
+    /// NNG_OPT_RECVBUF` and therefore already bounded
+    /// (`docs/INVARIANTS.md`).
+    leftovers: Mutex<std::collections::VecDeque<(PipeId, Message)>>,
     /// Holds this socket's slot under its context's ceiling for as long as
     /// the engine lives.
     slot: SocketSlot,
@@ -372,6 +381,7 @@ impl Engine {
                     closed: false,
                 }),
                 changed: Notify::new(),
+                leftovers: Mutex::new(std::collections::VecDeque::new()),
                 slot,
                 inproc: Arc::clone(context.inproc()),
             }),
@@ -759,12 +769,52 @@ impl Engine {
     fn retire(&self, id: PipeId) {
         let entry = self.lock().pipes.remove(&id);
         if let Some(entry) = entry {
+            // What already arrived is not lost with the pipe. NNG keeps
+            // received messages in the socket's own receive buffer rather
+            // than in the pipe, so a peer that replies and then closes —
+            // which is what a REP socket answering its last request does —
+            // has its answer delivered. Only what was still queued *for*
+            // the peer goes, because that never left (§1).
+            let mut arrived = Vec::new();
+            while let Ok(message) = entry.pipe.incoming().try_recv() {
+                arrived.push(message);
+            }
             entry.pipe.close();
+            if !arrived.is_empty() {
+                let mut leftovers = self.inner.leftovers.lock().expect("leftovers poisoned");
+                for message in arrived {
+                    leftovers.push_back((id, message));
+                }
+            }
             if entry.admitted {
                 self.fire(PipeEvent::RemPost, &entry.info);
                 self.inner.changed.notify_waiters();
             }
         }
+    }
+
+    /// The next message that arrived on a pipe which has since been
+    /// retired, if any.
+    ///
+    /// A socket takes from here before it looks at its pipes: a message
+    /// that crossed the wire has arrived, and the peer closing afterwards
+    /// does not un-arrive it.
+    pub fn take_arrived(&self) -> Option<(PipeId, Message)> {
+        self.inner
+            .leftovers
+            .lock()
+            .expect("leftovers poisoned")
+            .pop_front()
+    }
+
+    /// Whether any message is waiting from a pipe that has been retired.
+    pub fn has_arrived(&self) -> bool {
+        !self
+            .inner
+            .leftovers
+            .lock()
+            .expect("leftovers poisoned")
+            .is_empty()
     }
 
     fn lock(&self) -> MutexGuard<'_, EngineState> {
