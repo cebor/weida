@@ -208,6 +208,13 @@ pub struct PySession {
     inner: Session,
 }
 
+impl PySession {
+    /// The library's session, as the blocking surface takes it.
+    pub fn inner(&self) -> &Session {
+        &self.inner
+    }
+}
+
 #[pymethods]
 impl PySession {
     /// A fresh session for `client_id`.

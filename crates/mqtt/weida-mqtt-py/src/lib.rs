@@ -48,8 +48,13 @@
 //! blocks the event loop and nothing holds the GIL while waiting. A cancelled
 //! task cancels the Rust future underneath — and for a publish that means the
 //! *caller* stops waiting while the exchange, which is session state, survives
-//! to be retransmitted on the next connection. That asymmetry is the protocol's
-//! and not this binding's. The synchronous surface is B-152.
+//! to be retransmitted on the next connection. That asymmetry is the
+//! protocol's and not this binding's.
+//!
+//! **`weida_mqtt.sync` is the same client without a loop** — see [`sync`],
+//! which is a facade over the library's own `blocking` module and implements
+//! no protocol behaviour of its own. Its one difference is where it has to be:
+//! a receive deadline, because a blocking caller has no task to cancel.
 //!
 //! # Errors
 //!
@@ -92,6 +97,7 @@ use pyo3::prelude::*;
 mod client;
 mod errors;
 mod options;
+mod sync;
 mod values;
 
 /// `weida_mqtt`, as Python sees it.
@@ -108,6 +114,7 @@ fn weida_mqtt(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<values::PyDelivery>()?;
     module.add_class::<values::PySubscription>()?;
     module.add_class::<values::PyCompletion>()?;
+    sync::install(module)?;
 
     // The two DISCONNECT codes a client sends, named rather than left as
     // magic numbers at every call site: 0x00 discards the Will

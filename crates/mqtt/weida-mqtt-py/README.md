@@ -73,6 +73,52 @@ asyncio.run(main())
   `SessionPresentWithoutState`. The answer is `clean_start=True`. That is a
   cost of MQTT's session model rather than of this binding.
 
+## Without an event loop
+
+`weida_mqtt.sync` is the same client for a program with no asyncio loop at
+all:
+
+```python
+import weida_mqtt
+from weida_mqtt import sync
+
+context = sync.Context()
+client, deliveries = context.connect(
+    "127.0.0.1:1883", weida_mqtt.ConnectOptions("sync-1")
+)
+client.subscribe([weida_mqtt.Subscription("room/+", 1)])
+client.publish(weida_mqtt.Message("room/12", b"21.5", qos=2))
+
+# Where the asynchronous surface has cancellation, this has a deadline.
+delivery = deliveries.recv(timeout=5.0)
+print(delivery.topic, delivery.payload)
+
+for delivery in deliveries:      # an ordinary Python iterator
+    print(delivery.topic)
+    break
+
+client.disconnect()
+```
+
+Three things about it:
+
+* **It implements nothing.** It is a facade over the Rust library's own
+  `blocking` module, which is a `block_on` around each asynchronous method.
+  The QoS state machines, the session, the send quota, the topic aliases, the
+  keep-alive timer and every refusal are decided once, in the asynchronous
+  client, so the two surfaces cannot disagree. `Message`, `Subscription`,
+  `ConnectOptions`, `Session`, `Delivery` and `Completion` are the **same
+  classes** in both.
+* **The GIL is released while blocked**, so one thread waiting in `recv` does
+  not stop another. That is what makes the usual shape — one thread
+  publishing, one consuming — work.
+* **`publish` has no timeout**, deliberately. A publish abandoned
+  mid-exchange is still session state on both sides, so a deadline there would
+  return control while the exchange continued; the asynchronous surface's
+  cancellation does exactly that and is honest about it, and an argument named
+  `timeout` would not be. A caller who wants it runs the publish on its own
+  thread.
+
 ## Building and testing it
 
 ```sh
