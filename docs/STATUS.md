@@ -30,20 +30,38 @@ notes (0001–0014), all
 Reading it: **Phase A is complete** except named pipes (A9), blocked on a Windows runner
 rather than on a design. The control-connection tier (A5) is not a gap: decision 0011 parks
 it with a revival condition, because no existing or reserved frame is peer-scoped. The last
-open question in it, what a
-local `open` does at its ceiling, is answered: it **waits for a slot**, so `Block` means the
-same thing on every transport (B-059). **Phase B's first protocol is complete as a library**:
-`weida-zmq` is [decision 0013](decisions/0013-competitor-libraries.md)'s definition of done,
-all twenty-six items B-070..B-095 merged — eleven socket types against `zmq_socket(3)`'s twenty
-rows, three transports, NULL/PLAIN/CURVE with the ZAP dialog, a 98-row option table decided
-row by row, the monitor and the devices, a non-default blocking facade, nine zguide recipes,
-interop in both roles against `zeromq` 0.6 and against libzmq 4.3.5, and a parity table where
-every row carries its evidence. The forwarder was rebuilt on it and lost 1352 lines. **B2 has
-its codec, its mapping document and its bridge in both directions** — all interoperating with
-the `nng` C library — and reopens as `weida-nng` under the same six slices; its items are not
-filed yet. MQTT is next among the mapping documents, because it is the first protocol with a
-session and weida deliberately has none.
-Phase C's prerequisite (`Runtime::owned`) exists; its first slice is parked until MQTT.
+open question in it, what a local `open` does at its ceiling, is answered: it **waits for a
+slot**, so `Block` means the same thing on every transport (B-059).
+
+**Phase B is complete across all four slices, and Phase C's Python row with it** — sixty-six
+items of [0014](decisions/0014-parallel-libraries.md) in four parallel workstreams, each
+library the definition of done of
+[0013](decisions/0013-competitor-libraries.md) §4.7 and each binding following its own
+library, asyncio first and synchronous second:
+
+- **B1 ZeroMQ** — `weida-zmq` and `weida-zmq-py`: eleven socket types against
+  `zmq_socket(3)`'s twenty rows, three transports, NULL/PLAIN/CURVE with the ZAP dialog, a
+  98-row option table decided row by row, the monitor, the devices, nine zguide recipes,
+  interop in both roles against libzmq 4.3.5, and a forwarder rebuilt on the library that lost
+  1352 lines.
+- **B2 nanomsg SP** — `weida-nng` and `weida-nng-py`: one socket type per protocol, the
+  endpoint engine, a 48-row option table, TLS and IPC credentials, **eleven interop tests
+  against NNG 1.4.0-rc.0 through the `nng` crate**, and the bridge rebuilt on the library —
+  780 insertions against 731 deletions, which is what a rebuild should look like. That rebuild
+  found two library bugs no unit test had.
+- **B3 MQTT 5** — `weida-mqtt` and `weida-mqtt-py`, a **client**: the server half is Phase D
+  ([0014](decisions/0014-parallel-libraries.md) §2), so its parity table adds a fourth verdict
+  and says why. Interop ran against **two** brokers, `rumqttd` 0.20.0 and `rmqtt` 0.23.1, and
+  measured **six** disagreements with the specification.
+- **B4 AMQP 1.0 and Core NATS** — `weida-amqp`, `weida-nats` and both bindings: nine
+  performatives, both credit schemes, the settle modes and dispositions, interop in both roles
+  against `fe2o3-amqp` 0.17.0 — and NATS interop **written and not run**, because no
+  `nats-server` was reachable, which its parity table records as a clause **not met** rather
+  than rounding up.
+
+What that leaves: **Phase C's Java and Node rows**, untouched and unfiled; **Phase D**, the L2
+broker, which is also where MQTT's and AMQP's server halves live; and the five parity
+documents' own open questions, each named in its document rather than here.
 AMQP 0-9-1 (RabbitMQ) is deliberately not a Phase B adapter: its clients come with the broker (D2), and B4's AMQP 1.0 client already reaches RabbitMQ 4.x.
 
 ## 2. What exists, layer by layer
@@ -107,27 +125,44 @@ other end.
 
 ## 6. What needs a human
 
-One thing, and it is the same one [NIGHTLOG.md](NIGHTLOG.md) leads with:
+Two things, and the second one is new:
 
 1. **B-039, named pipes.** Blocked on a Windows runner by the loop's judgement: code the gate
    cannot compile is code nobody verified. Decision 0012 already covers its shape. A Windows
    route is being prepared outside this tree; `wine` here is a possible later smoke-test path
    and not a substitute for a runner.
+2. **B-184, the gate's doc step, needs a change to [LOOP.md](LOOP.md) §6 that only you make.**
+   The loop does not edit its own standing instructions. Two holes, both paid for tonight: the
+   gate runs no per-crate `--no-default-features` rustdoc, so an intra-doc link to a
+   `#[cfg(feature = ...)]` item is a hard error **only** in the configuration nobody runs —
+   one such link shipped in B-147 and another in B-165, and each survived three or four merges
+   invisibly; and the doc step can run against a stale target, which is why a worker's own
+   green run was silent on a break that was really there. The item names the commands; adding
+   them to §6 is the part that is yours.
 
 ## 7. Where the loop stands
 
-- **Paused, not stopped, and nothing is in flight.** Every branch of the session is merged —
-  the last was `b095-crate-move` as `bcdfdff` — the gate is green at 764 tests with one
-  ignored, and the tree is clean. No worktree holds unmerged work.
-- **14 items are `ready`, one is `blocked`** (B-039, named pipes, §6) and **two are `parked`**
-  (A5's control tier by 0011 §4.3, the Python binding by your decision until MQTT).
-- Resuming is one instruction, and the choice is yours: **`weida-nng` as a library**, which is
-  B2's half of [decision 0013](decisions/0013-competitor-libraries.md) and needs its items
-  filed first — the ZeroMQ line is the template, twenty-six items in one day — or **B-062, the
-  MQTT mapping document**, which is the one that moves the roadmap, because MQTT is the first
-  protocol with a session and weida deliberately has none.
-- Five small items are ready and would cost under two hours together: B-104 (write the
-  pipe-pairing diagnosis where somebody would try it again), B-106 (a regression test for the
-  `Queue` lost wakeup that landed without one), B-107 (one sentence so LOOP §6's gate compiles
-  the non-default `blocking` feature), B-109 (the codec's `MESSAGE` encoder still frames a
-  command) and B-110 (the interop port probe races).
+- **Nothing is in flight and every branch is merged.** The four workstreams of
+  [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
+  commits** since `184e439`, checked branch by branch rather than taken on report — the gate is green at
+  **1678 tests** with 37 ignored, and the tree is clean. The tree has **no known red**, in any
+  configuration, including the four that are not in the gate yet.
+- **22 items are `ready`, one is `blocked`** (B-039, §6) and **one is `parked`** (A5's control
+  tier by 0011 §4.3). Of 187 filed items, 163 are `done`.
+- **The six the night left behind**, all filed with their evidence: **B-184** (the gate change
+  above, §6), **B-182** (an NNG survey test asserts an exact count it only waited for
+  approximately — a real flake, whose workstream is gone, so it has no owner), **B-180** (the
+  same shape in `weida`'s drain test), **B-183** and **B-185** (`weida-nng-py` and
+  `weida-mqtt-py` have no parity document, while the library index's "Planned:" line names
+  both — the other two bindings have theirs), and **B-176** (the adapters index still says
+  "bridges next" about bridges that exist).
+- **The older loose ends**, unchanged by tonight: B-060, B-061, B-064..B-068 (requirement-driven
+  work), B-096 and B-099 (a byte ceiling for the per-peer queues and the peer count that is
+  its other half), B-104, B-106, B-107, B-109, B-110 (five small ones, under two hours
+  together), and B-177, B-178, B-179 (found by W1 and W2 from inside the libraries: concurrent
+  send and receive on one `weida-zmq` socket, a device whose end cannot receive, and an
+  operation that does not wait still costing a loop wakeup).
+- **What moves the roadmap next** is yours to choose: **Phase D**, the L2 broker, which is also
+  where MQTT's and AMQP's server halves live and where the credit of 0003 gets a consumer on
+  both ends; or **Phase C's Java row**, now that the Python row is four bindings wide and
+  `weida-py-core` has proved the shape a per-language foundation takes.
