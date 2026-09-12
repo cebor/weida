@@ -117,6 +117,7 @@ impl std::fmt::Display for SocketId {
 struct ContextInner {
     config: ContextConfig,
     exec: Exec,
+    inproc: Arc<crate::inproc::Inproc>,
     state: Mutex<State>,
     /// Signalled whenever a socket slot is released, so that `shutdown` can
     /// wait for the last one without polling.
@@ -199,6 +200,7 @@ impl Context {
         Context {
             inner: Arc::new(ContextInner {
                 exec,
+                inproc: Arc::new(crate::inproc::Inproc::new(MAX_INPROC_NAME_BYTES)),
                 state: Mutex::new(State {
                     open: 0,
                     next_id: 1,
@@ -220,6 +222,18 @@ impl Context {
     /// name lookups on.
     pub fn exec(&self) -> &Exec {
         &self.inner.exec
+    }
+
+    /// This context's `inproc://` namespace.
+    ///
+    /// Context-scoped: a name bound in one context is invisible in
+    /// another, which is the only scoping rule an in-process namespace can
+    /// have when the process is not the unit. Names are bounded at
+    /// [`MAX_INPROC_NAME_BYTES`]. Handed out as the shared handle it is,
+    /// because a binding outlives the call that made it and frees its name
+    /// when it is dropped.
+    pub fn inproc(&self) -> &Arc<crate::inproc::Inproc> {
+        &self.inner.inproc
     }
 
     /// The byte budget an `inproc://` name in this context lives under.

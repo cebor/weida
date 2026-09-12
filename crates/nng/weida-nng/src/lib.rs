@@ -115,6 +115,9 @@ pub mod context;
 pub mod endpoint;
 pub mod engine;
 pub mod error;
+pub mod inproc;
+#[cfg(unix)]
+pub mod ipc;
 pub mod message;
 pub mod options;
 pub mod pair;
@@ -163,3 +166,7 @@ pub use session::SpSession;
 pub use socket::{Broadcast, SocketCore};
 pub use survey::{RespondentCtx, RespondentSocket, SurveyorCtx, SurveyorSocket};
 pub use transport::Stream;
+
+pub use inproc::{INPROC_BUFFER_BYTES, Inproc, InprocBinding, InprocDial};
+#[cfg(unix)]
+pub use ipc::IpcBinding;

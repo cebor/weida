@@ -164,6 +164,17 @@ pub struct PipeInfo {
     pub local_addr: Option<String>,
     /// `NNG_OPT_REMADDR`: the peer's address, where the transport has one.
     pub remote_addr: Option<String>,
+    /// What the kernel said about the peer, for the transport where that
+    /// question has an answer.
+    ///
+    /// `Some` only for `ipc://`: "IPC can expose OS-derived peer UID, GID,
+    /// PID" and the UID and GID "are described as non-forgeable at
+    /// connection time" (§10). This is where "local authorization logic"
+    /// reads them — a pipe-add-pre callback may refuse the pipe on them,
+    /// "application policy, not SP authorization" (§10) — and the PID is
+    /// an observation that must not be authorized on
+    /// ([0010](../../../docs/decisions/0010-local-transport.md) §4.4).
+    pub credentials: Option<weida_core::LocalPrincipal>,
 }
 
 /// A callback's answer to [`PipeEvent::AddPre`].
@@ -302,7 +313,10 @@ struct EngineInner {
     changed: Notify,
     /// Holds this socket's slot under its context's ceiling for as long as
     /// the engine lives.
-    _slot: SocketSlot,
+    slot: SocketSlot,
+    /// This context's `inproc://` namespace, so that a socket can bind and
+    /// dial a name in it.
+    inproc: Arc<crate::inproc::Inproc>,
 }
 
 /// The transport-facing half of a socket: what dials, listens, reconnects
@@ -348,7 +362,8 @@ impl Engine {
                     closed: false,
                 }),
                 changed: Notify::new(),
-                _slot: slot,
+                slot,
+                inproc: Arc::clone(context.inproc()),
             }),
         })
     }
@@ -466,8 +481,8 @@ impl Engine {
         if self.is_closed() {
             return Err(closed());
         }
-        let listener = bind(endpoint).await?;
-        let bound = bound_endpoint(endpoint, &listener)?;
+        let listener = bind(self, endpoint).await?;
+        let bound = listener.bound_endpoint(endpoint)?;
         let id = {
             let mut state = self.lock();
             if state.closed {
@@ -644,6 +659,7 @@ impl Engine {
                     peer: None,
                     local_addr: stream.local_addr(),
                     remote_addr: stream.remote_addr(),
+                    credentials: stream.peer_credentials(),
                 },
                 admitted: false,
                 dialer,
@@ -746,7 +762,7 @@ async fn dialer_loop(
         if ctx.engine.is_closed() {
             return;
         }
-        let outcome = match connect(ctx.engine.exec(), &endpoint, &ctx.engine.inner.options).await {
+        let outcome = match connect(&ctx.engine, &endpoint).await {
             Ok(stream) => {
                 run_pipe(
                     &ctx,
@@ -789,12 +805,16 @@ async fn dialer_loop(
 
 /// Accepts connections on one listening endpoint. There is no accept call in
 /// SP's API: a listener accepts automatically (§1).
-async fn accept_loop(ctx: TaskCtx, listener: TcpListener, id: ListenerId, endpoint: Endpoint) {
+async fn accept_loop(ctx: TaskCtx, listener: Bound, id: ListenerId, endpoint: Endpoint) {
+    let mut listener = listener;
     loop {
         let accepted = match listener.accept().await {
-            Ok((stream, _)) => Stream::tcp(stream),
+            Ok(stream) => stream,
             Err(error) => {
                 tracing::debug!(%endpoint, %error, "SP listener could not accept");
+                if listener.is_finished() {
+                    return;
+                }
                 continue;
             }
         };
@@ -843,7 +863,15 @@ async fn run_pipe(
         role,
         endpoint: endpoint.clone(),
         protocol: ctx.engine.protocol(),
-        recv_max_size: ctx.engine.inner.options.recv_max_size,
+        recv_max_size: if endpoint.enforces_recv_max_size() {
+            ctx.engine.inner.options.recv_max_size
+        } else {
+            // "`inproc` accepts but deliberately ignores `RECVMAXSZ`,
+            // because peers share an address space" (§3). The option is
+            // taken and honoured on every other transport rather than
+            // refused here, which is NNG's own behaviour.
+            crate::message::RECV_MAX_SIZE_UNLIMITED
+        },
         handshake: HandshakeGate { done: Some(done) },
     };
     let mut session = ctx.engine.inner.session.start(connection);
@@ -902,11 +930,12 @@ async fn run_pipe(
 }
 
 /// One connect attempt against one endpoint.
-async fn connect(exec: &Exec, endpoint: &Endpoint, options: &SocketOptions) -> Result<Stream> {
+async fn connect(engine: &Engine, endpoint: &Endpoint) -> Result<Stream> {
+    let options = &engine.inner.options;
     match endpoint {
         Endpoint::Tcp { host, port } => {
             let mut last = Error::EADDRINVAL("no address to dial".into());
-            for addr in addresses(exec, host, *port, options.max_addresses).await? {
+            for addr in addresses(&engine.inner.exec, host, *port, options.max_addresses).await? {
                 match TcpStream::connect(addr).await {
                     Ok(stream) => return Ok(Stream::tcp(stream)),
                     Err(error) => last = Error::from(error),
@@ -914,12 +943,87 @@ async fn connect(exec: &Exec, endpoint: &Endpoint, options: &SocketOptions) -> R
             }
             Err(last)
         }
+        Endpoint::Inproc(name) => {
+            // NNG's inproc dialer retries rather than failing outright, so
+            // a dial to a name nobody holds waits for the bind. The wait is
+            // on a `Notify`, so a dial nobody ever answers costs nothing.
+            engine.inner.inproc.wait_until_bound(name).await;
+            engine
+                .inner
+                .inproc
+                .dial(name, engine.inner.slot.id())
+                .ok_or_else(|| {
+                    Error::ECONNREFUSED(
+                        format!("inproc://{name} was unbound again before the dial landed").into(),
+                    )
+                })
+        }
+        #[cfg(unix)]
+        Endpoint::Ipc(path) => {
+            let stream = crate::ipc::dial(path).await?;
+            // The kernel's answer is taken now, because now is when it is
+            // about the process that connected.
+            let principal = crate::ipc::credentials(&stream)?;
+            Ok(Stream::unix(stream, principal))
+        }
         other => Err(unsupported(other)),
     }
 }
 
+/// One listening endpoint, whichever transport it is on.
+enum Bound {
+    Tcp(TcpListener),
+    Inproc(crate::inproc::InprocBinding),
+    #[cfg(unix)]
+    Ipc(crate::ipc::IpcBinding),
+}
+
+impl Bound {
+    /// The next connection, with its credentials where the transport has
+    /// any.
+    async fn accept(&mut self) -> Result<Stream> {
+        match self {
+            Bound::Tcp(listener) => {
+                let (stream, _) = listener.accept().await.map_err(Error::from)?;
+                Ok(Stream::tcp(stream))
+            }
+            Bound::Inproc(binding) => match binding.accept().await {
+                Some(dial) => Ok(dial.stream),
+                None => Err(Error::ECLOSED("the inproc name was released".into())),
+            },
+            #[cfg(unix)]
+            Bound::Ipc(binding) => {
+                let (stream, principal) = binding.accept().await?;
+                Ok(Stream::unix(stream, principal))
+            }
+        }
+    }
+
+    /// Whether accepting will never succeed again, so the loop should stop
+    /// rather than spin. Only the in-process namespace can say so: a
+    /// socket listener's accept error is per-connection.
+    const fn is_finished(&self) -> bool {
+        matches!(self, Bound::Inproc(_))
+    }
+
+    /// The endpoint actually bound, which for a wildcard port is the only
+    /// way to learn the port.
+    fn bound_endpoint(&self, requested: &Endpoint) -> Result<Endpoint> {
+        match (self, requested) {
+            (Bound::Tcp(listener), Endpoint::Tcp { host, .. }) => {
+                let local = listener.local_addr().map_err(Error::from)?;
+                Ok(Endpoint::Tcp {
+                    host: host.clone(),
+                    port: local.port(),
+                })
+            }
+            _ => Ok(requested.clone()),
+        }
+    }
+}
+
 /// Binds one endpoint.
-async fn bind(endpoint: &Endpoint) -> Result<TcpListener> {
+async fn bind(engine: &Engine, endpoint: &Endpoint) -> Result<Bound> {
     match endpoint {
         Endpoint::Tcp { host, port } => {
             let addr = match host {
@@ -944,20 +1048,15 @@ async fn bind(endpoint: &Endpoint) -> Result<TcpListener> {
                     SocketAddr::new(ip, *port)
                 }
             };
-            TcpListener::bind(addr).await.map_err(Error::from)
+            TcpListener::bind(addr)
+                .await
+                .map(Bound::Tcp)
+                .map_err(Error::from)
         }
+        Endpoint::Inproc(name) => engine.inner.inproc.bind(name).map(Bound::Inproc),
+        #[cfg(unix)]
+        Endpoint::Ipc(path) => crate::ipc::IpcBinding::bind(path).map(Bound::Ipc),
         other => Err(unsupported(other)),
-    }
-}
-
-fn bound_endpoint(requested: &Endpoint, listener: &TcpListener) -> Result<Endpoint> {
-    let local = listener.local_addr().map_err(Error::from)?;
-    match requested {
-        Endpoint::Tcp { host, .. } => Ok(Endpoint::Tcp {
-            host: host.clone(),
-            port: local.port(),
-        }),
-        other => Ok(other.clone()),
     }
 }
 
@@ -1342,16 +1441,27 @@ mod tests {
     /// Claim: a transport this engine does not carry is refused by name
     /// rather than accepted and quietly dropped, because SP's only way to
     /// refuse anything is a close and a silent one is a hang (§6).
+    ///
+    /// `tls+tcp` parses — a URL is not a capability — and is refused here
+    /// until the slice that carries it lands.
     #[tokio::test]
     async fn an_uncarried_transport_is_refused_by_name() {
         let ctx = Context::new(ContextConfig::default()).expect("context");
         let seen = counter();
         let socket = engine(&ctx, EndpointType::Bus, SocketOptions::default(), &seen);
         let error = socket
-            .listen(&Endpoint::parse("inproc://orders").unwrap())
+            .listen(&Endpoint::parse("tls+tcp://127.0.0.1:0").unwrap())
             .await
             .unwrap_err();
         assert!(matches!(error, Error::ENOTSUP(_)), "{error:?}");
-        assert!(error.cause().contains("inproc"));
+        assert!(error.cause().contains("tls+tcp"));
+
+        // And the two that are now carried are not refused.
+        assert!(
+            socket
+                .listen(&Endpoint::parse("inproc://orders").unwrap())
+                .await
+                .is_ok()
+        );
     }
 }
