@@ -39,8 +39,18 @@ use weida_nats_codec::error::{DecodeError, EncodeError};
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Why a NATS operation failed.
+///
+/// **Exhaustive on purpose**, as `weida-zmq`'s own error enum is. A
+/// `#[non_exhaustive]` enum forces every downstream `match` to carry a
+/// wildcard arm, and the one
+/// downstream that must not have one is a language binding: `weida-nats-py`
+/// writes its exception-class list and its name lookup from a single macro so
+/// that a variant added here and not added there is a *compile* error rather
+/// than a failure that silently arrives as the base class. Keeping this enum
+/// closed is what buys that check; the cost is that adding a variant is a
+/// breaking change, which is the honest description of adding a failure a
+/// caller may have to handle.
 #[derive(Debug)]
-#[non_exhaustive]
 pub enum Error {
     /// The transport failed: a refused connect, a reset, a closed socket.
     Io(io::Error),

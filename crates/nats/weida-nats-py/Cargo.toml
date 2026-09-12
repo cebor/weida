@@ -1,0 +1,69 @@
+[package]
+name = "weida-nats-py"
+description = "The Python binding of weida-nats: asyncio Core NATS on the Rust implementation, with the library's error vocabulary as exception classes"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+# The Python module is `weida_nats` — that is what `#[pymodule] fn weida_nats`
+# and therefore the `PyInit_weida_nats` symbol say, and what `module-name` in
+# pyproject.toml names the file maturin writes into the wheel. The *crate*
+# cannot be called that as well: rustdoc writes one directory per lib name and
+# `weida-nats` already owns `weida_nats`, so `cargo doc --workspace` would
+# refuse the collision.
+name = "weida_nats_py"
+crate-type = ["cdylib"]
+# A cdylib has no rlib for rustdoc to link a doctest against, so the examples
+# in this crate's documentation are Python rather than Rust and are run by
+# `pytest`, not by `cargo test`.
+doctest = false
+
+[dependencies]
+# The shared foundation: exception families, the asyncio bridge, the bytes
+# boundary. Every binding in this workspace sits on it and none re-derives it
+# (`docs/decisions/0014-parallel-libraries.md` §2).
+weida-py-core.workspace = true
+pyo3.workspace = true
+# The library being bound. Nothing of weida is reachable through it, which is
+# the dependency direction 0013 §4.2 fixed.
+#
+# The library's default features, `tls` among them, are inherited unchanged:
+# a workspace dependency cannot be narrowed by one member, and cargo unifies
+# features across the workspace anyway, so turning TLS off here would change
+# nothing but this manifest. What is deliberate is that **no TLS connect is
+# exposed to Python**: `Connection::connect_tls` takes a
+# `rustls::ClientConfig`, and which certificates an application trusts is the
+# application's decision — there is no Python object to hand it today, so
+# offering one here would mean choosing a trust store on the caller's behalf.
+# A server whose `INFO` demands TLS therefore arrives as
+# `weida_nats.TlsRequired`, which is the honest answer rather than a silent
+# plaintext `CONNECT`.
+weida-nats.workspace = true
+# The reactor: `Exec::owned` is what lets a plain Python process with no
+# ambient Tokio runtime open a connection, and `OwnedReactor` is the value
+# that keeps that runtime alive for as long as the connection object.
+weida-runtime.workspace = true
+# One thing: `tokio::sync::Notify`, which is what makes a `Subscription` —
+# whose `next` takes `&mut self` — usable from two coroutines in turn without
+# ever being used by two at once. See `src/lease.rs`.
+tokio.workspace = true
+# `futures::executor::block_on`, and nothing else. It is the executor the
+# synchronous surface drives the library's futures on, on the *calling*
+# thread; see the module documentation of `src/sync.rs` for why it is not the
+# reactor's own `block_on`.
+futures.workspace = true
+
+[features]
+# Off by default, and enabled by maturin through `pyproject.toml`. With it on,
+# the extension does not link libpython — which is right for a wheel and wrong
+# for `cargo test`, because a test binary is an executable and would be left
+# with undefined symbols. Cargo unifies features across a workspace build, so a
+# default-on `extension-module` here would break `cargo test --workspace` for
+# `weida-py-core` as well.
+extension-module = ["pyo3/extension-module"]
+
+[lints.rust]
+# As in `weida-py-core`: PyO3's macros expand to `unsafe impl`s, so `forbid` is
+# not available. No `unsafe` is written by hand in this crate.
+unsafe_code = "allow"

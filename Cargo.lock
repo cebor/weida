@@ -3056,6 +3056,18 @@ name = "weida-nats-codec"
 version = "0.1.0"
 
 [[package]]
+name = "weida-nats-py"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "pyo3",
+ "tokio",
+ "weida-nats",
+ "weida-py-core",
+ "weida-runtime",
+]
+
+[[package]]
 name = "weida-nng"
 version = "0.1.0"
 dependencies = [
