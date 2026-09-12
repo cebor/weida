@@ -202,17 +202,28 @@ replaces. Slices 1, 2 and the bridges already exist for B1 and B2 and are not re
 zero — [0013](decisions/0013-competitor-libraries.md) §5.2 says which code moves where.
 B1 ZeroMQ/ZMTP 3.1: `weida-zmq`, complete to the definition of done of
    [0013](decisions/0013-competitor-libraries.md) §4.7.
-B2 nanomsg/NNG SP: `weida-nng`, the same six slices in the same order.
-B3 MQTT 5, server side first: sessions, QoS 0/1/2, shared subscriptions, retained messages.
-   It stays an adapter rather than a library until Phase D, because an MQTT server is a
-   broker and the broker is Phase D.
-B4 AMQP 1.0 client (link credit onto the L2 credit of 0003), then NATS core client.
+B2 nanomsg/NNG SP: `weida-nng`, the library per
+   [0013](decisions/0013-competitor-libraries.md) on the existing `weida-sp` codec, the same
+   six slices in the same order minus the security slice, because SP defines no message-level
+   authentication, authorization or sender identity.
+B3 MQTT 5 **client**: `weida-mqtt`, the library per
+   [0013](decisions/0013-competitor-libraries.md) on a new sans-I/O `weida-mqtt-codec`. The
+   server side stays out of Phase B, because an MQTT server is a broker and the broker is
+   Phase D.
+B4 AMQP 1.0 client `weida-amqp` (link credit onto the L2 credit of 0003) and NATS core client
+   `weida-nats`, the library per [0013](decisions/0013-competitor-libraries.md) each, on the
+   codecs `weida-amqp-codec` and `weida-nats-codec`.
 After every Phase B slice, one research item: update that protocol's sheet with what the
 implementation taught, or open the next protocol's unknowns.
 
-**Phase C — bindings, after A8.** Python (PyO3; sync and asyncio) first, then Java, then
-Node. Each reuses the interop bench: binding client against the Rust server against a
-foreign adapter, and later binding against binding.
+**Phase C — bindings, one per library, per
+[0014](decisions/0014-parallel-libraries.md).** A binding follows its own library and nothing
+else: the library's interop slice is green, then the binding — **asyncio first, then a sync
+surface** over that library's blocking facade, which is the order that builds the facade once.
+Python (PyO3 plus maturin) first, then Java, then Node; every binding sits on the one shared
+`weida-py-core` (error mapping, the Runtime/Context bridge to asyncio, the `bytes` boundary)
+and no binding re-derives it. Each reuses the interop bench: binding client against the Rust
+server against a foreign adapter, and later binding against binding.
 
 **Phase D — the L2 broker** (master plan Phase 6), only once B1-B3 have green cross-adapter
 tests and the credit of 0003 has a consumer on both ends.
