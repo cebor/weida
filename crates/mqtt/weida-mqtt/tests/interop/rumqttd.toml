@@ -1,0 +1,29 @@
+# rumqttd 0.20.0 for the B-148 interop run.
+#
+# Cut down from `rumqttd generate-config`: one MQTT 5 listener and nothing
+# else. The Prometheus exporter, the console, the websocket listener and the
+# v4 listener are all removed, because a test that binds four ports fails on a
+# machine where any one of them is busy.
+#
+# The ports are deliberately unusual. 1883 and 1884 are where a developer's own
+# broker lives, and an interop test that silently measured against *that* would
+# be the worst possible outcome.
+id = 0
+
+[router]
+id = 0
+max_connections = 64
+max_outgoing_packet_count = 200
+max_segment_size = 1048576
+max_segment_count = 4
+
+[v5.1]
+name = "v5-interop"
+listen = "127.0.0.1:21884"
+next_connection_delay_ms = 1
+    [v5.1.connections]
+    connection_timeout_ms = 60000
+    # Well above anything these tests publish; the point of the run is the
+    # protocol, not the broker's limits.
+    max_payload_size = 65536
+    max_inflight_count = 100
