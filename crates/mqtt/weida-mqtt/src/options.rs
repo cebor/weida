@@ -110,6 +110,16 @@ pub struct ConnectOptions {
     pub authentication_data: Option<Vec<u8>>,
     /// The Will.
     pub will: Option<WillMessage>,
+    /// TLS, where the connection is to run under it. `None` is plain TCP on
+    /// 1883; `Some` is `mqtts` on 8883 and the handshake completes before the
+    /// CONNECT is written.
+    ///
+    /// It is `Option` and not a flag because the configuration *is* the
+    /// decision: there is no default set of trust anchors a messaging library
+    /// could pick that an application should not have had to choose
+    /// ([`crate::TlsOptions`]).
+    #[cfg(feature = "tls")]
+    pub tls: Option<crate::transport::TlsOptions>,
     /// `User Property` pairs, forwarded unaltered and in order.
     pub user_properties: Vec<(String, String)>,
     /// What this client declares about itself, and the two bounds the
@@ -140,6 +150,8 @@ impl Default for ConnectOptions {
             authentication_method: None,
             authentication_data: None,
             will: None,
+            #[cfg(feature = "tls")]
+            tls: None,
             user_properties: Vec::new(),
             limits: Limits::default(),
             connect_timeout: Duration::from_secs(10),
@@ -217,6 +229,19 @@ impl ConnectOptions {
                  ([MQTT-3.1.2-33])"
                     .into(),
             ));
+        }
+        // A `server_name` that is not a DNS name or an IP address can never
+        // validate a certificate, so it is refused here rather than after a
+        // socket has been opened: "refused at configuration time" is the rule
+        // every option in this crate follows.
+        #[cfg(feature = "tls")]
+        if let Some(tls) = &self.tls
+            && let Some(name) = &tls.server_name
+            && tokio_rustls::rustls::pki_types::ServerName::try_from(name.clone()).is_err()
+        {
+            return Err(Error::Configuration(format!(
+                "{name} is not a valid server name to validate a certificate against"
+            )));
         }
         check_interval("session_expiry", self.session_expiry)?;
         if let Some(will) = &self.will {

@@ -21,10 +21,27 @@ weida-mqtt-codec.workspace = true
 # keep-alive loop nobody can debug.
 tracing.workspace = true
 
+# TLS on 8883. Optional, because MQTT on 1883 is a complete protocol and a
+# client that only ever speaks to a broker on a trusted local network has no
+# business linking a TLS stack. The trust anchors are **not** here:
+# `TlsOptions` takes the caller's `rustls::ClientConfig`, because which
+# certificates an application trusts is the application's decision and not a
+# messaging library's (5.4.3).
+tokio-rustls = { workspace = true, optional = true }
+
 [dev-dependencies]
 # Drives the owned-context tests from an executor that is not tokio, which is
 # what `Context::owned` exists for.
 futures.workspace = true
+# A certificate for the TLS tests. The trust anchors are the caller's
+# everywhere else; here the test is the caller.
+rcgen.workspace = true
+
+[features]
+default = ["tls"]
+# `mqtts` on 8883: the TLS handshake completed before the CONNECT is written,
+# which is what makes the credentials in it worth sending.
+tls = ["dep:tokio-rustls"]
 
 [lints.rust]
 unsafe_code = "forbid"

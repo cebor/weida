@@ -34,6 +34,7 @@ use weida_runtime::Exec;
 use crate::error::{Error, Result};
 use crate::limits::{Limits, ServerLimits};
 use crate::options::{ConnectOptions, interval_seconds};
+use crate::transport::Stream;
 
 /// Bytes to ask the socket for at a time. Not a bound on anything: the bound
 /// is `Maximum Packet Size`, applied by the codec from the fixed header.
@@ -77,7 +78,7 @@ impl Authenticator for NoAuthenticator {
 
 /// The read half, with the receive buffer.
 pub(crate) struct Reader {
-    half: ReadHalf<TcpStream>,
+    half: ReadHalf<Stream>,
     buf: Vec<u8>,
     /// Bytes of `buf` the last [`Reader::next`] handed out, dropped at the
     /// start of the next call. Deferring the compaction is what lets the
@@ -136,7 +137,7 @@ impl Reader {
 
 /// The write half, with the encode buffer and the server's size ceiling.
 pub(crate) struct Writer {
-    half: WriteHalf<TcpStream>,
+    half: WriteHalf<Stream>,
     buf: Vec<u8>,
     /// The server's `Maximum Packet Size`, or the encoding's ceiling where it
     /// declared none. "The Client MUST NOT send packets exceeding Maximum
@@ -176,6 +177,9 @@ pub(crate) struct Handshake {
     pub(crate) session_present: bool,
     pub(crate) keep_alive: Option<Duration>,
     pub(crate) client_id: String,
+    /// Whether the transport is encrypted, so a caller can ask what its
+    /// credentials travelled over.
+    pub(crate) encrypted: bool,
 }
 
 /// Dials `address`, sends CONNECT, and awaits CONNACK.
@@ -203,8 +207,22 @@ pub(crate) async fn handshake(
 ) -> Result<Handshake> {
     options.validate()?;
 
-    let stream = dial(exec, address, options).await?;
-    stream.set_nodelay(true)?;
+    // Only TLS needs the host: it is what the certificate is validated
+    // against where the caller named no other name.
+    #[cfg(feature = "tls")]
+    let (host, _) = split_host_port(address)?;
+    let stream = Stream::Plain(dial(exec, address, options).await?);
+    // TLS **before** the CONNECT, which is the whole ordering requirement:
+    // the User Name, the Password and the Authentication Data all travel in
+    // that packet, and a handshake completed afterwards would have protected
+    // none of them (5.4.3) [mqtt5 §10].
+    #[cfg(feature = "tls")]
+    let stream = match &options.tls {
+        Some(tls) => crate::transport::upgrade(stream, tls, host).await?,
+        None => stream,
+    };
+    stream.set_nodelay()?;
+    let encrypted = stream.is_encrypted();
     let (read_half, write_half) = tokio::io::split(stream);
 
     let mut reader = Reader {
@@ -261,6 +279,7 @@ pub(crate) async fn handshake(
         writer,
         limits,
         session_present,
+        encrypted,
         keep_alive,
         client_id,
     })
@@ -487,9 +506,12 @@ mod tests {
             ("127.0.0.1", 8883)
         );
         assert_eq!(split_host_port("[::1]:1883").unwrap(), ("::1", 1883));
-        // A bare IPv6 literal is ambiguous with host:port and is refused
-        // rather than guessed at.
-        assert!(split_host_port("::1:1883").is_err() || split_host_port("::1:1883").is_ok());
+        // An unbracketed IPv6 literal is split on its **last** colon, so
+        // `::1:1883` parses as the host `::1` - which is what `rsplit_once`
+        // does and what a caller writing the bracketless form gets. Asserted
+        // rather than left open, because the previous version of this line
+        // accepted either answer and therefore asserted nothing.
+        assert_eq!(split_host_port("::1:1883").unwrap(), ("::1", 1883));
         assert!(split_host_port("broker").is_err());
         assert!(split_host_port("broker:0").is_err());
         assert!(split_host_port("broker:no").is_err());

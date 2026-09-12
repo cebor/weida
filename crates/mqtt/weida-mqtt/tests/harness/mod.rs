@@ -33,8 +33,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use weida_mqtt_codec::{
-    FixedHeader, Packet, PacketType, PayloadList, Properties, Puback, PubackReasonCode, Pubcomp,
-    PubcompReasonCode, Pubrec, QoS, Suback, SubackReasonCode, Unsuback, UnsubackReasonCode, varint,
+    Auth, AuthReasonCode, FixedHeader, Packet, PacketType, PayloadList, Properties, Puback,
+    PubackReasonCode, Pubcomp, PubcompReasonCode, Pubrec, QoS, Suback, SubackReasonCode, Unsuback,
+    UnsubackReasonCode, varint,
 };
 
 /// The ceiling every harness decode is done under: the largest packet the
@@ -94,6 +95,17 @@ pub enum Act {
     Suback(Vec<u8>),
     /// Read one UNSUBSCRIBE and answer UNSUBACK with these codes.
     Unsuback(Vec<u8>),
+    /// Read one AUTH and answer AUTH with this reason code, echoing the
+    /// client's `Authentication Data` back so a test can assert the exchange
+    /// carried it.
+    ///
+    /// The method is copied from the client's packet, which is what a
+    /// conforming server does ([MQTT-4.12.0-5]); a test that needs the
+    /// **wrong** method uses `AnswerAuthAs`.
+    AnswerAuth(u8),
+    /// The same, answering with this method instead of the client's - the
+    /// [MQTT-4.12.0-5] violation a client has to catch.
+    AnswerAuthAs(u8, &'static str),
     /// Wait, so a client timer can expire.
     Idle(Duration),
     /// Drop the connection with no DISCONNECT, which is always available to a
@@ -351,6 +363,36 @@ async fn run(mut stream: TcpStream, script: Vec<Act>, shared: Shared) {
                     packet_id: unsubscribe.packet_id,
                     properties: Properties::new(),
                     reason_codes: PayloadList::new(&codes),
+                }));
+                if stream.write_all(&answer).await.is_err() {
+                    return;
+                }
+                let _ = stream.flush().await;
+            }
+            Act::AnswerAuth(code) | Act::AnswerAuthAs(code, _) => {
+                let Some(raw) = read_packet(&mut stream, &mut buf).await else {
+                    return;
+                };
+                shared.seen.lock().await.push(raw.clone());
+                let Packet::Auth(request) = decode(&raw) else {
+                    panic!(
+                        "the script expected an AUTH, got {}",
+                        decode(&raw).packet_type()
+                    );
+                };
+                let method = match act {
+                    Act::AnswerAuthAs(_, method) => Some(method),
+                    _ => request.properties.authentication_method,
+                };
+                let data = request.properties.authentication_data.map(<[u8]>::to_vec);
+                let answer = bytes(&Packet::Auth(Auth {
+                    reason_code: AuthReasonCode::from_byte(code)
+                        .expect("an AUTH code the script names"),
+                    properties: Properties {
+                        authentication_method: method,
+                        authentication_data: data.as_deref(),
+                        ..Properties::new()
+                    },
                 }));
                 if stream.write_all(&answer).await.is_err() {
                     return;

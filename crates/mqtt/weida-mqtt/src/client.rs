@@ -35,9 +35,9 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use weida_mqtt_codec::{
-    self as codec, DecodeError, Disconnect, DisconnectReasonCode, Packet, PacketType, PayloadList,
-    Properties, Puback, Pubcomp, PubcompReasonCode, Publish, Pubrec, PubrecReasonCode, Pubrel, QoS,
-    SubackReasonCode, UnsubackReasonCode, varint,
+    self as codec, AuthReasonCode, DecodeError, Disconnect, DisconnectReasonCode, Packet,
+    PacketType, PayloadList, Properties, Puback, Pubcomp, PubcompReasonCode, Publish, Pubrec,
+    PubrecReasonCode, Pubrel, QoS, SubackReasonCode, UnsubackReasonCode, varint,
 };
 use weida_runtime::{Exec, OwnedReactor};
 
@@ -193,6 +193,9 @@ enum Command {
         filters: Vec<String>,
         done: oneshot::Sender<Result<Vec<UnsubackReasonCode>>>,
     },
+    /// Start re-authentication on the live connection, resolving on the
+    /// server's answer (4.12.1) [mqtt5 §10].
+    Reauthenticate { done: oneshot::Sender<Result<()>> },
 }
 
 /// The application's end of one connection.
@@ -207,6 +210,12 @@ pub struct Client {
     resumption: Resumption,
     client_id: String,
     keep_alive: Option<Duration>,
+    /// Whether the transport is encrypted, which is what the credentials in
+    /// CONNECT travelled over.
+    encrypted: bool,
+    /// The `Authentication Method` this connection was opened with, which is
+    /// the only method re-authentication may use ([MQTT-4.12.1-1]).
+    authentication_method: Option<String>,
 }
 
 /// The application's end of the event stream.
@@ -270,7 +279,14 @@ impl Client {
         options: ConnectOptions,
         session: &Session,
     ) -> Result<(Client, Events)> {
-        Client::connect_full(context, address, options, session, &NoAuthenticator).await
+        Client::connect_full(
+            context,
+            address,
+            options,
+            session,
+            Arc::new(NoAuthenticator),
+        )
+        .await
     }
 
     /// The same, answering the server's AUTH challenges through
@@ -285,7 +301,7 @@ impl Client {
         context: &Context,
         address: &str,
         options: ConnectOptions,
-        authenticator: &dyn Authenticator,
+        authenticator: Arc<dyn Authenticator>,
     ) -> Result<(Client, Events)> {
         let session = Session::new(options.client_id.clone(), &options.limits);
         Client::connect_full(context, address, options, &session, authenticator).await
@@ -301,7 +317,7 @@ impl Client {
         address: &str,
         options: ConnectOptions,
         session: &Session,
-        authenticator: &dyn Authenticator,
+        authenticator: Arc<dyn Authenticator>,
     ) -> Result<(Client, Events)> {
         options.validate()?;
 
@@ -317,7 +333,9 @@ impl Client {
         // nothing left to read it from.
         session.declare_expiry(expiry_seconds(options.session_expiry));
 
-        let mut handshake = handshake(&context.exec, address, &options, authenticator).await?;
+        let options_authentication_method = options.authentication_method.clone();
+        let mut handshake =
+            handshake(&context.exec, address, &options, authenticator.as_ref()).await?;
 
         // "The sender sets an initial send quota, non-zero and not exceeding
         // the peer's Receive Maximum" ([MQTT-4.9.0-1]): the server's number
@@ -351,7 +369,10 @@ impl Client {
             inbound_aliases: InboundAliases::new(options.limits.topic_alias_maximum),
             subscribe_waiters: HashMap::new(),
             unsubscribe_waiters: HashMap::new(),
+            reauthenticating: None,
+            authentication_method: options_authentication_method.clone(),
             stalled: VecDeque::new(),
+            authenticator,
         };
         context.exec.spawn(task.run());
 
@@ -364,6 +385,8 @@ impl Client {
                 resumption,
                 client_id: handshake.client_id,
                 keep_alive: handshake.keep_alive,
+                encrypted: handshake.encrypted,
+                authentication_method: options_authentication_method,
             },
             Events { events: events_rx },
         ))
@@ -439,6 +462,61 @@ impl Client {
         };
         crate::filter::check_topic_name(&topic, false)?;
         Ok(Some(topic))
+    }
+
+    /// Whether this connection's transport is encrypted.
+    ///
+    /// The User Name, the Password and every byte of `Authentication Data`
+    /// travel in the CONNECT, and on a plain connection they travel in the
+    /// clear. "The MQTT protocol is not trust symmetrical... there is no
+    /// mechanism for the Client to authenticate the Server" with basic
+    /// authentication (5.4.3) [mqtt5 §10], so this is the only question a
+    /// client can ask about what protected them.
+    #[must_use]
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
+    }
+
+    /// Re-authenticates on the live connection, resolving when the server
+    /// accepts or refuses.
+    ///
+    /// "A Client that has named an Authentication Method MAY send AUTH 0x19
+    /// at any time after CONNACK using the same method" ([MQTT-4.12.1-1])
+    /// (4.12.1) [mqtt5 §10], which is the protocol's answer to credential
+    /// rotation on a long-lived connection - 5.4.10 also suggests periodic
+    /// forced re-authentication.
+    ///
+    /// **Other traffic continues during the exchange.** The specification is
+    /// explicit that the previous authentication stays in force while it runs,
+    /// so this does not quiesce the connection: publishes and deliveries flow
+    /// through the same event loop, and only the re-authentication's own
+    /// outcome waits here. On failure "both sides SHOULD send DISCONNECT and
+    /// MUST close" ([MQTT-4.12.1-2]), which arrives as
+    /// [`Error::ServerDisconnected`] on the event stream.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Configuration`] where this client named no
+    /// `Authentication Method` - there is nothing to re-authenticate with, and
+    /// a server "MUST NOT send AUTH" to such a client ([MQTT-4.12.0-6]);
+    /// [`Error::AuthenticationMethodMismatch`] where the server answers with
+    /// a different method; and [`Error::NotConnected`] where the connection
+    /// ended.
+    pub async fn reauthenticate(&self) -> Result<()> {
+        if self.authentication_method.is_none() {
+            return Err(Error::Configuration(
+                "re-authentication needs the Authentication Method this connection was \
+                 opened with; a client that named none has nothing to re-authenticate \
+                 ([MQTT-4.12.1-1])"
+                    .into(),
+            ));
+        }
+        let (done, wait) = oneshot::channel();
+        self.commands
+            .send(Command::Reauthenticate { done })
+            .await
+            .map_err(|_| Error::NotConnected)?;
+        wait.await.map_err(|_| Error::NotConnected)?
     }
 
     /// The Keep Alive in force: the client's, or `Server Keep Alive` where
@@ -742,6 +820,18 @@ struct Task {
     /// an identifier frees the oldest waiting publish takes it. Bounded by
     /// the command channel, which is `Limits::incoming_queue` deep.
     stalled: VecDeque<(Box<Message>, oneshot::Sender<Result<Completion>>)>,
+    /// How this connection answers an AUTH challenge, kept because
+    /// re-authentication happens on the **live** connection and not in the
+    /// handshake (4.12.1) [mqtt5 §10].
+    authenticator: Arc<dyn Authenticator>,
+    /// Who is waiting for a re-authentication to finish.
+    ///
+    /// `None` means none is in progress, which is also what makes an
+    /// unrequested AUTH detectable: after CONNACK a server may only send AUTH
+    /// inside an exchange the client started ([MQTT-4.12.1-1]).
+    reauthenticating: Option<oneshot::Sender<Result<()>>>,
+    /// The method every AUTH of this connection repeats ([MQTT-4.12.0-5]).
+    authentication_method: Option<String>,
 }
 
 impl Task {
@@ -855,12 +945,10 @@ impl Task {
                         }
                         Packet::Suback(suback) => self.suback(&suback),
                         Packet::Unsuback(unsuback) => self.unsuback(&unsuback),
-                        Packet::Auth(_) => {
-                            // Re-authentication is B-146's; until then an AUTH
-                            // after the handshake is unasked-for.
-                            return Err(Error::UnexpectedPacket {
-                                packet_type: PacketType::Auth,
-                            });
+                        Packet::Auth(auth) => {
+                            if self.auth(&auth).await? {
+                                last_write = std::time::Instant::now();
+                            }
                         }
                     }
 
@@ -901,6 +989,10 @@ impl Task {
                 }
                 Step::Command(Some(Command::Unsubscribe { filters, done })) => {
                     self.send_unsubscribe(filters, done).await?;
+                    last_write = std::time::Instant::now();
+                }
+                Step::Command(Some(Command::Reauthenticate { done })) => {
+                    self.send_reauthenticate(done).await?;
                     last_write = std::time::Instant::now();
                 }
                 Step::Command(Some(Command::Disconnect {
@@ -1060,6 +1152,120 @@ impl Task {
             }
         }
         let _ = done.send(Ok(codes));
+    }
+
+    /// Starts re-authentication: AUTH 0x19 with the CONNECT's method and the
+    /// authenticator's opening data ([MQTT-4.12.1-1]).
+    ///
+    /// The authenticator is asked with `None` for the opening move, which is
+    /// the same shape as a challenge with no `Authentication Data`: the server
+    /// has said nothing yet, so there is nothing to answer.
+    async fn send_reauthenticate(&mut self, done: oneshot::Sender<Result<()>>) -> Result<()> {
+        if let Some(previous) = self.reauthenticating.take() {
+            // A second re-authentication while one is running would make two
+            // exchanges indistinguishable on the wire - the AUTH packets carry
+            // no identifier - so the older waiter is told rather than left
+            // pending forever.
+            let _ = previous.send(Err(Error::UnexpectedPacket {
+                packet_type: PacketType::Auth,
+            }));
+        }
+        let data = match self.authenticator.challenge(None) {
+            Ok(data) => data,
+            Err(error) => {
+                let _ = done.send(Err(error));
+                return Ok(());
+            }
+        };
+        let packet = Packet::Auth(codec::Auth {
+            reason_code: AuthReasonCode::ReAuthenticate,
+            properties: Properties {
+                authentication_method: self.authentication_method.as_deref(),
+                authentication_data: Some(&data),
+                ..Properties::new()
+            },
+        });
+        if let Err(error) = self.writer.send(&packet).await {
+            let _ = done.send(Err(error));
+            return Err(Error::ConnectionClosed);
+        }
+        self.reauthenticating = Some(done);
+        Ok(())
+    }
+
+    /// Answers a server AUTH during re-authentication.
+    ///
+    /// Returns whether anything was written, so the caller can reset the
+    /// keep-alive timer.
+    async fn auth(&mut self, auth: &codec::Auth<'_>) -> Result<bool> {
+        // "Absent a client-named method the Server MUST NOT send AUTH"
+        // ([MQTT-4.12.0-6]), and after CONNACK it may only send one inside an
+        // exchange this client started ([MQTT-4.12.1-1]). Either way an AUTH
+        // arriving outside one is the server breaking the protocol, and it is
+        // checked before the method so an unrequested AUTH is not misreported
+        // as a mismatch with a method that was never in play.
+        if self.reauthenticating.is_none() {
+            return Err(Error::UnexpectedPacket {
+                packet_type: PacketType::Auth,
+            });
+        }
+        // [MQTT-4.12.0-5]: every AUTH of an exchange repeats the same method.
+        // A server that omits it is tolerated on the packet that *ends* the
+        // exchange, as in the handshake; naming a different one never is.
+        if let Some(theirs) = auth.properties.authentication_method
+            && Some(theirs) != self.authentication_method.as_deref()
+        {
+            let done = self.reauthenticating.take().expect("checked above");
+            let _ = done.send(Err(Error::AuthenticationMethodMismatch));
+            return Err(Error::AuthenticationMethodMismatch);
+        }
+        match auth.reason_code {
+            AuthReasonCode::Success => {
+                // The exchange is over and the new credentials are in force.
+                let done = self.reauthenticating.take().expect("checked above");
+                let _ = done.send(Ok(()));
+                Ok(false)
+            }
+            AuthReasonCode::ContinueAuthentication => {
+                let data = match self
+                    .authenticator
+                    .challenge(auth.properties.authentication_data)
+                {
+                    Ok(data) => data,
+                    Err(error) => {
+                        let done = self.reauthenticating.take().expect("checked above");
+                        // "On failure both sides SHOULD send DISCONNECT and
+                        // MUST close" ([MQTT-4.12.1-2]). Returning ends the
+                        // connection, which is the MUST; the SHOULD is not
+                        // attempted, because a client that cannot answer a
+                        // challenge has nothing to say about it. The cause
+                        // goes to the caller who asked for the
+                        // re-authentication, and the event stream learns why
+                        // the connection ended.
+                        let reported =
+                            Error::Configuration(format!("re-authentication failed: {error}"));
+                        let _ = done.send(Err(error));
+                        return Err(reported);
+                    }
+                };
+                let packet = Packet::Auth(codec::Auth {
+                    reason_code: AuthReasonCode::ContinueAuthentication,
+                    properties: Properties {
+                        authentication_method: self.authentication_method.as_deref(),
+                        authentication_data: Some(&data),
+                        ..Properties::new()
+                    },
+                });
+                self.writer.send(&packet).await?;
+                Ok(true)
+            }
+            // 0x19 is the client's own opening move; a server that sends it is
+            // asking the client to re-authenticate, which the protocol does
+            // not provide for ([MQTT-4.12.1-1] is one-directional).
+            AuthReasonCode::ReAuthenticate => Err(Error::UnexpectedPacket {
+                packet_type: PacketType::Auth,
+            }),
+        }
     }
 
     async fn send_disconnect(

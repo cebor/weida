@@ -134,6 +134,7 @@ pub mod limits;
 pub mod message;
 pub mod options;
 pub mod session;
+pub mod transport;
 
 pub use alias::{Aliased, InboundAliases, OutboundAliases};
 pub use client::{Client, Context, Event, Events};
@@ -147,6 +148,9 @@ pub use limits::{DEFAULT_RECEIVE_MAXIMUM, DEFAULT_TOPIC_ALIAS_MAXIMUM, Limits, S
 pub use message::{Completion, Delivery, DeliveryProperties, Message, RetainedOrigin};
 pub use options::{ConnectOptions, MAX_INTERVAL, MAX_KEEP_ALIVE, WillMessage};
 pub use session::{InFlight, Resend, Resumption, Session, Stage, StoredPublish};
+pub use transport::Stream;
+#[cfg(feature = "tls")]
+pub use transport::TlsOptions;
 
 // The protocol vocabulary a caller needs in order to talk to this client at
 // all, re-exported so that `weida-mqtt` is one dependency rather than two.
