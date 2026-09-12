@@ -354,7 +354,7 @@ mod tests {
         );
         assert_eq!(
             protocol(EndpointType::Sub).full_when_receiving(),
-            FullAction::DropOldest
+            FullAction::Block
         );
     }
 }

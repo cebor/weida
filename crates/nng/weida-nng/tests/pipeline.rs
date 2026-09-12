@@ -99,7 +99,7 @@ async fn a_puller_that_cannot_accept_is_skipped_rather_than_waited_for() {
     let stalled = PullSocket::with_options(
         &ctx,
         SocketOptions {
-            recv_depth: 1,
+            recv_depth: Some(1),
             ..options()
         },
     )

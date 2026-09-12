@@ -87,6 +87,10 @@
 //! - [`PushSocket`] and [`PullSocket`] — the pipeline: round-robin over
 //!   the pullers that can accept a message now, fair-queued at the sink,
 //!   and each direction absent from the other's type.
+//! - [`PubSocket`] and [`SubSocket`] — broadcast with the filter at the
+//!   receiver: every publication is offered to every subscriber, each one
+//!   matches an arbitrary byte prefix locally, and
+//!   [`SubSocket::discarded`] counts what that costs.
 
 #![warn(missing_docs)]
 
@@ -99,6 +103,7 @@ pub mod options;
 pub mod pipe;
 pub mod pipeline;
 pub mod protocol;
+pub mod pubsub;
 pub mod reqrep;
 pub mod session;
 pub mod socket;
@@ -127,6 +132,7 @@ pub use pipe::{
 pub use pipe::{Discarded, Pipe, PipeConfig};
 pub use pipeline::{PullSocket, PushSocket};
 pub use protocol::{PROTOCOLS, Protocol, protocol};
+pub use pubsub::{PubSocket, SubSocket};
 pub use reqrep::{CtxId, RepCtx, RepSocket, ReqCtx, ReqSocket};
 pub use session::SpSession;
 pub use socket::{Broadcast, SocketCore};

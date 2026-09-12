@@ -60,6 +60,20 @@ pub const DEFAULT_SEND_DEPTH: usize = 0;
 /// rather than within one machine (`docs/INVARIANTS.md`).
 pub const DEFAULT_RECV_DEPTH: usize = 128;
 
+/// Default `NNG_OPT_SENDBUF` for the protocols that **drop** rather than
+/// wait — PUB, BUS and SURVEYOR.
+///
+/// [`DEFAULT_SEND_DEPTH`] is zero because that is PUSH's documented value,
+/// and for PUSH it means what it says: the send waits for a puller that
+/// can take the message. For a protocol whose answer to a full queue is to
+/// discard, a depth of zero would mean discarding every message that
+/// arrives while the connection's writer is busy with the previous one,
+/// which is not "best effort" but "almost never" — and it is not what a
+/// real NNG node does, because its pipes carry a queue of their own. So
+/// the dropping protocols get a depth, and it is named here rather than
+/// hidden in each of them.
+pub const DEFAULT_BROADCAST_SEND_DEPTH: usize = 128;
+
 /// What a protocol does when the queue it is putting a message into is full.
 ///
 /// The four values are the four behaviours the sheet names, and no socket
@@ -100,20 +114,21 @@ impl FullAction {
         }
     }
 
-    /// What `protocol` does at a full incoming queue.
+    /// What every protocol does at a full **incoming** queue: it stops
+    /// reading the connection.
     ///
-    /// SUB is the only protocol with a documented receive-side policy, and
-    /// it has two — [`FullAction::DropOldest`] by default and
-    /// [`FullAction::RejectNewest`] under `SUB_PREFNEW=false` (§4). For
-    /// every other protocol a full receive queue stops the pipe from
-    /// reading, which is [`FullAction::Block`] and is how the backpressure
-    /// reaches the peer at all: SP has no credit to withhold (§12/P12), so
-    /// the only signal is not reading.
-    pub const fn receiving(protocol: EndpointType) -> FullAction {
-        match protocol {
-            EndpointType::Sub => FullAction::DropOldest,
-            _ => FullAction::Block,
-        }
+    /// [`FullAction::Block`] for all of them, and not because nothing else
+    /// is specified — SUB has two documented policies (§4) — but because
+    /// its policies belong one layer up. A SUB filters by prefix, and a
+    /// queue that dropped a subscribed message to make room for an
+    /// unsubscribed one would be applying `SUB_PREFNEW` to traffic the
+    /// application never asked for. So the pipe's queue is plain
+    /// backpressure, which is the only signal SP has — it grants no credit
+    /// on the wire (§12/P12), so not reading is the whole of it — and
+    /// `SUB_PREFNEW` applies to the queue of *admitted* publications on
+    /// the socket, which is where NNG's receive buffer is too.
+    pub const fn receiving(_protocol: EndpointType) -> FullAction {
+        FullAction::Block
     }
 }
 
@@ -490,15 +505,26 @@ impl PipeConfig {
     /// bound, so that a socket type that says nothing gets the protocol's
     /// own answer rather than a house one.
     pub const fn of(protocol: EndpointType) -> PipeConfig {
+        let sending = FullAction::sending(protocol);
         PipeConfig {
             outgoing: QueueConfig {
-                depth: DEFAULT_SEND_DEPTH,
-                full: FullAction::sending(protocol),
+                depth: PipeConfig::default_send_depth(protocol),
+                full: sending,
             },
             incoming: QueueConfig {
                 depth: DEFAULT_RECV_DEPTH,
                 full: FullAction::receiving(protocol),
             },
+        }
+    }
+
+    /// `NNG_OPT_SENDBUF`'s default for `protocol`: zero where a full queue
+    /// makes the sender wait, and [`DEFAULT_BROADCAST_SEND_DEPTH`] where it
+    /// makes the sender discard.
+    pub const fn default_send_depth(protocol: EndpointType) -> usize {
+        match FullAction::sending(protocol) {
+            FullAction::Block => DEFAULT_SEND_DEPTH,
+            _ => DEFAULT_BROADCAST_SEND_DEPTH,
         }
     }
 }
@@ -615,8 +641,9 @@ mod tests {
     }
 
     /// Claim: the per-protocol table is the sheet's sentence — PUSH and PAIR
-    /// block, BUS drops, SUB drops the oldest — and every protocol has an
-    /// answer rather than a default nobody chose.
+    /// block, BUS and PUB and SURVEYOR drop — and an incoming queue always
+    /// blocks, because `SUB_PREFNEW` applies to the admitted publications
+    /// on the socket rather than to everything that arrived.
     #[test]
     fn the_full_queue_action_is_the_protocols_own() {
         assert_eq!(FullAction::sending(EndpointType::Push), FullAction::Block);
@@ -629,10 +656,7 @@ mod tests {
             FullAction::sending(EndpointType::Surveyor),
             FullAction::Drop
         );
-        assert_eq!(
-            FullAction::receiving(EndpointType::Sub),
-            FullAction::DropOldest
-        );
+        assert_eq!(FullAction::receiving(EndpointType::Sub), FullAction::Block);
         assert_eq!(FullAction::receiving(EndpointType::Pull), FullAction::Block);
     }
 
