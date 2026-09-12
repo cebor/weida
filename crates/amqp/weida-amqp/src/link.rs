@@ -696,7 +696,7 @@ impl Link {
         // frame and not per frame: "one unit of link-credit permits the
         // delivery-count to advance by one", and a multi-frame message
         // advances it once.
-        self.take_credit().await?;
+        self.take_credit(settled).await?;
 
         let mut delivery_id = 0u32;
         let mut frames = 0usize;
@@ -837,22 +837,38 @@ impl Link {
         Ok(ceiling.saturating_sub(FRAME_HEADER + scratch.len()).max(1))
     }
 
-    /// Waits until this link has credit, and takes one unit.
+    /// Waits until this link has credit **and room to remember the delivery**,
+    /// and takes one unit of credit.
     ///
-    /// Registered with the waker *before* the state is read, so a `flow` that
-    /// lands between the two is not a lost wake-up.
-    async fn take_credit(&self) -> Result<()> {
+    /// Two conditions, because two things can be exhausted: the credit the
+    /// receiver granted, and the unsettled map this end keeps. The second
+    /// only applies to an unsettled delivery — a settled one is recorded
+    /// nowhere — and is a bound of ours, because a receiver that keeps
+    /// granting credit while settling nothing would otherwise grow the map
+    /// without limit ([`crate::settlement::DEFAULT_MAX_UNSETTLED`]).
+    ///
+    /// Registered with the waker *before* the state is read, so a `flow` or a
+    /// `disposition` landing between the two is not a lost wake-up.
+    async fn take_credit(&self, settled: bool) -> Result<()> {
         loop {
             let notified = self.shared.flow.notified();
             let mut notified = std::pin::pin!(notified);
             notified.as_mut().enable();
             self.still_usable()?;
-            if self
-                .shared
-                .credit
-                .lock()
-                .expect("not poisoned")
-                .record_sent()
+            let room = settled
+                || self
+                    .shared
+                    .unsettled
+                    .lock()
+                    .expect("not poisoned")
+                    .has_room();
+            if room
+                && self
+                    .shared
+                    .credit
+                    .lock()
+                    .expect("not poisoned")
+                    .record_sent()
             {
                 return Ok(());
             }
