@@ -89,10 +89,18 @@ pub struct SocketOptions {
     /// [`crate::RECV_MAX_SIZE_UNLIMITED`] is NNG's "no limit".
     pub recv_max_size: u64,
     /// `NNG_OPT_SENDBUF`: outgoing queue depth per pipe, in messages,
-    /// `0..=`[`crate::MAX_QUEUE_DEPTH`]. Zero is a rendezvous.
-    pub send_depth: usize,
+    /// `0..=`[`crate::MAX_QUEUE_DEPTH`]. Zero is a rendezvous, not "no
+    /// limit".
+    ///
+    /// `None` is the protocol's own default
+    /// ([`PipeConfig::default_send_depth`](crate::PipeConfig::default_send_depth)):
+    /// zero for the protocols that wait at a full queue, which is PUSH's
+    /// documented value (§5), and a real depth for the ones that discard,
+    /// because discarding at depth zero would discard nearly everything.
+    pub send_depth: Option<usize>,
     /// `NNG_OPT_RECVBUF`: incoming queue depth per pipe, in messages.
-    pub recv_depth: usize,
+    /// `None` is [`crate::DEFAULT_RECV_DEPTH`].
+    pub recv_depth: Option<usize>,
     /// `NNG_OPT_SENDTIMEO`: how long a send waits before `NNG_ETIMEDOUT`.
     /// `None` is NNG's `NNG_DURATION_INFINITE`, which is its default.
     pub send_timeout: Option<Duration>,
@@ -114,6 +122,14 @@ pub struct SocketOptions {
     /// Addresses one hostname may resolve to. Also ours
     /// ([`DEFAULT_MAX_ADDRESSES`]).
     pub max_addresses: usize,
+    /// `NNG_OPT_SUB_PREFNEW`: what a SUB socket does when its queue of
+    /// admitted publications is full.
+    ///
+    /// `true` — NNG's default — "removes its oldest queued message to make
+    /// room"; `false` "preserves old queued messages by rejecting the new
+    /// message" (§4). It is a SUB-only option and says nothing on any
+    /// other protocol.
+    pub sub_prefer_new: bool,
     /// `NNG_OPT_REQ_RESENDTIME`: how long a REQ context waits for its
     /// reply before sending the request again. NNG's default is a minute.
     ///
@@ -136,8 +152,8 @@ impl Default for SocketOptions {
     fn default() -> SocketOptions {
         SocketOptions {
             recv_max_size: DEFAULT_RECV_MAX_SIZE,
-            send_depth: DEFAULT_SEND_DEPTH,
-            recv_depth: DEFAULT_RECV_DEPTH,
+            send_depth: None,
+            recv_depth: None,
             send_timeout: None,
             recv_timeout: None,
             reconnect_min: DEFAULT_RECONNECT_MIN,
@@ -145,6 +161,7 @@ impl Default for SocketOptions {
             max_pipes: DEFAULT_MAX_PIPES,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             max_addresses: DEFAULT_MAX_ADDRESSES,
+            sub_prefer_new: true,
             resend_time: DEFAULT_RESEND_TIME,
             max_ttl: DEFAULT_MAX_TTL,
         }
@@ -155,12 +172,12 @@ impl SocketOptions {
     /// Checks everything that can be judged without knowing the protocol.
     pub fn validate(&self) -> Result<()> {
         QueueConfig {
-            depth: self.send_depth,
+            depth: self.send_depth.unwrap_or(DEFAULT_SEND_DEPTH),
             full: FullAction::Block,
         }
         .validate("NNG_OPT_SENDBUF")?;
         QueueConfig {
-            depth: self.recv_depth,
+            depth: self.recv_depth.unwrap_or(DEFAULT_RECV_DEPTH),
             full: FullAction::Block,
         }
         .validate("NNG_OPT_RECVBUF")?;
@@ -219,10 +236,10 @@ impl SocketOptions {
     pub fn validate_for(&self, endpoint: EndpointType) -> Result<()> {
         self.validate()?;
         let row = protocol(endpoint);
-        if self.send_depth != DEFAULT_SEND_DEPTH {
+        if self.send_depth.is_some() {
             row.require_buffers("NNG_OPT_SENDBUF")?;
         }
-        if self.recv_depth != DEFAULT_RECV_DEPTH {
+        if self.recv_depth.is_some() {
             row.require_buffers("NNG_OPT_RECVBUF")?;
         }
         Ok(())
@@ -232,8 +249,12 @@ impl SocketOptions {
     /// depths, and that protocol's behaviour at the bound.
     pub fn pipe_config(&self, endpoint: EndpointType) -> PipeConfig {
         let mut config = PipeConfig::of(endpoint);
-        config.outgoing.depth = self.send_depth;
-        config.incoming.depth = self.recv_depth;
+        if let Some(depth) = self.send_depth {
+            config.outgoing.depth = depth;
+        }
+        if let Some(depth) = self.recv_depth {
+            config.incoming.depth = depth;
+        }
         config
     }
 
@@ -308,14 +329,14 @@ mod tests {
         let cases: [(SocketOptions, &str); 5] = [
             (
                 SocketOptions {
-                    send_depth: crate::MAX_QUEUE_DEPTH + 1,
+                    send_depth: Some(crate::MAX_QUEUE_DEPTH + 1),
                     ..SocketOptions::default()
                 },
                 "NNG_OPT_SENDBUF",
             ),
             (
                 SocketOptions {
-                    recv_depth: crate::MAX_QUEUE_DEPTH + 1,
+                    recv_depth: Some(crate::MAX_QUEUE_DEPTH + 1),
                     ..SocketOptions::default()
                 },
                 "NNG_OPT_RECVBUF",
@@ -359,7 +380,7 @@ mod tests {
         assert!(defaults.validate_for(EndpointType::Req).is_ok());
 
         let buffered = SocketOptions {
-            send_depth: 4,
+            send_depth: Some(4),
             ..SocketOptions::default()
         };
         let err = buffered.validate_for(EndpointType::Req).unwrap_err();
@@ -374,8 +395,8 @@ mod tests {
     #[test]
     fn pipe_bounds_combine_the_depths_with_the_protocols_action() {
         let options = SocketOptions {
-            send_depth: 4,
-            recv_depth: 5,
+            send_depth: Some(4),
+            recv_depth: Some(5),
             ..SocketOptions::default()
         };
         let bus = options.pipe_config(EndpointType::Bus);
@@ -384,7 +405,14 @@ mod tests {
         assert_eq!(bus.incoming.depth, 5);
         assert_eq!(bus.incoming.full, FullAction::Block);
 
-        let sub = options.pipe_config(EndpointType::Sub);
-        assert_eq!(sub.incoming.full, FullAction::DropOldest);
+        // And a protocol that says nothing keeps its own default depth:
+        // zero where a full queue makes the sender wait, a real depth
+        // where it makes the sender discard.
+        let defaults = SocketOptions::default();
+        assert_eq!(defaults.pipe_config(EndpointType::Push).outgoing.depth, 0);
+        assert_eq!(
+            defaults.pipe_config(EndpointType::Pub).outgoing.depth,
+            crate::pipe::DEFAULT_BROADCAST_SEND_DEPTH
+        );
     }
 }
