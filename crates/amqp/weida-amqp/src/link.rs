@@ -1,8 +1,19 @@
-//! The link: `attach`, `detach`, and the two handle spaces.
+//! The link: `attach`, `detach`, the two handle spaces, and the credit a
+//! delivery is sent under.
 //!
 //! A link is "a unidirectional named route between two nodes, attached at
-//! each end to a terminus" (Part 2 §2.6). Three of its rules are easy to get
+//! each end to a terminus" (Part 2 §2.6). Five of its rules are easy to get
 //! subtly wrong, and each one has a test here.
+//!
+//! # Two schemes must permit one transfer
+//!
+//! A message goes out only when **both** the link's credit and the session's
+//! window allow it. Link credit is counted in messages and lives in
+//! [`crate::credit`]; the window is counted in `transfer` frames and lives in
+//! [`crate::window`]. So a message larger than one frame takes one unit of
+//! credit and as many window units as it takes frames, and either scheme
+//! alone can stall a sender that the other is happy with. The specification
+//! ties them together nowhere, and neither does this module.
 //!
 //! # The two ends choose their handles independently
 //!
@@ -46,18 +57,33 @@
 //! error means a late frame for the dead link lands on a live one, and the
 //! peer is entitled to still be sending them. So handle allocation skips
 //! a handle that was errored, for the life of the session.
+//!
+//! # Deliveries on one link do not interleave, and are bounded
+//!
+//! "The deliveries on a given link MUST NOT interleave" (Part 2 §2.6.14), so
+//! a second delivery-tag arriving while the first is incomplete is refused
+//! here rather than concatenated — the octets of two messages are not a
+//! message. And nothing in the protocol bounds the *number* of frames a
+//! delivery may take, which is what makes `max-message-size` load-bearing
+//! rather than advisory: without it a peer hands a receiver an unbounded
+//! message one bounded frame at a time. The bound is checked before the
+//! buffer grows, and exceeding it is `amqp:link:message-size-exceeded`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{mpsc, oneshot};
-use weida_amqp_codec::performative::{Attach, Detach, Performative};
+use tokio::sync::{Notify, mpsc, oneshot};
+use weida_amqp_codec::message::{Message, Progress, Reassembly};
+use weida_amqp_codec::performative::{Attach, Detach, Flow, Performative, Transfer};
 use weida_amqp_codec::types::condition;
 use weida_amqp_codec::{ReceiverSettleMode, Role, SenderSettleMode};
 
+use crate::credit::Credit;
+use crate::delivery::{Delivery, Sent};
 use crate::error::{Condition, Error, Result};
 use crate::options::multiple;
 use crate::terminus::{Source, Target};
+use crate::window::Windows;
 
 /// How many frames may be queued for one link before the driver waits.
 ///
@@ -230,9 +256,19 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 16 * 1024 * 1024;
 /// What a link hands to the layer above it.
 #[derive(Clone, Debug)]
 pub enum LinkEvent {
-    /// A frame for this link, whole and undecoded — the transfers and
-    /// dispositions of B-160 and B-161.
+    /// A whole message, reassembled from however many `transfer` frames it
+    /// took.
+    Delivery(Delivery),
+    /// A frame for this link that is neither a `transfer` nor a `flow`: a
+    /// `disposition`, whole and undecoded.
     Frame(Vec<u8>),
+    /// The peer's `flow` changed this link's credit state, and the new state
+    /// is the one [`Link::credit`] reports.
+    ///
+    /// Worth an event rather than only a field, because a receiver draining a
+    /// link is *waiting* for this: credit reaching zero with no delivery in
+    /// between is the definite answer that there was nothing to get.
+    Flow(Credit),
     /// The link detached.
     Detached(Option<Condition>),
 }
@@ -250,6 +286,21 @@ pub(crate) struct Shared {
     pub(crate) negotiated: Mutex<Option<Negotiated>>,
     /// The peer's choice, learned from the answering `attach`.
     pub(crate) input_handle: Mutex<Option<u32>>,
+    /// This link's credit, counted in messages.
+    pub(crate) credit: Mutex<Credit>,
+    /// The session this link rides on, held for the **other** credit scheme:
+    /// a `transfer` frame needs link credit *and* a session window unit, the
+    /// two are independent, and only the session has the second.
+    pub(crate) session: Arc<crate::session::Shared>,
+    /// Woken whenever either scheme may have made room — a `flow` for this
+    /// link, or one for the session it is on. A sender waiting for credit
+    /// waits here rather than polling.
+    pub(crate) flow: Notify,
+    /// The largest frame the peer will accept, which is what decides where a
+    /// message is split.
+    pub(crate) max_frame_size: u32,
+    /// The next delivery-tag this end will choose.
+    pub(crate) next_tag: Mutex<u64>,
 }
 
 /// An AMQP 1.0 link.
@@ -332,6 +383,378 @@ impl Link {
         self.events.recv().await
     }
 
+    /// The next whole message, skipping the events that are not one.
+    ///
+    /// `None` where the link detached before another delivery arrived — which
+    /// includes the drain case, and is why a caller that needs to tell
+    /// "nothing to get" from "link gone" reads [`Link::next_event`] instead.
+    pub async fn next_delivery(&mut self) -> Option<Delivery> {
+        loop {
+            match self.events.recv().await? {
+                LinkEvent::Delivery(delivery) => return Some(delivery),
+                LinkEvent::Detached(_) => return None,
+                LinkEvent::Frame(_) | LinkEvent::Flow(_) => {}
+            }
+        }
+    }
+
+    /// This link's credit state: `delivery-count`, `link-credit`,
+    /// `available` and `drain`.
+    #[must_use]
+    pub fn credit(&self) -> Credit {
+        *self.shared.credit.lock().expect("not poisoned")
+    }
+
+    /// Whether a message could go out right now.
+    ///
+    /// Three conditions, and they are three because the protocol has three:
+    /// the link must be attached, the **link** must have credit — counted in
+    /// messages, granted by the receiver — and the **session** window must
+    /// have room for a frame. A generous grant with a full window sends
+    /// nothing, and so does an empty window with generous credit.
+    #[must_use]
+    pub fn may_send(&self) -> bool {
+        self.state().is_usable()
+            && self.credit().may_send()
+            && self
+                .shared
+                .session
+                .windows
+                .lock()
+                .expect("not poisoned")
+                .may_send()
+    }
+
+    /// A **receiver**: grants credit for `credit` more messages.
+    ///
+    /// Sets rather than adds. What goes on the wire is the absolute limit
+    /// `delivery-count + link-credit`, so granting 10 twice grants 10 and a
+    /// `flow` that is duplicated or overtaken cannot inflate anything. Clears
+    /// `drain`, because a grant and a drain are opposite requests.
+    pub async fn grant_credit(&self, credit: u32) -> Result<()> {
+        self.role_must_be(Role::Receiver, "grant credit")?;
+        {
+            let mut state = self.shared.credit.lock().expect("not poisoned");
+            state.grant(credit);
+            state.set_drain(false);
+        }
+        self.send_flow(false).await
+    }
+
+    /// A **receiver**: asks the sender to drain.
+    ///
+    /// The sender sends whatever it has and then advances `delivery-count`
+    /// until `link-credit` is zero, reporting the new state. That is what
+    /// turns "wait for a message" into "wait for a definite answer": credit
+    /// reaching zero with no delivery in between means there was nothing to
+    /// get, and a get-with-timeout is built out of exactly that.
+    pub async fn drain(&self) -> Result<()> {
+        self.role_must_be(Role::Receiver, "drain")?;
+        self.shared
+            .credit
+            .lock()
+            .expect("not poisoned")
+            .set_drain(true);
+        self.send_flow(false).await
+    }
+
+    /// A **receiver**: stops the link with `flow(link-credit=0, echo=true)`.
+    ///
+    /// The echo is the point. Transfers already in flight may still arrive
+    /// until the sender has processed the new limit, and the echoed `flow` is
+    /// the marker after which no further transfer will come — without it,
+    /// "stopped" is a hope rather than an observation (Part 2 §2.6.10).
+    pub async fn stop(&self) -> Result<()> {
+        self.role_must_be(Role::Receiver, "stop")?;
+        {
+            let mut state = self.shared.credit.lock().expect("not poisoned");
+            state.grant(0);
+            state.set_drain(false);
+        }
+        self.send_flow(true).await
+    }
+
+    /// A **receiver**: restores the session's incoming window and tells the
+    /// peer.
+    ///
+    /// The session window shrinks as `transfer` frames arrive and only grows
+    /// again when the receiver says so; this is the saying so. A receiver
+    /// that granted link credit but never replenished the window would stall
+    /// its sender with credit in hand.
+    pub async fn replenish_session_window(&self) -> Result<()> {
+        let window = self.shared.session.options.incoming_window;
+        self.shared
+            .session
+            .windows
+            .lock()
+            .expect("not poisoned")
+            .replenish_incoming(window);
+        self.send_flow(false).await
+    }
+
+    /// A **sender**: sends one message, stalling until both schemes permit
+    /// it.
+    ///
+    /// Link credit is taken once for the whole message, because it is counted
+    /// in messages; a session window unit is taken for **each frame**, which
+    /// is what makes a large message dribble out under a tight window instead
+    /// of violating it.
+    pub async fn send(&self, message: &Message<'_>) -> Result<Sent> {
+        self.send_payload(&message.to_vec()?).await
+    }
+
+    /// A **sender**: sends already-encoded message sections.
+    ///
+    /// The sections are not re-parsed: a forwarder that received octets and
+    /// is passing them on has nothing to gain from a decode and re-encode,
+    /// and the specification's message identity is the octets.
+    pub async fn send_payload(&self, payload: &[u8]) -> Result<Sent> {
+        self.role_must_be(Role::Sender, "send")?;
+        let settled = matches!(self.settle_mode(), SenderSettleMode::Settled);
+        let tag = self.next_tag();
+        let budget = self.frame_budget(&tag)?;
+
+        // One unit of link credit, for the message. Taken before the first
+        // frame and not per frame: "one unit of link-credit permits the
+        // delivery-count to advance by one", and a multi-frame message
+        // advances it once.
+        self.take_credit().await?;
+
+        let mut delivery_id = 0u32;
+        let mut frames = 0usize;
+        let mut offset = 0usize;
+        loop {
+            let end = (offset + budget).min(payload.len());
+            let more = end < payload.len();
+            let id = match self.take_window().await {
+                Ok(id) => id,
+                Err(error) => {
+                    // Half a delivery on the wire is worse than none: `abort`
+                    // tells the receiver to discard what it has and settles
+                    // the delivery implicitly (Part 2 §2.7.5).
+                    self.abort(delivery_id, &tag, frames).await;
+                    return Err(error);
+                }
+            };
+            if frames == 0 {
+                // A delivery's id is the transfer-id of its first frame. The
+                // specification never states the relation between the two
+                // sequences; every implementation derives both from the one
+                // counter, and a peer that expected otherwise would have no
+                // way to say so.
+                delivery_id = id;
+            }
+            let fragment = &payload[offset..end];
+            let mut transfer = Transfer::new(self.shared.output_handle);
+            if frames == 0 {
+                transfer.delivery_id = Some(delivery_id);
+                transfer.delivery_tag = Some(&tag);
+                transfer.message_format = Some(0);
+                transfer.settled = Some(settled);
+            }
+            transfer.more = more;
+            let frame = self.frame(Performative::Transfer(transfer), fragment);
+            match frame {
+                Ok(bytes) => self.write(bytes).await?,
+                Err(error) => {
+                    self.abort(delivery_id, &tag, frames).await;
+                    return Err(error);
+                }
+            }
+            frames += 1;
+            offset = end;
+            if !more {
+                break;
+            }
+        }
+
+        Ok(Sent {
+            delivery_id,
+            delivery_tag: tag,
+            frames,
+            settled,
+        })
+    }
+
+    /// How this end settles, as the answering `attach` left it.
+    ///
+    /// `Mixed` before the answer arrives, which is the specification's own
+    /// default and means "decided per delivery" — and this client's decision
+    /// for a `Mixed` link is unsettled, because a settled transfer is one the
+    /// receiver cannot report anything about.
+    fn settle_mode(&self) -> SenderSettleMode {
+        self.negotiated()
+            .map_or(SenderSettleMode::Mixed, |n| n.snd_settle_mode)
+    }
+
+    /// Refuses an operation the other end of the link owns.
+    fn role_must_be(&self, role: Role, what: &str) -> Result<()> {
+        if self.shared.role == role {
+            return Ok(());
+        }
+        Err(Error::Configuration(format!(
+            "only the {} may {what}, and link {} is the {}",
+            role_name(role),
+            self.shared.name,
+            role_name(self.shared.role)
+        )))
+    }
+
+    /// The next delivery-tag: a per-link counter, eight octets.
+    ///
+    /// The requirement is that a tag be "unique among the deliveries either
+    /// end could consider unsettled on this link", which a counter satisfies
+    /// without a random source — and the field allows 32 octets, so eight is
+    /// a quarter of the budget for a number that cannot repeat before the
+    /// connection has outlived everything.
+    fn next_tag(&self) -> Vec<u8> {
+        let mut next = self.shared.next_tag.lock().expect("not poisoned");
+        let tag = *next;
+        *next = next.wrapping_add(1);
+        tag.to_be_bytes().to_vec()
+    }
+
+    /// How many payload octets fit in one frame of this delivery.
+    ///
+    /// Measured rather than guessed: the first frame's performative is the
+    /// largest one the delivery will carry — it is the frame with the id, the
+    /// tag and the format — so encoding it once and subtracting gives a
+    /// budget every frame of the delivery fits inside.
+    fn frame_budget(&self, tag: &[u8]) -> Result<usize> {
+        let mut probe = Transfer::new(self.shared.output_handle);
+        probe.delivery_id = Some(u32::MAX);
+        probe.delivery_tag = Some(tag);
+        probe.message_format = Some(0);
+        probe.settled = Some(true);
+        probe.more = true;
+        let mut scratch = Vec::new();
+        Performative::Transfer(probe).encode(&mut scratch)?;
+        let ceiling = self
+            .shared
+            .max_frame_size
+            .max(weida_amqp_codec::frame::MIN_MAX_FRAME_SIZE) as usize;
+        Ok(ceiling.saturating_sub(FRAME_HEADER + scratch.len()).max(1))
+    }
+
+    /// Waits until this link has credit, and takes one unit.
+    ///
+    /// Registered with the waker *before* the state is read, so a `flow` that
+    /// lands between the two is not a lost wake-up.
+    async fn take_credit(&self) -> Result<()> {
+        loop {
+            let notified = self.shared.flow.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            self.still_usable()?;
+            if self
+                .shared
+                .credit
+                .lock()
+                .expect("not poisoned")
+                .record_sent()
+            {
+                return Ok(());
+            }
+            notified.await;
+        }
+    }
+
+    /// Waits until the session window has room for one frame, and takes it,
+    /// reporting the transfer-id that frame will carry.
+    async fn take_window(&self) -> Result<u32> {
+        loop {
+            let notified = self.shared.flow.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            self.still_usable()?;
+            let reserved = self
+                .shared
+                .session
+                .windows
+                .lock()
+                .expect("not poisoned")
+                .reserve();
+            if let Some(id) = reserved {
+                return Ok(id);
+            }
+            notified.await;
+        }
+    }
+
+    /// Refuses to keep waiting on a link that has gone.
+    fn still_usable(&self) -> Result<()> {
+        let state = self.state();
+        if state.is_usable() {
+            return Ok(());
+        }
+        match state {
+            LinkState::Detached(Some(condition)) => Err(Error::Closed(Some(condition))),
+            _ => Err(Error::ConnectionGone),
+        }
+    }
+
+    /// Tells the receiver to discard a delivery this end could not finish.
+    async fn abort(&self, delivery_id: u32, tag: &[u8], frames: usize) {
+        if frames == 0 {
+            // Nothing left our hands, so there is nothing to discard and no
+            // delivery-id the peer would recognise.
+            return;
+        }
+        let mut transfer = Transfer::new(self.shared.output_handle);
+        transfer.delivery_id = Some(delivery_id);
+        transfer.delivery_tag = Some(tag);
+        transfer.aborted = true;
+        if let Ok(bytes) = self.frame(Performative::Transfer(transfer), &[]) {
+            let _ = self.write(bytes).await;
+        }
+    }
+
+    /// This end's `flow`, carrying both link and session state.
+    ///
+    /// Every `flow` carries the session's three mandatory fields whether or
+    /// not it names a handle, so a link-level `flow` refreshes the session
+    /// too — which is also why an `echo` asking for session state is
+    /// satisfied by one.
+    async fn send_flow(&self, echo: bool) -> Result<()> {
+        let credit = *self.shared.credit.lock().expect("not poisoned");
+        let windows = *self.shared.session.windows.lock().expect("not poisoned");
+        let flow = flow_frame(&windows, &credit, self.shared.output_handle, echo);
+        self.send_performative(Performative::Flow(flow)).await
+    }
+
+    /// Sends one performative on this link's session channel.
+    pub(crate) async fn send_performative(&self, performative: Performative<'_>) -> Result<()> {
+        let bytes = self.frame(performative, &[])?;
+        self.write(bytes).await
+    }
+
+    /// Encodes one frame: a performative and, for a `transfer`, the payload
+    /// that follows it in the same body.
+    fn frame(&self, performative: Performative<'_>, payload: &[u8]) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        weida_amqp_codec::frame::write(
+            &mut bytes,
+            weida_amqp_codec::frame::FrameKind::Amqp,
+            self.shared.channel,
+            self.shared.max_frame_size,
+            |body| {
+                performative.encode(body)?;
+                body.extend_from_slice(payload);
+                Ok(())
+            },
+        )?;
+        Ok(bytes)
+    }
+
+    /// Hands a frame to the connection driver, which is what keeps `close`
+    /// the last thing ever written.
+    async fn write(&self, bytes: Vec<u8>) -> Result<()> {
+        self.outbound
+            .send(crate::connection::Outbound::Frame(bytes))
+            .await
+            .map_err(|_| Error::ConnectionGone)
+    }
+
     /// Detaches the link, destroying the endpoint at both ends.
     ///
     /// Idempotent.
@@ -353,28 +776,12 @@ impl Link {
             *state = LinkState::Detaching;
         }
         let codec = error.as_ref().map(Condition::as_codec);
-        self.send(Performative::Detach(Detach {
+        self.send_performative(Performative::Detach(Detach {
             handle: self.shared.output_handle,
             closed,
             error: codec,
         }))
         .await
-    }
-
-    /// Sends one performative on this link's session channel.
-    pub(crate) async fn send(&self, performative: Performative<'_>) -> Result<()> {
-        let mut bytes = Vec::new();
-        weida_amqp_codec::frame::write(
-            &mut bytes,
-            weida_amqp_codec::frame::FrameKind::Amqp,
-            self.shared.channel,
-            u32::MAX,
-            |body| performative.encode(body),
-        )?;
-        self.outbound
-            .send(crate::connection::Outbound::Frame(bytes))
-            .await
-            .map_err(|_| Error::ConnectionGone)
     }
 }
 
@@ -401,6 +808,165 @@ pub(crate) struct Entry {
     /// against it: the settle modes we own are ours and the ones we do not
     /// are the peer's, and only this tells them apart.
     pub(crate) options: Box<LinkOptions>,
+    /// The delivery being reassembled, bounded by the `max-message-size`
+    /// **this** end advertised: the bound is ours to enforce, because it is
+    /// our buffer the frames land in.
+    pub(crate) reassembly: Reassembly,
+}
+
+/// What one incoming frame for a link amounts to.
+#[derive(Debug)]
+pub(crate) enum Incoming {
+    /// Accounted for, with nothing for the application yet.
+    Nothing,
+    /// A whole message.
+    Delivery(Delivery),
+    /// The link must be detached with this condition, and its handle is
+    /// poisoned for the life of the session.
+    Refused(Condition),
+}
+
+impl Entry {
+    /// One `transfer` frame for this link.
+    ///
+    /// Three things happen here and the order matters: the delivery's
+    /// identity is checked, the payload is appended **under the
+    /// `max-message-size` bound**, and the receiver's credit is spent once
+    /// per delivery rather than once per frame.
+    pub(crate) fn accept_transfer(&mut self, transfer: &Transfer<'_>, payload: &[u8]) -> Incoming {
+        if self.shared.role == Role::Sender {
+            // A sending link has no incoming deliveries; the peer has the
+            // roles the wrong way round and there is nothing to reassemble.
+            return Incoming::Refused(Condition::described(
+                condition::NOT_ALLOWED,
+                format!(
+                    "a transfer arrived on link {}, which this end attached as the sender",
+                    self.shared.name
+                ),
+            ));
+        }
+
+        // A tag that differs from the one being reassembled is a *second*
+        // delivery arriving before the first finished, which Part 2 §2.6.14
+        // forbids outright: "deliveries on one link MUST NOT interleave".
+        // Reported here rather than left to the payload check, because the
+        // octets of two messages concatenated are not a message.
+        let interleaving = self.reassembly.in_progress()
+            && transfer
+                .delivery_tag
+                .is_some_and(|tag| self.reassembly.delivery_tag() != Some(tag));
+        if interleaving {
+            return Incoming::Refused(Condition::described(
+                condition::NOT_ALLOWED,
+                format!(
+                    "a second delivery began on link {} before the first was complete",
+                    self.shared.name
+                ),
+            ));
+        }
+
+        let first = !self.reassembly.in_progress();
+        if first {
+            let within = self
+                .shared
+                .credit
+                .lock()
+                .expect("not poisoned")
+                .record_received();
+            if !within {
+                // The specification lets a receiver either handle the excess
+                // or detach with `amqp:link:transfer-limit-exceeded`. This
+                // client handles it: the sender sent under credit we had
+                // granted and then withdrew, and dropping the message would
+                // lose it.
+                tracing::debug!(
+                    link = self.shared.name,
+                    "a delivery arrived past the credit this end had granted"
+                );
+            }
+        }
+
+        match self.reassembly.accept(transfer, payload) {
+            Ok(Progress::Incomplete { .. }) => Incoming::Nothing,
+            Ok(Progress::Aborted) => {
+                // "Discard everything transferred for this delivery"; it is
+                // implicitly settled, so there is nothing to answer either.
+                tracing::debug!(link = self.shared.name, "the sender aborted a delivery");
+                Incoming::Nothing
+            }
+            Ok(Progress::Complete) => {
+                let delivery_id = self.reassembly.delivery_id().unwrap_or_default();
+                let tag = self.reassembly.delivery_tag().unwrap_or_default().to_vec();
+                let format = self.reassembly.message_format().unwrap_or_default();
+                let settled = transfer.settled.unwrap_or(false);
+                Incoming::Delivery(Delivery::new(
+                    delivery_id,
+                    tag,
+                    format,
+                    settled,
+                    self.shared.output_handle,
+                    self.reassembly.take(),
+                ))
+            }
+            Err(error) => {
+                // `MessageTooLarge` is the one that matters: the codec
+                // refused it before the buffer grew, and
+                // `amqp:link:message-size-exceeded` is the condition that
+                // exists so a receiver can say no.
+                let condition =
+                    if matches!(error, weida_amqp_codec::DecodeError::MessageTooLarge { .. }) {
+                        condition::LINK_MESSAGE_SIZE_EXCEEDED
+                    } else {
+                        condition::NOT_ALLOWED
+                    };
+                self.reassembly.reset();
+                Incoming::Refused(Condition::described(condition, error.to_string()))
+            }
+        }
+    }
+
+    /// The peer's `flow` for this link.
+    ///
+    /// Returns the `flow` this end owes in answer, which is owed in two
+    /// cases: an `echo` asked for our state, or a `drain` did — a drained
+    /// sender MUST report, and a sender with nothing available MUST advance
+    /// `delivery-count` until `link-credit` is zero first.
+    pub(crate) fn accept_flow(
+        &mut self,
+        flow: &Flow<'_>,
+        windows: &Windows,
+    ) -> Option<Flow<'static>> {
+        let mut credit = self.shared.credit.lock().expect("not poisoned");
+        let mut owed = flow.echo;
+        match self.shared.role {
+            Role::Sender => {
+                credit.apply_grant(flow.delivery_count, flow.link_credit, flow.drain);
+                if flow.drain {
+                    credit.consume_for_drain();
+                    owed = true;
+                }
+            }
+            Role::Receiver => credit.apply_sender_state(flow.delivery_count, flow.available),
+        }
+        let snapshot = *credit;
+        drop(credit);
+        // The waker before the event: a sender parked on credit should be
+        // running again whether or not anything is reading the events.
+        self.shared.flow.notify_waiters();
+        // Never with `echo` set: answering an echo with an echo loops
+        // forever, and the specification says so.
+        owed.then(|| flow_frame(windows, &snapshot, self.shared.output_handle, false))
+    }
+
+    /// The credit state, for the event the application sees.
+    pub(crate) fn credit(&self) -> Credit {
+        *self.shared.credit.lock().expect("not poisoned")
+    }
+
+    /// Wakes anything parked on this link because the session window moved.
+    pub(crate) fn wake(&self) {
+        self.shared.flow.notify_waiters();
+    }
 }
 
 impl Links {
@@ -458,6 +1024,14 @@ impl Links {
             self.errored.insert(output);
         }
         self.by_output.remove(&output)
+    }
+
+    /// Wakes everything parked on any link of this session, which is what a
+    /// session-level `flow` amounts to: the window may have room now.
+    pub(crate) fn wake_all(&self) {
+        for entry in self.by_output.values() {
+            entry.wake();
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -520,12 +1094,62 @@ pub(crate) fn attach_frame(channel: u16, handle: u32, options: &LinkOptions) -> 
     Ok(bytes)
 }
 
+/// Builds a `flow` carrying this link's credit and its session's windows.
+///
+/// Every `flow` carries `incoming-window`, `next-outgoing-id` and
+/// `outgoing-window` whether or not it names a handle — they are mandatory —
+/// so a link-level `flow` refreshes the session state too, and an `echo`
+/// asking for session state is answered by one.
+pub(crate) fn flow_frame(
+    windows: &Windows,
+    credit: &Credit,
+    handle: u32,
+    echo: bool,
+) -> Flow<'static> {
+    Flow {
+        next_incoming_id: windows.wire_next_incoming_id(),
+        incoming_window: windows.incoming_window,
+        next_outgoing_id: windows.next_outgoing_id,
+        outgoing_window: windows.outgoing_window,
+        handle: Some(handle),
+        delivery_count: credit.wire_delivery_count(),
+        // A receiver states the credit it grants; a sender states what it has
+        // left, which is the same number read from the other side.
+        link_credit: Some(credit.link_credit()),
+        available: Some(credit.available()),
+        drain: credit.drain(),
+        echo,
+        properties: None,
+    }
+}
+
+/// Eight octets: `SIZE`, `DOFF`, `TYPE` and two type-specific bytes.
+const FRAME_HEADER: usize = 8;
+
+/// The word for a role, for an error message a person has to read.
+const fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Sender => "sender",
+        Role::Receiver => "receiver",
+    }
+}
+
 /// The condition a stolen link is closed with (Part 2 §2.8.18).
 pub const STOLEN: &str = condition::LINK_STOLEN;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session_shared() -> Arc<crate::session::Shared> {
+        Arc::new(crate::session::Shared {
+            outgoing_channel: 0,
+            incoming_channel: Mutex::new(Some(0)),
+            windows: Mutex::new(Windows::new(0, 400, 400)),
+            state: Mutex::new(crate::session::SessionState::Begun),
+            options: crate::session::SessionOptions::default(),
+        })
+    }
 
     fn entry(name: &str, role: Role, handle: u32) -> Entry {
         let (events, rx) = mpsc::channel(4);
@@ -539,12 +1163,21 @@ mod tests {
                 state: Mutex::new(LinkState::Attaching),
                 negotiated: Mutex::new(None),
                 input_handle: Mutex::new(None),
+                credit: Mutex::new(match role {
+                    Role::Sender => Credit::sender(0),
+                    Role::Receiver => Credit::receiver(),
+                }),
+                session: session_shared(),
+                flow: Notify::new(),
+                max_frame_size: weida_amqp_codec::frame::MIN_MAX_FRAME_SIZE,
+                next_tag: Mutex::new(0),
             }),
             events,
             pending: None,
             outbound,
             rx: Some(rx),
             options: Box::new(LinkOptions::sender(name, Target::at("q"))),
+            reassembly: Reassembly::new(DEFAULT_MAX_MESSAGE_SIZE),
         }
     }
 

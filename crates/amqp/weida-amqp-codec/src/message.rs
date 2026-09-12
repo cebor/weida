@@ -756,6 +756,16 @@ impl Reassembly {
         self.delivery_tag.as_deref()
     }
 
+    /// The `message-format` of the delivery being reassembled.
+    ///
+    /// Carried by the first frame and legitimately absent from every
+    /// continuation, so it is held here rather than read off the frame that
+    /// happened to complete the delivery.
+    #[must_use]
+    pub const fn message_format(&self) -> Option<u32> {
+        self.message_format
+    }
+
     /// Whether a delivery is part-way through.
     #[must_use]
     pub const fn in_progress(&self) -> bool {
