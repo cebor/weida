@@ -44,6 +44,14 @@ rustls-webpki.workspace = true
 # `#[ignore]`d on top of that, so `--ignored` is the deliberate step that
 # runs them.
 nng = { version = "1.0", optional = true }
+# The executor the blocking facade drives its futures on, and only that:
+# the reactor's own threads are busy driving the connections, so a
+# blocking caller polls the socket's future on the thread that asked.
+# `weida-runtime`'s Exec promises exactly this - the caller may drive the
+# returned futures on any executor - and the `blocking` feature is that
+# promise taken up. Optional, so a caller who does not want the facade
+# does not link it.
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Drives the owned-context doctest and tests from an executor that is not
@@ -57,12 +65,29 @@ trybuild.workspace = true
 # it, generated in the test rather than committed, so nothing expires and
 # no private key lives in the repository. Tests only.
 rcgen.workspace = true
+# This crate, as its own dev-dependency, with `blocking` on.
+#
+# Not a circle and not a second copy: it makes the feature set the test
+# targets build against **the same one every time**, whether they are run
+# as `cargo test -p weida-nng` or inside `cargo test --workspace`, where
+# the Python binding turns `blocking` on for everybody. The compile-fail
+# harness in `tests/directions` is why it matters: rustc prints a type as
+# `PushSocket` when the name is unique and as `weida_nng::PushSocket` when
+# the facade gives it a namesake, so without this the expected stderr
+# would depend on who else is in the build.
+weida-nng = { path = ".", features = ["blocking"] }
 
 [features]
 # The NNG interop tests. Off by default because the C library is a build
 # condition, not a runtime one: with this on and no cmake or compiler
 # present, nothing links.
 nng-interop = ["dep:nng"]
+# The synchronous facade, off by default: `weida_nng::blocking`. Not
+# default because a caller who already runs a reactor wants the
+# asynchronous sockets, and a feature nobody asked for is a reactor
+# nobody asked for (`ContextConfig::worker_threads` threads, owned by the
+# context).
+blocking = ["dep:futures"]
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -1,5 +1,5 @@
-error[E0599]: no method named `recv` found for struct `PushSocket` in the current scope
+error[E0599]: no method named `recv` found for struct `weida_nng::PushSocket` in the current scope
  --> tests/directions/a_pusher_cannot_receive.rs:8:18
   |
 8 |     let _ = push.recv();
-  |                  ^^^^ method not found in `PushSocket`
+  |                  ^^^^ method not found in `weida_nng::PushSocket`

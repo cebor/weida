@@ -1,5 +1,5 @@
-error[E0599]: no method named `send` found for struct `PullSocket` in the current scope
+error[E0599]: no method named `send` found for struct `weida_nng::PullSocket` in the current scope
  --> tests/directions/a_puller_cannot_send.rs:8:18
   |
 8 |     let _ = pull.send(b"work".to_vec());
-  |                  ^^^^ method not found in `PullSocket`
+  |                  ^^^^ method not found in `weida_nng::PullSocket`

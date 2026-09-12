@@ -2758,6 +2758,7 @@ dependencies = [
  "tracing",
  "trybuild",
  "weida-core",
+ "weida-nng",
  "weida-runtime",
  "weida-sp",
 ]
