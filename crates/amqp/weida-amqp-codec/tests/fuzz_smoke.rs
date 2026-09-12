@@ -16,7 +16,8 @@
 //! octets and a decoder that reserved a declared count would abort the test
 //! process rather than fail it.
 
-use weida_amqp_codec::{DecodeError, Limits, Value, decode, encode};
+use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
+use weida_amqp_codec::{DecodeError, Limits, Performative, SaslFrame, Value, decode, encode};
 
 const ITERATIONS: usize = 100_000;
 
@@ -73,7 +74,55 @@ impl Rng {
         bytes[0] = CODES[self.below(CODES.len())];
         bytes
     }
+
+    /// A well-formed `list8` of `count` values drawn from the encodings of
+    /// [`ATOMS`].
+    ///
+    /// Random bytes reach a *performative's* field decoding about never: the
+    /// body has to be a list before the first field is even looked at, and
+    /// then every field has to carry a type the field accepts. So the
+    /// generator builds a real list of real values of random types, which is
+    /// what makes the wrong-type, missing-mandatory and restriction paths
+    /// the ones being explored.
+    fn field_list(&mut self, max_fields: usize) -> Vec<u8> {
+        let count = self.below(max_fields + 1);
+        let mut body = Vec::new();
+        for _ in 0..count {
+            body.extend_from_slice(ATOMS[self.below(ATOMS.len())]);
+        }
+        if count == 0 {
+            return vec![0x45];
+        }
+        if body.len() + 1 > usize::from(u8::MAX) || count > usize::from(u8::MAX) {
+            unreachable!("max_fields and ATOMS keep this inside the narrow form");
+        }
+        let mut list = vec![0xc0, (body.len() + 1) as u8, count as u8];
+        list.extend_from_slice(&body);
+        list
+    }
 }
+
+/// One well-formed encoding of each type a performative field can have,
+/// including the forms that are deliberately the *wrong* type for most
+/// fields.
+const ATOMS: [&[u8]; 16] = [
+    &[0x40],                         // null
+    &[0x41],                         // true
+    &[0x42],                         // false
+    &[0x43],                         // uint 0
+    &[0x44],                         // ulong 0
+    &[0x45],                         // list0
+    &[0x50, 0x02],                   // ubyte 2
+    &[0x52, 0x07],                   // uint 7
+    &[0x53, 0x07],                   // ulong 7
+    &[0x60, 0x00, 0x07],             // ushort 7
+    &[0x70, 0x00, 0x00, 0x01, 0x00], // uint 256
+    &[0xa0, 0x01, 0xff],             // binary
+    &[0xa1, 0x01, b'x'],             // string
+    &[0xa3, 0x01, b'x'],             // symbol
+    &[0xc1, 0x01, 0x00],             // empty map
+    &[0x00, 0x53, 0x24, 0x45],       // described: accepted
+];
 
 /// Every invariant an accepted value must satisfy, checked recursively.
 fn check(value: &Value<'_>, depth: u32) {
@@ -226,4 +275,146 @@ fn a_declared_count_is_never_believed() {
             "unexpected {error:?} for {header:02x?}"
         );
     }
+}
+
+#[test]
+fn fuzz_smoke_frame() {
+    let mut rng = Rng::new(0xF0_0D);
+    let mut accepted = 0usize;
+    for _ in 0..ITERATIONS {
+        // A frame around a body that is itself well formed most of the
+        // time, because a uniformly random SIZE is above the ceiling
+        // 99.99% of the time and a uniformly random DOFF overruns the frame
+        // nearly always — so the header check would be the only thing ever
+        // exercised. One time in four each of DOFF and TYPE is random
+        // anyway, which is what keeps the malformed paths covered.
+        let body = match rng.below(4) {
+            0 => rng.bytes(24),
+            _ => {
+                let mut described = vec![0x00u8, 0x53, 0x10 + rng.below(9) as u8];
+                described.extend_from_slice(&rng.field_list(4));
+                described
+            }
+        };
+        let doff = if rng.below(4) == 0 { rng.byte() } else { 2 };
+        let kind = if rng.below(4) == 0 {
+            rng.byte()
+        } else {
+            rng.below(2) as u8
+        };
+        let size = (8 + body.len()) as u32;
+        let mut input = size.to_be_bytes().to_vec();
+        input.push(doff);
+        input.push(kind);
+        input.push(rng.byte());
+        input.push(rng.byte());
+        input.extend_from_slice(&body);
+
+        match frame::decode(&input, MIN_MAX_FRAME_SIZE) {
+            Ok(read) => {
+                accepted += 1;
+                assert!(read.header.size >= 8);
+                assert!(read.header.size <= MIN_MAX_FRAME_SIZE);
+                assert!(read.header.doff >= 2);
+                assert!(read.used() <= input.len());
+                assert_eq!(read.body.len(), read.header.body_len());
+                assert!(read.header.body_offset() <= read.used());
+
+                match read.header.kind {
+                    FrameKind::Amqp => {
+                        if let Ok((performative, used)) = Performative::decode(read.body, LIMITS) {
+                            assert!(used <= read.body.len());
+                            let mut written = Vec::new();
+                            performative.encode(&mut written).expect("re-encodes");
+                            let (again, used2) =
+                                Performative::decode(&written, LIMITS).expect("decodes");
+                            assert_eq!(used2, written.len());
+                            assert_eq!(again, performative);
+                        }
+                    }
+                    FrameKind::Sasl => {
+                        if let Ok((body, used)) = SaslFrame::decode(read.body, LIMITS) {
+                            assert!(used <= read.body.len());
+                            let mut written = Vec::new();
+                            body.encode(&mut written).expect("re-encodes");
+                            let (again, used2) =
+                                SaslFrame::decode(&written, LIMITS).expect("decodes");
+                            assert_eq!(used2, written.len());
+                            assert_eq!(again, body);
+                        }
+                    }
+                }
+            }
+            Err(error) => assert_eq!(
+                error.is_violation(),
+                !matches!(error, DecodeError::Incomplete { .. })
+            ),
+        }
+    }
+    assert!(
+        accepted > ITERATIONS / 20,
+        "the generator must reach the frame decoder: only {accepted} of \
+         {ITERATIONS} inputs decoded"
+    );
+}
+
+#[test]
+fn fuzz_smoke_performative() {
+    let mut rng = Rng::new(0x0B_ADC0DE);
+    let mut accepted = 0usize;
+    for _ in 0..ITERATIONS {
+        // A described list with a real performative descriptor in front, so
+        // the field-by-field decoding is what gets explored rather than the
+        // dispatch.
+        let code = 0x10 + rng.below(9) as u8;
+        let body = rng.field_list(6);
+        let mut input = vec![0x00u8, 0x53, code];
+        input.extend_from_slice(&body);
+
+        match Performative::decode(&input, LIMITS) {
+            Ok((performative, used)) => {
+                accepted += 1;
+                assert!(used <= input.len());
+                assert_eq!(performative.descriptor(), u64::from(code));
+                let mut written = Vec::new();
+                performative.encode(&mut written).expect("re-encodes");
+                let (again, used2) = Performative::decode(&written, LIMITS).expect("decodes");
+                assert_eq!(used2, written.len());
+                assert_eq!(again, performative);
+                let mut twice = Vec::new();
+                again.encode(&mut twice).expect("re-encodes");
+                assert_eq!(twice, written, "the canonical encoding is idempotent");
+            }
+            Err(error) => assert_eq!(
+                error.is_violation(),
+                !matches!(error, DecodeError::Incomplete { .. })
+            ),
+        }
+    }
+    assert!(
+        accepted > ITERATIONS / 100,
+        "the generator must reach the performatives: only {accepted} of \
+         {ITERATIONS} inputs decoded"
+    );
+}
+
+#[test]
+fn a_frame_size_field_is_never_believed() {
+    // Four octets claiming four gigabytes, in an eight-octet buffer. Before
+    // `open` has been read the ceiling is 512, and this is the check that
+    // makes the ceiling an argument rather than a constant nobody passes.
+    let hostile = [0xff, 0xff, 0xff, 0xff, 0x02, 0x00, 0x00, 0x00];
+    assert_eq!(
+        frame::decode(&hostile, MIN_MAX_FRAME_SIZE),
+        Err(DecodeError::FrameTooLarge {
+            size: u32::MAX,
+            max: MIN_MAX_FRAME_SIZE
+        })
+    );
+    // And the same header once the partner has advertised room: still
+    // refused, because the octets are not there.
+    assert!(matches!(
+        frame::decode(&hostile, u32::MAX),
+        Err(DecodeError::Incomplete { .. })
+    ));
 }

@@ -1,4 +1,5 @@
-//! AMQP 1.0 codec: the Part 1 type system, sans-I/O.
+//! AMQP 1.0 codec: the type system, the frames and the performatives,
+//! sans-I/O.
 //!
 //! This crate is the first slice of the AMQP 1.0 library described in
 //! [0013](../../../docs/decisions/0013-competitor-libraries.md) §4.3 and
@@ -23,6 +24,20 @@
 //! * [`encode`] — values to bytes in **one** canonical form, the shortest
 //!   that carries the value, with a composite's trailing null fields omitted.
 //! * [`Limits`] — the caller's bounds, an argument to every decode.
+//! * [`fields`] — reading a composite's fields by position, with the
+//!   specification's own names in the error messages.
+//! * [`types`] — the restricted types the performatives are built from:
+//!   `role`, the two settle modes, `multiple`, `error` and the error
+//!   conditions.
+//! * [`protocol_header`] — the eight octets before any frame, and the three
+//!   protocol-ids that select a layer.
+//! * [`frame`] — the 8-octet frame header, the two frame types, the empty
+//!   keep-alive frame, and the 512-octet bound that holds until `open` has
+//!   been read.
+//! * [`performative`] — the nine performatives, `open` `0x10` through
+//!   `close` `0x18`.
+//! * [`sasl`] — the five SASL bodies, `0x40` through `0x44`, and `PLAIN`'s
+//!   NUL-separated initial response.
 //!
 //! # Reading a value
 //!
@@ -125,9 +140,21 @@ pub mod codes;
 pub mod decode;
 pub mod encode;
 pub mod error;
+pub mod fields;
+pub mod frame;
 pub mod limits;
+pub mod performative;
+pub mod protocol_header;
+pub mod sasl;
+pub mod types;
 pub mod value;
 
 pub use error::{DecodeError, EncodeError};
+pub use fields::Fields;
+pub use frame::{Frame, FrameHeader, FrameKind};
 pub use limits::Limits;
+pub use performative::Performative;
+pub use protocol_header::{ProtocolHeader, ProtocolId};
+pub use sasl::{SaslCode, SaslFrame};
+pub use types::{AmqpError, Multiple, ReceiverSettleMode, Role, SenderSettleMode};
 pub use value::{Array, Described, Descriptor, ElementKind, Value};

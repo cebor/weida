@@ -185,6 +185,21 @@ impl Descriptor<'_> {
     pub const fn is(&self, code: u64) -> bool {
         matches!(self, Self::Code(found) if *found == code)
     }
+
+    /// Whether this descriptor is the given numeric code or the symbolic
+    /// name assigned alongside it.
+    ///
+    /// Both forms are legal. Every implementation writes the numeric one
+    /// because it is two octets against sixteen, but Part 1 §1.5 assigns the
+    /// pair together and a peer may send either, so a decoder that
+    /// dispatched on the number alone would refuse a legal frame.
+    #[must_use]
+    pub fn matches(&self, code: u64, name: &str) -> bool {
+        match self {
+            Self::Code(found) => *found == code,
+            Self::Symbol(found) => *found == name,
+        }
+    }
 }
 
 /// A described type: `0x00`, a descriptor, and the value being described.
