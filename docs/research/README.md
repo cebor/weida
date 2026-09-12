@@ -119,9 +119,9 @@ through this list; the synthesis compares the answers side by side.
 | --- | --- | --- |
 | `zeromq.md` | ZeroMQ: ZMTP 3.1, the zguide patterns, CURVE/ZAP | done; §1, §6 and §13 carry what an interop run against `zeromq` 0.6.0 measured [40] |
 | `rabbitmq-amqp091.md` | RabbitMQ and AMQP 0-9-1 with RabbitMQ extensions | done |
-| `amqp10.md` | AMQP 1.0 (ISO/IEC 19464) | done |
+| `amqp10.md` | AMQP 1.0 (ISO/IEC 19464) | done; §1, §3, §6.2, §6.3 and §13 carry what a client run against `fe2o3-amqp` 0.17.0 in both roles measured [67], including `rcv-settle-mode=second` honoured by an implementation the sheet's incompatibility list had only seen refused. RabbitMQ 4.x was unreachable, so its four published non-supports stay documentation and are listed as an open question |
 | `mqtt5.md` | MQTT 5.0, with 3.1.1 differences | done |
-| `nats.md` | NATS core and JetStream | done |
+| `nats.md` | NATS core and JetStream | done; §1, §3, §4 and §13 carry what writing a client from the protocol reference settled where the reference is silent [30] and what the server's own subject validator enforces [31]. **No `nats-server` was reachable**, so nothing added is an observation of a server and the sheet says so at the source |
 | `nanomsg-nng.md` | nanomsg / NNG scalability protocols | done; §1, §3, §4, §6, §8, §11 and §13 carry what an implementation run against NNG 1.4.0-rc.0 through `nng` 1.0.1 observed [30], including the byte-level layouts the RFCs leave in prose |
 | `kafka.md` | Apache Kafka protocol and client semantics | done |
 | `ipc.md` | Inter-process and in-process transports per platform | done |
