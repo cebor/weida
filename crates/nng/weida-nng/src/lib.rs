@@ -78,6 +78,12 @@
 //! `docs/research/nanomsg-nng.md`, which cites the nanomsg RFCs and NNG
 //! 1.10.0's manual pages. Section references in this crate's documentation
 //! (`§2`, `§11`) are that sheet's.
+//!
+//! The socket types arrive one protocol family at a time:
+//!
+//! - [`ReqSocket`] and [`RepSocket`] — request-reply with `nng_ctx`
+//!   contexts, the 32-bit tag stack, the resend timer and its three
+//!   triggers, and `NNG_ESTATE` for every order the protocol forbids.
 
 #![warn(missing_docs)]
 
@@ -89,7 +95,9 @@ pub mod message;
 pub mod options;
 pub mod pipe;
 pub mod protocol;
+pub mod reqrep;
 pub mod session;
+pub mod socket;
 pub mod transport;
 
 pub use context::{
@@ -114,5 +122,7 @@ pub use pipe::{
 };
 pub use pipe::{Discarded, Pipe, PipeConfig};
 pub use protocol::{PROTOCOLS, Protocol, protocol};
+pub use reqrep::{CtxId, RepCtx, RepSocket, ReqCtx, ReqSocket};
 pub use session::SpSession;
+pub use socket::{Broadcast, SocketCore};
 pub use transport::Stream;

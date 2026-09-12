@@ -359,12 +359,27 @@ impl Queue {
     /// where the drop is its documented behaviour rather than the caller's
     /// choice.
     pub fn try_send(&self, message: Message) -> Result<()> {
-        let mut state = self.lock();
-        if state.closed {
-            return Err(gone());
+        let closed = self.is_closed();
+        match self.offer(message) {
+            Ok(()) => Ok(()),
+            Err(_) if closed => Err(gone()),
+            Err(_) => Err(Error::EAGAIN(self.full_cause())),
         }
-        if !self.accepts(&state) {
-            return Err(Error::EAGAIN(self.full_cause()));
+    }
+
+    /// Queues `message` if there is room **right now**, and hands it back
+    /// if there is not.
+    ///
+    /// The primitive a round-robin needs: a sender that has just seen
+    /// [`Queue::has_room`] may still lose the last slot to another thread —
+    /// an NNG socket is usable from several at once (§2) — and a send that
+    /// swallowed the message on that race would lose it. A closed queue
+    /// hands it back too, so a caller rotating over pipes skips a dead one
+    /// and keeps its message.
+    pub fn offer(&self, message: Message) -> std::result::Result<(), Message> {
+        let mut state = self.lock();
+        if state.closed || !self.accepts(&state) {
+            return Err(message);
         }
         state.messages.push_back(message);
         drop(state);

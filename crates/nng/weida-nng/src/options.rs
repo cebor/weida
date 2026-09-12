@@ -65,6 +65,22 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// number; this one is ours and is settable.
 pub const DEFAULT_MAX_ADDRESSES: usize = 8;
 
+/// Default `NNG_OPT_REQ_RESENDTIME`: NNG's own one minute.
+pub const DEFAULT_RESEND_TIME: Duration = Duration::from_secs(60);
+
+/// Default `NNG_OPT_MAXTTL`: the 8 that "supported forwarding protocols
+/// commonly default to" (§11).
+pub const DEFAULT_MAX_TTL: usize = 8;
+
+/// The largest `NNG_OPT_MAXTTL` the *manual* documents (§11).
+pub const SPEC_MAX_TTL: usize = 255;
+
+/// The largest `NNG_OPT_MAXTTL` NNG's own source accepts, which is what a
+/// real peer enforces: `NNI_MAX_MAX_TTL` is 15 (§11). A value above this
+/// is legal here and is not portable, and that is said where it is set
+/// rather than discovered when a node drops the message.
+pub const NNG_MAX_TTL: usize = 15;
+
 /// One socket's configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SocketOptions {
@@ -98,6 +114,22 @@ pub struct SocketOptions {
     /// Addresses one hostname may resolve to. Also ours
     /// ([`DEFAULT_MAX_ADDRESSES`]).
     pub max_addresses: usize,
+    /// `NNG_OPT_REQ_RESENDTIME`: how long a REQ context waits for its
+    /// reply before sending the request again. NNG's default is a minute.
+    ///
+    /// The resend is protocol recovery and not flow control: "it can
+    /// duplicate a request after a missing reply" (§5), which is why a
+    /// service behind REQ has to be repeat-safe (§9).
+    pub resend_time: Duration,
+    /// `NNG_OPT_MAXTTL`: how many forwarder hops a message may carry, and
+    /// therefore how deep a tag stack may be.
+    ///
+    /// "`MAXTTL` is 1-255; supported forwarding protocols commonly default
+    /// to 8" (§11). NNG's own source caps it at 15, so a value above that
+    /// is accepted here and is **not portable** — a real NNG node refuses
+    /// a stack of 16 (§11). Both numbers are published rather than one
+    /// chosen silently.
+    pub max_ttl: usize,
 }
 
 impl Default for SocketOptions {
@@ -113,6 +145,8 @@ impl Default for SocketOptions {
             max_pipes: DEFAULT_MAX_PIPES,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             max_addresses: DEFAULT_MAX_ADDRESSES,
+            resend_time: DEFAULT_RESEND_TIME,
+            max_ttl: DEFAULT_MAX_TTL,
         }
     }
 }
@@ -157,6 +191,22 @@ impl SocketOptions {
                     self.reconnect_max, self.reconnect_min
                 )
                 .into(),
+            ));
+        }
+        if self.max_ttl < 1 || self.max_ttl > SPEC_MAX_TTL {
+            return Err(crate::Error::EINVAL(
+                format!(
+                    "NNG_OPT_MAXTTL is 1..={SPEC_MAX_TTL}; {} is out of range",
+                    self.max_ttl
+                )
+                .into(),
+            ));
+        }
+        if self.resend_time.is_zero() {
+            return Err(crate::Error::EINVAL(
+                "NNG_OPT_REQ_RESENDTIME must be nonzero; zero would resend a request \
+                 continuously"
+                    .into(),
             ));
         }
         Ok(())
