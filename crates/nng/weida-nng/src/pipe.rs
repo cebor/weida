@@ -461,6 +461,103 @@ impl Queue {
     }
 }
 
+/// How both directions of one pipe are bounded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PipeConfig {
+    /// `NNG_OPT_SENDBUF` and the protocol's action at its bound.
+    pub outgoing: QueueConfig,
+    /// `NNG_OPT_RECVBUF` and the protocol's action at its bound.
+    pub incoming: QueueConfig,
+}
+
+impl PipeConfig {
+    /// The defaults of `protocol`: NNG's depths and NNG's behaviour at the
+    /// bound, so that a socket type that says nothing gets the protocol's
+    /// own answer rather than a house one.
+    pub const fn of(protocol: EndpointType) -> PipeConfig {
+        PipeConfig {
+            outgoing: QueueConfig {
+                depth: DEFAULT_SEND_DEPTH,
+                full: FullAction::sending(protocol),
+            },
+            incoming: QueueConfig {
+                depth: DEFAULT_RECV_DEPTH,
+                full: FullAction::receiving(protocol),
+            },
+        }
+    }
+}
+
+/// One connection's double queue, outgoing and incoming, each bounded on
+/// its own.
+///
+/// A pipe exists **only while its connection does**: "endpoints create
+/// pipes, which are message-oriented connected streams and commonly map 1:1
+/// to TCP or IPC connections" (§1), and a pipe "is removed when its peer,
+/// owning dialer/listener, or `nng_pipe_close()` closes it" (§1). That is
+/// the opposite of ZMTP's rule, where a queue is created when a connection
+/// is *initiated* and survives reconnects, and it is why nothing here can
+/// be queued for a peer that has not arrived.
+///
+/// Cloning shares the queues: the socket holds one clone and the session
+/// driving the connection holds the other, which is the only way a queue
+/// can be a rendezvous between them.
+#[derive(Clone, Debug)]
+pub struct Pipe {
+    id: PipeId,
+    outgoing: std::sync::Arc<Queue>,
+    incoming: std::sync::Arc<Queue>,
+}
+
+impl Pipe {
+    /// A pipe with both queues empty.
+    pub fn new(id: PipeId, config: PipeConfig) -> Pipe {
+        Pipe {
+            id,
+            outgoing: std::sync::Arc::new(Queue::new(config.outgoing)),
+            incoming: std::sync::Arc::new(Queue::new(config.incoming)),
+        }
+    }
+
+    /// This pipe's id within its socket.
+    pub const fn id(&self) -> PipeId {
+        self.id
+    }
+
+    /// Messages on their way to the peer.
+    pub fn outgoing(&self) -> &Queue {
+        &self.outgoing
+    }
+
+    /// Messages that arrived from the peer.
+    pub fn incoming(&self) -> &Queue {
+        &self.incoming
+    }
+
+    /// Destroys both queues and reports what they held, which is the only
+    /// trace a discarded message leaves: SP tells nobody anything (§6).
+    pub fn close(&self) -> Discarded {
+        Discarded {
+            outgoing: self.outgoing.close(),
+            incoming: self.incoming.close(),
+        }
+    }
+
+    /// Whether this pipe has been destroyed.
+    pub fn is_closed(&self) -> bool {
+        self.outgoing.is_closed()
+    }
+}
+
+/// What destroying a pipe discarded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Discarded {
+    /// Messages queued for the peer that will never be sent.
+    pub outgoing: usize,
+    /// Messages received from the peer that will never be delivered.
+    pub incoming: usize,
+}
+
 /// Decrements the parked-taker count however [`Queue::recv`]'s await ends,
 /// cancellation included: a cancelled receive that left its count behind
 /// would make a depth-zero queue accept a message nobody is waiting for.
