@@ -294,3 +294,68 @@ async fn a_message_survives_the_sender_closing_right_behind_it() {
         .expect("the message arrived before the close");
     assert_eq!(received.body(), b"last words");
 }
+
+/// Claim: the buffer those survivors live in has a ceiling of its own, and
+/// a peer that connects, sends and disconnects in a loop cannot grow it.
+///
+/// Retiring a pipe frees its slot, so `max_pipes` bounds how many peers
+/// are connected at once and not how many have ever been - the buffer is
+/// therefore bounded separately, at one pipe's receive depth, and the
+/// oldest messages are the ones kept, because they are the ones somebody
+/// is already waiting for (`docs/INVARIANTS.md`).
+#[tokio::test]
+async fn a_peer_that_reconnects_in_a_loop_cannot_grow_the_buffer() {
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    let depth = 4;
+    let pull = PullSocket::with_options(
+        &ctx,
+        SocketOptions {
+            recv_depth: Some(depth),
+            ..options()
+        },
+    )
+    .expect("pull");
+    let url = pull
+        .listen("tcp://127.0.0.1:0")
+        .await
+        .expect("listen")
+        .url()
+        .to_string();
+    let addr = url.trim_start_matches("tcp://").to_owned();
+
+    // Four times the ceiling, and nobody receives while they arrive.
+    let cycles = depth * 4;
+    for n in 0..cycles {
+        let mut peer = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("connect");
+        peer.write_all(&ProtocolHeader::new(EndpointType::Push).encode())
+            .await
+            .expect("our header");
+        let mut theirs = [0u8; HEADER_LEN];
+        peer.read_exact(&mut theirs).await.expect("their header");
+        peer.write_all(&message::encode(format!("{n}").as_bytes()))
+            .await
+            .expect("the message");
+        peer.shutdown().await.expect("close");
+        drop(peer);
+        while pull.pipe_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    let mut held = Vec::new();
+    while let Ok(message) = pull.try_recv() {
+        held.push(String::from_utf8(message.body().to_vec()).expect("utf8"));
+    }
+    assert_eq!(
+        held.len(),
+        depth,
+        "the buffer holds one pipe's depth however many pipes have come and gone: {held:?}"
+    );
+    assert_eq!(
+        held,
+        vec!["0", "1", "2", "3"],
+        "and it is the newest that are refused, not the oldest that are dropped"
+    );
+}
