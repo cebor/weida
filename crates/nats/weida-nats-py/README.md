@@ -72,3 +72,12 @@ It creates a `uv`-managed virtualenv at the repository root, installs
 `maturin` and `pytest` into it, runs `maturin develop` and then the Python
 tests. Nothing is installed into a system interpreter. The tests script the
 server half in Python and need no `nats-server`.
+
+```sh
+sh crates/nats/weida-nats-py/package.sh
+```
+
+builds the `abi3` release wheel, installs it into a throwaway virtualenv and
+runs one publish/subscribe round trip, one request-reply and the
+`NATS/1.0 503` with `cargo`, `rustc` and `maturin` off `PATH` — so "no Rust
+toolchain and no C library to install this" is checked rather than claimed.
