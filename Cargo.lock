@@ -2254,6 +2254,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "weida-nng"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "tokio",
+ "tracing",
+ "weida-core",
+ "weida-runtime",
+ "weida-sp",
+]
+
+[[package]]
 name = "weida-nng-bridge"
 version = "0.1.0"
 dependencies = [

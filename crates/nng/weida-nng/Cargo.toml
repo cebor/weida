@@ -1,0 +1,32 @@
+[package]
+name = "weida-nng"
+description = "An implementation of the nanomsg Scalability Protocols in Rust: sockets, endpoints and pipes, usable with no weida in the picture"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+# The machine room only: the reactor, the resolver, the AF_UNIX hygiene and
+# the name registry, plus one OS-error vocabulary at the boundary. `weida` and
+# `weida-protocol` MUST NOT appear here
+# (`docs/decisions/0013-competitor-libraries.md` §4.2).
+weida-core.workspace = true
+weida-runtime.workspace = true
+tokio.workspace = true
+# The sans-I/O SP codec: the 8-octet protocol header, the 64-bit framing, the
+# REQ/SURVEY tag stack and the PAIR v1 hop count, with the declared-length
+# check that makes `NNG_OPT_RECVMAXSZ` enforceable before a body is
+# allocated. Reused rather than reimplemented; its own manifest stays empty
+# (0013 §4.3).
+weida-sp.workspace = true
+# Connection lifecycle logging: a reconnect loop that says nothing is a
+# reconnect loop nobody can debug.
+tracing.workspace = true
+
+[dev-dependencies]
+# Drives the owned-context doctest and tests from an executor that is not
+# tokio, which is what `Context::owned` exists for.
+futures.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
