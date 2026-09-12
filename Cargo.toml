@@ -79,6 +79,11 @@ minicbor = { version = "2", features = ["alloc"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
 ring = "0.17"
+# The `tls+tcp` transport of `weida-nng`: TLS over TCP, in pure Rust so that
+# `unsafe_code = "forbid"` survives it and no OpenSSL is linked. `ring` is
+# the provider, which is the one weida's QUIC transport already uses, so the
+# workspace has one cryptographic backend rather than two.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 # The one cryptographic dependency of `weida-zmq`, for CURVE. RustCrypto's
 # NaCl-compatible `crypto_box`: X25519 key agreement, HSalsa20 to derive the
 # shared key, XSalsa20-Poly1305 for the box - which is exactly the

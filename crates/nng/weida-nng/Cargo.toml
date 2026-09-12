@@ -22,6 +22,16 @@ weida-sp.workspace = true
 # Connection lifecycle logging: a reconnect loop that says nothing is a
 # reconnect loop nobody can debug.
 tracing.workspace = true
+# The `tls+tcp` transport, and the only cryptographic dependency this crate
+# has. `rustls` through `tokio-rustls` is a pure-Rust TLS implementation, so
+# `unsafe_code = "forbid"` below survives it and no OpenSSL is linked;
+# `rustls-webpki` is the path validator behind it and is read directly for
+# the peer's subject alternative names, which is what NNG exposes as
+# `NNG_OPT_TLS_PEER_ALT_NAMES`. Both are already in this workspace for
+# weida's own QUIC transport, so `tls+tcp` adds one node to `cargo tree`
+# rather than a new cryptographic stack.
+tokio-rustls.workspace = true
+rustls-webpki.workspace = true
 
 [dev-dependencies]
 # Drives the owned-context doctest and tests from an executor that is not
@@ -31,6 +41,10 @@ futures.workspace = true
 # receive and a PULL socket has no send, which is NNG's rule about
 # direction and only a compiler can assert an absent method. Tests only.
 trybuild.workspace = true
+# Certificates for the `tls+tcp` tests: a CA and one identity signed by
+# it, generated in the test rather than committed, so nothing expires and
+# no private key lives in the repository. Tests only.
+rcgen.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

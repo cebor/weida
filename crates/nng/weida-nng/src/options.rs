@@ -152,6 +152,13 @@ pub struct SocketOptions {
     /// `NNG_OPT_SURVEYOR_SURVEYTIME`: how long a surveyor collects
     /// responses, counted **from the send** (§4).
     pub survey_time: Duration,
+    /// The `tls+tcp` transport's configuration: authentication mode, CA,
+    /// certificate and key.
+    ///
+    /// `None` refuses a `tls+tcp://` endpoint rather than dialling one
+    /// unconfigured, because a TLS transport with no configuration is a
+    /// TCP transport with a longer name.
+    pub tls: Option<crate::tls::TlsConfig>,
 }
 
 impl Default for SocketOptions {
@@ -168,6 +175,7 @@ impl Default for SocketOptions {
             survey_time: DEFAULT_SURVEY_TIME,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             max_addresses: DEFAULT_MAX_ADDRESSES,
+            tls: None,
             sub_prefer_new: true,
             resend_time: DEFAULT_RESEND_TIME,
             max_ttl: DEFAULT_MAX_TTL,

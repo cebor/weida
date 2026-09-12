@@ -2371,7 +2371,10 @@ name = "weida-nng"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "rcgen",
+ "rustls-webpki",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "trybuild",
  "weida-core",
