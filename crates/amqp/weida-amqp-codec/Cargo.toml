@@ -1,0 +1,16 @@
+[package]
+name = "weida-amqp-codec"
+description = "AMQP 1.0 codec: the Part 1 type system, frames, performatives and message sections, sans-I/O"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# No dependencies, deliberately: not even weida-core. The codec is the half of
+# the AMQP library that can be tested byte-for-byte against the OASIS text, so
+# it must not be able to reach for weida's types, its limits or its error
+# vocabulary. `weida-amqp` depends on this crate and on `weida-runtime`; this
+# one depends on neither (`docs/decisions/0013-competitor-libraries.md` §4.3).
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"

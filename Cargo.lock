@@ -2303,6 +2303,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "weida-amqp-codec"
+version = "0.1.0"
+
+[[package]]
 name = "weida-core"
 version = "0.1.0"
 
