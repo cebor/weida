@@ -84,6 +84,9 @@
 //! - [`ReqSocket`] and [`RepSocket`] — request-reply with `nng_ctx`
 //!   contexts, the 32-bit tag stack, the resend timer and its three
 //!   triggers, and `NNG_ESTATE` for every order the protocol forbids.
+//! - [`PushSocket`] and [`PullSocket`] — the pipeline: round-robin over
+//!   the pullers that can accept a message now, fair-queued at the sink,
+//!   and each direction absent from the other's type.
 
 #![warn(missing_docs)]
 
@@ -94,6 +97,7 @@ pub mod error;
 pub mod message;
 pub mod options;
 pub mod pipe;
+pub mod pipeline;
 pub mod protocol;
 pub mod reqrep;
 pub mod session;
@@ -121,6 +125,7 @@ pub use pipe::{
     QueueConfig, Sent,
 };
 pub use pipe::{Discarded, Pipe, PipeConfig};
+pub use pipeline::{PullSocket, PushSocket};
 pub use protocol::{PROTOCOLS, Protocol, protocol};
 pub use reqrep::{CtxId, RepCtx, RepSocket, ReqCtx, ReqSocket};
 pub use session::SpSession;
