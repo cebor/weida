@@ -2367,6 +2367,10 @@ name = "weida-mqtt-codec"
 version = "0.1.0"
 
 [[package]]
+name = "weida-nats-codec"
+version = "0.1.0"
+
+[[package]]
 name = "weida-nng"
 version = "0.1.0"
 dependencies = [
