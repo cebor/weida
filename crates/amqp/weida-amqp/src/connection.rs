@@ -60,15 +60,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
+use weida_amqp_codec::Limits;
 use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
 use weida_amqp_codec::performative::{Close, End, Open, Performative};
 use weida_amqp_codec::protocol_header::{ProtocolHeader, ProtocolId};
 use weida_amqp_codec::types::condition;
-use weida_amqp_codec::{Limits, Multiple};
 use weida_runtime::Exec;
 
 use crate::error::{Condition, Error, Result};
-use crate::options::{ConnectionOptions, Sasl, TlsMode};
+use crate::link::{self, Link, LinkOptions, Links};
+use crate::options::{ConnectionOptions, Sasl, TlsMode, multiple};
 use crate::sasl;
 use crate::session::{
     self, Entry, SESSION_QUEUE, Session, SessionEvent, SessionOptions, SessionState, Shared, Table,
@@ -199,15 +200,27 @@ pub struct Connection {
     inner: Arc<Inner>,
 }
 
-/// A frame a session has built and wants written.
+/// What a session asks the connection driver to do.
 ///
 /// Sessions do not own the transport: everything they send goes through the
 /// driver, which is what keeps `close` the last thing ever written and what
-/// lets the driver refuse a frame once it has sent one.
+/// lets the driver refuse a frame once it has sent one. Attaching is a
+/// request rather than a frame because the driver owns the handle space and
+/// the link table.
 #[derive(Debug)]
 pub(crate) enum Outbound {
     /// A whole frame, channel already in its header.
     Frame(Vec<u8>),
+    /// Attach a link on the lowest free handle of this session.
+    Attach {
+        /// The session's outgoing channel.
+        channel: u16,
+        /// Boxed because `LinkOptions` carries two termini and this enum's
+        /// other variant is one `Vec`.
+        options: Box<LinkOptions>,
+        /// Answered once the answering `attach` has arrived.
+        reply: oneshot::Sender<Result<Link>>,
+    },
 }
 
 #[derive(Debug)]
@@ -529,14 +542,6 @@ fn local_open(options: &ConnectionOptions) -> Open<'_> {
     open
 }
 
-fn multiple(items: &[String]) -> Multiple<'_> {
-    match items {
-        [] => Multiple::None,
-        [one] => Multiple::One(one),
-        many => Multiple::Many(many.iter().map(String::as_str).collect()),
-    }
-}
-
 /// Bounds one handshake step on wall-clock time.
 ///
 /// Every step needs it and none of them has a deadline in the protocol: a
@@ -677,6 +682,22 @@ impl Driver {
                             continue;
                         }
                         if let Err(error) = writer.send(&bytes).await {
+                            outcome = State::Failed(error.to_string());
+                            break;
+                        }
+                    }
+                    Some(Outbound::Attach {
+                        channel,
+                        options,
+                        reply,
+                    }) => {
+                        if closing {
+                            let _ = reply.send(Err(Error::ConnectionGone));
+                            continue;
+                        }
+                        if let Err(error) =
+                            self.attach(channel, *options, reply, &mut writer).await
+                        {
                             outcome = State::Failed(error.to_string());
                             break;
                         }
@@ -866,12 +887,108 @@ impl Driver {
                     options,
                 }),
                 events,
+                remote_handle_max: 0,
+                links: Links::default(),
                 pending: Some(reply),
                 outbound: self.outbound.clone(),
                 rx: Some(rx),
             },
         );
         writer.send(&bytes).await
+    }
+
+    /// Attaches a link: lowest free handle, `attach` on the wire, and the
+    /// caller parked until the answer says what the peer actually created.
+    ///
+    /// A link whose name and direction are already attached steals the
+    /// incumbent, which is detached with `amqp:link:stolen` first
+    /// (Part 2 §2.6.1).
+    async fn attach(
+        &mut self,
+        channel: u16,
+        options: LinkOptions,
+        reply: oneshot::Sender<Result<Link>>,
+        writer: &mut FrameWriter,
+    ) -> Result<()> {
+        // Read before the table is borrowed: the bound is the peer's
+        // `handle-max` from its answering `begin`.
+        let handle_max = self.remote_handle_max(channel);
+        let Some(entry) = self.sessions.get_mut(channel) else {
+            let _ = reply.send(Err(Error::ConnectionGone));
+            return Ok(());
+        };
+
+        // The steal. Doing it before allocating a handle means the
+        // incumbent's handle is not a candidate for the newcomer, which
+        // matters because a stolen link is an errored one.
+        let stolen = entry.links.by_name(&options.name, options.role);
+        if let Some(incumbent) = stolen {
+            let condition = Condition::described(
+                link::STOLEN,
+                format!(
+                    "link {} was attached again in the same direction",
+                    options.name
+                ),
+            );
+            let _ = write_detach(writer, channel, incumbent, true, Some(&condition)).await;
+            if let Some(loser) = entry.links.remove(incumbent, true) {
+                *loser.shared.state.lock().expect("not poisoned") =
+                    crate::link::LinkState::Detached(Some(condition.clone()));
+                let _ = loser
+                    .events
+                    .send(crate::link::LinkEvent::Detached(Some(condition)))
+                    .await;
+            }
+        }
+
+        let Some(handle) = entry.links.lowest_free(handle_max) else {
+            let _ = reply.send(Err(Error::Local(Condition::described(
+                condition::RESOURCE_LIMIT_EXCEEDED,
+                format!("every handle up to the peer's handle-max of {handle_max} is in use"),
+            ))));
+            return Ok(());
+        };
+
+        let bytes = match link::attach_frame(channel, handle, &options) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return Ok(());
+            }
+        };
+
+        let (events, rx) = mpsc::channel(link::LINK_QUEUE);
+        entry.links.insert(
+            handle,
+            crate::link::Entry {
+                shared: Arc::new(crate::link::Shared {
+                    name: options.name.clone(),
+                    role: options.role,
+                    output_handle: handle,
+                    channel,
+                    state: Mutex::new(crate::link::LinkState::Attaching),
+                    negotiated: Mutex::new(None),
+                    input_handle: Mutex::new(None),
+                }),
+                events,
+                pending: Some(reply),
+                outbound: self.outbound.clone(),
+                rx: Some(rx),
+                options: Box::new(options),
+            },
+        );
+        writer.send(&bytes).await
+    }
+
+    /// The `handle-max` the peer advertised for this session.
+    ///
+    /// Kept per session because `begin.handle-max` is per session, and
+    /// falling back to our own would be using the wrong side's number: the
+    /// peer's is what says which handles it will accept.
+    fn remote_handle_max(&mut self, channel: u16) -> u32 {
+        self.sessions
+            .get_mut(channel)
+            .map_or(0, |entry| entry.remote_handle_max)
     }
 
     /// One frame for a session, or for a channel that has none.
@@ -907,7 +1024,7 @@ impl Driver {
             return self.complete_begin(channel, ours, begin);
         }
 
-        let Some(entry) = self.sessions.by_incoming(channel) else {
+        if self.sessions.by_incoming(channel).is_none() {
             // In range, but no session was ever begun on it. The
             // specification names no condition for this case - it covers
             // only the out-of-range one above - so the condition is ours and
@@ -921,17 +1038,19 @@ impl Driver {
             );
             let _ = write_close(writer, Some(&condition)).await;
             return Ok(Some(State::Closed(Some(condition))));
-        };
+        }
 
         // A session that sent or received `end(error=...)` discards
         // everything until the partner's `end`. Counted and logged, never
         // acted upon.
-        let discarding = entry
-            .shared
-            .state
-            .lock()
-            .expect("not poisoned")
-            .is_discarding();
+        let discarding = self.sessions.by_incoming(channel).is_some_and(|entry| {
+            entry
+                .shared
+                .state
+                .lock()
+                .expect("not poisoned")
+                .is_discarding()
+        });
         if discarding && !matches!(performative, Performative::End(_)) {
             tracing::debug!(
                 channel,
@@ -941,22 +1060,38 @@ impl Driver {
             return Ok(None);
         }
 
+        // `attach` and `detach` belong to the link layer, and they are taken
+        // first because they change a table the session's own bookkeeping
+        // does not touch.
+        match &performative {
+            Performative::Attach(attach) => {
+                return self.route_attach(channel, attach, writer).await;
+            }
+            Performative::Detach(detach) => {
+                return self.route_detach(channel, detach).await;
+            }
+            _ => {}
+        }
+
+        let entry = self
+            .sessions
+            .by_incoming(channel)
+            .expect("checked just above");
         match &performative {
             Performative::Flow(flow) => {
-                let mut windows = entry.shared.windows.lock().expect("not poisoned");
-                windows.apply_flow(session::remote_flow_of_flow(flow));
-            }
-            Performative::Transfer(_) => {
-                let id = {
-                    let windows = entry.shared.windows.lock().expect("not poisoned");
-                    windows.next_incoming_id
-                };
-                let violation = entry
+                entry
                     .shared
                     .windows
                     .lock()
                     .expect("not poisoned")
-                    .record_received(id);
+                    .apply_flow(session::remote_flow_of_flow(flow));
+            }
+            Performative::Transfer(_) => {
+                let violation = {
+                    let mut windows = entry.shared.windows.lock().expect("not poisoned");
+                    let id = windows.next_incoming_id;
+                    windows.record_received(id)
+                };
                 if let Err(violation) = violation {
                     // Part 2 §2.8.17: `end` the session with
                     // `amqp:session:window-violation`.
@@ -987,16 +1122,168 @@ impl Driver {
                     // each side reports.
                     let _ = write_end(writer, outgoing, None).await;
                 }
+                // "Sessions also end automatically when the connection
+                // closes"; a session ending takes its links with it for the
+                // same reason.
+                if let Some(session) = self.sessions.remove(outgoing) {
+                    drain_links(session, condition.clone()).await;
+                }
                 let _ = events.send(SessionEvent::Ended(condition)).await;
-                self.sessions.remove(outgoing);
                 return Ok(None);
             }
             _ => {}
         }
 
-        // Everything else is for the layer above: the link frames of B-159
-        // on, handed over whole because only a link can read them.
+        // A frame naming a handle goes to the link; anything else goes to
+        // the session.
+        if let Some(handle) = addressed_handle(&performative) {
+            let Some(entry) = self.sessions.by_incoming(channel) else {
+                return Ok(None);
+            };
+            if let Some(link) = entry.links.by_input(handle) {
+                let _ = link
+                    .events
+                    .send(crate::link::LinkEvent::Frame(bytes.to_vec()))
+                    .await;
+                return Ok(None);
+            }
+            // "A frame (other than attach) was received referencing a handle
+            // which is not currently in use of an attached link" is exactly
+            // what `amqp:session:unattached-handle` names (Part 2 §2.8.17),
+            // and the remedy is to end the session.
+            let condition = Condition::described(
+                condition::SESSION_UNATTACHED_HANDLE,
+                format!(
+                    "{} arrived on handle {handle}, which is not an attached link",
+                    performative.name()
+                ),
+            );
+            let outgoing = entry.shared.outgoing_channel;
+            *entry.shared.state.lock().expect("not poisoned") =
+                SessionState::Discarding(condition.clone());
+            let _ = write_end(writer, outgoing, Some(&condition)).await;
+            return Ok(None);
+        }
+
+        let entry = self
+            .sessions
+            .by_incoming(channel)
+            .expect("checked just above");
         let _ = entry.events.send(SessionEvent::Frame(bytes.to_vec())).await;
+        Ok(None)
+    }
+
+    /// An `attach` from the peer: either the answer to ours, or an
+    /// unsolicited one.
+    async fn route_attach(
+        &mut self,
+        channel: u16,
+        attach: &weida_amqp_codec::performative::Attach<'_>,
+        writer: &mut FrameWriter,
+    ) -> Result<Option<State>> {
+        let entry = self
+            .sessions
+            .by_incoming(channel)
+            .expect("the caller checked the channel");
+        let outgoing = entry.shared.outgoing_channel;
+
+        // "Attaching on a handle already in use MUST be answered with an
+        // immediate close carrying amqp:session:handle-in-use"
+        // (Part 2 §2.6.2). The handle space in question is the *input* one:
+        // the peer's own numbering.
+        if entry.links.input_in_use(attach.handle) {
+            let condition = Condition::described(
+                condition::SESSION_HANDLE_IN_USE,
+                format!("handle {} is already attached", attach.handle),
+            );
+            let _ = write_close(writer, Some(&condition)).await;
+            return Ok(Some(State::Closed(Some(condition))));
+        }
+
+        // The answer is correlated by *name*, because the two ends choose
+        // their handles independently and the numbers do not agree.
+        let ours = entry.links.by_name(attach.name, attach.role.opposite());
+        let Some(ours) = ours else {
+            // An unsolicited `attach`. This client holds no nodes — AMQP 1.0
+            // "defines no operation to create, configure, enumerate or delete
+            // a node" and a client is not a broker — so the specified refusal
+            // is an answering `attach` with the terminus null followed by an
+            // immediate `detach` (Part 2 §2.6.3).
+            let refusal = refuse_attach(channel, attach)?;
+            writer.send(&refusal).await?;
+            let _ = write_detach(writer, outgoing, attach.handle, true, None).await;
+            tracing::debug!(
+                link = attach.name,
+                handle = attach.handle,
+                "refused an unsolicited attach: this client offers no nodes"
+            );
+            return Ok(None);
+        };
+
+        let Some(link) = entry.links.get_mut(ours) else {
+            return Ok(None);
+        };
+        let negotiated = match link::negotiate(&link.options, attach) {
+            Ok(negotiated) => negotiated,
+            Err(error) => {
+                if let Some(reply) = link.pending.take() {
+                    let _ = reply.send(Err(error));
+                }
+                return Ok(None);
+            }
+        };
+        *link.shared.input_handle.lock().expect("not poisoned") = Some(attach.handle);
+        *link.shared.negotiated.lock().expect("not poisoned") = Some(negotiated);
+        *link.shared.state.lock().expect("not poisoned") = crate::link::LinkState::Attached;
+        let handed = match (link.pending.take(), link.rx.take()) {
+            (Some(reply), Some(rx)) => {
+                let handle = Link::new(Arc::clone(&link.shared), link.outbound.clone(), rx);
+                let _ = reply.send(Ok(handle));
+                true
+            }
+            _ => false,
+        };
+        entry.links.map_input(attach.handle, ours);
+        tracing::debug!(
+            link = attach.name,
+            output = ours,
+            input = attach.handle,
+            links = entry.links.len(),
+            handed_over = handed,
+            "link attached"
+        );
+        Ok(None)
+    }
+
+    /// A `detach` from the peer.
+    async fn route_detach(
+        &mut self,
+        channel: u16,
+        detach: &weida_amqp_codec::performative::Detach<'_>,
+    ) -> Result<Option<State>> {
+        let entry = self
+            .sessions
+            .by_incoming(channel)
+            .expect("the caller checked the channel");
+        let condition = detach.error.as_ref().map(Condition::from_codec);
+        let Some(link) = entry.links.by_input(detach.handle) else {
+            tracing::debug!(
+                handle = detach.handle,
+                "a detach for a handle that is not attached"
+            );
+            return Ok(None);
+        };
+        let output = link.shared.output_handle;
+        *link.shared.state.lock().expect("not poisoned") =
+            crate::link::LinkState::Detached(condition.clone());
+        let events = link.events.clone();
+        // An errored endpoint's handle is never reused, because the peer is
+        // entitled to still be sending frames for it.
+        let errored = condition.is_some();
+        entry.links.remove(output, errored);
+        let _ = events
+            .send(crate::link::LinkEvent::Detached(condition))
+            .await;
         Ok(None)
     }
 
@@ -1008,6 +1295,8 @@ impl Driver {
         ours: u16,
         begin: &weida_amqp_codec::performative::Begin<'_>,
     ) -> Result<Option<State>> {
+        let exec = self.exec.clone();
+        let attach_timeout = self.options.handshake_timeout;
         let Some(entry) = self.sessions.get_mut(ours) else {
             // A `remote-channel` naming a session we never begun. Nothing to
             // attach it to, and inventing one would be inventing state.
@@ -1025,10 +1314,19 @@ impl Driver {
             .lock()
             .expect("not poisoned")
             .apply_begin(session::remote_flow_of_begin(begin));
+        // The bound on this session's link table, and the peer's number: it
+        // states which handles the peer will accept.
+        entry.remote_handle_max = begin.handle_max;
         *entry.shared.state.lock().expect("not poisoned") = SessionState::Begun;
         let handle = match (entry.pending.take(), entry.rx.take()) {
             (Some(reply), Some(rx)) => {
-                let session = Session::new(Arc::clone(&entry.shared), entry.outbound.clone(), rx);
+                let session = Session::new(
+                    Arc::clone(&entry.shared),
+                    entry.outbound.clone(),
+                    rx,
+                    exec,
+                    attach_timeout,
+                );
                 let _ = reply.send(Ok(session));
                 true
             }
@@ -1047,6 +1345,92 @@ impl Driver {
         );
         Ok(None)
     }
+}
+
+/// The handle a frame names, where it names one.
+///
+/// `flow` may carry link state on top of session state and may not, which is
+/// why its handle is an `Option` and `transfer` and `disposition` are not
+/// treated alike: a `disposition` names no handle at all, it names a range of
+/// delivery-ids on the session.
+const fn addressed_handle(performative: &Performative<'_>) -> Option<u32> {
+    match performative {
+        Performative::Transfer(transfer) => Some(transfer.handle),
+        Performative::Flow(flow) => flow.handle,
+        _ => None,
+    }
+}
+
+/// Tells every link of an ending session that it is over.
+///
+/// A session ending destroys its link endpoints, so a caller holding a
+/// [`Link`] finds out here rather than waiting on a channel nobody will send
+/// on again.
+async fn drain_links(mut session: session::Entry, condition: Option<Condition>) {
+    for link in session.links.drain() {
+        *link.shared.state.lock().expect("not poisoned") =
+            crate::link::LinkState::Detached(condition.clone());
+        let _ = link
+            .events
+            .send(crate::link::LinkEvent::Detached(condition.clone()))
+            .await;
+    }
+}
+
+/// The specified refusal of an `attach` this client cannot honour: an
+/// answering `attach` with both termini null.
+///
+/// Part 2 §2.6.3: "a partner that will not provide a terminus answers with
+/// that field null, which establishes a link to a nonexistent terminus, and
+/// MUST then immediately detach." An error code would be inventing one; this
+/// is the absence the specification asks for.
+fn refuse_attach(
+    channel: u16,
+    theirs: &weida_amqp_codec::performative::Attach<'_>,
+) -> Result<Vec<u8>> {
+    let mut answer = weida_amqp_codec::performative::Attach::new(
+        theirs.name,
+        theirs.handle,
+        theirs.role.opposite(),
+    );
+    // Both termini null: nothing was created.
+    answer.source = None;
+    answer.target = None;
+    if answer.role == weida_amqp_codec::Role::Sender {
+        answer.initial_delivery_count = Some(0);
+    }
+    let mut bytes = Vec::new();
+    frame::write(&mut bytes, FrameKind::Amqp, channel, u32::MAX, |body| {
+        Performative::Attach(answer).encode(body)
+    })?;
+    Ok(bytes)
+}
+
+/// Writes `detach` on one session's outgoing channel.
+async fn write_detach(
+    writer: &mut FrameWriter,
+    channel: u16,
+    handle: u32,
+    closed: bool,
+    error: Option<&Condition>,
+) -> Result<()> {
+    let mut out = Vec::new();
+    let codec = error.map(Condition::as_codec);
+    frame::write(
+        &mut out,
+        FrameKind::Amqp,
+        channel,
+        writer.max_frame_size(),
+        |body| {
+            Performative::Detach(weida_amqp_codec::performative::Detach {
+                handle,
+                closed,
+                error: codec,
+            })
+            .encode(body)
+        },
+    )?;
+    writer.send(&out).await
 }
 
 /// Writes `end` on one session's outgoing channel.

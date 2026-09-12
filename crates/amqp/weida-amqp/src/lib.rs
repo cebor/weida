@@ -75,15 +75,21 @@
 
 pub mod connection;
 pub mod error;
+pub mod link;
 pub mod options;
+pub mod owned;
 pub mod sasl;
 pub mod session;
+pub mod terminus;
 pub mod transport;
 pub mod window;
 
 pub use connection::{Connection, RemoteOpen, State};
 pub use error::{Condition, Error, Result};
+pub use link::{Link, LinkEvent, LinkOptions, LinkState, Negotiated};
 pub use options::{ConnectionOptions, Sasl, TlsMode};
+pub use owned::OwnedValue;
 pub use session::{Session, SessionOptions};
+pub use terminus::{DistributionMode, Source, Target, TerminusDurability, TerminusExpiryPolicy};
 pub use transport::{Stream, Wire};
 pub use window::Windows;

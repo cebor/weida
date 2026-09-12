@@ -27,6 +27,20 @@ use weida_amqp_codec::frame::MIN_MAX_FRAME_SIZE;
 
 use crate::error::{Error, Result};
 
+/// Turns a list of owned strings into the wire form a `multiple` field takes.
+///
+/// Shared by `open`, `begin`, `attach` and both termini, because all six of
+/// them carry capability lists and Part 1 §1.4's rule — one value is a bare
+/// symbol, several are an array, none is null — is the same for all of them.
+pub(crate) fn multiple(items: &[String]) -> weida_amqp_codec::Multiple<'_> {
+    use weida_amqp_codec::Multiple;
+    match items {
+        [] => Multiple::None,
+        [one] => Multiple::One(one),
+        many => Multiple::Many(many.iter().map(String::as_str).collect()),
+    }
+}
+
 /// This client's `max-frame-size`, deliberately not the specification's
 /// default of `4294967295`.
 ///
