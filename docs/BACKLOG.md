@@ -834,12 +834,14 @@ note: merged `--no-ff` as e0bdaa8, one commit (85660c9), 546 insertions, no conf
 note: polyamorous mode is absent and the absence is a **public constant**, `POLYAMOROUS_ABSENT`, carrying the manual's own deprecation and three reasons (a pipe handle rather than a routable identity, silent discard, cannot route through devices) — with a test asserting the reason text is there, so the absence cannot decay into an unexplained gap. That is the shape I would want every "we do not implement this" to take.
 
 ### B-127 — SURVEYOR and RESPONDENT
-kind: code | size: 90 | status: in_progress (delegated) 2026-09-12T04:40Z | needs: [B-123]
+kind: code | size: 90 | status: done d184336 | needs: [B-123]
 acceptance: a survey broadcast to every respondent with `SURVEYTIME` starting **at send**, at most one response collected per respondent, late responses discarded, a blocked receive expiring as `NNG_ETIMEDOUT` and a receive with no active survey returning `NNG_ESTATE`, contexts overlapping surveys with independent deadlines; a respondent that declines by silence is indistinguishable from a slow one, and the test asserts that equality rather than treating silence as failure.
 note: workstream W2, worktree ../weida-w2, branch b127-nng-survey
+note: merged `--no-ff` as d184336, one commit (329acad), no conflicts; gate green: **1194 tests**, 0 failed, 1 ignored, fmt, clippy in both configurations, rustdoc with `-D warnings`. The two clauses that decide this item are both tests rather than paragraphs. `the_deadline_starts_at_the_send` (`tests/survey.rs:74`) has the respondent answer 400 ms after *receiving* while the surveyor gives up ~300 ms after the *send*, so the clock cannot have started at arrival, and the following `recv` is `ESTATE` because the survey is over. `silence_is_indistinguishable_from_slowness` (`:117`) runs four surveys — a respondent that declines, one that is slow, one that closes, one that never reads — and asserts all four observations are the **same** `NNG_ETIMEDOUT`, which is the equality the sheet insists on instead of treating silence as failure.
+note: the item also **deduplicated a state machine rather than copying it**, and I checked the claim that behaviour did not move: REP and RESPONDENT are the same machine — same tag stack, same answer-only-what-you-received rule, same one-receive-per-context — so it now lives once in `replier.rs` with `RepCtx` and `RespondentCtx` as aliases of `ReplierCtx`, and **all seven of B-123's tests still pass unchanged**, which is the only check that an extraction changed nothing. `NNG_OPT_SURVEYOR_SURVEYTIME` arrives with NNG's 1 s default, at most one response per pipe, and late or orphaned responses counted in `discarded_late()` rather than dropped silently.
 
 ### B-128 — BUS
-kind: code | size: 60 | status: ready | needs: [B-125]
+kind: code | size: 60 | status: in_progress (delegated) 2026-09-12T04:45Z | needs: [B-125]
 acceptance: BUS sends to every *directly connected* peer only, best-effort and non-blocking, discarding the copy for a peer that cannot receive while the send still succeeds; a three-node line asserts the far node receives nothing, which turns "a mesh must be fully connected" into a test, and raw BUS carries the ingress pipe ID and excludes that pipe when re-broadcasting.
 note: workstream W2, worktree ../weida-w2, branch b128-nng-bus
 
