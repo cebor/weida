@@ -827,12 +827,14 @@ note: with it, `send_depth`/`recv_depth` became `Option<usize>` where `None` mea
 note: workstream W2, worktree ../weida-w2, branch b125-nng-pub-sub
 
 ### B-126 — PAIR v0 and PAIR v1
-kind: code | size: 90 | status: in_progress (delegated) 2026-09-12T04:10Z | needs: [B-122]
+kind: code | size: 90 | status: done e0bdaa8 | needs: [B-122]
 acceptance: PAIR v0 with no protocol header, PAIR v1 with its 32-bit word whose low octet is the hop count, `MAXTTL` between 1 and 255 enforced locally, and both readings of the initial count decoded — the RFC's one and NNG's zero — with what we send named in the doc comment and asserted by a vector; a paired socket rejects a second connection while one is live, and polyamorous mode is absent with the manual's own deprecation as the stated reason.
 note: workstream W2, worktree ../weida-w2, branch b126-nng-pair
+note: merged `--no-ff` as e0bdaa8, one commit (85660c9), 546 insertions, no conflicts; gate green: **1188 tests**, 0 failed, 1 ignored, fmt, clippy in both configurations, rustdoc with `-D warnings`. The vector clause is met as octets off a raw `TcpStream`: `pair_v1_originates_nngs_zero_hop_count` reads `00 53 50 00 00 11 00 00` then `00..06 00 00 00 00 "hi"`, which pins the doc comment's claim that **we send NNG's zero and not the RFC's one**, and the same test feeds both readings back in, 0 and 1, with the count kept in the message's protocol header. The exclusivity is claimed at the **add-pre** hook rather than add-post, so two connections arriving together cannot both be admitted — the right ordering, and the same lesson as B-121's pipe ceiling. `a_message_past_the_local_hop_ceiling_is_dropped_and_the_pipe_kept` asserts the message gone, `dropped_over_ttl()` at 1, the pipe still there and **nothing sent back within 200 ms**, which is the silence §8 describes rather than an error the protocol has no room for.
+note: polyamorous mode is absent and the absence is a **public constant**, `POLYAMOROUS_ABSENT`, carrying the manual's own deprecation and three reasons (a pipe handle rather than a routable identity, silent discard, cannot route through devices) — with a test asserting the reason text is there, so the absence cannot decay into an unexplained gap. That is the shape I would want every "we do not implement this" to take.
 
 ### B-127 — SURVEYOR and RESPONDENT
-kind: code | size: 90 | status: ready | needs: [B-123]
+kind: code | size: 90 | status: in_progress (delegated) 2026-09-12T04:40Z | needs: [B-123]
 acceptance: a survey broadcast to every respondent with `SURVEYTIME` starting **at send**, at most one response collected per respondent, late responses discarded, a blocked receive expiring as `NNG_ETIMEDOUT` and a receive with no active survey returning `NNG_ESTATE`, contexts overlapping surveys with independent deadlines; a respondent that declines by silence is indistinguishable from a slow one, and the test asserts that equality rather than treating silence as failure.
 note: workstream W2, worktree ../weida-w2, branch b127-nng-survey
 
