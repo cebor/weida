@@ -250,10 +250,30 @@ macro_rules! python_socket {
         #[pymethods]
         impl $class {
             /// Opens the socket on `context`, against its `ZMQ_MAX_SOCKETS`
-            /// ceiling.
+            /// ceiling, with `options` if any are given.
+            ///
+            /// Every option is honoured or refused **here**, where it is
+            /// configured: a `ZMQ_SUBSCRIBE` set on a socket type that has no
+            /// subscriptions fails at this line rather than silently doing
+            /// nothing.
             #[new]
-            fn new(py: Python<'_>, context: &Context) -> PyResult<$class> {
-                let socket = crate::errors::raise(py, weida_zmq::$rust::new(context.inner()))?;
+            #[pyo3(signature = (context, options=None))]
+            fn new(
+                py: Python<'_>,
+                context: &Context,
+                options: Option<&crate::options::PySocketOptions>,
+            ) -> PyResult<$class> {
+                let configured = options.map(|o| o.library()).unwrap_or_default();
+                let mut socket = crate::errors::raise(
+                    py,
+                    weida_zmq::$rust::with_options(context.inner(), configured),
+                )?;
+                if let Some(options) = options {
+                    crate::errors::raise(
+                        py,
+                        crate::ops::apply_subscriptions(&mut socket, &options.subscriptions),
+                    )?;
+                }
                 Ok($class {
                     socket: Slot::new(socket),
                     bridge: context.bridge().clone(),
