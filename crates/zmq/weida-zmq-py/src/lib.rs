@@ -64,6 +64,7 @@ mod context;
 mod errors;
 mod lease;
 mod ops;
+mod options;
 mod sockets;
 mod values;
 
@@ -72,6 +73,22 @@ mod values;
 fn weida_zmq(module: &Bound<'_, PyModule>) -> PyResult<()> {
     errors::install(module)?;
     module.add_class::<context::Context>()?;
+    module.add_class::<options::PyZmqOption>()?;
+    module.add_class::<options::PySocketOptions>()?;
+    module.add_class::<options::PyContextOptions>()?;
+    module.add("OPTIONS", options::table(module.py())?)?;
+    module.add_function(pyo3::wrap_pyfunction!(option, module)?)?;
+    // `::` because `#[pymodule]` puts a module of this function's name in
+    // scope, and that name is the crate's.
+    module.add(
+        "DEFAULT_CLOSE_BUDGET",
+        ::weida_zmq::DEFAULT_CLOSE_BUDGET.as_secs_f64(),
+    )?;
+    module.add(
+        "DEFAULT_MAX_MESSAGE_SIZE",
+        ::weida_zmq::DEFAULT_MAX_MESSAGE_SIZE,
+    )?;
+    module.add("DEFAULT_MAX_SOCKETS", ::weida_zmq::DEFAULT_MAX_SOCKETS)?;
     module.add_class::<sockets::Discarded>()?;
     module.add_class::<values::PyMultipart>()?;
     module.add_class::<values::PySent>()?;
@@ -89,6 +106,13 @@ fn weida_zmq(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<sockets::PyPairSocket>()?;
     module.add("__all__", every_name())?;
     Ok(())
+}
+
+/// `weida_zmq.option("ZMQ_SNDHWM")`: one row of libzmq's option table, or
+/// `None` for a name it does not have.
+#[pyfunction]
+fn option(py: Python<'_>, name: &str) -> PyResult<Option<Py<options::PyZmqOption>>> {
+    options::row(py, name)
 }
 
 /// What `from weida_zmq import *` gets: the classes above and the exception
@@ -112,6 +136,14 @@ fn every_name() -> Vec<&'static str> {
         "PullSocket",
         "PairSocket",
         "ZmqError",
+        "ZmqOption",
+        "SocketOptions",
+        "ContextOptions",
+        "OPTIONS",
+        "option",
+        "DEFAULT_CLOSE_BUDGET",
+        "DEFAULT_MAX_MESSAGE_SIZE",
+        "DEFAULT_MAX_SOCKETS",
     ];
     names.extend_from_slice(errors::NAMES);
     names

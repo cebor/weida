@@ -52,11 +52,14 @@ impl Context {
 /// Builds the library's configuration, refusing a value at configuration time
 /// rather than rounding it into something usable.
 fn config(
+    options: Option<&crate::options::PyContextOptions>,
     max_sockets: Option<usize>,
     worker_threads: Option<usize>,
     close_budget: Option<f64>,
 ) -> Result<ContextConfig, Error> {
-    let mut config = ContextConfig::default();
+    // The option table first, the keyword arguments over it: two spellings of
+    // the same three numbers, and the one written at the call site wins.
+    let mut config = options.map(|o| o.library()).unwrap_or_default();
     if let Some(max_sockets) = max_sockets {
         config.max_sockets = max_sockets;
     }
@@ -86,29 +89,34 @@ impl Context {
     /// this library's two deliberate differences from libzmq, readable here as
     /// `Context().close_budget`.
     #[new]
-    #[pyo3(signature = (*, max_sockets=None, worker_threads=None, close_budget=None))]
+    #[pyo3(signature = (*, options=None, max_sockets=None, worker_threads=None, close_budget=None))]
     fn new(
         py: Python<'_>,
+        options: Option<&crate::options::PyContextOptions>,
         max_sockets: Option<usize>,
         worker_threads: Option<usize>,
         close_budget: Option<f64>,
     ) -> PyResult<Context> {
-        let config = errors::raise(py, config(max_sockets, worker_threads, close_budget))?;
+        let config = errors::raise(
+            py,
+            config(options, max_sockets, worker_threads, close_budget),
+        )?;
         errors::raise(py, weida_zmq::Context::owned(config)).map(Context::wrap)
     }
 
     /// The same as `Context(...)`, spelled for a reader who wants to see which
     /// of the three constructors is in use.
     #[classmethod]
-    #[pyo3(signature = (*, max_sockets=None, worker_threads=None, close_budget=None))]
+    #[pyo3(signature = (*, options=None, max_sockets=None, worker_threads=None, close_budget=None))]
     fn owned(
         _class: &Bound<'_, PyType>,
         py: Python<'_>,
+        options: Option<&crate::options::PyContextOptions>,
         max_sockets: Option<usize>,
         worker_threads: Option<usize>,
         close_budget: Option<f64>,
     ) -> PyResult<Context> {
-        Context::new(py, max_sockets, worker_threads, close_budget)
+        Context::new(py, options, max_sockets, worker_threads, close_budget)
     }
 
     /// A context on the **ambient** Tokio reactor: `Context::new`.
@@ -117,14 +125,15 @@ impl Context {
     /// process has. `worker_threads` is not taken, because the reactor was
     /// sized by whoever created it.
     #[classmethod]
-    #[pyo3(signature = (*, max_sockets=None, close_budget=None))]
+    #[pyo3(signature = (*, options=None, max_sockets=None, close_budget=None))]
     fn current(
         _class: &Bound<'_, PyType>,
         py: Python<'_>,
+        options: Option<&crate::options::PyContextOptions>,
         max_sockets: Option<usize>,
         close_budget: Option<f64>,
     ) -> PyResult<Context> {
-        let config = errors::raise(py, config(max_sockets, None, close_budget))?;
+        let config = errors::raise(py, config(options, max_sockets, None, close_budget))?;
         errors::raise(py, weida_zmq::Context::new(config)).map(Context::wrap)
     }
 
@@ -134,15 +143,16 @@ impl Context {
     /// process wants when it isolates two subsystems from each other's
     /// `inproc://` names without paying for a second thread pool.
     #[classmethod]
-    #[pyo3(signature = (other, *, max_sockets=None, close_budget=None))]
+    #[pyo3(signature = (other, *, options=None, max_sockets=None, close_budget=None))]
     fn sharing(
         _class: &Bound<'_, PyType>,
         py: Python<'_>,
         other: &Context,
+        options: Option<&crate::options::PyContextOptions>,
         max_sockets: Option<usize>,
         close_budget: Option<f64>,
     ) -> PyResult<Context> {
-        let config = errors::raise(py, config(max_sockets, None, close_budget))?;
+        let config = errors::raise(py, config(options, max_sockets, None, close_budget))?;
         // `Exec` hands out no handle, so the handle is taken the way Tokio
         // itself hands one out: from inside the runtime's context, which
         // `Exec::enter` is exactly for. The guard is held across nothing but

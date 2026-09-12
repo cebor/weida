@@ -206,6 +206,76 @@ macro_rules! subscribes {
 
 subscribes!(SubSocket, XSubSocket, XPubSocket);
 
+/// Applies the `ZMQ_SUBSCRIBE`/`ZMQ_UNSUBSCRIBE` rows a `SocketOptions`
+/// collected, at construction.
+///
+/// libzmq's two subscription options are honoured by a *method* here rather
+/// than by a field, and only three socket types have one. Both halves are
+/// written out per socket type below rather than left to a blanket
+/// implementation, so that a socket type which grows subscriptions later
+/// cannot keep the refusal by accident.
+pub trait ApplySubscriptions {
+    /// Each prefix, `true` to subscribe and `false` to cancel.
+    fn apply_subscriptions(&mut self, wanted: &[(Vec<u8>, bool)]) -> Result<()>;
+}
+
+macro_rules! applies_subscriptions {
+    ($($socket:ident),+ $(,)?) => {
+        $(impl ApplySubscriptions for weida_zmq::$socket {
+            fn apply_subscriptions(&mut self, wanted: &[(Vec<u8>, bool)]) -> Result<()> {
+                for (prefix, add) in wanted {
+                    if *add {
+                        Subscribe::subscribe(self, prefix)?;
+                    } else {
+                        Subscribe::unsubscribe(self, prefix)?;
+                    }
+                }
+                Ok(())
+            }
+        })+
+    };
+}
+
+macro_rules! refuses_subscriptions {
+    ($($socket:ident),+ $(,)?) => {
+        $(impl ApplySubscriptions for weida_zmq::$socket {
+            fn apply_subscriptions(&mut self, wanted: &[(Vec<u8>, bool)]) -> Result<()> {
+                if wanted.is_empty() {
+                    return Ok(());
+                }
+                Err(weida_zmq::Error::EINVAL(
+                    concat!(
+                        "ZMQ_SUBSCRIBE and ZMQ_UNSUBSCRIBE belong to a subscribing socket; ",
+                        stringify!($socket),
+                        " has no subscriptions, and libzmq refuses them here too",
+                    )
+                    .into(),
+                ))
+            }
+        })+
+    };
+}
+
+applies_subscriptions!(SubSocket, XSubSocket, XPubSocket);
+refuses_subscriptions!(
+    ReqSocket,
+    RepSocket,
+    DealerSocket,
+    RouterSocket,
+    PubSocket,
+    PushSocket,
+    PullSocket,
+    PairSocket,
+);
+
+/// Applies what a `SocketOptions` collected, at construction.
+pub fn apply_subscriptions<S: ApplySubscriptions>(
+    socket: &mut S,
+    wanted: &[(Vec<u8>, bool)],
+) -> Result<()> {
+    socket.apply_subscriptions(wanted)
+}
+
 /// A timeout in seconds, as the library's `Duration`.
 ///
 /// Refused where it is given rather than rounded: a negative or infinite
