@@ -1,0 +1,61 @@
+[package]
+name = "weida-mqtt-codec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+weida-mqtt-codec = { path = ".." }
+
+# Deliberately its own workspace: the fuzz crate needs nightly and must not
+# affect `cargo build --workspace` or the lockfile of the library crates.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "varint"
+path = "fuzz_targets/varint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "data"
+path = "fuzz_targets/data.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fixed_header"
+path = "fuzz_targets/fixed_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "properties"
+path = "fuzz_targets/properties.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packet_stream"
+path = "fuzz_targets/packet_stream.rs"
+test = false
+doc = false
+bench = false
