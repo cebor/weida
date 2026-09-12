@@ -1,52 +1,63 @@
 //! The outbound direction: weida endpoints, a foreign SP peer onward.
 //!
-//! The mirror of [`crate::Inbound`], and the mirror is not symmetric. Inbound,
-//! the bridge binds on the SP side and dials on the weida side; here it
-//! **binds on the weida side** - Rep, Pull and Pub bind, per
-//! `docs/ARCHITECTURE.md` §6c.4 - and dials the foreign peer.
+//! The mirror of [`crate::Inbound`], and the mirror is not symmetric.
+//! Inbound, the bridge binds on the SP side and dials on the weida side;
+//! here it **binds on the weida side** — Rep, Pull and Pub bind, per
+//! `docs/ARCHITECTURE.md` §6c.4 — and dials the foreign peer.
 //!
-//! Three things exist only in this direction.
+//! **The bridge no longer speaks SP.** The protocol header, the pairing
+//! check, the framing, the tag stack and the local prefix match are
+//! `weida-nng`'s sockets
+//! ([0013](https://github.com/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! §5.2). Three things remain this direction's own, and all three are the
+//! reason it is a bridge rather than a socket.
 //!
-//! **The bridge writes the request tag itself, and never retransmits.** A
-//! cooked REQ socket owns a resend timer: it retransmits on the timer, on
-//! peer disconnect, or when a peer becomes available
-//! (`docs/research/nanomsg-nng.md` §4). A bridge that did the same would be
-//! inventing at-least-once on behalf of a weida requester that asked for one
-//! attempt - the duplicate-producing behaviour `docs/adapters/nng.md` §8 names
-//! as L3 and L4, arriving from the wrong side. So this bridge speaks the
-//! **raw** REQ header shape: it allocates a 31-bit request id per exchange,
-//! writes it with the terminal bit [rfc-reqrep §5], matches the reply by that
-//! id, and owns no timer that would send anything twice. Exactly one request
-//! per weida exchange reaches the wire, which is the observation L3 asks for.
+//! **It uses a raw REQ socket, deliberately.** A cooked REQ owns a resend
+//! timer: it retransmits on the timer, on peer disconnect, or when a peer
+//! becomes available (`docs/research/nanomsg-nng.md` §4). A bridge that did
+//! the same would be inventing at-least-once on behalf of a weida requester
+//! that asked for one attempt — the duplicate-producing behaviour
+//! `docs/adapters/nng.md` §8 names as L3 and L4, arriving from the wrong
+//! side. [`weida_nng::RawSocket`] is exactly the socket with the wire and
+//! without the state machine: the bridge allocates a 31-bit request id per
+//! exchange, writes it with the terminal bit [rfc-reqrep §5], matches the
+//! reply by that id, and owns no timer that would send anything twice.
+//! Exactly one request per weida exchange reaches the wire, which is the
+//! observation L3 asks for.
 //!
 //! **A reply that never comes is a deadline.** A REP peer may simply not
-//! answer - a respondent "may decline by not replying" and SP has no way to
-//! say "no" (`docs/research/nanomsg-nng.md` §4, §6) - so the absence is the
+//! answer — a respondent "may decline by not replying" and SP has no way to
+//! say "no" (`docs/research/nanomsg-nng.md` §4, §6) — so the absence is the
 //! only observation available, and a weida exchange would otherwise wait
-//! forever. Every exchange therefore has a deadline, and on expiry the weida
-//! requester is told with a typed `ERROR{NoReply}` rather than left hanging.
+//! forever. Every exchange therefore has a deadline, and on expiry the
+//! weida requester is told with a typed `ERROR{NoReply}` rather than left
+//! hanging.
 //!
-//! **Subscriptions never reach the wire.** SP filters at the subscriber and a
-//! SUB socket cannot send (§4), so a subscription is not a wire message at
-//! all: the bridge receives every publication the peer sends and applies the
-//! configured byte prefixes **itself**. What it may not do is derive those
-//! prefixes from weida filters - see [`OutboundConfig::subscribe`] and loss
-//! L11.
+//! **Subscriptions never reach the wire.** SP filters at the subscriber and
+//! a SUB socket cannot send (§4), so a subscription is not a wire message at
+//! all. The prefixes are now held by the [`weida_nng::SubSocket`] the bridge
+//! dials with — the library does the matching, and counts what it
+//! discarded — but what may *not* happen is deriving those prefixes from
+//! weida filters; see [`OutboundConfig::subscribe`] and loss L11.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio::net::TcpStream;
+use tokio::sync::Notify;
 use weida::{
     ErrorCode, GuaranteeSet, IncomingRequest, Listener, Runtime, RuntimeConfig, ServerTls,
     TransferMeta,
+};
+use weida_nng::{
+    Admission, Context, ContextConfig, Message, PipeEvent, PipeInfo, PushSocket, RawSocket,
+    SocketOptions, SubSocket,
 };
 use weida_sp::backtrace::{self, Backtrace, MAX_ID};
 use weida_sp::header::EndpointType;
 
 use crate::error::BridgeError;
-use crate::wire::Session;
 
 /// Which SP protocol the bridge presents when it dials out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,24 +89,24 @@ impl Dialling {
 /// (`docs/research/nanomsg-nng.md` §3). weida's `publish` takes the two
 /// separately (`docs/PROTOCOL.md` §6.4), so *something* has to say where the
 /// topic ends, and nothing on the wire does. That something is this
-/// configuration, which is what `docs/adapters/nng.md` §6 means by "the split
-/// is adapter configuration, not SP".
+/// configuration, which is what `docs/adapters/nng.md` §6 means by "the
+/// split is adapter configuration, not SP".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TopicSplit {
-    /// The topic is everything before the first occurrence of this octet, and
-    /// the payload is everything after it.
+    /// The topic is everything before the first occurrence of this octet,
+    /// and the payload is everything after it.
     ///
-    /// The default is `0x00`: a weida topic is text (`docs/PROTOCOL.md` §6.4),
-    /// so NUL is the one octet that can never occur inside one, which makes it
-    /// the only delimiter that is never ambiguous. It is also what
+    /// The default is `0x00`: a weida topic is text (`docs/PROTOCOL.md`
+    /// §6.4), so NUL is the one octet that can never occur inside one, which
+    /// makes it the only delimiter that is never ambiguous. It is also what
     /// [`crate::InboundConfig::topic_delimiter`] writes when the two
     /// directions are paired.
     Delimiter(u8),
     /// The first `n` octets are the topic and the rest is payload, for a
     /// fixed-width topic convention. A body shorter than `n` is refused.
     Fixed(usize),
-    /// The whole body is the payload and every message is published under this
-    /// topic. For a publisher whose bodies carry no topic at all.
+    /// The whole body is the payload and every message is published under
+    /// this topic. For a publisher whose bodies carry no topic at all.
     Constant(String),
 }
 
@@ -113,8 +124,8 @@ impl TopicSplit {
                 Some(at) => (&body[..at], &body[at + 1..]),
                 None => {
                     return Err(BridgeError::Protocol(format!(
-                        "a published body carries no {byte:#04x} delimiter, so this bridge cannot \
-                         tell where its topic ends (docs/adapters/nng.md §6)"
+                        "a published body carries no {byte:#04x} delimiter, so this bridge \
+                         cannot tell where its topic ends (docs/adapters/nng.md §6)"
                     )));
                 }
             },
@@ -150,17 +161,20 @@ pub struct OutboundConfig {
     pub dialling: Dialling,
     /// Largest message body the bridge will hold, in octets.
     ///
-    /// 1 MiB, the same number and the same reasoning as the inbound
-    /// direction's: it bounds memory rather than latency, and the product it
-    /// is a factor of is stated on
+    /// `NNG_OPT_RECVMAXSZ` on the SP socket and this crate's own weida-side
+    /// cap, which is the split 0013 §5.2 asks for. 1 MiB, the same number
+    /// and the same reasoning as the inbound direction's: it bounds memory
+    /// rather than latency, and the product it is a factor of is stated on
     /// [`max_pending_exchanges`](OutboundConfig::max_pending_exchanges).
     pub max_message_bytes: u64,
-    /// Largest tag stack the bridge will accept on a reply, in hops.
+    /// Largest tag stack the bridge will accept on a reply, in hops:
+    /// `NNG_OPT_MAXTTL` on the socket.
     ///
     /// The bridge writes a one-tag stack, but a reply may come back through
-    /// devices that pushed their own peer ids [rfc-reqrep §5], so the ceiling
-    /// applies to what is read. `MAXTTL` is 1-255 on the specification side
-    /// and 15 in NNG's source (`docs/adapters/nng.md` §11).
+    /// devices that pushed their own peer ids [rfc-reqrep §5], so the
+    /// ceiling applies to what is read. `MAXTTL` is 1-255 on the
+    /// specification side and 15 in NNG's source (`docs/adapters/nng.md`
+    /// §11).
     pub max_hops: usize,
     /// How long an exchange may wait for its SP reply before the weida
     /// requester is told there will not be one.
@@ -172,10 +186,8 @@ pub struct OutboundConfig {
     pub reply_deadline: Duration,
     /// Exchanges that may wait for an SP reply at once.
     ///
-    /// The bound the ZMTP bridge needed a review pass to grow (B-053), put
-    /// here while the code was written. Each waiting exchange holds a weida
-    /// request **and** its body, already read, so the worst case one bridge
-    /// holds is
+    /// Each waiting exchange holds a weida request **and** its body, already
+    /// read, so the worst case one bridge holds is
     ///
     /// ```text
     /// max_pending_exchanges × max_message_bytes
@@ -186,24 +198,24 @@ pub struct OutboundConfig {
     /// remote input: QUIC bounds concurrent streams per connection and the
     /// deadline bounds how long an entry lives, but neither bounds the sum
     /// across clients. Past the ceiling an exchange is refused immediately
-    /// with `ERROR{REJECTED}` - before its body is read, which is the cheaper
-    /// refusal - rather than parked until the deadline.
+    /// with `ERROR{REJECTED}` — before its body is read, which is the
+    /// cheaper refusal — rather than parked until the deadline.
     pub max_pending_exchanges: usize,
     /// Byte prefixes this side accepts when presenting `SUB`, applied
     /// **locally**.
     ///
     /// SP subscriptions never reach the wire: matching happens at the
     /// subscriber (`docs/research/nanomsg-nng.md` §4), so these are what the
-    /// bridge itself keeps, not something the peer is told. An empty prefix
-    /// accepts everything, which is SP's own empty subscription, and it must
-    /// be written explicitly - a `SUB` with no subscription at all receives
-    /// nothing.
+    /// bridge's own SUB socket keeps, not something the peer is told. An
+    /// empty prefix accepts everything, which is SP's own empty
+    /// subscription, and it must be written explicitly — a `SUB` with no
+    /// subscription at all receives nothing.
     ///
     /// They are configuration and **not** derived from weida filters. Two
     /// reasons, one per direction: the weida side here is a `Publisher`, and
     /// weida gives a publisher no way to learn its subscribers' filters; and
-    /// a segmented weida filter does not reduce to a byte prefix unless it is
-    /// a literal prefix ending at a separator followed by `#`
+    /// a segmented weida filter does not reduce to a byte prefix unless it
+    /// is a literal prefix ending at a separator followed by `#`
     /// ([0007](https://github.com/tuco86/weida/blob/main/docs/decisions/0007-topic-namespace.md)
     /// §4.5). That is loss L11 of `docs/adapters/nng.md` §8.
     pub subscribe: Vec<Vec<u8>>,
@@ -213,8 +225,8 @@ pub struct OutboundConfig {
     /// How long the bridge keeps answering the weida side after the SP peer
     /// turned out to be the wrong endpoint type.
     ///
-    /// A mismatch closes the SP connection - SP has no error frame, so there
-    /// is nothing to answer the peer with (loss L10) - but the weida side is
+    /// A mismatch closes the SP connection — SP has no error frame, so there
+    /// is nothing to answer the peer with (loss L10) — but the weida side is
     /// bound and its clients deserve better than a vanished endpoint. For
     /// this long, every exchange is refused with `ERROR{UNSUPPORTED}`, which
     /// reaches a requester as [`weida::Error::Unsupported`]; then the bridge
@@ -248,6 +260,24 @@ impl OutboundConfig {
             runtime: RuntimeConfig::default(),
         }
     }
+
+    /// The SP socket's options: this configuration's bounds under NNG's own
+    /// names.
+    fn socket_options(&self) -> SocketOptions {
+        SocketOptions {
+            recv_max_size: self.max_message_bytes,
+            max_ttl: self.max_hops,
+            // One peer, because that is what the configuration names: this
+            // bridge dials one address.
+            max_pipes: 1,
+            ..SocketOptions::default()
+        }
+    }
+
+    /// The URL for the SP peer this bridge dials.
+    fn url(&self) -> String {
+        format!("tcp://{}", self.connect)
+    }
 }
 
 /// A bridge from one weida endpoint to one foreign SP peer.
@@ -263,7 +293,7 @@ impl Outbound {
     ///
     /// Refuses, before anything is served: a guarantee set above `core`, a
     /// `max_message_bytes` or `max_pending_exchanges` of zero, a zero
-    /// `max_hops`, a zero `reply_deadline`, and - for `SUB` - an empty
+    /// `max_hops`, a zero `reply_deadline`, and — for `SUB` — an empty
     /// subscription list, which would dial a publisher and keep nothing.
     pub async fn bind(config: OutboundConfig, tls: ServerTls) -> Result<Outbound, BridgeError> {
         if config.runtime.guarantees != GuaranteeSet::CORE {
@@ -294,8 +324,8 @@ impl Outbound {
         if config.reply_deadline.is_zero() {
             return Err(BridgeError::Configuration(
                 "reply_deadline is zero: an SP peer that does not answer says nothing and this \
-                 bridge does not retransmit, so the deadline is the only thing that ends such an \
-                 exchange"
+                 bridge does not retransmit, so the deadline is the only thing that ends such \
+                 an exchange"
                     .into(),
             ));
         }
@@ -331,66 +361,141 @@ impl Outbound {
 
     /// Dials the foreign peer and serves until either side ends.
     ///
-    /// One connection, because that is what the configuration names. An SP
-    /// dialer reconnects on its own with a configured backoff
-    /// (`docs/research/nanomsg-nng.md` §1) and this bridge does not: a peer
-    /// that goes away ends the run and its supervisor decides, the same
-    /// choice the inbound direction makes about its weida side.
+    /// One connection, because that is what the configuration names — the
+    /// socket's pipe ceiling is one. The dial is the synchronous form, so it
+    /// returns only once the peer's protocol header has arrived and the
+    /// pairing has been checked (`docs/research/nanomsg-nng.md` §1); a
+    /// refused pairing therefore fails here, before any traffic, and the
+    /// weida side is told for `refusal_grace`.
     pub async fn serve(self) -> Result<(), BridgeError> {
-        let socket = TcpStream::connect(self.config.connect).await?;
-        socket.set_nodelay(true)?;
-        let mut session = Session::new(socket, self.config.max_message_bytes);
+        let sp = Context::new(ContextConfig::default())?;
+        let options = self.config.socket_options();
         let ours = self.config.dialling.endpoint();
-        let theirs = match session.handshake(ours).await {
-            Ok(theirs) => theirs,
-            // The peer is not what this bridge dialled for. Its connection is
-            // dropped with nothing said, because SP has no error frame
-            // (L10) - but the weida side is bound, so its clients are told
-            // what happened for as long as `refusal_grace` allows.
-            Err(BridgeError::EndpointType { ours, theirs }) => {
-                drop(session);
-                tracing::warn!(
-                    ?ours,
-                    ?theirs,
-                    "the dialled SP peer is the wrong endpoint type; refusing the weida side"
-                );
-                refuse_weida_side(&self.listener, &self.config).await;
-                return Err(BridgeError::EndpointType { ours, theirs });
-            }
-            Err(e) => return Err(e),
-        };
-        tracing::debug!(presenting = ?ours, peer = ?theirs, "SP protocol headers exchanged");
+        let url = self.config.url();
 
         match self.config.dialling {
-            Dialling::Req => serve_req(session, &self.listener, &self.config).await,
-            Dialling::Push => serve_push(session, &self.listener, &self.config).await,
-            Dialling::Sub => serve_sub(session, &self.listener, &self.config).await,
+            Dialling::Req => {
+                // Raw, so that nothing retransmits: see the module note.
+                let socket = RawSocket::with_options(&sp, ours, options)?;
+                let gone = watch_for_the_peer(&socket);
+                dial_or_refuse(socket.dial(&url).await, ours, &self.listener, &self.config).await?;
+                serve_req(socket, gone, &self.listener, &self.config).await
+            }
+            Dialling::Push => {
+                let socket = PushSocket::with_options(&sp, options)?;
+                let gone = watch_for_the_peer(&socket);
+                dial_or_refuse(socket.dial(&url).await, ours, &self.listener, &self.config).await?;
+                serve_push(socket, gone, &self.listener, &self.config).await
+            }
+            Dialling::Sub => {
+                let socket = SubSocket::with_options(&sp, options)?;
+                // The prefixes are the library's now: it receives every
+                // publication and discards what matches nothing, which is
+                // what "SP filters at the subscriber" means when the
+                // subscriber is a bridge.
+                for prefix in &self.config.subscribe {
+                    socket.subscribe(prefix.clone());
+                }
+                let gone = watch_for_the_peer(&socket);
+                dial_or_refuse(socket.dial(&url).await, ours, &self.listener, &self.config).await?;
+                serve_sub(socket, gone, &self.listener, &self.config).await
+            }
         }
     }
 }
+
+/// Turns a refused dial into the two things it means: a closed SP
+/// connection, and a weida side that says so for a while.
+///
+/// `NNG_EPROTO` is the pairing refusal — the library checks the peer's
+/// endpoint type before any traffic and closes with nothing sent back, which
+/// is all SP has (loss L10). Everything else is a connection that did not
+/// happen and is reported as itself.
+async fn dial_or_refuse(
+    dialled: Result<weida_nng::Dialer, weida_nng::Error>,
+    ours: EndpointType,
+    listener: &Listener,
+    config: &OutboundConfig,
+) -> Result<(), BridgeError> {
+    match dialled {
+        Ok(_dialer) => Ok(()),
+        Err(weida_nng::Error::EPROTO(reason)) => {
+            let reason = reason.to_string();
+            tracing::warn!(
+                ?ours,
+                %reason,
+                "the dialled SP peer is the wrong endpoint type; refusing the weida side"
+            );
+            refuse_weida_side(listener, config).await;
+            Err(BridgeError::EndpointType { ours, reason })
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Signals once the peer's pipe is removed.
+///
+/// The library reconnects a dialer whose pipe closes
+/// (`docs/research/nanomsg-nng.md` §1); this bridge does not want that —
+/// "a peer that goes away ends the run and its supervisor decides" — so the
+/// pipe event is what ends the loops. The callback is handed a
+/// [`PipeInfo`] and no socket handle, which is why it can be this small.
+///
+/// `notify_one` rather than `notify_waiters`: it stores a permit, so a loop
+/// that reaches its wait after the pipe has already gone still sees it.
+fn watch_for_the_peer<S: HasNotify>(socket: &S) -> Arc<Notify> {
+    let gone = Arc::new(Notify::new());
+    let signal = Arc::clone(&gone);
+    socket.install(Arc::new(move |event, info: &PipeInfo| {
+        tracing::debug!(?event, id = info.id.get(), "SP pipe event");
+        if event == PipeEvent::RemPost {
+            signal.notify_one();
+        }
+        Admission::Accept
+    }));
+    gone
+}
+
+/// The one thing the three socket types have in common here: a pipe-event
+/// callback. Written as a trait rather than a macro so the three loops take
+/// an ordinary argument.
+trait HasNotify {
+    fn install(&self, callback: weida_nng::PipeCallback);
+}
+
+macro_rules! has_notify {
+    ($socket:ty) => {
+        impl HasNotify for $socket {
+            fn install(&self, callback: weida_nng::PipeCallback) {
+                self.notify(callback);
+            }
+        }
+    };
+}
+
+has_notify!(RawSocket);
+has_notify!(PushSocket);
+has_notify!(SubSocket);
 
 /// Tells the weida side that the far end is unusable, for a bounded while.
 ///
 /// `Unsupported` rather than `Rejected`: nothing declined the work, the
 /// endpoint behind this bridge cannot serve it at all
 /// (`docs/PROTOCOL.md` §6.4). A `Puller` has no coded refusal to send, so a
-/// transfer is dropped, which resets its stream - the per-stream refusal
+/// transfer is dropped, which resets its stream — the per-stream refusal
 /// weida already defines.
 async fn refuse_weida_side(listener: &Listener, config: &OutboundConfig) {
-    let until = tokio::time::sleep(config.refusal_grace);
-    tokio::pin!(until);
+    let until = Instant::now() + config.refusal_grace;
     match config.dialling {
         Dialling::Req => {
             let Ok(replier) = listener.replier(&config.weida_path) else {
                 return;
             };
-            loop {
-                tokio::select! {
-                    () = &mut until => return,
-                    accepted = replier.accept() => match accepted {
-                        Ok(request) => request.refuse(ErrorCode::Unsupported).await,
-                        Err(_) => return,
-                    },
+            while Instant::now() < until {
+                let remaining = until.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, replier.accept()).await {
+                    Ok(Ok(request)) => request.refuse(ErrorCode::Unsupported).await,
+                    Ok(Err(_)) | Err(_) => return,
                 }
             }
         }
@@ -398,20 +503,18 @@ async fn refuse_weida_side(listener: &Listener, config: &OutboundConfig) {
             let Ok(puller) = listener.puller(&config.weida_path) else {
                 return;
             };
-            loop {
-                tokio::select! {
-                    () = &mut until => return,
-                    arrived = puller.recv() => match arrived {
-                        Ok(transfer) => drop(transfer),
-                        Err(_) => return,
-                    },
+            while Instant::now() < until {
+                let remaining = until.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, puller.recv()).await {
+                    Ok(Ok(transfer)) => drop(transfer),
+                    Ok(Err(_)) | Err(_) => return,
                 }
             }
         }
-        // A publisher has nobody to refuse: a subscriber that gets nothing is
-        // what a dead upstream looks like from there, and saying so is the
-        // bridge's log.
-        Dialling::Sub => until.await,
+        // A publisher has nobody to refuse: a weida subscriber that
+        // connects simply receives nothing, because there is no publication
+        // to forward.
+        Dialling::Sub => {}
     }
 }
 
@@ -426,15 +529,14 @@ struct Pending {
 ///
 /// "At random" matters for a bridge that may be restarted while a peer still
 /// holds state from the previous run, so the seed is the clock rather than a
-/// constant; this crate has no dependencies and wants none for sixteen bits
-/// of entropy.
+/// constant; this crate wants no dependency for sixteen bits of entropy.
 struct RequestIds(u32);
 
 impl RequestIds {
     fn new() -> RequestIds {
         let seed = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
+            .map(|since| since.subsec_nanos())
             .unwrap_or(1);
         RequestIds(seed & MAX_ID)
     }
@@ -447,7 +549,8 @@ impl RequestIds {
 
 /// `REQ` toward a foreign `REP`: weida exchanges, one request each.
 async fn serve_req(
-    mut session: Session<TcpStream>,
+    socket: RawSocket,
+    gone: Arc<Notify>,
     listener: &Listener,
     config: &OutboundConfig,
 ) -> Result<(), BridgeError> {
@@ -458,11 +561,44 @@ async fn serve_req(
 
     // Two ways an exchange ends without an answer, and both have to reach
     // the requester as something typed. The deadline is one; the peer's
-    // close is the other, and it is the faster of the two - SP says nothing
+    // close is the other, and it is the faster of the two — SP says nothing
     // when it gives up, so the close *is* the message (L10 seen from this
     // side).
     let outcome = loop {
         tokio::select! {
+            // Biased, and the order is the rule: a reply already in hand
+            // beats the peer's close. A REP peer that answers and hangs up
+            // makes both branches ready at once, and an unbiased select
+            // would refuse a request that was in fact answered.
+            biased;
+            inbound = socket.recv() => {
+                let (_, message) = match inbound {
+                    Ok(received) => received,
+                    Err(e) => break Err(e.into()),
+                };
+                let (stack, payload) = match backtrace::decode(message.body(), config.max_hops) {
+                    Ok((stack, payload)) => (stack, payload.to_vec()),
+                    // A reply this side cannot parse is a reply nobody can
+                    // be given; the connection is finished, as a real REQ
+                    // socket's would be.
+                    Err(e) => break Err(BridgeError::Protocol(e.to_string())),
+                };
+                match pending.remove(&stack.id) {
+                    Some(waiting) => {
+                        let mut out = waiting.request.reply(TransferMeta::default()).await?;
+                        out.write_all(&payload).await?;
+                        out.finish()?;
+                    }
+                    // A reply for an exchange that timed out, or an id this
+                    // side never sent — which is also what a
+                    // *retransmitted* answer looks like. Neither is worth
+                    // closing on: the requester has already been told.
+                    None => tracing::debug!(
+                        id = stack.id,
+                        "a reply arrived for no pending exchange"
+                    ),
+                }
+            }
             accepted = replier.accept() => {
                 let mut request = match accepted {
                     Ok(request) => request,
@@ -471,7 +607,8 @@ async fn serve_req(
                 // The ceiling first, because it is the cheaper refusal: a
                 // request refused before its body is read costs this side
                 // nothing, where reading first would buffer up to
-                // `max_message_bytes` for an exchange about to be turned away.
+                // `max_message_bytes` for an exchange about to be turned
+                // away.
                 if pending.len() >= config.max_pending_exchanges {
                     tracing::warn!(
                         ceiling = config.max_pending_exchanges,
@@ -497,45 +634,27 @@ async fn serve_req(
                 let id = ids.next();
                 // One request, once. The tag is the correlation and there is
                 // no timer that would write it a second time.
-                if let Err(e) = session
-                    .write_message(&[&Backtrace::direct(id).encode(), &body])
-                    .await
-                {
+                let message = Message::from_body(Backtrace::direct(id).encode_message(&body));
+                if let Err(e) = socket.send(message).await {
                     request.refuse(ErrorCode::NoReply).await;
-                    break Err(e);
+                    break Err(e.into());
                 }
                 pending.insert(id, Pending { request, since: Instant::now() });
             }
-            inbound = session.read_message() => {
-                let body = match inbound {
-                    Ok(body) => body,
-                    Err(e) => break Err(e),
-                };
-                let (stack, payload) = match backtrace::decode(&body, config.max_hops) {
-                    Ok((stack, payload)) => (stack, payload.to_vec()),
-                    Err(e) => break Err(e.into()),
-                };
-                match pending.remove(&stack.id) {
-                    Some(waiting) => {
-                        let mut out = waiting.request.reply(TransferMeta::default()).await?;
-                        out.write_all(&payload).await?;
-                        out.finish()?;
-                    }
-                    // A reply for an exchange that timed out, or an id this
-                    // side never sent - which is also what a *retransmitted*
-                    // answer looks like. Neither is worth closing on: the
-                    // requester has already been told.
-                    None => tracing::debug!(
-                        id = stack.id,
-                        "a reply arrived for no pending exchange"
-                    ),
-                }
+            () = gone.notified() => {
+                break Err(BridgeError::PeerClosed);
             }
             () = tokio::time::sleep(config.reply_deadline / 4) => {
                 expire(&mut pending, config.reply_deadline).await;
             }
         }
     };
+
+    // A run that ends says why: the two sides each see half of it, and
+    // without this the half nobody is looking at is lost.
+    if let Err(error) = &outcome {
+        tracing::warn!(%error, "the outbound REQ bridge is ending");
+    }
 
     // Whatever ended the loop, nobody waiting may be left waiting: without
     // this they would sit out the whole deadline for an answer that has
@@ -563,8 +682,8 @@ async fn expire(pending: &mut HashMap<u32, Pending>, deadline: Duration) {
             "no SP reply within the deadline; refusing the weida exchange with NoReply"
         );
         // `NoReply` rather than `Rejected`: the request was taken and nobody
-        // declined it - SP has no way to decline - so the absence is all this
-        // side can report.
+        // declined it — SP has no way to decline — so the absence is all
+        // this side can report.
         waiting.request.refuse(ErrorCode::NoReply).await;
     }
 }
@@ -572,12 +691,14 @@ async fn expire(pending: &mut HashMap<u32, Pending>, deadline: Duration) {
 /// `PUSH` toward a foreign `PULL`: one SP message per weida transfer.
 ///
 /// Both sides block: a PUSH socket waits for a puller that can accept
-/// (`docs/research/nanomsg-nng.md` §4, §5) and weida's Push/Pull backpressure
-/// is `Block` (`docs/GUARANTEES.md` §6), so writing when the peer's window is
-/// full stops this loop, which stops the weida puller. Nothing is converted
-/// into a drop, which is the pairing rule of `docs/adapters/nng.md` §4.
+/// (`docs/research/nanomsg-nng.md` §4, §5) and weida's Push/Pull
+/// backpressure is `Block` (`docs/GUARANTEES.md` §6), so sending when the
+/// peer cannot take the message stops this loop, which stops the weida
+/// puller. Nothing is converted into a drop, which is the pairing rule of
+/// `docs/adapters/nng.md` §4.
 async fn serve_push(
-    mut session: Session<TcpStream>,
+    socket: PushSocket,
+    gone: Arc<Notify>,
     listener: &Listener,
     config: &OutboundConfig,
 ) -> Result<(), BridgeError> {
@@ -585,11 +706,15 @@ async fn serve_push(
     let cap = usize::try_from(config.max_message_bytes).unwrap_or(usize::MAX);
 
     loop {
-        let transfer = puller.recv().await?;
-        // Over the cap, `collect` has already refused the rest of the payload
-        // and buffered none of it. That is a refusal of **this transfer**, and
-        // weida keeps refusals per stream, so the loop continues rather than
-        // taking the SP peer down for one oversized message it never saw.
+        let transfer = tokio::select! {
+            transfer = puller.recv() => transfer?,
+            () = gone.notified() => return Err(BridgeError::PeerClosed),
+        };
+        // Over the cap, `collect` has already refused the rest of the
+        // payload and buffered none of it. That is a refusal of **this
+        // transfer**, and weida keeps refusals per stream, so the loop
+        // continues rather than taking the SP peer down for one oversized
+        // message it never saw.
         let body = match transfer.collect(cap).await {
             Ok(body) => body,
             Err(weida::Error::LimitExceeded) => {
@@ -602,38 +727,37 @@ async fn serve_push(
             }
             Err(e) => return Err(e.into()),
         };
-        session.write_message(&[&body]).await?;
+        socket.send(body).await?;
     }
 }
 
-/// `SUB` toward a foreign `PUB`: what the publisher sends is published onward.
+/// `SUB` toward a foreign `PUB`: what the publisher sends is published
+/// onward.
 ///
-/// Nothing is sent to the peer, ever - a SUB socket has no send operation
-/// (`docs/research/nanomsg-nng.md` §4) - so the prefix match happens here,
-/// against the body as it arrived, before the topic is split off. That is
-/// what "SP filters at the subscriber" means when the subscriber is a bridge.
+/// Nothing is sent to the peer, ever — a SUB socket has no send operation
+/// (`docs/research/nanomsg-nng.md` §4) — and the prefix match happens in the
+/// library's own SUB socket, against the body as it arrived and before the
+/// topic is split off. That is what "SP filters at the subscriber" means
+/// when the subscriber is a bridge, and
+/// [`SubSocket::discarded`](weida_nng::SubSocket::discarded) counts what it
+/// cost: the bandwidth was spent either way, which is L1 seen from this end.
 async fn serve_sub(
-    mut session: Session<TcpStream>,
+    socket: SubSocket,
+    gone: Arc<Notify>,
     listener: &Listener,
     config: &OutboundConfig,
 ) -> Result<(), BridgeError> {
     let publisher = listener.publisher(&config.weida_path)?;
 
     loop {
-        let body = session.read_message().await?;
-        if !config
-            .subscribe
-            .iter()
-            .any(|prefix| body.starts_with(prefix))
-        {
-            // Received and discarded: the bandwidth was spent either way,
-            // which is L1 seen from this end.
-            continue;
-        }
-        let (topic, payload) = match config.topic_split.apply(&body) {
+        let message = tokio::select! {
+            received = socket.recv() => received?,
+            () = gone.notified() => return Err(BridgeError::PeerClosed),
+        };
+        let (topic, payload) = match config.topic_split.apply(message.body()) {
             Ok(split) => split,
             // A body this bridge cannot split is a configuration mismatch,
-            // not a protocol violation by the peer - but it is also not
+            // not a protocol violation by the peer — but it is also not
             // something to guess about, so the run ends and says why.
             Err(e) => return Err(e),
         };
@@ -653,49 +777,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_delimiter_split_finds_the_topic_and_keeps_the_rest_whole() {
+    fn dialling_maps_onto_the_endpoint_types_of_the_document() {
+        assert_eq!(Dialling::Req.endpoint(), EndpointType::Req);
+        assert_eq!(Dialling::Push.endpoint(), EndpointType::Push);
+        assert_eq!(Dialling::Sub.endpoint(), EndpointType::Sub);
+    }
+
+    #[test]
+    fn a_delimited_body_splits_where_the_octet_is() {
         let split = TopicSplit::Delimiter(0);
-        let (topic, payload) = split.apply(b"px.eur\x001.09\x002").expect("split");
-        assert_eq!(topic, "px.eur");
-        assert_eq!(
-            payload, b"1.09\x002",
-            "only the first delimiter separates; the payload is opaque"
-        );
-        assert!(
-            split.apply(b"no delimiter here").is_err(),
-            "a body the configuration cannot split is refused, not guessed at"
-        );
+        let (topic, payload) = split.apply(b"orders/new\0{}").expect("split");
+        assert_eq!(topic, "orders/new");
+        assert_eq!(payload, b"{}");
+        assert!(split.apply(b"no delimiter here").is_err());
     }
 
     #[test]
-    fn a_fixed_split_refuses_a_body_shorter_than_its_topic() {
+    fn a_fixed_topic_takes_the_first_octets_and_refuses_a_short_body() {
         let split = TopicSplit::Fixed(4);
-        assert_eq!(
-            split.apply(b"feedbody").expect("split"),
-            ("feed", &b"body"[..])
-        );
-        assert_eq!(split.apply(b"feed").expect("split"), ("feed", &b""[..]));
-        assert!(split.apply(b"fee").is_err());
+        let (topic, payload) = split.apply(b"abcdrest").expect("split");
+        assert_eq!(topic, "abcd");
+        assert_eq!(payload, b"rest");
+        assert!(split.apply(b"ab").is_err());
     }
 
     #[test]
-    fn a_constant_split_publishes_the_whole_body() {
-        let split = TopicSplit::Constant("ticks".into());
-        assert_eq!(
-            split.apply(b"\0\x01raw").expect("split"),
-            ("ticks", &b"\0\x01raw"[..])
-        );
+    fn a_constant_topic_keeps_the_whole_body() {
+        let split = TopicSplit::Constant("feed".into());
+        let (topic, payload) = split.apply(b"whatever").expect("split");
+        assert_eq!(topic, "feed");
+        assert_eq!(payload, b"whatever");
     }
 
+    /// Claim: request ids stay inside the 31 bits the tag stack leaves,
+    /// because the terminal bit is the encoding's and not the id's
+    /// [rfc-reqrep §5].
     #[test]
-    fn request_ids_stay_inside_31_bits_and_never_repeat_in_a_run() {
+    fn request_ids_stay_inside_thirty_one_bits() {
         let mut ids = RequestIds(MAX_ID - 1);
-        let first = ids.next();
-        let second = ids.next();
-        let third = ids.next();
-        assert!(first <= MAX_ID && second <= MAX_ID && third <= MAX_ID);
-        // The wrap is the specification's: "adding 1 to the last request ID
-        // and possibly overflowing to 0" [rfc-reqrep §5].
-        assert_eq!((first, second, third), (MAX_ID, 0, 1));
+        assert_eq!(ids.next(), MAX_ID);
+        assert_eq!(ids.next(), 0);
+        assert!(RequestIds::new().next() <= MAX_ID);
+    }
+
+    /// Claim: the bridge's bounds become the SP socket's options under
+    /// NNG's own names, and the pipe ceiling is one because the
+    /// configuration names one peer.
+    #[test]
+    fn the_bridges_bounds_are_the_sockets_options() {
+        let mut config = OutboundConfig::new(
+            "127.0.0.1:1".parse().expect("addr"),
+            "127.0.0.1:0".parse().expect("addr"),
+            "/rpc",
+            Dialling::Req,
+        );
+        config.max_message_bytes = 2048;
+        config.max_hops = 5;
+        let options = config.socket_options();
+        assert_eq!(options.recv_max_size, 2048);
+        assert_eq!(options.max_ttl, 5);
+        assert_eq!(options.max_pipes, 1);
+        assert_eq!(config.url(), "tcp://127.0.0.1:1");
     }
 }

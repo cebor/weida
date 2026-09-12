@@ -265,7 +265,15 @@ impl SocketCore {
 
     /// Takes one message from whichever pipe has one, advancing the
     /// rotation.
+    ///
+    /// A message that arrived on a pipe which has since been retired comes
+    /// first: it crossed the wire before the peer closed, and the close
+    /// does not un-arrive it (see
+    /// [`Engine::take_arrived`](crate::Engine::take_arrived)).
     pub fn try_take_any(&self) -> Option<(PipeId, Message)> {
+        if let Some(arrived) = self.engine.take_arrived() {
+            return Some(arrived);
+        }
         let pipes = self.pipes();
         if pipes.is_empty() {
             return None;
@@ -422,18 +430,29 @@ fn nowhere_to_send() -> Error {
 }
 
 /// Waits for room on any of `pipes`, or for the pipe set to change.
+///
+/// A pipe whose queues are already closed is **skipped**, and that is
+/// load-bearing rather than tidy: a closed queue's wait returns at once —
+/// it has to, so that a parked sender is released when its peer goes — so
+/// waiting on one between the close and the engine's retire would spin
+/// this loop hot instead of parking it. The retire is what removes the
+/// pipe, and `engine.changed()` is what wakes this when it does.
 async fn wait_for_room(engine: &Engine, pipes: &[Pipe]) {
     let waits: Vec<_> = pipes
         .iter()
+        .filter(|pipe| !pipe.outgoing().is_closed())
         .map(|pipe| pipe.outgoing().wait_for_room())
         .collect();
     first_of(waits, engine.changed()).await;
 }
 
 /// Waits for a message on any of `pipes`, or for the pipe set to change.
+///
+/// Closed pipes are skipped, for the reason [`wait_for_room`] gives.
 async fn wait_for_message(engine: &Engine, pipes: &[Pipe]) {
     let waits: Vec<_> = pipes
         .iter()
+        .filter(|pipe| !pipe.incoming().is_closed())
         .map(|pipe| pipe.incoming().wait_for_message())
         .collect();
     first_of(waits, engine.changed()).await;

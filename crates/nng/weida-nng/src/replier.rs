@@ -184,8 +184,15 @@ impl ReplierCtx {
                 continue;
             };
             let Ok((stack, payload)) = backtrace::decode(message.body(), max_hops) else {
-                // A malformed stack makes the message unusable; NNG drops
-                // the message and keeps the pipe (§8), so take the next.
+                // A stack with no terminator inside the local `MAXTTL`, or
+                // one that ends inside a tag, is malformed rather than
+                // merely deep: "if the reply is shorter than 32 bits, it is
+                // malformed and the endpoint MUST ignore it"
+                // [rfc-reqrep §5], and NNG closes the pipe on a truncated
+                // tag rather than reading the next message out of a stream
+                // it can no longer trust (§8). So the pipe goes and the
+                // loop looks at the others.
+                self.shared().core.engine().close_pipe(pipe);
                 continue;
             };
             let received = framed(&stack, payload);
