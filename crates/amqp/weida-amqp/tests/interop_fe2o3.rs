@@ -613,10 +613,19 @@ async fn a_transactional_attach_is_not_something_this_client_can_ask_for() {
     // refusal — which is what the parity table records.
     //
     // What the probe does establish is the other half: the capability is not
-    // silently claimed either. A `txn-capable` peer advertises
-    // `amqp:txn:local` (or the multi-transaction variants) in its `attach`
+    // silently claimed either. A transaction-capable peer advertises one of
+    // Part 4's five coordinator capabilities in its `attach`
     // offered-capabilities, and this client reads them rather than ignoring
-    // them.
+    // them. Their names are `amqp:local-transactions` and its four
+    // relatives - not an `amqp:txn:` prefix, which is what the *state* and
+    // the error conditions use (Part 4 §4.5.1, §4.5.5).
+    const COORDINATOR: [&str; 5] = [
+        "amqp:local-transactions",
+        "amqp:distributed-transactions",
+        "amqp:promotable-transactions",
+        "amqp:multi-txns-per-ssn",
+        "amqp:multi-ssns-per-txn",
+    ];
     let link = tokio::time::timeout(
         DEADLINE,
         session.attach(LinkOptions::sender("txn-probe", Target::at("q1"))),
@@ -628,9 +637,9 @@ async fn a_transactional_attach_is_not_something_this_client_can_ask_for() {
     assert!(
         !offered
             .iter()
-            .any(|capability| capability.starts_with("amqp:txn:")),
-        "{PEER} built without its `transaction` feature offers no transactional \
-         capability, and this client offers none either: {offered:?}"
+            .any(|capability| COORDINATOR.contains(&capability.as_str())),
+        "{PEER} built without its `transaction` feature offers none of Part 4's \
+         coordinator capabilities, and this client offers none either: {offered:?}"
     );
 
     tokio::time::timeout(DEADLINE, connection.close())
