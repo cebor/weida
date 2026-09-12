@@ -72,7 +72,7 @@
 //!   and messages and subscriptions sent upstream.
 //! - [`Error`] — libzmq's errno vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
-//! - [`IpcBinding`] — the `ipc` transport on `AF_UNIX`, with
+//! - `IpcBinding` (unix only) — the `ipc` transport on `AF_UNIX`, with
 //!   `weida-runtime`'s bind hygiene (socket-type check, unlink-then-bind,
 //!   explicit `0600`, the node removed on drop), the kernel's path budget
 //!   beside libzmq's published 113, the peer's credentials captured at

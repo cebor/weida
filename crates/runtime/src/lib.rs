@@ -38,11 +38,11 @@
 //!   names with a byte budget, generic over what a bound name hands its
 //!   acceptor. weida's `weida+inproc://` buses and ZeroMQ's `inproc://`
 //!   endpoints are the same object under two names.
-//! - On unix: [`BoundUnixSocket`], which binds an `AF_UNIX` socket with the
+//! - On unix: `BoundUnixSocket`, which binds an `AF_UNIX` socket with the
 //!   hygiene a filesystem endpoint needs — socket-type check, unlink before
 //!   bind, an explicit mode rather than whatever `umask` allowed, a
 //!   `sun_path` budget, and removal of the node on drop — and
-//!   [`peer_credentials`], the kernel's answer to *who is on the other end*
+//!   `peer_credentials`, the kernel's answer to *who is on the other end*
 //!   ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
 //!   §4.5).
 //!

@@ -222,6 +222,17 @@ impl Peer {
                 let conn = self.runtime.connect_unix(&addr.socket).await?;
                 (conn, addr.path)
             }
+            #[cfg(not(unix))]
+            Address::Unix(addr) => {
+                // The address parses everywhere — it is data — but the
+                // transport exists only where the kernel offers `AF_UNIX`.
+                // Refused by name rather than falling through to another
+                // transport [0010 §4.6].
+                return Err(Error::InvalidAddress(format!(
+                    "{}: AF_UNIX is not available on this platform",
+                    addr.socket.display()
+                )));
+            }
         };
         self.peers.add(ConnHandle::clone(&conn), &path);
         Ok((conn, Arc::from(path.as_str())))

@@ -35,7 +35,7 @@ use crate::error::BridgeError;
 
 /// weida's topic separator ([0007] §4.2).
 ///
-//! [0007]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0007-topic-namespace.md
+/// [0007]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0007-topic-namespace.md
 const SEPARATOR: char = '.';
 
 /// What to do with a byte prefix that does not end at a segment boundary.
