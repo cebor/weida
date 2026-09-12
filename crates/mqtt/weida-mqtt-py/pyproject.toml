@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://git.doodleshnookie.net/hannes/weida"
+Repository = "https://git.doodleshnookie.net/tuco86/weida"
 
 [tool.maturin]
 module-name = "weida_mqtt"

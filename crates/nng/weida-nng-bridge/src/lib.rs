@@ -1,7 +1,7 @@
 //! Bridges foreign nanomsg/NNG SP peers onto weida endpoints.
 //!
 //! This is the forwarder of
-//! [0013](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! [0013](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
 //! §4.5: **configuration plus mapping plus refusal, and no protocol**. The
 //! SP side is `weida-nng`'s sockets — the protocol header, the pairing
 //! check, the 64-bit framing, the REQ tag stack, the pipe ceiling and the

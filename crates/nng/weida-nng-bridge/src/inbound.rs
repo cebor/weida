@@ -5,7 +5,7 @@
 //! the pairing check, the 64-bit framing and the REQ tag stack are the
 //! library's, and what is left here is configuration, mapping and refusal —
 //! which is all a hop ever was
-//! ([0013](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! ([0013](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
 //! §4.5, §5.2).
 
 use std::net::SocketAddr;
@@ -62,7 +62,7 @@ pub struct InboundConfig {
     ///
     /// This is `NNG_OPT_RECVMAXSZ` on the SP socket **and** the bridge's own
     /// weida-side cap, which is the split
-//! [0013](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! [0013](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
     /// §5.2 asks for: the SP side's limit is the library's option, judged
     /// from the declared 64-bit length before anything is allocated, and the
     /// weida side's is this crate's, because a weida payload has to be

@@ -6,7 +6,7 @@
 //! * **L2/L4 — a byte prefix is not a segmented filter.** ZeroMQ matches bytes
 //!   from the start of the message and knows nothing about boundaries;
 //!   weida's filter is `.`-segmented with `*` and a trailing `#`
-//!   ([0007](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0007-topic-namespace.md)
+//!   ([0007](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0007-topic-namespace.md)
 //!   §4.2). A prefix that ends mid-segment selects a different set than any
 //!   filter does, so it is refused — unless the configuration opts into
 //!   subscribing at the enclosing boundary and re-applying the byte prefix
@@ -16,7 +16,7 @@
 //! subscriptions, and would require two CANCEL commands to undo" — is
 //! 37/ZMTP's rule about a *socket*, not about a bridge, and the reference
 //! counting that implemented it is now `weida-zmq`'s XPUB
-//! ([0013](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! ([0013](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
 //! §5.2): that socket delivers a subscription to its application only when
 //! the count for a prefix crosses zero, which is exactly the signal this
 //! bridge used to compute for itself. The same move took the per-peer prefix
@@ -35,7 +35,7 @@ use crate::error::BridgeError;
 
 /// weida's topic separator ([0007] §4.2).
 ///
-//! [0007]: https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0007-topic-namespace.md
+//! [0007]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0007-topic-namespace.md
 const SEPARATOR: char = '.';
 
 /// What to do with a byte prefix that does not end at a segment boundary.
@@ -44,7 +44,7 @@ pub enum MidSegment {
     /// Refuse the subscription and say why. The default, and the rule at an
     /// adapter edge: a guarantee that cannot be carried is refused rather
     /// than approximated
-    /// ([0006](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0006-guarantee-sets.md)
+    /// ([0006](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0006-guarantee-sets.md)
     /// §4.7).
     #[default]
     Refuse,

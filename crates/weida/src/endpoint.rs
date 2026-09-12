@@ -462,7 +462,7 @@ impl Subscriber {
     /// travelling to the publisher, which would answer it by closing the
     /// connection.
     ///
-    /// [`PROTOCOL.md`]: https://git.doodleshnookie.net/hannes/weida/blob/main/docs/PROTOCOL.md
+    /// [`PROTOCOL.md`]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/PROTOCOL.md
     pub async fn subscribe(&self, filter: &str) -> Result<(), Error> {
         weida_protocol::filter::validate(filter)?;
         let fresh = self

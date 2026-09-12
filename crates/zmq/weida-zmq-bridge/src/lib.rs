@@ -3,7 +3,7 @@
 //!
 //! This is the **forwarder** of `docs/adapters/zmtp.md`, built on the
 //! [`weida_zmq`] sockets rather than on a ZMTP session of its own
-//! ([0013](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
+//! ([0013](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0013-competitor-libraries.md)
 //! §5.2). What each side speaks is somebody else's code: ZeroMQ is
 //! `weida-zmq`'s, weida is `weida`'s, and what is here is the mapping between
 //! them and nothing else.
@@ -72,7 +72,7 @@
 //! `subscriptions.rs`'s reference counting. Each was a piece of ZeroMQ with a
 //! bridge's name on it, and each now lives where a socket can be checked
 //! against libzmq for it: the parity table is
-//! [`docs/libraries/zmq.md`](https://git.doodleshnookie.net/hannes/weida/blob/main/docs/libraries/zmq.md),
+//! [`docs/libraries/zmq.md`](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/libraries/zmq.md),
 //! and the interop evidence is `weida-zmq`'s own matrices against libzmq 4.3.5
 //! and the pure-Rust `zeromq` crate. `docs/adapters/zmtp.md` §3 lists the five
 //! differences the rebuild made.

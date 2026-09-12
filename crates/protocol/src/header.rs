@@ -187,7 +187,7 @@ macro_rules! wire_enum {
 wire_enum! {
     /// Delivery dimension ([`GUARANTEES.md`] §3). A ladder: later is stronger.
     ///
-    /// [`GUARANTEES.md`]: https://git.doodleshnookie.net/hannes/weida/blob/main/docs/GUARANTEES.md
+    /// [`GUARANTEES.md`]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/GUARANTEES.md
     Delivery {
         /// v0: no retries, losses reported.
         #[default]
