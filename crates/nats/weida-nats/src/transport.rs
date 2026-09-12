@@ -23,7 +23,9 @@
 //!
 //! # The trust anchors are not here
 //!
-//! [`upgrade_tls`] takes the caller's `rustls::ClientConfig`. Which
+//! `upgrade_tls` takes the caller's `rustls::ClientConfig` — not a link,
+//! because that function exists only under the `tls` feature and this
+//! module's documentation is built without it too. Which
 //! certificates are valid is the application's decision — a service on a
 //! private network trusts a private CA, a hosted one trusts the public
 //! roots — and a messaging library that shipped a default would be making

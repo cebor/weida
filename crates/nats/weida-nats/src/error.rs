@@ -106,7 +106,9 @@ pub enum Error {
     ///
     /// Which certificates are valid is the application's decision, so the
     /// only honest answer is to say TLS is required and let the caller come
-    /// back through [`Connection::connect_tls`](crate::Connection::connect_tls).
+    /// back through `Connection::connect_tls`. Not a link: that constructor
+    /// exists only under the `tls` feature, and this variant is reported by
+    /// a build that may not have it.
     TlsRequired,
 
     /// `INFO.tls_required` is set and this build has no TLS at all.
