@@ -190,20 +190,20 @@ fn golden_pair_v1_messages() {
     #[rustfmt::skip]
     let initial = [
         0, 0, 0, 0, 0, 0, 0, 0x06,
-        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01,
         b'h', b'i',
     ];
     #[rustfmt::skip]
     let forwarded = [
         0, 0, 0, 0, 0, 0, 0, 0x06,
-        0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x02,
         b'h', b'i',
     ];
     assert_eq!(message::encode(&pair::encode_initial(b"hi")), initial);
 
     let (body, _) = message::decode(&initial, CAP).expect("decode");
     let (hops, payload) = pair::decode(body, pair::DEFAULT_MAX_HOPS).expect("hop count");
-    assert_eq!(hops, 0);
+    assert_eq!(hops, 1);
     assert_eq!(payload, b"hi");
 
     assert_eq!(
@@ -213,7 +213,7 @@ fn golden_pair_v1_messages() {
     let (body, _) = message::decode(&forwarded, CAP).expect("decode");
     assert_eq!(
         pair::decode(body, pair::DEFAULT_MAX_HOPS).expect("hop count"),
-        (1, &b"hi"[..])
+        (2, &b"hi"[..])
     );
 }
 

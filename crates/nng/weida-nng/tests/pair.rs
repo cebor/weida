@@ -48,10 +48,12 @@ async fn pair_v0_puts_no_header_in_front_of_the_body() {
 }
 
 /// Claim: PAIR v1 prefixes the body with one 32-bit word, and the count
-/// this library originates is NNG's zero rather than the RFC's one (§3).
-/// This is the vector the doc comment names.
+/// this library originates is **one** — the RFC's value, and the value a
+/// running NNG 1.4.0-rc.0 was measured to send, against a reading of
+/// NNG's source that suggested zero (§3, §31). This is the vector the doc
+/// comment names.
 #[tokio::test]
-async fn pair_v1_originates_nngs_zero_hop_count() {
+async fn pair_v1_originates_the_measured_hop_count() {
     let ctx = Context::new(ContextConfig::default()).expect("context");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -77,12 +79,12 @@ async fn pair_v1_originates_nngs_zero_hop_count() {
     let mut wire = [0u8; 14];
     peer.read_exact(&mut wire).await.expect("the message");
     assert_eq!(
-        wire, *b"\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00hi",
+        wire, *b"\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x01hi",
         "six body octets: four of hop count, then the payload"
     );
 
     // And both readings of the initial count are accepted on the way in:
-    // NNG's zero and the RFC's one.
+    // NNG's source reading and the RFC's one.
     for count in [0u32, 1] {
         let mut body = count.to_be_bytes().to_vec();
         body.extend_from_slice(b"back");
@@ -260,7 +262,7 @@ async fn a_pair_talks_both_ways() {
     client1.send(b"ping".to_vec()).await.expect("send");
     let request = server1.recv().await.expect("recv");
     assert_eq!(request.body(), b"ping");
-    assert_eq!(request.header(), [0, 0, 0, 0], "one hop so far: ours");
+    assert_eq!(request.header(), [0, 0, 0, 1], "one hop so far: ours");
     server1.send(b"pong".to_vec()).await.expect("send");
     assert_eq!(client1.recv().await.expect("recv").body(), b"pong");
 }

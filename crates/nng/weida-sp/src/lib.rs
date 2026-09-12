@@ -69,10 +69,11 @@
 //!   assign the 12-bit protocol IDs and delegate the 4-bit endpoint roles to
 //!   the per-protocol RFCs, which never published them [rfc-ids §1]. The role
 //!   halves here are NNG's registry [nng-src `core/protocol.h`].
-//! * **PAIR v1's initial hop count is NNG's, not the sheet's.** The sheet says
-//!   the counter starts at one [nanomsg-nng §4]; NNG sends zero
-//!   [nng-src `pair1/pair.c`]. This codec encodes zero and decodes both - see
-//!   [`pair`].
+//! * **PAIR v1's initial hop count is the one that was measured.** The
+//!   sheet says the counter starts at one [nanomsg-nng §4]; a reading of
+//!   NNG's source suggested zero [nng-src `pair1/pair.c`]; a running NNG
+//!   1.4.0-rc.0 sends **one** [nanomsg-nng §31]. This codec encodes one
+//!   and decodes both - see [`pair`].
 //! * **The hop ceiling has two values.** 1-255 on the specification side
 //!   [nanomsg-nng §11], 15 in NNG's source [nng-src `core/defs.h`]. Both are
 //!   published as constants and the caller chooses - see [`backtrace`].

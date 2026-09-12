@@ -17,13 +17,14 @@
 //! **The hop count, and the disagreement about where it starts.** PAIR v1
 //! prefixes the body with one big-endian 32-bit word whose low octet is a
 //! hop count. The RFC says the counter is "initialized to one and
-//! incremented at each node"; NNG's implementation originates `0` and each
-//! receiving node increments (§3). **This library sends NNG's `0`**, which
+//! incremented at each node"; a reading of NNG's source suggested it
+//! originates `0` (§3). **Measured against a running NNG 1.4.0-rc.0, the
+//! implementation sends one**, so the RFC and the implementation agree and
+//! the source reading was wrong (§31). **This library sends one**, which
 //! [`weida_sp::pair::INITIAL_HOPS`] holds and
 //! [`the wire vector`](Pair1Socket::send) asserts, and it **accepts
 //! both** readings on receipt, because the difference is a count and not a
-//! format. A peer implements one or the other and neither can be detected
-//! from the octets.
+//! format: a receiver compares it to its own `MAXTTL` and nothing else.
 //!
 //! **`NNG_OPT_MAXTTL` is local and is checked here.** "A forwarder checks
 //! its own limit" (§4) and a message past it is "dropped on receipt, the
@@ -177,8 +178,9 @@ impl Pair1Socket {
     /// Sends `body` with a fresh hop count.
     ///
     /// The count this library originates is [`pair::INITIAL_HOPS`], which
-    /// is **zero**: NNG's value, not the RFC's one (§3). On the wire a
-    /// message is therefore `00 00 00 00` followed by the body, which
+    /// is **one**: the RFC's value, and the one a running NNG
+    /// 1.4.0-rc.0 was measured to send (§3, §31). On the wire a message is
+    /// therefore `00 00 00 01` followed by the body, which
     /// `tests/pair.rs` pins as a vector.
     pub async fn send(&self, body: impl Into<Vec<u8>>) -> Result<()> {
         let message = Message::from_parts(pair::INITIAL_HOPS.to_be_bytes().to_vec(), body.into());
@@ -259,9 +261,9 @@ mod tests {
     /// Claim: the count this library originates is NNG's zero, and the
     /// codec agrees with the socket about it — one number, in one place.
     #[test]
-    fn the_originated_hop_count_is_nngs_zero() {
-        assert_eq!(pair::INITIAL_HOPS, 0);
-        assert_eq!(pair::INITIAL_HOPS.to_be_bytes(), [0, 0, 0, 0]);
+    fn the_originated_hop_count_is_the_measured_one() {
+        assert_eq!(pair::INITIAL_HOPS, 1);
+        assert_eq!(pair::INITIAL_HOPS.to_be_bytes(), [0, 0, 0, 1]);
     }
 
     /// Claim: the absence of polyamorous mode carries the manual's own

@@ -32,6 +32,18 @@ tracing.workspace = true
 # rather than a new cryptographic stack.
 tokio-rustls.workspace = true
 rustls-webpki.workspace = true
+# NNG itself, for B-133's interop tests — the reference implementation this
+# library is measured against, reached through the `nng` crate's bindings
+# over `nng-sys`, which builds the C library from vendored sources.
+#
+# **Optional and off**, and in `[dependencies]` rather than beside the
+# other test-only crates because cargo forbids an optional
+# dev-dependency. Building NNG must not be a condition of building this
+# crate's tests: a machine with no C toolchain builds and tests everything
+# else. Turn it on with `--features nng-interop`; the tests are
+# `#[ignore]`d on top of that, so `--ignored` is the deliberate step that
+# runs them.
+nng = { version = "1.0", optional = true }
 
 [dev-dependencies]
 # Drives the owned-context doctest and tests from an executor that is not
@@ -45,6 +57,12 @@ trybuild.workspace = true
 # it, generated in the test rather than committed, so nothing expires and
 # no private key lives in the repository. Tests only.
 rcgen.workspace = true
+
+[features]
+# The NNG interop tests. Off by default because the C library is a build
+# condition, not a runtime one: with this on and no cmake or compiler
+# present, nothing links.
+nng-interop = ["dep:nng"]
 
 [lints.rust]
 unsafe_code = "forbid"

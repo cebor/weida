@@ -5,19 +5,23 @@
 //! [nanomsg-nng §3, §4, §11]. It is the protocol's whole loop protection:
 //! a forwarder increments and a node past its own limit drops.
 //!
-//! **Where the sheet and the implementation disagree.** The sheet says the
-//! counter is "initialized to one and incremented at each node"
-//! [nanomsg-nng §4]; NNG's current source appends `0` on a cooked send and
-//! increments on receipt, rejecting a raw send whose count is already `0xff`
-//! [nng-src `pair1/pair.c`]. The two differ by one, and interoperability
-//! depends on which a peer implements. This codec:
+//! **Where the sheet, the source and the running implementation
+//! disagreed.** The sheet says the counter is "initialized to one and
+//! incremented at each node" [nanomsg-nng §4], and a reading of NNG's
+//! source suggested it appends `0` on a cooked send
+//! [nng-src `pair1/pair.c`]. **Measured, the implementation sends one**:
+//! a cooked `nng_pair1` socket of NNG 1.4.0-rc.0 puts `00 00 00 01` in
+//! front of its body [nanomsg-nng §31]. The source reading was wrong — or
+//! true of some other version — and the RFC was right. This codec:
 //!
-//! * **encodes** what NNG does, because NNG is what a peer will be
-//!   ([`INITIAL_HOPS`] is `0`);
-//! * **decodes** both without complaint, because the difference is a count
-//!   and not a format;
-//! * publishes the disagreement rather than resolving it silently -
-//!   `docs/adapters/nng.md` §11 and `docs/IMPLEMENTATION.md`.
+//! * **encodes** one, which is what the RFC says and what a real peer was
+//!   observed to send ([`INITIAL_HOPS`] is `1`);
+//! * **decodes** both readings without complaint, because the difference
+//!   is a count and not a format, and a peer built from the other reading
+//!   still interoperates: a receiver only compares the count to its own
+//!   `MAXTTL`;
+//! * records where the number came from rather than resolving it
+//!   silently.
 //!
 //! PAIR v0 has no header at all and is therefore not this module's business
 //! [nanomsg-nng §4].
@@ -28,8 +32,10 @@ use crate::error::TagError;
 pub const HEADER_LEN: usize = 4;
 
 /// What a cooked PAIR v1 socket puts in a message it originates
-/// [nng-src `pair1/pair.c`]. See the module note: the sheet says one.
-pub const INITIAL_HOPS: u32 = 0;
+/// [rfc-pair §3], and what NNG 1.4.0-rc.0 was measured to send
+/// [nanomsg-nng §31]. See the module note for the source reading that
+/// suggested zero.
+pub const INITIAL_HOPS: u32 = 1;
 
 /// The default `MAXTTL` [nanomsg-nng §4, §11].
 pub const DEFAULT_MAX_HOPS: u32 = 8;
@@ -80,11 +86,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_cooked_body_round_trips_with_a_zero_count() {
+    fn a_cooked_body_round_trips_with_the_initial_count() {
         let body = encode_initial(b"hi");
-        assert_eq!(body, [0, 0, 0, 0, b'h', b'i']);
+        assert_eq!(body, [0, 0, 0, 1, b'h', b'i']);
         let (hops, payload) = decode(&body, DEFAULT_MAX_HOPS).expect("decode");
         assert_eq!(hops, INITIAL_HOPS);
+        assert_eq!(payload, b"hi");
+    }
+
+    /// Claim: the other reading of the initial count decodes too. A peer
+    /// built from NNG's source rather than from the RFC sends zero, and
+    /// nothing here refuses it: the count is compared to `MAXTTL` and
+    /// nothing else.
+    #[test]
+    fn the_other_reading_of_the_initial_count_decodes() {
+        let from_the_source_reading = encode(0, b"hi");
+        let (hops, payload) = decode(&from_the_source_reading, DEFAULT_MAX_HOPS).expect("decode");
+        assert_eq!(hops, 0);
         assert_eq!(payload, b"hi");
     }
 
@@ -93,8 +111,8 @@ mod tests {
         let incoming = encode_initial(b"hi");
         let (hops, payload) = decode(&incoming, DEFAULT_MAX_HOPS).expect("decode");
         let forwarded = encode(next_hop(hops), payload);
-        assert_eq!(forwarded, [0, 0, 0, 1, b'h', b'i']);
-        assert_eq!(decode(&forwarded, DEFAULT_MAX_HOPS).expect("decode").0, 1);
+        assert_eq!(forwarded, [0, 0, 0, 2, b'h', b'i']);
+        assert_eq!(decode(&forwarded, DEFAULT_MAX_HOPS).expect("decode").0, 2);
     }
 
     #[test]
