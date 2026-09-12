@@ -2337,6 +2337,7 @@ dependencies = [
  "futures",
  "tokio",
  "tracing",
+ "trybuild",
  "weida-core",
  "weida-runtime",
  "weida-sp",
