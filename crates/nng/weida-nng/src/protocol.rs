@@ -20,6 +20,8 @@
 
 use weida_sp::EndpointType;
 
+use crate::pipe::FullAction;
+
 use crate::error::{Error, Result};
 
 /// What one SP protocol permits, beside what its wire form says.
@@ -49,6 +51,16 @@ pub struct Protocol {
     /// state gains nothing from a context and refuses one by name rather
     /// than handing back an object that does nothing.
     pub contexts: bool,
+    /// Whether `NNG_OPT_SENDBUF` and `NNG_OPT_RECVBUF` mean anything for
+    /// this protocol.
+    ///
+    /// "`SENDBUF` is likewise unavailable for protocols that permit only one
+    /// outstanding transaction per context, notably REQ", and `RECVBUF` is
+    /// not supported by "not every protocol ... notably REQ can handle one
+    /// reply per context" (§5). A queue depth on a socket that holds exactly
+    /// one message in each direction is a number with nowhere to go, so it
+    /// is refused by name rather than accepted and ignored.
+    pub buffers: bool,
 }
 
 impl Protocol {
@@ -62,6 +74,16 @@ impl Protocol {
         self.endpoint.peer()
     }
 
+    /// What this protocol does at a full outgoing queue.
+    pub const fn full_when_sending(&self) -> FullAction {
+        FullAction::sending(self.endpoint)
+    }
+
+    /// What this protocol does at a full incoming queue.
+    pub const fn full_when_receiving(&self) -> FullAction {
+        FullAction::receiving(self.endpoint)
+    }
+
     /// Refuses a context for a protocol that has no per-transaction state,
     /// with NNG's own code and the reason.
     pub fn require_contexts(&self) -> Result<()> {
@@ -72,6 +94,22 @@ impl Protocol {
             format!(
                 "{} holds no per-transaction state, so a context would hold nothing; \
                  contexts exist for req0, rep0, surveyor0 and respondent0",
+                self.name
+            )
+            .into(),
+        ))
+    }
+
+    /// Refuses a queue depth for a protocol that has no queue to give it to,
+    /// naming the option and the protocol.
+    pub fn require_buffers(&self, option: &str) -> Result<()> {
+        if self.buffers {
+            return Ok(());
+        }
+        Err(Error::ENOTSUP(
+            format!(
+                "{} permits one outstanding transaction per context, so {option} has nothing \
+                 to bound",
                 self.name
             )
             .into(),
@@ -92,6 +130,7 @@ pub const PROTOCOLS: &[Protocol] = &[
         can_send: true,
         can_recv: true,
         contexts: false,
+        buffers: true,
     },
     Protocol {
         endpoint: EndpointType::PairV1,
@@ -99,6 +138,7 @@ pub const PROTOCOLS: &[Protocol] = &[
         can_send: true,
         can_recv: true,
         contexts: false,
+        buffers: true,
     },
     Protocol {
         endpoint: EndpointType::Pub,
@@ -106,6 +146,7 @@ pub const PROTOCOLS: &[Protocol] = &[
         can_send: true,
         can_recv: false,
         contexts: false,
+        buffers: true,
     },
     Protocol {
         endpoint: EndpointType::Sub,
@@ -113,6 +154,7 @@ pub const PROTOCOLS: &[Protocol] = &[
         can_send: false,
         can_recv: true,
         contexts: false,
+        buffers: true,
     },
     Protocol {
         endpoint: EndpointType::Req,
@@ -120,6 +162,7 @@ pub const PROTOCOLS: &[Protocol] = &[
         can_send: true,
         can_recv: true,
         contexts: true,
+        buffers: false,
     },
     Protocol {
         endpoint: EndpointType::Rep,
@@ -127,6 +170,7 @@ pub const PROTOCOLS: &[Protocol] = &[
         can_send: true,
         can_recv: true,
         contexts: true,
+        buffers: true,
     },
     Protocol {
         endpoint: EndpointType::Push,
@@ -134,6 +178,7 @@ pub const PROTOCOLS: &[Protocol] = &[
         can_send: true,
         can_recv: false,
         contexts: false,
+        buffers: true,
     },
     Protocol {
         endpoint: EndpointType::Pull,
@@ -141,6 +186,7 @@ pub const PROTOCOLS: &[Protocol] = &[
         can_send: false,
         can_recv: true,
         contexts: false,
+        buffers: true,
     },
     Protocol {
         endpoint: EndpointType::Surveyor,
@@ -148,6 +194,7 @@ pub const PROTOCOLS: &[Protocol] = &[
         can_send: true,
         can_recv: true,
         contexts: true,
+        buffers: true,
     },
     Protocol {
         endpoint: EndpointType::Respondent,
@@ -155,6 +202,7 @@ pub const PROTOCOLS: &[Protocol] = &[
         can_send: true,
         can_recv: true,
         contexts: true,
+        buffers: true,
     },
     Protocol {
         endpoint: EndpointType::Bus,
@@ -162,6 +210,7 @@ pub const PROTOCOLS: &[Protocol] = &[
         can_send: true,
         can_recv: true,
         contexts: false,
+        buffers: true,
     },
 ];
 
@@ -261,6 +310,51 @@ mod tests {
         assert_eq!(
             protocol(EndpointType::Surveyor).peer(),
             EndpointType::Respondent
+        );
+    }
+
+    /// Claim: REQ is the protocol that permits neither buffer option, and
+    /// it refuses each by name — the option's and its own — rather than
+    /// accepting a depth it would then ignore (§5).
+    #[test]
+    fn req_refuses_both_buffer_options_by_name() {
+        let without: Vec<&str> = PROTOCOLS
+            .iter()
+            .filter(|row| !row.buffers)
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(without, ["req0"]);
+
+        let req = protocol(EndpointType::Req);
+        for option in ["NNG_OPT_SENDBUF", "NNG_OPT_RECVBUF"] {
+            let err = req.require_buffers(option).unwrap_err();
+            assert!(matches!(err, Error::ENOTSUP(_)), "{err:?}");
+            assert!(err.cause().contains(option));
+            assert!(err.cause().contains("req0"));
+        }
+        assert!(
+            protocol(EndpointType::Rep)
+                .require_buffers("NNG_OPT_RECVBUF")
+                .is_ok()
+        );
+    }
+
+    /// Claim: each protocol's full-queue action is reachable from its row,
+    /// so a socket type takes the behaviour from the table rather than
+    /// deciding it again at each send.
+    #[test]
+    fn each_row_carries_its_full_queue_action() {
+        assert_eq!(
+            protocol(EndpointType::Push).full_when_sending(),
+            FullAction::Block
+        );
+        assert_eq!(
+            protocol(EndpointType::Bus).full_when_sending(),
+            FullAction::Drop
+        );
+        assert_eq!(
+            protocol(EndpointType::Sub).full_when_receiving(),
+            FullAction::DropOldest
         );
     }
 }

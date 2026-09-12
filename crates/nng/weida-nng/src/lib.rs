@@ -34,6 +34,13 @@
 //!   holds the per-transaction state an `nng_ctx` is made of.
 //! - [`Error`] — NNG's own `NNG_E*` vocabulary, each error carrying a cause,
 //!   with weida's `Error` converted at the boundary and never re-exported.
+//! - [`Message`] — a protocol header and an application body in separate
+//!   storage, delivered whole or not at all, with `NNG_OPT_RECVMAXSZ`
+//!   judged from the declared 64-bit length before a body is allocated.
+//! - [`Queue`] and [`PipeId`] — `NNG_OPT_SENDBUF`/`NNG_OPT_RECVBUF` as
+//!   depths in messages, where depth zero is NNG's rendezvous rather than
+//!   libzmq's "unlimited", with [`FullAction`] carrying each protocol's
+//!   behaviour at the bound so that no socket type re-decides it.
 //!
 //! # Rules this crate keeps
 //!
@@ -63,6 +70,8 @@
 pub mod context;
 pub mod endpoint;
 pub mod error;
+pub mod message;
+pub mod pipe;
 pub mod protocol;
 
 pub use context::{
@@ -72,4 +81,9 @@ pub use endpoint::{
     Endpoint, MAX_INPROC_NAME_BYTES, MAX_LEGACY_IPC_PATH_BYTES, NNG_MAXADDRLEN, TcpHost,
 };
 pub use error::{Cause, Error, Result};
+pub use message::{DEFAULT_RECV_MAX_SIZE, Message, RECV_MAX_SIZE_UNLIMITED};
+pub use pipe::{
+    DEFAULT_RECV_DEPTH, DEFAULT_SEND_DEPTH, FullAction, MAX_QUEUE_DEPTH, PipeId, Queue,
+    QueueConfig, Sent,
+};
 pub use protocol::{PROTOCOLS, Protocol, protocol};
