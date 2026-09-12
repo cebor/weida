@@ -113,6 +113,32 @@ impl Message {
         self
     }
 
+    /// The **delete** of a topic's retained message: RETAIN 1 and a
+    /// zero-length payload.
+    ///
+    /// "A PUBLISH with RETAIN 1 and a zero-byte payload removes the retained
+    /// message for that topic, is delivered to current subscribers as a
+    /// normal message, and **is itself not stored**"
+    /// ([MQTT-3.3.1-6], [MQTT-3.3.1-7], [MQTT-3.3.1-10], [MQTT-3.3.1-11])
+    /// (3.3.1.3) [mqtt5 §8]. So the delete is a message and not an
+    /// operation: current subscribers see an empty payload arrive, and a
+    /// later subscriber sees nothing at all.
+    ///
+    /// It exists as its own constructor because `Message::new(topic, "")`
+    /// `.retained()` reads like an oversight and this reads like the delete
+    /// it is. The QoS is the caller's - a delete at QoS 0 "MAY be discarded
+    /// at any time" like any other QoS 0 retained message (3.3.1.3), so a
+    /// delete that must happen is a delete at QoS 1 or above.
+    #[must_use]
+    pub fn delete_retained(topic: impl Into<String>) -> Message {
+        Message {
+            topic: topic.into(),
+            payload: Vec::new(),
+            retain: true,
+            ..Message::default()
+        }
+    }
+
     /// Refuses what the server said it will not accept, **before the packet
     /// reaches the wire**.
     ///
@@ -126,6 +152,10 @@ impl Message {
     /// and [`Error::Configuration`] for a `Message Expiry Interval` a Four
     /// Byte Integer cannot carry.
     pub fn check(&self, limits: &ServerLimits) -> Result<()> {
+        // A Topic Name and never a filter ([MQTT-3.3.2-2]). The zero-length
+        // case is legal only with an established Topic Alias (3.3.2.1),
+        // which is B-146's, so it is refused here.
+        crate::filter::check_topic_name(&self.topic, false)?;
         limits.require(crate::error::Feature::Qos(self.qos))?;
         if self.retain {
             limits.require(crate::error::Feature::Retain)?;
@@ -266,6 +296,30 @@ impl DeliveryProperties {
     }
 }
 
+/// Where a delivery came from, as far as the protocol can say.
+///
+/// The third value is not a gap in this library: it is the protocol's, and
+/// naming it is the difference between reporting what happened and guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RetainedOrigin {
+    /// The server's retained-message cache: one message per exact Topic Name,
+    /// sent because a subscription was made (3.3.1.3) [mqtt5 §8].
+    ///
+    /// **A last-value cache and not a replay log**: no history, no
+    /// snapshot-plus-delta, no offset, no "last N messages". A late joiner
+    /// needing more must have subscribed with Clean Start 0 and a non-zero
+    /// Session Expiry Interval *before* the messages were published, so the
+    /// server queued them (4.1) [mqtt5 §8].
+    Retained,
+    /// Forwarded live from a publisher while this subscription was already in
+    /// place.
+    Live,
+    /// The subscription set Retain As Published, so RETAIN reports the
+    /// publisher's flag rather than this copy's origin ([MQTT-3.3.1-13]).
+    /// Nothing in the packet distinguishes the two cases.
+    Unknowable,
+}
+
 /// A message the server delivered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delivery {
@@ -311,6 +365,36 @@ impl Delivery {
             packet_id: publish.packet_id,
             properties: DeliveryProperties::read(&publish.properties, limits)?,
         })
+    }
+
+    /// Whether this delivery came out of the server's retained-message cache
+    /// or off the wire live - and where the protocol makes that unanswerable,
+    /// says so.
+    ///
+    /// `retain_as_published` is the option of the subscription that matched,
+    /// which is what decides whether [`Delivery::retain`] is an answer:
+    ///
+    /// * **0** (the default): the server sets RETAIN 1 only on a message it
+    ///   sends "as a result of a new subscription being made"
+    ///   ([MQTT-3.3.1-8]) and clears it on every forwarded live message
+    ///   ([MQTT-3.3.1-12]) [mqtt5 §8]. So the flag *is* the verdict.
+    /// * **1**: the flag is forwarded "as published" ([MQTT-3.3.1-13]), so it
+    ///   reports what the publisher asked the server to store and says
+    ///   nothing about where this copy came from. A live message published
+    ///   with RETAIN 1 and a cached one are then indistinguishable, which is
+    ///   [`RetainedOrigin::Unknowable`].
+    ///
+    /// Retain As Published exists for bridges, which need the publisher's
+    /// flag preserved so the far side stores what the near side stored
+    /// [mqtt5 §4.6]. The cost is exactly this: a bridge cannot also tell
+    /// which of its inbound messages were snapshots.
+    #[must_use]
+    pub fn origin(&self, retain_as_published: bool) -> RetainedOrigin {
+        match (retain_as_published, self.retain) {
+            (true, _) => RetainedOrigin::Unknowable,
+            (false, true) => RetainedOrigin::Retained,
+            (false, false) => RetainedOrigin::Live,
+        }
     }
 }
 

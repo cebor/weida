@@ -142,7 +142,7 @@ pub use filter::{
     check_topic_filter, check_topic_name, matches, split_shared,
 };
 pub use limits::{DEFAULT_RECEIVE_MAXIMUM, DEFAULT_TOPIC_ALIAS_MAXIMUM, Limits, ServerLimits};
-pub use message::{Completion, Delivery, DeliveryProperties, Message};
+pub use message::{Completion, Delivery, DeliveryProperties, Message, RetainedOrigin};
 pub use options::{ConnectOptions, MAX_INTERVAL, MAX_KEEP_ALIVE, WillMessage};
 pub use session::{InFlight, Resend, Resumption, Session, Stage, StoredPublish};
 

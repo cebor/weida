@@ -247,6 +247,15 @@ struct State {
     /// and UNSUBSCRIBE are not in the retransmission list at all" (4.4)
     /// [mqtt5 §6].
     control: BTreeSet<u16>,
+    /// Whether a session for this Client Identifier outlives the connection,
+    /// because the last CONNECT declared a non-zero `Session Expiry
+    /// Interval`.
+    ///
+    /// **The piece of client-side session state 4.1's list omits.** Without
+    /// it [MQTT-3.2.2-4] cannot be applied: a correct resumption of a session
+    /// that happens to hold no unacknowledged messages is indistinguishable
+    /// from a server inventing one.
+    server_holds_session: bool,
     /// The client's mirror of the subscriptions the server holds.
     subscriptions: Subscriptions,
     /// Where the next identifier search starts, so allocation walks the space
@@ -282,6 +291,7 @@ impl Session {
                 outbound: BTreeMap::new(),
                 inbound_qos2: BTreeSet::new(),
                 control: BTreeSet::new(),
+                server_holds_session: false,
                 subscriptions: Subscriptions::new(),
                 next_packet_id: 1,
                 sequence: 0,
@@ -345,6 +355,9 @@ impl Session {
         // "Subscriptions do not survive Clean Start 1" [mqtt5 §1], so the
         // mirror goes with the rest of the session.
         state.subscriptions.clear();
+        // Clean Start 1 discards the server's half too ([MQTT-3.1.2-4]), so
+        // after this nothing claims a session exists until the next CONNACK.
+        state.server_holds_session = false;
         state.next_packet_id = 1;
         state.sequence = 0;
     }
@@ -418,20 +431,48 @@ impl Session {
         if !session_present {
             // "A Client that receives Session Present 0 and has Session State
             // MUST discard it" ([MQTT-3.2.2-5]).
-            if self.is_empty() {
-                return Ok(Resumption::Fresh);
+            let fresh = self.is_empty();
+            if !fresh {
+                self.clear();
             }
-            self.clear();
-            return Ok(Resumption::Discarded);
+            self.note_session_exists();
+            return Ok(if fresh {
+                Resumption::Fresh
+            } else {
+                Resumption::Discarded
+            });
         }
         // "A Client with no Session State that receives Session Present 1 MUST
         // close the Network Connection" ([MQTT-3.2.2-4]). Trusting it instead
         // would mean believing the server holds exchanges this client has no
         // record of, and then answering acknowledgements it cannot match.
-        if self.is_empty() {
+        //
+        // **"No Session State" is not the same as "holds no messages"**, and
+        // reading it that way makes the rule unusable: 4.1's client-side list
+        // is only the unacknowledged QoS 1 and 2 exchanges [mqtt5 §2], so a
+        // client that connected with Clean Start 0 and a non-zero Session
+        // Expiry Interval and then published nothing would be obliged to close
+        // on its own correct resumption. What this client tracks instead is
+        // whether a session exists on the server at all - which is what the
+        // server's flag is actually claiming - and that is the third piece of
+        // client-side session state the specification's list omits.
+        if self.is_empty() && !self.lock().server_holds_session {
             return Err(Error::SessionPresentWithoutState);
         }
+        self.note_session_exists();
         Ok(Resumption::Resumed)
+    }
+
+    /// Records whether the session this client just declared outlives the
+    /// connection, which is what the next CONNACK's `Session Present` can
+    /// legitimately be 1 about.
+    ///
+    /// A `Session Expiry Interval` of zero or absent means "the session ends
+    /// when the connection ends" (3.1.2.11.2) [mqtt5 §1], so after such a
+    /// connection a `Session Present` 1 really is the forbidden row.
+    fn note_session_exists(&self) {
+        let mut state = self.lock();
+        state.server_holds_session = state.declared_expiry.unwrap_or(0) > 0;
     }
 
     /// The exchanges to put back on the wire, in the order the originals were
@@ -787,6 +828,47 @@ mod tests {
         let empty = session(10);
         assert!(matches!(
             empty.accept_connack(true),
+            Err(Error::SessionPresentWithoutState)
+        ));
+    }
+
+    /// The forbidden row of [MQTT-3.2.2-4] is "no Session State", and reading
+    /// that as "holds no unacknowledged messages" makes every correct
+    /// resumption of an idle session illegal.
+    ///
+    /// So what decides it is whether a session exists on the server at all:
+    /// a CONNECT that declared a non-zero `Session Expiry Interval` leaves
+    /// one behind (3.1.2.11.2), and one that declared zero or none does not.
+    #[test]
+    fn an_idle_session_that_outlives_its_connection_may_be_resumed() {
+        // First connection: Clean Start 0, Session Expiry 300, and nothing
+        // ever published.
+        let session = session(10);
+        session.declare_expiry(Some(300));
+        assert_eq!(session.accept_connack(false).unwrap(), Resumption::Fresh);
+        assert!(session.is_empty(), "no exchange ever happened");
+
+        // The reconnect: Session Present 1 is now the truth, and refusing it
+        // would be refusing our own session back.
+        session.declare_expiry(Some(300));
+        assert_eq!(session.accept_connack(true).unwrap(), Resumption::Resumed);
+
+        // A session that declared no expiry ends with its connection, so
+        // Session Present 1 afterwards really is the forbidden row.
+        let ephemeral = Session::new("c", &Limits::default());
+        ephemeral.declare_expiry(None);
+        assert_eq!(ephemeral.accept_connack(false).unwrap(), Resumption::Fresh);
+        ephemeral.declare_expiry(None);
+        assert!(matches!(
+            ephemeral.accept_connack(true),
+            Err(Error::SessionPresentWithoutState)
+        ));
+
+        // And Clean Start 1 throws the claim away with the rest of it.
+        session.declare_expiry(Some(300));
+        session.clear();
+        assert!(matches!(
+            session.accept_connack(true),
             Err(Error::SessionPresentWithoutState)
         ));
     }

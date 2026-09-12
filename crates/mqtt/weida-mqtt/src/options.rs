@@ -220,6 +220,10 @@ impl ConnectOptions {
         }
         check_interval("session_expiry", self.session_expiry)?;
         if let Some(will) = &self.will {
+            // The Will Topic is a Topic **Name**, so no wildcards and never
+            // zero-length ([MQTT-3.1.3-10]) - and the Topic Alias exception
+            // cannot apply, because no alias exists before the CONNACK.
+            crate::filter::check_topic_name(&will.topic, false)?;
             check_interval("will.delay", will.delay)?;
             check_interval("will.message_expiry", will.message_expiry)?;
         }
