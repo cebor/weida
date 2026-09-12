@@ -1,0 +1,39 @@
+[package]
+name = "weida-py-core"
+description = "The shared PyO3 foundation of every Python binding in this workspace: errno exception families, the asyncio bridge and the bytes boundary"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+# CPython, and the reactor ownership every binding inherits. **These two and
+# nothing else**: `weida`, `weida-protocol` and every protocol library MUST NOT
+# appear here, which is the dependency-direction rule
+# `docs/decisions/0013-competitor-libraries.md` §4.2 gives `weida-runtime`, one
+# layer up (`docs/decisions/0014-parallel-libraries.md` §2). A crate that knew a
+# wire format could not be the foundation of four bindings.
+#
+# `tokio` is deliberately absent too, even though the reactor is one: the only
+# tokio value this crate handles is the join handle `Exec::spawn` returns, and it
+# is captured in a closure rather than named, so no binding links a second copy
+# of tokio through this crate.
+pyo3.workspace = true
+weida-runtime.workspace = true
+
+[dev-dependencies]
+# The bytes boundary's measurement, which 0014 §2 asks for by name: the copy
+# that cannot be avoided is measured rather than called cheap.
+criterion.workspace = true
+
+[[bench]]
+name = "bytes_boundary"
+harness = false
+
+[lints.rust]
+# Every other crate in this workspace forbids `unsafe_code`; this one cannot.
+# PyO3's `#[pyclass]`, `#[pymethods]` and `#[pyfunction]` macros expand to
+# `unsafe impl`s of its type-object traits, and a `forbid` applies to macro
+# output as much as to hand-written code. `tests/no_handwritten_unsafe.rs`
+# asserts the property that is still true and is the one that matters: no
+# `unsafe` block or `unsafe impl` is written by hand anywhere in `src`.
+unsafe_code = "allow"
