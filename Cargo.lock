@@ -3039,6 +3039,16 @@ name = "weida-mqtt-codec"
 version = "0.1.0"
 
 [[package]]
+name = "weida-mqtt-py"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "tokio",
+ "weida-mqtt",
+ "weida-py-core",
+]
+
+[[package]]
 name = "weida-nats"
 version = "0.1.0"
 dependencies = [

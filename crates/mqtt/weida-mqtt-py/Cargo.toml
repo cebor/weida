@@ -1,0 +1,53 @@
+[package]
+name = "weida-mqtt-py"
+description = "The Python binding of weida-mqtt: an asyncio MQTT 5.0 client on the Rust implementation, with MQTT's reason codes as exception classes"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+# The Python module is `weida_mqtt` — that is what `#[pymodule] fn weida_mqtt`
+# and therefore the `PyInit_weida_mqtt` symbol say, and what `module-name` in
+# pyproject.toml names the file maturin writes into the wheel. The *crate*
+# cannot be called that as well: rustdoc writes one directory per lib name and
+# `weida-mqtt` already owns `weida_mqtt`, so `cargo doc --workspace` would
+# refuse the collision.
+name = "weida_mqtt_py"
+crate-type = ["cdylib"]
+# A cdylib has no rlib for rustdoc to link a doctest against, so the examples
+# in this crate's documentation are Python rather than Rust and are run by
+# `pytest`, not by `cargo test`.
+doctest = false
+
+[dependencies]
+# The shared foundation: exception families, the asyncio bridge, the bytes
+# boundary. Every binding in this workspace sits on it and none re-derives it
+# (`docs/decisions/0014-parallel-libraries.md` §2).
+weida-py-core.workspace = true
+pyo3.workspace = true
+# The library being bound. Nothing of weida is reachable through it, which is
+# the dependency direction 0013 §4.2 fixed. Default features are off: the
+# `tls` feature links a TLS stack, and B-151's surface has no way to hand a
+# `rustls::ClientConfig` in from Python — a binding that linked one it could
+# not configure would be linking it for nothing. `default-features = false`
+# cannot override an inherited default, so the path is named here rather than
+# through `workspace = true`.
+weida-mqtt = { path = "../weida-mqtt", version = "0.1.0", default-features = false }
+# One thing: `tokio::sync::Mutex`, which is what lets the delivery stream —
+# whose `next` takes `&mut self` — be shared between coroutines without ever
+# being used by two at once.
+tokio.workspace = true
+
+[features]
+# Off by default, and enabled by maturin through `pyproject.toml`. With it on,
+# the extension does not link libpython — which is right for a wheel and wrong
+# for `cargo test`, because a test binary is an executable and would be left
+# with undefined symbols. Cargo unifies features across a workspace build, so a
+# default-on `extension-module` here would break `cargo test --workspace` for
+# `weida-py-core` as well.
+extension-module = ["pyo3/extension-module"]
+
+[lints.rust]
+# As in `weida-py-core`: PyO3's macros expand to `unsafe impl`s, so `forbid` is
+# not available. No `unsafe` is written by hand in this crate.
+unsafe_code = "allow"
