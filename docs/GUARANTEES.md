@@ -80,6 +80,16 @@ is worth stating exactly:
   and the replica set (Phase 7) that make them true. A configuration asking for a level a hop
   cannot reach is refused when it is configured, never silently degraded (§4).
 
+**Two of these are cursors and two are verdicts**, which matters for a system whose payloads are
+streams ([decisions/0023](decisions/0023-completion-is-a-cursor.md) §4.2). `Accepted` is a verdict
+by construction: a hop either took the message or refused it. `Stored(*)` and
+`Replicated(n, flushed)` are statements about **bytes**, reported as an absolute offset that
+advances — "durable up to *N*" — which is what lets a payload larger than memory be certified at
+all, and what lets an interrupted transfer continue at *N* instead of starting over. `Processed`
+is a cursor too, and it is a **settlement toward the queue** — "you may forget up to *N*" — never
+an end-to-end claim: a producer that needs to know a consumer succeeded uses an application reply
+(§2, [decisions/0018](decisions/0018-minimal-broker.md) §4.3).
+
 In the **v0 core**, with no broker in the topology, all four remain absent from the wire:
 there is nobody to transfer responsibility *to*, and an acknowledgement that only says "the
 bytes are in the peer's RAM" is a claim QUIC already makes for free (§3).

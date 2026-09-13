@@ -80,6 +80,21 @@ kind: code | size: 60 | status: blocked | needs: [B-229]
 acceptance: the property of [0022](decisions/0022-consensus-topology.md) §4.7 proved rather than claimed: with the **control group** below quorum, no queue may be created, deleted or reconfigured — each refused with a message naming the reason — while every existing queue keeps admitting and delivering under its own group's quorum. And the converse: a queue whose own group is below quorum refuses admission and pauses delivery while every other queue on the same nodes is unaffected. Two tests, each killing a different majority.
 note: this is the reason the topology has two kinds of group at all, so it is the test that earns the design. Deliberately unlike Kafka's fencing, and the note says why.
 
+### B-233 — Frame kind `6`: the completion cursor
+kind: code | size: 90 | status: ready | needs: []
+acceptance: `FrameKind::Cursor` = 6 with a header carrying a level (the `acknowledgement` value of [PROTOCOL.md](PROTOCOL.md) §6.5) and an **absolute byte offset**, encoded and decoded in `weida-protocol` with golden vectors in §8's shape and a fuzz target beside the other headers; §4.1's reply-half rule relaxed to "zero or more CURSOR frames, then exactly one DATA or ERROR, then FIN", with a hostile test proving that a CURSOR on a **one-way** stream and a CURSOR **after** the terminal frame are both protocol violations. The receiving side keeps the **maximum** offset per level, so a duplicated or reordered cursor changes nothing — mutation-checked, as B-202's credit rule was.
+note: the frame is the cheap half of [0023](decisions/0023-completion-is-a-cursor.md); what makes it useful is a store that can report an offset, which is why the reporting side is a separate item.
+
+### B-234 — Reporting a cursor, and the number that says how often
+kind: code | size: 60 | status: blocked | needs: [B-233, the Phase 5 store]
+acceptance: a hop with a store reports `Stored(Written)` and, where it flushes, `Stored(Flushed)` up to a byte offset on the reply half, at a granularity from its own configuration — "every *N* bytes or every *T* milliseconds, whichever comes first", with a default and the rule that more often is always allowed and less often never ([0023](decisions/0023-completion-is-a-cursor.md) §4.5). A peer that negotiated `TransportReceipt` receives **no** cursor frames at all; a peer that negotiated `Stored` and talks to a hop with no store fails the negotiation rather than being sent nothing ([0006](decisions/0006-guarantee-sets.md) §4.4).
+note: the granularity number is the whole of the configuration surface, and it is named here so that no slice invents its own.
+
+### B-235 — Resumption: continue at the cursor instead of starting over
+kind: code | size: 90 | status: blocked | needs: [B-234]
+acceptance: the property the cursor exists for, proved twice. A producer whose transfer was interrupted after *N* durable bytes continues at *N* rather than re-sending the prefix; a consumer that settled up to *N* and then died is redelivered **from *N***, not from zero, and the redelivery says so ([0023](decisions/0023-completion-is-a-cursor.md) §4.6). Both tests use a payload larger than any window so the prefix is real, and both assert the bytes rather than a counter.
+note: this is the item that makes [0023](decisions/0023-completion-is-a-cursor.md) worth its frame; without it a cursor is a progress bar.
+
 ### B-232 — PROTOCOL said no sender writes the sequence key, and a publisher does
 kind: docs | size: 15 | status: done | needs: []
 acceptance: [PROTOCOL.md](PROTOCOL.md) §6.2 stops claiming that DATA keys `6` and `7` are both "coded but unused", because key `6` is written by a publisher whose connection negotiated `PerProducer` ordering (`crates/weida/src/pubsub.rs`: the number is assigned once per published message, before fan-out, and both the whole-message and the streamed path put it in the header). The three other places that repeated the claim — §8's vector comment, §8's decoded description and §9.5's ordering paragraph — say the same thing, and the `DataHeader::sequence` doc comment in the codec with them.

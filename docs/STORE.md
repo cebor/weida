@@ -78,6 +78,12 @@ The callback is the persist-before-send rule of the Raft thesis in a signature: 
 sent to a peer before it has fired. *Prevents:* a leader acknowledging a write its own disk never
 took, and a follower claiming a match index it cannot reproduce.
 
+**The callback's offset is what a `Stored` cursor reports.** A store's durability granularity is
+therefore the cursor's granularity: a hop cannot report "durable up to *N*" more finely than its
+store can make *N* true ([decisions/0023](decisions/0023-completion-is-a-cursor.md) §4.2, §4.5).
+A store that flushes in 4 MiB segments reports in 4 MiB steps, and that is honest rather than
+coarse.
+
 A consequence for testing, found while implementing the reference in-memory store: openraft's
 `LogFlushed::new` is `pub(crate)`, so **a store cannot construct the callback in a unit test**.
 `append` conformance is exercised through a live consensus group; everything else in this document

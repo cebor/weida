@@ -62,6 +62,14 @@ receipt cannot resolve until the reader has consumed at least `p - w` bytes, rou
 next eighth of a window (quinn announces window credit in eighths). So a receipt for a large
 transfer is evidence that the application is reading it; a receipt for a small one is not.
 
+**And it stays an explanation rather than an interface.** There is deliberately no byte-cursor on
+`Delivery`: QUIC tracks the acknowledged ranges and `quinn` keeps them internal, ZeroMQ hides even
+the connect and offers a separate opt-in monitor socket instead, and an API here would invite an
+application to rebuild the reliability QUIC already provides — the mistake
+[ARCHITECTURE.md](ARCHITECTURE.md) §1 records for brokerless application ACKs. What *is*
+cursor-shaped is a store's durability and a consumer's settlement, which are application state and
+travel as frames ([decisions/0023](decisions/0023-completion-is-a-cursor.md)).
+
 *`push_delivery_receipt` (1 KiB, resolves before `recv`);
 `a_receipt_beyond_the_window_implies_the_reader_consumed` (160 KiB against a 64 KiB window:
 the write completed once 131072 bytes were consumed, the receipt at 163840);
