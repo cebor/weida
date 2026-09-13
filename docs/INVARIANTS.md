@@ -90,6 +90,16 @@ say so in the parity table: `ZMQ_MAXMSGSIZE` is a real number rather than "no li
 a ZMTP frame may declare 2^63-1 octets, and `ZMQ_LINGER` is finite rather than infinite
 [0013 §4.4].
 
+**A message count is not a memory bound**, and that is the one place a standalone library
+adds a name of its own rather than the foreign protocol's. `ZMQ_SNDHWM` and `ZMQ_RCVHWM`
+count messages, so at libzmq's own defaults one peer could hold `1000 × ZMQ_MAXMSGSIZE` per
+direction; `weida-zmq`'s `QueueConfig::max_bytes` (`DEFAULT_QUEUE_BYTES`, 8 MiB per
+direction per peer) bounds the bytes instead, with the message count left at exactly what
+`zmq_setsockopt(3)` documents. A queue that is empty still accepts one message of any size,
+because a bound that can refuse the only message in a queue is a deadlock and not a bound,
+so the exposure is `max_bytes - 1 + max_message_size` and `ZMQ_MAXMSGSIZE` is what bounds
+the single-message case (B-096, `docs/libraries/zmq.md` §9).
+
 The hot-path invariant binds all three structures that now exist: a connection that
 negotiated `Ordering = None` and `Deduplication = None` — which is every connection that
 declares nothing, since `core` is the default guarantee set — allocates none of them. That

@@ -232,7 +232,8 @@ pub use options::{
 pub use optiontable::{OPTIONS, Refusal, Scope, Verdict, ZmqOption};
 pub use pair::PairSocket;
 pub use pipe::{
-    DEFAULT_RCVHWM, DEFAULT_SNDHWM, MuteAction, Pipe, PipeConfig, Queue, QueueConfig, Sent,
+    DEFAULT_QUEUE_BYTES, DEFAULT_RCVHWM, DEFAULT_SNDHWM, MuteAction, Pipe, PipeConfig, Queue,
+    QueueConfig, Sent,
 };
 pub use pipeline::{PullSocket, PushSocket};
 pub use proxy::{

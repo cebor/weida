@@ -419,6 +419,7 @@ mod tests {
                     outgoing: QueueConfig {
                         hwm: 1,
                         mute: MuteAction::Drop,
+                        ..PipeConfig::default().outgoing
                     },
                     ..PipeConfig::default()
                 },
@@ -449,6 +450,56 @@ mod tests {
         // And the subscriber still works: what it does get is well-formed.
         let first = subscriber.recv().await.expect("recv");
         assert!(text(&first).starts_with("event "));
+    }
+
+    /// Claim: with `ZMQ_SNDHWM` set to libzmq's "no limit", a subscriber
+    /// that never reads is **still** bounded, because the queue is bounded
+    /// in bytes as well (`pipe::DEFAULT_QUEUE_BYTES`, B-096). Nothing here
+    /// can refuse on a message count: `hwm: 0` means there is none.
+    #[tokio::test]
+    async fn a_byte_ceiling_bounds_a_subscriber_whose_high_water_mark_is_unlimited() {
+        let ctx = context();
+        let mut publisher = PubSocket::with_options(
+            &ctx,
+            SocketOptions {
+                pipe: PipeConfig {
+                    outgoing: QueueConfig {
+                        hwm: 0,
+                        max_bytes: 4096,
+                        mute: MuteAction::Drop,
+                    },
+                    ..PipeConfig::default()
+                },
+                ..SocketOptions::default()
+            },
+        )
+        .expect("pub");
+        let endpoint = publisher.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut subscriber = SubSocket::new(&ctx).expect("sub");
+        subscriber.connect(&endpoint.to_string()).expect("connect");
+        wait_for(|| publisher.subscriber_count() == 1).await;
+        subscriber.subscribe("").expect("subscribe to all");
+        wait_for(|| publisher.anybody_wants(b"x")).await;
+
+        // A kibibyte per message and five mebibytes in total: far more than
+        // the ceiling, the socket buffers and anything the subscriber's
+        // unread queue could absorb.
+        let body = "x".repeat(1024);
+        let mut dropped = 0;
+        for _ in 0..5_000 {
+            dropped += publisher.publish(body.clone()).dropped;
+        }
+        assert!(
+            dropped > 0,
+            "a queue with no message bound must still refuse at its byte ceiling"
+        );
+        for peer in publisher.core.peers().iter() {
+            assert!(
+                peer.pipe.outgoing().queued_bytes() <= 4096 + 1024,
+                "the ceiling plus the one message an empty queue always takes: {}",
+                peer.pipe.outgoing().queued_bytes()
+            );
+        }
     }
 
     /// Claim: both subscription wire forms work. The default sends 3.x

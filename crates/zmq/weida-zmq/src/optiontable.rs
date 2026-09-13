@@ -247,12 +247,18 @@ pub const OPTIONS: &[ZmqOption] = &[
     ZmqOption {
         name: "ZMQ_SNDHWM",
         scope: Sock,
-        verdict: Honoured("SocketOptions::pipe.outgoing.hwm, in messages, default 1000"),
+        verdict: Honoured(
+            "SocketOptions::pipe.outgoing.hwm, in messages, default 1000, beside \
+             SocketOptions::pipe.outgoing.max_bytes (8 MiB), which libzmq has no option for",
+        ),
     },
     ZmqOption {
         name: "ZMQ_RCVHWM",
         scope: Sock,
-        verdict: Honoured("SocketOptions::pipe.incoming.hwm, in messages, default 1000"),
+        verdict: Honoured(
+            "SocketOptions::pipe.incoming.hwm, in messages, default 1000, beside \
+             SocketOptions::pipe.incoming.max_bytes (8 MiB), which libzmq has no option for",
+        ),
     },
     ZmqOption {
         name: "ZMQ_MAXMSGSIZE",

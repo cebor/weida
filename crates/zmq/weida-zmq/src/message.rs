@@ -37,13 +37,16 @@ use crate::error::{Error, Result};
 /// so a payload that fits here fits the weida side of a forwarder too. It is
 /// settable back to anything, including far higher; it is never silent.
 ///
-/// **The exposure is a product, and this is only one factor.** The high-water
-/// marks bound a queue in *messages* — libzmq's unit — so one peer's queue
-/// can hold `hwm` messages of this size in each direction. At the defaults
-/// that is 1000 × 1 MiB per direction per peer, which is the arithmetic
-/// B-051 made explicit for the bridge; a deployment that cannot afford the
-/// product lowers one of the two factors, and the socket slices that hand
-/// these numbers to real peers say so where they take them.
+/// **The exposure was a product, and the product is now bounded.** The
+/// high-water marks bound a queue in *messages* — libzmq's unit — so one
+/// peer's queue could hold `hwm` messages of this size in each direction:
+/// 1000 × 1 MiB at the defaults, the arithmetic B-051 made explicit for the
+/// bridge and the reason a message count alone is not a memory bound. Each
+/// direction of each peer's queue therefore carries
+/// [`crate::DEFAULT_QUEUE_BYTES`] as well (8 MiB), and a queue that is not
+/// empty refuses past it (`pipe`'s module documentation, B-096). What this
+/// number bounds is what remains: the **one** message an empty queue always
+/// accepts, whatever its size.
 pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1024 * 1024;
 
 /// Default ceiling on the frames of one message.

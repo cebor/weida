@@ -344,13 +344,14 @@ no `split`: 28/REQREP alternates, so two independent halves would promise what t
 forbids. Each half is still one operation at a time, and a ROUTER's two halves share one
 routing table behind a lock that is never held across an `await`.
 
-**Six bounds that are not libzmq options at all.** libzmq bounds a message count per queue and
+**Seven bounds that are not libzmq options at all.** libzmq bounds a message count per queue and
 nothing else; every number below exists because no remote input may cause unbounded allocation
 ([INVARIANTS.md](../INVARIANTS.md)), and each is a named constant rather than a magic value:
 
 | Bound | Default | What it bounds, and why libzmq has no option for it |
 | --- | --- | --- |
 | `SocketOptions::max_peers` | 1024 | how many peers one socket admits. libzmq bounds sockets per context (`ZMQ_MAX_SOCKETS`) but not connections per socket, so a stranger decides the multiplier on every per-peer queue |
+| `QueueConfig::max_bytes` | 8 MiB | the payload one direction of one peer's queue holds. `ZMQ_SNDHWM`/`ZMQ_RCVHWM` count **messages**, so at the defaults one peer could hold 1000 × 1 MiB per direction — a product, not a bound (B-096). The message count keeps libzmq's meaning exactly; this refuses the peer that actually occupies the memory. A queue that is *empty* accepts one message of any size, so the real exposure is `max_bytes - 1 + max_message_size`, just under 9 MiB, and never a wait for room that cannot appear |
 | `Subscriptions::max_subscriptions` | 1024 | distinct prefixes one peer may hold. 37/ZMTP makes subscriptions additive and non-idempotent, so N `SUBSCRIBE` commands cost N entries and the count is a peer's choice |
 | `Subscriptions::max_subscription_bytes` | 256 | one prefix's length. 37/ZMTP's grammar is `subscription = *OCTET`, unbounded; a count alone is not a bound, because 1024 prefixes of a megabyte each is a megabyte times 1024 |
 | `MessageLimits::max_message_frames` | 1024 | frames in one message. ZMTP bounds a frame's size through `ZMQ_MAXMSGSIZE` and the frame *count* not at all, so a peer could send a million empty frames |

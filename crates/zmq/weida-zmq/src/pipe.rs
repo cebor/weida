@@ -23,6 +23,37 @@
 //! `EAGAIN` (§4.1). [`MuteAction::sending`] is that column, written once, so
 //! that the socket types of the later slices carry it rather than each
 //! re-deciding it at every send site.
+//!
+//! # A queue is bounded twice: in messages, as libzmq is, and in bytes
+//!
+//! libzmq's high-water mark counts messages, and a message may be as large as
+//! `ZMQ_MAXMSGSIZE` allows, so the memory one peer can occupy is the
+//! **product** of the two — 1000 × 1 MiB per direction per peer at the
+//! defaults. Stating the product is honest but it is not a bound
+//! ([`crate::DEFAULT_MAX_MESSAGE_SIZE`]), so every queue carries
+//! [`QueueConfig::max_bytes`] as well: [`DEFAULT_QUEUE_BYTES`], 8 MiB, per
+//! direction per peer.
+//!
+//! The two bounds are **not** the same thing said twice, which is why the
+//! byte ceiling is enforced here rather than divided into a smaller message
+//! count the way the bridge does it (`weida-zmq-bridge`'s
+//! `InboundConfig::queue_bytes`, B-053/B-054). The bridge knows the size of
+//! the messages it forwards, so a depth of `queue_bytes / max_message_bytes`
+//! is a real budget there. In the library `max_message_size` is a **ceiling**
+//! and not a size: dividing by it would cut libzmq's documented default from
+//! 1000 messages to 8 for every socket, including the ones whose messages are
+//! forty bytes. Enforcing bytes where the bytes actually are keeps
+//! `ZMQ_SNDHWM` behaving exactly as `zmq_setsockopt(3)` says it does and
+//! refuses only the peer that occupies the memory.
+//!
+//! **A queue always accepts one message**, however large, which is why the
+//! byte ceiling applies only to a queue that is not already empty. Without
+//! that rule a message above the ceiling could never be queued at all, and a
+//! blocking socket type would wait for room that cannot appear — a deadlock
+//! in place of a bound. The exposure per direction per peer is therefore
+//! `min(hwm, ...) × message size` capped at
+//! `max_bytes - 1 + max_message_size`, i.e. **just under 9 MiB** at the
+//! defaults, and `max_message_size` is what bounds the single-message case.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -43,6 +74,24 @@ pub const DEFAULT_SNDHWM: usize = 1000;
 
 /// Default `ZMQ_RCVHWM`: the same bound on the receiving direction.
 pub const DEFAULT_RCVHWM: usize = 1000;
+
+/// Default byte ceiling on one direction of one peer's queue.
+///
+/// **libzmq has no such option**, and that is the reason this exists: its
+/// high-water marks count messages (§5), so at the defaults a single peer
+/// could hold 1000 × `ZMQ_MAXMSGSIZE` = 1 GiB per direction, and
+/// "no remote input can cause unbounded memory allocation"
+/// (`docs/INVARIANTS.md`) would be a statement about a product nobody
+/// bounded.
+///
+/// 8 MiB is the number the ZMTP bridge already uses for the same quantity
+/// (`weida-zmq-bridge`'s `InboundConfig::queue_bytes`, B-053) and the number
+/// weida's own runtime gives a subscriber (`Limits::subscriber_buffer_bytes`),
+/// so a socket, a bridge and a weida endpoint expose a peer to the same
+/// order of memory rather than three numbers chosen separately. `0` means no
+/// ceiling, which is libzmq's behaviour and is available for a caller who
+/// wants exactly it.
+pub const DEFAULT_QUEUE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// What a socket does when a peer's queue is full, or when it has no peer to
 /// send to at all: `zmq_socket(3)`'s "Action in mute state".
@@ -113,7 +162,12 @@ pub struct QueueConfig {
     /// `ZMQ_SNDHWM`/`ZMQ_RCVHWM` for this direction, in messages. `0` means
     /// no limit, as in libzmq.
     pub hwm: usize,
-    /// What to do at the bound.
+    /// The same direction's ceiling in bytes, which libzmq has no option for.
+    /// `0` means no ceiling. A queue that is empty accepts one message of any
+    /// size regardless of this number, so the memory one peer occupies is
+    /// bounded by `max_bytes - 1 + max_message_size` and never by this alone.
+    pub max_bytes: u64,
+    /// What to do at either bound.
     pub mute: MuteAction,
 }
 
@@ -127,6 +181,7 @@ impl QueueConfig {
         match MuteAction::sending(socket) {
             Some(mute) => Ok(QueueConfig {
                 hwm: DEFAULT_SNDHWM,
+                max_bytes: DEFAULT_QUEUE_BYTES,
                 mute,
             }),
             None => Err(Error::EINVAL(std::borrow::Cow::Borrowed(
@@ -153,9 +208,10 @@ pub enum Sent {
 
 /// One direction of one peer's pipe: a bounded queue of whole messages.
 ///
-/// Messages, not bytes, because that is libzmq's unit of credit (§5). Whole
-/// messages, because a message is delivered "all frames or none" (§3), so a
-/// queue slot always holds a complete one.
+/// Whole messages, because a message is delivered "all frames or none" (§3),
+/// so a queue slot always holds a complete one. Bounded in messages because
+/// that is libzmq's unit of credit (§5), **and** in bytes because a message
+/// count is not a memory bound (module documentation).
 pub struct Queue {
     config: QueueConfig,
     state: Mutex<QueueState>,
@@ -167,8 +223,22 @@ pub struct Queue {
 
 struct QueueState {
     messages: VecDeque<Multipart>,
+    /// The payload the queued messages hold, maintained on every push and
+    /// pop rather than summed on demand: a send at the bound is on the hot
+    /// path and walking the queue there would make the ceiling cost more
+    /// than the memory it saves.
+    bytes: u64,
     dropped: u64,
     closed: bool,
+}
+
+/// Which bound a queue reached, so the refusal can name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Full {
+    /// `ZMQ_SNDHWM`/`ZMQ_RCVHWM`: the message count.
+    Messages,
+    /// [`QueueConfig::max_bytes`]: the byte ceiling.
+    Bytes,
 }
 
 /// The body a window event queues, so an assertion can name it.
@@ -206,6 +276,7 @@ impl Queue {
             config,
             state: Mutex::new(QueueState {
                 messages: VecDeque::new(),
+                bytes: 0,
                 dropped: 0,
                 closed: false,
             }),
@@ -229,7 +300,13 @@ impl Queue {
         self.lock().messages.is_empty()
     }
 
-    /// Messages this queue has discarded at its bound, for a socket type
+    /// The payload the queued messages hold, in bytes — what
+    /// [`QueueConfig::max_bytes`] bounds.
+    pub fn queued_bytes(&self) -> u64 {
+        self.lock().bytes
+    }
+
+    /// Messages this queue has discarded at either bound, for a socket type
     /// that drops.
     pub fn dropped(&self) -> u64 {
         self.lock().dropped
@@ -249,7 +326,10 @@ impl Queue {
     /// `true` here cannot become false under it before it sends.
     pub fn has_room(&self) -> bool {
         let state = self.lock();
-        !state.closed && !self.at_bound(&state)
+        // One byte, not one message: without the message in hand this is the
+        // strongest thing that can be said, and the send itself re-checks
+        // against the real size.
+        !state.closed && self.full(&state, 1).is_none()
     }
 
     /// Waits until [`Queue::has_room`] would be true, or the pipe is
@@ -309,6 +389,7 @@ impl Queue {
     /// Fails with `EHOSTUNREACH` once the pipe is destroyed: the peer is
     /// gone, and the RFCs destroy its queue with it.
     pub async fn send(&self, message: Multipart) -> Result<Sent> {
+        let size = message.total_bytes();
         loop {
             // Register before looking, so that room freed between the two
             // wakes this wait instead of being missed by it.
@@ -319,25 +400,19 @@ impl Queue {
                 if state.closed {
                     return Err(gone());
                 }
-                if !self.at_bound(&state) {
-                    state.messages.push_back(message);
+                let Some(bound) = self.full(&state, size) else {
+                    self.push(&mut state, message, size);
                     drop(state);
                     self.ready.notify_waiters();
                     return Ok(Sent::Queued);
-                }
+                };
                 match self.config.mute {
                     MuteAction::Drop => {
                         state.dropped += 1;
                         return Ok(Sent::Dropped);
                     }
                     MuteAction::Fail => {
-                        return Err(Error::EAGAIN(
-                            format!(
-                                "this peer's queue holds its high-water mark of {} messages",
-                                self.config.hwm
-                            )
-                            .into(),
-                        ));
+                        return Err(Error::EAGAIN(self.at(bound, state.bytes).into()));
                     }
                     MuteAction::Block => {}
                 }
@@ -356,20 +431,15 @@ impl Queue {
     /// path, where the drop is its documented behaviour rather than the
     /// caller's choice.
     pub fn try_send(&self, message: Multipart) -> Result<()> {
+        let size = message.total_bytes();
         let mut state = self.lock();
         if state.closed {
             return Err(gone());
         }
-        if self.at_bound(&state) {
-            return Err(Error::EAGAIN(
-                format!(
-                    "this peer's queue holds its high-water mark of {} messages",
-                    self.config.hwm
-                )
-                .into(),
-            ));
+        if let Some(bound) = self.full(&state, size) {
+            return Err(Error::EAGAIN(self.at(bound, state.bytes).into()));
         }
-        state.messages.push_back(message);
+        self.push(&mut state, message, size);
         drop(state);
         self.ready.notify_waiters();
         Ok(())
@@ -385,7 +455,7 @@ impl Queue {
             ready.as_mut().enable();
             {
                 let mut state = self.lock();
-                if let Some(message) = state.messages.pop_front() {
+                if let Some(message) = Self::pop(&mut state) {
                     drop(state);
                     self.room.notify_waiters();
                     return Ok(message);
@@ -403,7 +473,7 @@ impl Queue {
     /// Takes the next message if one is queued — `ZMQ_DONTWAIT`.
     pub fn try_recv(&self) -> Result<Multipart> {
         let mut state = self.lock();
-        match state.messages.pop_front() {
+        match Self::pop(&mut state) {
             Some(message) => {
                 drop(state);
                 self.room.notify_waiters();
@@ -429,6 +499,7 @@ impl Queue {
             state.closed = true;
             let discarded = state.messages.len();
             state.messages.clear();
+            state.bytes = 0;
             discarded
         };
         self.room.notify_waiters();
@@ -436,8 +507,50 @@ impl Queue {
         discarded
     }
 
-    fn at_bound(&self, state: &QueueState) -> bool {
-        self.config.hwm != 0 && state.messages.len() >= self.config.hwm
+    /// Which bound `size` further bytes would cross, if any.
+    ///
+    /// The byte ceiling is skipped for an empty queue, so a message larger
+    /// than the ceiling is queued rather than waited for forever (module
+    /// documentation).
+    fn full(&self, state: &QueueState, size: u64) -> Option<Full> {
+        if self.config.hwm != 0 && state.messages.len() >= self.config.hwm {
+            return Some(Full::Messages);
+        }
+        if self.config.max_bytes != 0
+            && !state.messages.is_empty()
+            && state.bytes.saturating_add(size) > self.config.max_bytes
+        {
+            return Some(Full::Bytes);
+        }
+        None
+    }
+
+    /// What a refusal at `bound` says, naming the number that was reached.
+    ///
+    /// `queued` is passed in rather than read here: every caller already
+    /// holds the state lock, and a `std::sync::Mutex` is not reentrant.
+    fn at(&self, bound: Full, queued: u64) -> String {
+        match bound {
+            Full::Messages => format!(
+                "this peer's queue holds its high-water mark of {} messages",
+                self.config.hwm
+            ),
+            Full::Bytes => format!(
+                "this peer's queue holds {queued} bytes of its {} byte ceiling",
+                self.config.max_bytes
+            ),
+        }
+    }
+
+    fn push(&self, state: &mut QueueState, message: Multipart, size: u64) {
+        state.bytes = state.bytes.saturating_add(size);
+        state.messages.push_back(message);
+    }
+
+    fn pop(state: &mut QueueState) -> Option<Multipart> {
+        let message = state.messages.pop_front()?;
+        state.bytes = state.bytes.saturating_sub(message.total_bytes());
+        Some(message)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
@@ -481,8 +594,10 @@ impl std::fmt::Debug for Queue {
         let state = self.lock();
         f.debug_struct("Queue")
             .field("hwm", &self.config.hwm)
+            .field("max_bytes", &self.config.max_bytes)
             .field("mute", &self.config.mute)
             .field("queued", &state.messages.len())
+            .field("queued_bytes", &state.bytes)
             .field("dropped", &state.dropped)
             .field("closed", &state.closed)
             .finish()
@@ -506,10 +621,12 @@ impl Default for PipeConfig {
         PipeConfig {
             outgoing: QueueConfig {
                 hwm: DEFAULT_SNDHWM,
+                max_bytes: DEFAULT_QUEUE_BYTES,
                 mute: MuteAction::Block,
             },
             incoming: QueueConfig {
                 hwm: DEFAULT_RCVHWM,
+                max_bytes: DEFAULT_QUEUE_BYTES,
                 mute: MuteAction::Block,
             },
         }
@@ -689,7 +806,21 @@ mod tests {
     use std::time::Duration;
 
     fn queue(hwm: usize, mute: MuteAction) -> Arc<Queue> {
-        Arc::new(Queue::new(QueueConfig { hwm, mute }))
+        Arc::new(Queue::new(QueueConfig {
+            hwm,
+            max_bytes: DEFAULT_QUEUE_BYTES,
+            mute,
+        }))
+    }
+
+    /// A queue bounded in bytes rather than in messages: the high-water mark
+    /// is out of the way, so what refuses is the ceiling.
+    fn byte_queue(max_bytes: u64, mute: MuteAction) -> Arc<Queue> {
+        Arc::new(Queue::new(QueueConfig {
+            hwm: 0,
+            max_bytes,
+            mute,
+        }))
     }
 
     fn message(body: &str) -> Multipart {
@@ -900,6 +1031,122 @@ mod tests {
         assert_eq!(q.dropped(), 0);
     }
 
+    /// Claim: the byte ceiling bounds a peer whose messages are large, where
+    /// the high-water mark alone would let 1000 of them in. The ceiling is
+    /// reached by *bytes*, so the refusal names bytes and not the message
+    /// count — and with `hwm: 0` there is no message count to blame.
+    #[tokio::test]
+    async fn at_the_byte_ceiling_a_failing_queue_names_the_bytes() {
+        let q = byte_queue(1024, MuteAction::Fail);
+        let chunk = message(&"x".repeat(400));
+        assert_eq!(q.send(chunk.clone()).await.expect("first"), Sent::Queued);
+        assert_eq!(q.send(chunk.clone()).await.expect("second"), Sent::Queued);
+        assert_eq!(q.queued_bytes(), 800);
+
+        // 800 + 400 > 1024, and nothing about the message count is at its
+        // bound: two messages of an unlimited number.
+        let err = q.send(chunk.clone()).await.unwrap_err();
+        assert!(
+            matches!(err, Error::EAGAIN(_)),
+            "the byte ceiling refuses like the message bound does: {err:?}"
+        );
+        assert!(
+            err.cause().contains("byte ceiling"),
+            "the refusal says which bound was reached: {}",
+            err.cause()
+        );
+        assert_eq!(q.len(), 2);
+
+        // A smaller message still fits under the ceiling: what is bounded is
+        // the memory, not the number of sends.
+        assert_eq!(
+            q.send(message(&"y".repeat(224))).await.expect("the rest"),
+            Sent::Queued
+        );
+        assert_eq!(q.queued_bytes(), 1024);
+    }
+
+    /// Claim: at the byte ceiling every mute action means what it means at
+    /// the message bound — a dropping socket type drops and counts, and a
+    /// blocking one waits until a receive frees the bytes.
+    #[tokio::test]
+    async fn at_the_byte_ceiling_the_mute_action_still_decides() {
+        let dropping = byte_queue(64, MuteAction::Drop);
+        dropping.send(message(&"a".repeat(60))).await.expect("kept");
+        assert_eq!(
+            dropping
+                .send(message(&"b".repeat(60)))
+                .await
+                .expect("dropped"),
+            Sent::Dropped
+        );
+        assert_eq!(dropping.dropped(), 1);
+        assert_eq!(dropping.len(), 1);
+
+        let blocking = Arc::new(Queue::new(QueueConfig {
+            hwm: 0,
+            max_bytes: 64,
+            mute: MuteAction::Block,
+        }));
+        blocking
+            .send(message(&"a".repeat(60)))
+            .await
+            .expect("first");
+        let sender = Arc::clone(&blocking);
+        let waiting = tokio::spawn(async move { sender.send(message(&"b".repeat(60))).await });
+        // The same 50 ms margin the message-bound test uses, and for the
+        // same reason: the phenomenon is the absence of an event.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the byte ceiling must hold the sender"
+        );
+        blocking.recv().await.expect("drain the ceiling");
+        assert_eq!(
+            waiting.await.expect("join").expect("room at last"),
+            Sent::Queued
+        );
+        assert_eq!(blocking.queued_bytes(), 60);
+    }
+
+    /// Claim: a queue always accepts one message, however large, so a
+    /// message above the ceiling is queued instead of waiting for room that
+    /// can never appear. This is what keeps `max_message_size` the bound on
+    /// the single-message case, and the byte ceiling a bound on the queue.
+    #[tokio::test]
+    async fn one_message_above_the_ceiling_is_queued_rather_than_deadlocked() {
+        let q = byte_queue(1024, MuteAction::Block);
+        let huge = message(&"x".repeat(4096));
+        assert_eq!(q.send(huge).await.expect("the one message"), Sent::Queued);
+        assert_eq!(q.queued_bytes(), 4096);
+
+        // And the next one waits, because the queue is no longer empty: the
+        // exemption is for an empty queue, not for every large message.
+        assert!(!q.has_room());
+        let err = q.try_send(message("after")).unwrap_err();
+        assert!(matches!(err, Error::EAGAIN(_)), "{err:?}");
+    }
+
+    /// Claim: `DEFAULT_QUEUE_BYTES` is what a real peer meets, so the
+    /// product the message limit's documentation states — `hwm ×
+    /// max_message_size` — is no longer the exposure. A peer sending 1 MiB
+    /// messages gets eight of them queued, not a thousand.
+    #[tokio::test]
+    async fn the_default_queue_bounds_a_peer_in_bytes_not_in_messages() {
+        let q = queue(DEFAULT_SNDHWM, MuteAction::Drop);
+        let one_mib = message(&"x".repeat(1024 * 1024));
+        for _ in 0..64 {
+            q.send(one_mib.clone()).await.expect("send");
+        }
+        assert_eq!(q.len(), 8, "8 MiB of 1 MiB messages, not 1000");
+        assert_eq!(q.queued_bytes(), DEFAULT_QUEUE_BYTES);
+        assert_eq!(q.dropped(), 56);
+        assert!(
+            q.len() < DEFAULT_SNDHWM,
+            "the message bound was never the thing that refused"
+        );
+    }
+
     /// Claim: destroying a peer's pipe discards what it held and unblocks
     /// everyone on it — the pattern RFCs' disconnect rule, and the reason a
     /// send that returned is not a delivery.
@@ -944,10 +1191,12 @@ mod tests {
         let pipe = Pipe::new(PipeConfig {
             outgoing: QueueConfig {
                 hwm: 1,
+                max_bytes: DEFAULT_QUEUE_BYTES,
                 mute: MuteAction::Fail,
             },
             incoming: QueueConfig {
                 hwm: 4,
+                max_bytes: DEFAULT_QUEUE_BYTES,
                 mute: MuteAction::Block,
             },
         });

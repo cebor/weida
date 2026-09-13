@@ -419,6 +419,7 @@ mod tests {
                     outgoing: QueueConfig {
                         hwm: 1,
                         mute: MuteAction::Drop,
+                        ..PipeConfig::default().outgoing
                     },
                     ..PipeConfig::default()
                 },
