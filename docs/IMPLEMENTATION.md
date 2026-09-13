@@ -1552,11 +1552,33 @@ it. It is the price of a blocking API over an asynchronous library, and it is th
 on a reactor thread, and `loop.call_soon_threadsafe` writes to the loop's self-pipe so that
 `epoll` wakes and the callback runs. That wakeup — not the GIL, not the copy, not the
 protocol — is the 78 µs, and four of them are 313 µs of the 330. **There is a fast path this
-does not take**: an operation that can complete without waiting (a `recv` whose message is
-already queued, a `send` with room) could be polled once inline and hand back an
-already-resolved future, which `await` consumes without yielding to the loop at all. It is
-not implemented, it is filed rather than hinted at, and this table is the number that says
-what it would be worth.
+did not take**, filed as B-179 rather than hinted at: an operation that can complete
+without waiting (a `recv` whose message is already queued, a `send` with room) polled once
+inline and handed back as an already-resolved future, which `await` consumes without
+yielding to the loop at all.
+
+**B-179 took it, and the saving is measured on the same script.** `Bridge::awaitable`'s
+first step now polls the future once on the loop's thread, inside the reactor's context and
+with a no-op waker; a ready outcome completes the delivery future in place and nothing is
+spawned, a pending one is spawned as before and re-registers its task's waker on its next
+poll. Measured on an idle machine — the table above was taken with four worktrees compiling,
+so its absolute numbers are higher — before and after, release profile, median of 2000:
+
+| `weida_zmq` asyncio round trip | inproc, 0 B | inproc, 1 KiB | tcp, 0 B | tcp, 1 KiB |
+| --- | --- | --- | --- | --- |
+| before, one wakeup per `await` | 145 µs | 144 µs | 157 µs | 155 µs |
+| after, ready futures resolved inline | **78 µs** | **82 µs** | **125 µs** | **122 µs** |
+| `weida_zmq.sync`, same runs | 17.8 µs | 19.1 µs | 39.1 µs | 40.4 µs |
+
+A round trip is four operations and two of them are sends into a queue with room, so two
+of the four wakeups go: **−67 µs on inproc, about 33 µs per wakeup saved on this machine**,
+which is the per-`await` cost with the loop otherwise idle. The two receives still wait for
+the peer and still pay the wakeup, which is why tcp saves less: the reply takes longer to
+arrive than a queue takes to have room. Nothing pinned by B-111 and B-112 moved: the future
+still starts at the first `await` (the inline poll runs inside the coroutine's first step,
+after it has been scheduled), a cancelled `Task` still aborts the reactor task, a panic still
+arrives as a `RuntimeError`, and the no-running-loop error is still raised before anything
+is polled.
 
 **Against `pyzmq` the honest reading has two halves.** Over `inproc://` libzmq is 12× faster
 than this binding's synchronous surface and 58× faster than its asyncio one, because libzmq's

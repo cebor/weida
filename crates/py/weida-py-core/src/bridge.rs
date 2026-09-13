@@ -68,7 +68,7 @@ use std::any::Any;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::task::{Context as TaskContext, Poll};
+use std::task::{Context as TaskContext, Poll, Waker};
 
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyRuntimeError;
@@ -165,10 +165,21 @@ impl Bridge {
     }
 }
 
-/// Creates the delivery future on the running loop and spawns the work.
+/// Creates the delivery future on the running loop and starts the work.
 ///
 /// Runs inside the coroutine, so "the running loop" is the loop that will
 /// await the result.
+///
+/// **One poll inline first.** A receive with a message already queued or a
+/// send with room in the queue is ready on its first poll, and for those the
+/// delivery future is completed here, on the loop's thread: `await` of an
+/// already-done future returns without yielding, so the common case of a
+/// busy program costs no reactor hop and no `call_soon_threadsafe` wakeup
+/// (B-117 measured the wakeup at ~78 µs). Only a future that is genuinely
+/// waiting is spawned. The poll runs inside the reactor's context, so a
+/// future that creates a timer on its first step finds one, and with a
+/// no-op waker: a future left pending is polled again the moment its task
+/// starts, which re-registers the task's real waker.
 fn start<F, T>(py: Python<'_>, exec: &Exec, errno: ErrnoMapper, future: F) -> PyResult<Py<PyAny>>
 where
     F: Future<Output = Result<T, Errno>> + Send + 'static,
@@ -179,10 +190,26 @@ where
         .call_method0(intern!(py, "get_running_loop"))?;
     let delivery = event_loop.call_method0(intern!(py, "create_future"))?;
 
+    let mut guarded = Guarded::new(future);
+    let first = {
+        let _reactor = exec.enter();
+        let mut cx = TaskContext::from_waker(Waker::noop());
+        Pin::new(&mut guarded).poll(&mut cx)
+    };
+    if let Poll::Ready(outcome) = first {
+        match resolve(py, outcome, errno) {
+            Ok(value) => delivery.call_method1(intern!(py, "set_result"), (value,))?,
+            Err(err) => {
+                delivery.call_method1(intern!(py, "set_exception"), (err.into_value(py),))?
+            }
+        };
+        return Ok(delivery.unbind());
+    }
+
     let target = delivery.clone().unbind();
     let notify = event_loop.unbind();
     let task = exec.spawn(async move {
-        let outcome = Guarded::new(future).await;
+        let outcome = guarded.await;
         deliver(notify, target, outcome, errno);
     });
 
@@ -261,6 +288,23 @@ fn wrapper(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     Ok(wrapper.bind(py))
 }
 
+/// The outcome as Python sees it: the value converted, the errno mapped, a
+/// panic named.
+fn resolve<T: PyValue>(
+    py: Python<'_>,
+    outcome: Result<Result<T, Errno>, Panicked>,
+    errno: ErrnoMapper,
+) -> PyResult<Py<PyAny>> {
+    match outcome {
+        Ok(Ok(value)) => value.into_python(py),
+        Ok(Err(failure)) => Err(errno(py, &failure)),
+        Err(panicked) => Err(PyRuntimeError::new_err(format!(
+            "the Rust future panicked: {}",
+            panicked.0
+        ))),
+    }
+}
+
 /// Hands the outcome to the loop that created the future.
 ///
 /// Runs on a reactor thread with no GIL held: it takes the GIL once, for the
@@ -272,14 +316,7 @@ fn deliver<T: PyValue>(
     errno: ErrnoMapper,
 ) {
     Python::attach(|py| {
-        let resolved = match outcome {
-            Ok(Ok(value)) => value.into_python(py),
-            Ok(Err(failure)) => Err(errno(py, &failure)),
-            Err(panicked) => Err(PyRuntimeError::new_err(format!(
-                "the Rust future panicked: {}",
-                panicked.0
-            ))),
-        };
+        let resolved = resolve(py, outcome, errno);
         let completion = match Py::new(
             py,
             Completion {
