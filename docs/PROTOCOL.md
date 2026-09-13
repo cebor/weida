@@ -640,6 +640,17 @@ Rules:
   levels reserved for the L2 broker — `acknowledgement` `2` to `5` — are legal to *declare*
   and impossible to honour in v0, so a peer that requires one gets a failed negotiation
   (§2.3), never a quieter success.
+- **`backpressure` `4` (Coalesce) with `ordering` `2` (PerProducer reassemble) is forbidden**,
+  because it asks for two incompatible things at once: reassembly holds an arrival until its
+  predecessors arrive, and a conflating hop is the reason some of them never will
+  ([decisions/0016](decisions/0016-conflation.md) §4.5). Either declaration alone is legal;
+  the combination is a framing violation like the others above. A conflating hop under
+  `ordering` `1` (detect) is coherent and is the intended pairing: the copy is numbered before
+  it is discarded, so what a subscriber sees is a gap rather than a renumbering.
+- **If `backpressure` `4` is ever honoured, the coalescing key is the DATA `topic` of §6.2**
+  and not a declared value. Nothing in this map carries a key, deliberately: a peer can read
+  the topic off the header it already parses, and a parameterized level would need a second
+  guarantee-set key for a value that is already on the wire [0016 §4.8].
 - The state set is **not a ladder**. Persistence level and replica count are independent axes,
   so `Stored(Flushed)` and `Replicated(3, flushed: false)` are incomparable and comparison is
   per axis ([decisions/0004](decisions/0004-durability-levels.md) §4.4). `backpressure` and

@@ -573,8 +573,13 @@ is Phase 6 [GUARANTEES §6], [ARCHITECTURE §1].
   `read_capped` refusing a payload past its cap with `STOP_SENDING(REJECTED)` before buffering
   it [GUARANTEES §6]. `Drop` is confined to publisher fan-out: a copy that does not fit in
   `subscriber_buffer_bytes` for that subscriber is dropped and counted, and the publisher never
-  blocks [PATTERNS §4]. There is no high-water-mark setting; the windows plus `endpoint_queue`
-  do that job "by exerting backpressure rather than by discarding" [ARCHITECTURE §6c].
+  blocks [PATTERNS §4]. **The end dropped is the arriving copy, not a queued one** — drop-new,
+  where conflation is drop-new at depth one *per key*, which is why the two look alike and are
+  not ([decisions/0016](../decisions/0016-conflation.md) §2). There is no high-water-mark
+  setting; the windows plus `endpoint_queue` do that job "by exerting backpressure rather than
+  by discarding" [ARCHITECTURE §6c]. A payload too large for the budget is not dropped at all
+  but streamed, one stream per subscriber, with the budget bounding a chunk
+  [PATTERNS §4.1].
 - **P5 — late joiner.** Nothing is retained: `publish` returns `0` with no subscribers and
   "nothing is queued for a subscriber that does not exist yet" [PATTERNS §4]. No last-value
   cache, snapshot or replay mechanism is stated in any weida document.

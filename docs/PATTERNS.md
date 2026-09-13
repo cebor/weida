@@ -408,6 +408,13 @@ has no ceiling.
 | `finish()` | FIN on every remaining copy; returns how many subscribers got all of it as far as this side can tell. A fan-out copy carries no receipt, so the acknowledgement is the drain's business and nobody else's |
 | dropping the handle | resets every copy, so no subscriber mistakes a partial payload for a whole one |
 
+**This is also v0's conflation**, and that is decided rather than a workaround
+([decisions/0016](decisions/0016-conflation.md) §4.3): a producer that wants "keep the newest,
+discard the rest" holds one slot for the latest value, publishes it with `open` plus
+`write_now`, and sets `subscriber_buffer_bytes` to about one value — then a subscriber that
+falls behind loses that value and receives the next one, which is what a conflating queue would
+have done for it. The transport grows no key for it, because the producer already has one.
+
 Two things are deliberately unlike `publish`. The subscriber set is **fixed at `open`**: a
 subscriber that arrives mid-payload would receive a fragment with no way to know it, so it
 gets the next message. And the drop is per subscriber and per *transfer* rather than per

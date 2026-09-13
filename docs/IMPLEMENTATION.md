@@ -666,6 +666,11 @@ the pool is not a special case: nothing above the transport knows it is there. 1
 - Per-producer ordering. Ordering is `None` for both new patterns; a sequence field would
   be a protocol addition, not an implementation detail.
 - Coalescing backpressure (master doc §27); only `Block`, `Reject` and fan-out `Drop` exist.
+  **Answered later as B-065** ([decisions/0016](decisions/0016-conflation.md)): the level stays
+  reserved for the L2 broker with its definition written down — a keyed queue at a hop, the key
+  being the DATA `topic` — and a fan-out coalescer at L1 is *refused*, because holding the
+  superseded value per key per subscriber is the materialization B-064 exists to remove. v0's
+  conflation is the producer's single slot over `Publisher::open` + `write_now`.
 - PAIR, BUS and SURVEYOR/RESPONDENT: mapped onto L0 in
   [ARCHITECTURE.md](ARCHITECTURE.md), deliberately not implemented until a use case asks.
 - Router/Dealer as first-class types, and the broker work they would actually require
