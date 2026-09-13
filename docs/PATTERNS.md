@@ -311,7 +311,10 @@ Which answer a pattern needs follows from the pattern, not from the transport:
 | a queue (L2) | **cancel on the way in, reschedule on the way out** | an inbound stream that never reached FIN was never a message, so nothing was admitted and nothing was confirmed; a delivery that broke is redelivered, because the queue still holds the message |
 
 That last row is the whole bridge from the stream primitives to the message world: **a message is
-a stream that reached FIN.** A queue's unit is a completed stream, which is why an interrupted
+a stream that reached FIN.** Which is why the stream and message pattern families **overlap rather
+than stack**: Req/Rep is both, because a request is a stream and a completed request is a message,
+and the message vocabulary adds an assumption — the payload is whole before it is used — rather
+than a layer ([decisions/0024](decisions/0024-three-families-one-back-channel.md) §4.1). A queue's unit is a completed stream, which is why an interrupted
 admission needs no vocabulary of its own — there is nothing to talk about yet — and why a
 redelivery is an ordinary new stream rather than a continuation.
 

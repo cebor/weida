@@ -157,9 +157,11 @@ nothing waits on a cursor to make progress.
 
 Two consequences, both deliberate:
 
-- **A one-way transfer gets no cursors**, because it has no reply half. That is the trade
-  [0018 §4.6] already names: "a producer that will not wait sends a one-way transfer and gets the
-  transport receipt and nothing more".
+- **A one-way transfer gets no *reliable* cursor**, because it has no reply half — the trade
+  [0018 §4.6] names: "a producer that will not wait sends a one-way transfer and gets the
+  transport receipt and nothing more". [0024](0024-three-families-one-back-channel.md) §4.4
+  amends this by half: progress cursors may travel as QUIC datagrams, which an absolute cursor
+  can afford to lose, so a one-way transfer may **watch** without gaining certainty.
 - **A cursor is never a refusal.** A hop that cannot continue sends the ERROR that terminates the
   reply half; cursors only ever move forward, which is what makes "keep the maximum" a complete
   rule.

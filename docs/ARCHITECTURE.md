@@ -1,9 +1,9 @@
 # Architecture
 
-This document describes the shape of the system: the layer model, the terminology, the
-crate boundaries, the v0 runtime design, and how the ZeroMQ pattern family maps onto it —
-including where it deliberately does not. It derives from master doc §0, §3, §4, §48, §73
-and §74.
+This document describes the shape of the system: the surface a user chooses from, the
+terminology, the crate boundaries, the v0 runtime design, and how the ZeroMQ pattern family maps
+onto it — including where it deliberately does not. It derives from master doc §0, §3, §4, §48,
+§73 and §74.
 
 Related: [PROTOCOL.md](PROTOCOL.md), [GUARANTEES.md](GUARANTEES.md),
 [FAILURE_MODEL.md](FAILURE_MODEL.md), [INVARIANTS.md](INVARIANTS.md),
@@ -11,24 +11,47 @@ Related: [PROTOCOL.md](PROTOCOL.md), [GUARANTEES.md](GUARANTEES.md),
 
 ---
 
-## 1. Layer model
+## 1. What a user chooses from
 
-weida is three layers plus adapters. The split is the load-bearing decision of the project,
-so it comes first: every later section is one layer's detail.
+weida is **two stream kinds and three vocabularies over them**, plus adapters. A user picks the
+vocabulary their problem has; there is no stack to climb, and no vocabulary is further from the
+metal than another ([decisions/0024](decisions/0024-three-families-one-back-channel.md)).
+
+| Vocabulary | What it gives you | What it is made of |
+| --- | --- | --- |
+| **stream** | `Peer`, `Acceptor`, one-way transfers, exchanges, `Delivery`, cancellation | QUIC's two stream kinds, nothing invented |
+| **message** | the ZeroMQ/nanomsg family: Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY, BUS | the same two stream kinds, plus a selection policy and a name |
+| **broker** | queues, confirms, subscriptions, redelivery | an ordinary weida process using the two above, plus a store |
+
+The families **overlap on purpose**. Req/Rep is a stream pattern and a message pattern at once,
+because a request is a stream and a completed request is a message — "**a message is a stream that
+reached FIN**" ([PATTERNS.md](PATTERNS.md) §1.11). What the message vocabulary adds is not a layer
+but an assumption: the payload is whole before it is used. What the broker vocabulary adds is a
+hop that outlives the sender.
+
+Across all three runs **one** extra mechanism, and it is the only significant addition to the
+ZeroMQ base: a sender may state, with a message, which completion levels it wants reported —
+`written`, `synced`, `processed`, or its own stages — as **cursors** over the bytes
+([decisions/0023](decisions/0023-completion-is-a-cursor.md)). It changes no pattern's semantics.
+Without it an application that wants progress builds a back-propagation stream and a correlation
+scheme by hand; with QUIC it is nearly free, and the broker helps itself to the same mechanism
+rather than to a private one.
 
 ```text
                          APPLICATIONS
                               │
                     idiomatic language APIs
                               │
-   L2   broker semantics — queues, publisher confirms,
-        consumer acks with redelivery          .......... Phase 6, own crate, not built
+      ┌───────────────────────┼───────────────────────┐
+      │                       │                       │
+   stream                  message                 broker
+   primitives              patterns                patterns
+   Peer/Acceptor           Req/Rep, Push/Pull      queues, confirms,
+   transfers, exchanges    Pub/Sub, PAIR,          subscriptions,
+                           SURVEY, BUS             redelivery
+      └───────────────────────┴───────────────────────┘
                               │
-   L1   patterns — Req/Rep, Push/Pull, Pub/Sub, thin wrappers over L0
-                              │
-   L0   stream core — Peer / Acceptor; one-way transfers and exchanges
-                              │
-                    native protocol model
+             two stream kinds + the cursor back channel
                               │
               ┌───────────────┴────────────────────────┐
               │                                        │
@@ -39,6 +62,20 @@ so it comes first: every later section is one layer's detail.
                                                   AMQP 0-9-1
                                                   ...
 ```
+
+**Streaming is the headline, and messaging is first-class.** The difference shows in a video
+upload: the uploader is satisfied by the **first** hop's transport receipt, and that hop — a load
+balancer — does not have to materialize the whole message to give it. If every hop keeps working
+in streams, the payload may never be materialized anywhere, and each hop's guarantee is still
+honest, because guarantees are hop-local
+([GUARANTEES.md](GUARANTEES.md) §2, [decisions/0024](decisions/0024-three-families-one-back-channel.md) §4.5).
+A message system forces a materialization boundary wherever it wants to acknowledge; this one does
+not, because its acknowledgements are cursors over bytes rather than verdicts about objects.
+
+**The dependency direction is a packaging fact, not a mental model**, and it is strict: `weida`
+never depends on the broker, and a brokerless program links none of it (§4). The names **L0**
+(stream core), **L1** (patterns) and **L2** (broker semantics) survive in this document where they
+name exactly that boundary — which is what they are for.
 
 ### L0 — the stream core
 

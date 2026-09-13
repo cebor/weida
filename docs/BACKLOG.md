@@ -80,6 +80,21 @@ kind: code | size: 60 | status: blocked | needs: [B-229]
 acceptance: the property of [0022](decisions/0022-consensus-topology.md) §4.7 proved rather than claimed: with the **control group** below quorum, no queue may be created, deleted or reconfigured — each refused with a message naming the reason — while every existing queue keeps admitting and delivering under its own group's quorum. And the converse: a queue whose own group is below quorum refuses admission and pauses delivery while every other queue on the same nodes is unaffected. Two tests, each killing a different majority.
 note: this is the reason the topology has two kinds of group at all, so it is the test that earns the design. Deliberately unlike Kafka's fencing, and the note says why.
 
+### B-239 — The three ack modes, including `fin_only`
+kind: code | size: 60 | status: blocked | needs: [B-233]
+acceptance: a sender states per message which levels it wants and in which mode — `per_chunk`, `coalesced { bytes, interval }`, `fin_only` ([0024](decisions/0024-three-families-one-back-channel.md) §4.3) — and the reporting side honours it, with `coalesced` proved lossless: a reporter that coalesces 100 advances into 3 frames leaves the receiver with the same final offset per level as one that reports all 100, because cursors are absolute. `fin_only` produces **exactly one** cursor frame per level and is the mode an adapter with a whole-message ack maps to; a test asserts that `fin_only` plus a `Stored` level is byte-for-byte the classic confirm, so the migration story is real rather than asserted.
+note: the mode is configuration, not protocol: the frame of B-233 is unchanged by all three.
+
+### B-240 — Progress cursors over QUIC datagrams
+kind: code | size: 90 | status: blocked | needs: [B-239]
+acceptance: intermediate cursors travel as QUIC datagrams carrying the kind `6` payload plus the connection-local stream id they report about ([0024](decisions/0024-three-families-one-back-channel.md) §4.4); a **one-way transfer** therefore gets progress where it previously got nothing, and still no terminal verdict. Three properties pinned: a peer with datagrams disabled (`max_datagram_size()` is `None`) behaves correctly and merely learns less; a dropped or reordered datagram changes no outcome, because the receiver keeps the maximum per level; and **nothing waits on a datagram** — a test with every datagram discarded must still complete every transfer and every guarantee.
+note: quinn drops the oldest unsent datagram to make room for the newest, which is exactly the one an absolute cursor makes redundant — the congestion policy and the cursor algebra agree, and the test for the dropped case is therefore cheap to write.
+
+### B-241 — ARCHITECTURE §1: three vocabularies instead of an onion
+kind: spec | size: 30 | status: done | needs: []
+acceptance: [ARCHITECTURE.md](ARCHITECTURE.md) §1 no longer opens with "weida is three layers" and a stack diagram, but with the surface a user actually chooses from — stream, message, broker — the overlap between the families and the reason for it, and the dependency direction as a single sentence rather than a picture. The L0/L1/L2 names survive only where they name crate boundaries, which is what they are.
+note: done. The onion was never wrong about dependencies and always wrong as a user's mental model, and the document said so itself two screens further down: "L2 is a layer, not a fork".
+
 ### B-236 — PAIR: one connection, one peer, a narrower API
 kind: code | size: 60 | status: ready | needs: []
 acceptance: the pattern [ARCHITECTURE.md](ARCHITECTURE.md) §6b maps as "one connection, one exchange or one one-way transfer each way", built as the API surface the owner asked for rather than as new protocol. Exactly one peer: a second connection to a bound `Pair` is refused with a stop code and the first is **kept** (ZeroMQ's PAIR drops the new one silently; refusing and saying so is this repository's rule for a capacity decision, [decisions/0005](decisions/0005-refusal-race.md)). Both directions usable concurrently, cancellation and the delivery receipt behaving exactly as the primitives already do, and a test proving the pattern adds no wire vocabulary: a `Pair` talks to a bare `Peer`/`Acceptor` on the same path.
