@@ -284,7 +284,7 @@ B-137's and B-138's acceptance clauses, plus B-183's, each with its verdict.
 | Send and receive timeouts turning a stalled exchange into an exception | yes, both asserted within two seconds | §9.5 |
 | The two absences stated as rows rather than as prose | yes — `tls+tcp` in §3 and §4, raw sockets with `nng_device` in §7 | §3, §7 |
 | Which C release each claim was measured against | yes, and the pynng version is recorded as **unpinned** | §1 |
-| The wheel needs no Rust toolchain | **not met, and nothing here claims it**: `weida-nng-py` has `develop.sh` only. It has no `package.sh` and no `smoke.py`, while `weida-zmq-py`, `weida-mqtt-py`, `weida-amqp-py` and `weida-nats-py` each have both. What is missing: a script that builds the `abi3` release wheel, installs it into a fresh virtualenv with `PATH` scrubbed of `cargo`, `rustc` and `maturin`, and runs a round trip from it | §11 |
+| The wheel needs no Rust toolchain | yes, since B-190: `package.sh` builds the `abi3` release wheel (`weida_nng-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl` here), installs it into a fresh virtualenv and runs `smoke.py` — one REQ/REP round trip on each surface, both ends this module, no `pynng` installed — with `PATH` scrubbed to `/usr/bin:/bin`. The document's first draft recorded this clause as not met, which is what filed B-190 | `package.sh`, `smoke.py` |
 | No row says "partial" | yes: §3, §6 and §7 name what a caller does not get | §3, §6, §7 |
 
 ## 11. Sources, and the commands behind every count
@@ -313,7 +313,7 @@ Every count in this document, with the command that produces it:
 | 31 pynng exception classes (§9.7) | `grep -c '^class [A-Za-z]*(NNGException):' .venv/lib/python3.13/site-packages/pynng/exceptions.py` | 31 |
 | Fifteen option keywords (§5) | `grep -cE '^        [a-z_]*=None,$' crates/nng/weida-nng-py/src/options.rs` | 15 |
 | 50 option rows, 33 honoured, 17 refused (§5) | `grep -c 'name: "NNG_OPT_' crates/nng/weida-nng/src/optiontable.rs`, then the same file with `'        disposition: Disposition::Honoured'` and `'        disposition: Disposition::Refused'` | 50, 33, 17 |
-| No `package.sh`, no `smoke.py` (§10) | `glob 'crates/**/package.sh; crates/**/smoke.py'` | four bindings have both; `weida-nng-py` appears in neither list |
+| `package.sh` and `smoke.py` present (§10) | `glob 'crates/**/package.sh; crates/**/smoke.py'` | all five bindings have both, `weida-nng-py` since B-190 |
 | pynng's transports (§3) | a listen attempt per scheme through `.venv/bin/python` against `pynng.Pull0` | `ws`, `wss`, `tls+tcp`, `inproc`, `ipc`, `abstract` accepted; `udp` raised `NotSupported` |
 | NNG's protocol names (§2) | `protocol_name` read from each of pynng's eleven classes | `pair` for `Pair0`, where this binding answers `pair0`; the other ten agree |
 

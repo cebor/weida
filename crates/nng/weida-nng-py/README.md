@@ -107,3 +107,12 @@ binding-level lock.
 
 The wheel is `abi3` from CPython 3.9, so one build serves every later
 interpreter.
+
+```sh
+./package.sh
+```
+
+builds the `abi3` release wheel, installs it into a throwaway virtualenv and
+runs one REQ/REP round trip on each surface with `cargo`, `rustc` and
+`maturin` off `PATH` — so "no Rust toolchain and no C library to install
+this" is checked rather than claimed.
