@@ -177,9 +177,9 @@ Three things, and only three:
   green at **1700 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session.
-- **3 items are `ready`, two are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
+- **2 items are `ready`, two are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
   B-068, a licence and a publication target) and **one is `parked`** (A5's control tier by
-  0011 §4.3). Of 190 filed items, **184 are `done`**.
+  0011 §4.3). Of 190 filed items, **185 are `done`**, and both `ready` ones are a sentence in a file this loop does not write (§6).
 - **The requirement-driven backlog is closed.** All five requests of
   [requirements/zeughaus-video.md](requirements/zeughaus-video.md) are answered where they were
   filed: streaming fan-out **built** (B-064, `Publisher::open`), conflation **answered without a
