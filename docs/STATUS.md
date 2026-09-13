@@ -163,7 +163,7 @@ Two things, the first one changed shape:
   green at **1680 tests** with 37 ignored on Linux and at 1658 on Windows, and the tree is
   clean. The tree has **no known red**, on either platform, in any configuration, including
   the four that are not in the gate yet.
-- **22 items are `ready`, none is `blocked`** and **one is `parked`** (A5's control tier by
+- **21 items are `ready`, none is `blocked`** and **one is `parked`** (A5's control tier by
   0011 §4.3). Of 189 filed items, 167 are `done`; B-189, the NNG survey interop hang on
   Windows, closed the same evening as a test race, not a library bug.
 - **The six the night left behind**, all filed with their evidence: **B-184** (the gate change

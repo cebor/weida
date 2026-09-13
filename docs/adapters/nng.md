@@ -1,9 +1,11 @@
 # NNG / SP v1 — adapter mapping
 
 Status: mapping document; slice 1 (the codec) implemented as `crates/nng/weida-sp` with
-an empty `[dependencies]`, and slices 2 and 3 (both bridge directions) as
-`crates/nng/weida-nng-bridge`. What is left is the interop bench against a real NNG peer
-([LOOP.md](../LOOP.md) §9 Phase B, [0006](../decisions/0006-guarantee-sets.md) §4.9).
+an empty `[dependencies]`, slices 2 and 3 (both bridge directions) as
+`crates/nng/weida-nng-bridge`, rebuilt on the `weida-nng` library (B-134), and the interop
+run against a real NNG peer done as `weida-nng`'s `tests/interop_nng.rs` (B-133: NNG
+1.4.0-rc.0 through the `nng` crate, eleven pairings in both roles; see
+[`../libraries/nng.md`](../libraries/nng.md) §8).
 Date: 2026-09-11
 Derived from: [docs/research/nanomsg-nng.md](../research/nanomsg-nng.md) (SP v1 RFCs
 revision 01; NNG 1.10.0). Every SP or NNG claim below carries that sheet's section; every

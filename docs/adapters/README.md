@@ -79,12 +79,14 @@ Two rules keep these documents honest:
 
 | File | Protocol | Sheet | Status |
 | --- | --- | --- | --- |
-| `zmtp.md` | ZeroMQ ZMTP 3.1 (libzmq 4.3.x, CURVE/ZAP) | [`zeromq.md`](../research/zeromq.md) | codec, both bridge directions and the interop run against the pure-Rust `zeromq` crate |
-| `nng.md` | nanomsg / NNG Scalability Protocols (SP v1 RFCs rev 01, NNG 1.10.0) | [`nanomsg-nng.md`](../research/nanomsg-nng.md) | mapping written; codec built (`weida-sp`), bridges next |
-| `mqtt5.md` | MQTT 5.0 (OASIS Standard 2019-03-07; 3.1.1 differences) | [`mqtt5.md`](../research/mqtt5.md) | mapping written for the **client** ([0014](../decisions/0014-parallel-libraries.md) §2); the broker half of each rule is marked deferred to Phase D, and no forwarder exists yet |
+| `zmtp.md` | ZeroMQ ZMTP 3.1 (libzmq 4.3.x, CURVE/ZAP) | [`zeromq.md`](../research/zeromq.md) | codec (`weida-zmtp`), both bridge directions (`weida-zmq-bridge`, rebuilt on the `weida-zmq` library in B-094) and the interop run against the pure-Rust `zeromq` crate and libzmq 4.3.5 |
+| `nng.md` | nanomsg / NNG Scalability Protocols (SP v1 RFCs rev 01, NNG 1.10.0) | [`nanomsg-nng.md`](../research/nanomsg-nng.md) | codec (`weida-sp`), both bridge directions (`weida-nng-bridge`, rebuilt on the `weida-nng` library in B-134), the cross-adapter test of `crates/interop/cross-tests`, and the interop run against NNG 1.4.0-rc.0 through the `nng` crate (B-133; eleven pairings, behind `--features nng-interop -- --ignored`, green on Linux and Windows) |
+| `mqtt5.md` | MQTT 5.0 (OASIS Standard 2019-03-07; 3.1.1 differences) | [`mqtt5.md`](../research/mqtt5.md) | mapping written for the **client** ([0014](../decisions/0014-parallel-libraries.md) §2), which exists as `weida-mqtt-codec` and `weida-mqtt` and is measured against rumqttd 0.20.0 and rmqtt 0.23.1 ([`../libraries/mqtt.md`](../libraries/mqtt.md)); the broker half of each rule is marked deferred to Phase D, and no forwarder exists — [0014](../decisions/0014-parallel-libraries.md) §3.4 files none for MQTT, AMQP or NATS |
 
-Planned, in the order the parallel workstreams build them
-([0014](../decisions/0014-parallel-libraries.md) §2): AMQP 1.0 and NATS core. Each gets its
-document in the same shape before its bridge code exists. MQTT is the first entry whose
-document precedes a *library* rather than a bridge, because MQTT's server side is a broker and
-the broker is Phase D ([LOOP.md](../LOOP.md) §9).
+No further mapping document is planned. AMQP 1.0 and NATS were built as **libraries** with
+parity documents ([`../libraries/amqp.md`](../libraries/amqp.md),
+[`../libraries/nats.md`](../libraries/nats.md)) and no forwarder, because a forwarder follows
+the library it forwards and [0014](../decisions/0014-parallel-libraries.md) §3.4 files none
+for them; a mapping document is written when a bridge is. MQTT is the one entry whose document
+precedes a *library* rather than a bridge, because MQTT's server side is a broker and the
+broker is Phase D ([LOOP.md](../LOOP.md) §9).
