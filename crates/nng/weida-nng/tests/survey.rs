@@ -93,7 +93,6 @@ async fn the_deadline_starts_at_the_send() {
         waited < Duration::from_millis(900),
         "the wait was {waited:?}: the clock must have started at the send, not at the receive"
     );
-
     // The late answer is discarded, and nothing is sent back about it. A
     // response is only routed — and therefore only counted late — by a
     // receive that drains the pipes, so the receive comes first: it discards
@@ -102,6 +101,21 @@ async fn the_deadline_starts_at_the_send() {
     // before that receive was a wait on nothing (B-182).
     let err = surveyor.recv().await.unwrap_err();
     assert!(matches!(err, Error::ESTATE(_)), "{err:?}");
+    // `discarded_late` drains the pipes itself, so the only thing left to
+    // wait for is the answer's *arrival*: the respondent's `send` returns
+    // when the message is queued, not when it is delivered, and on a
+    // transport that coalesces writes it may still be in flight here. The
+    // counter is monotone, so this poll is exact where a sleep would be a
+    // guess — and the Windows gate is what found the assumption (B-188's
+    // lesson, again).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while surveyor.discarded_late() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the late answer never arrived to be discarded"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(surveyor.discarded_late(), 1);
 }
 
