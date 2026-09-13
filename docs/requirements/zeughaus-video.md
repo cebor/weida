@@ -211,6 +211,12 @@ resume at the current frame, never replay a backlog.
    grows a credential in the handshake, zeughaus would pass the session token it
    already has. If not, an application handshake on a `/auth` path is
    zeughaus-side work -- so this is a question, not a blocker.
+   **Answered by [decisions/0015](../decisions/0015-peer-authorization.md) (B-066):
+   neither.** The handshake stays credential-free and authorization is the
+   acceptor's decision per endpoint path on the fingerprint the peer proved, so
+   the `/auth` exchange is the shape -- with `ServerTls::require_client` where the
+   verdict must outlive the connection it was given on, because a subscription has
+   no reply half to carry a token.
 4. **Per-topic drop counters.** `Publisher::dropped` is aggregate
    (`crates/weida/src/endpoint.rs:366-373`); knowing *which* sample channel is
    starving is what makes a stall diagnosable.
