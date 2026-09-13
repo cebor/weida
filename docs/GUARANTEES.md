@@ -472,7 +472,9 @@ Three points deserve emphasis, because each is easy to assume otherwise:
 - **Pub/Sub drops are silent to the subscriber under `core`, and visible under
   `PerProducer` in either mode.** A subscriber whose byte budget at the publisher is
   exhausted simply does not receive that message; the publisher counts the drop locally
-  (`Publisher::dropped`). This is the one place where weida answers overload by discarding,
+  (`Publisher::dropped`, and per topic and cause in `Publisher::dropped_on`, so "which
+  signal is starving" is a lookup and not a guess). This is the one place where weida
+  answers overload by discarding,
   and it is confined to fan-out (master doc §17). The copy is numbered before fan-out, so the
   number a dropped copy would have carried is missing from that subscriber's sequence. Under
   **detect** the next copy it receives carries `IncomingMeta::gap` naming exactly what it

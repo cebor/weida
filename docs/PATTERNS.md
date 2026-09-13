@@ -347,14 +347,14 @@ exactly [0007 §4.1].
 | Transport | one server-opened unidirectional stream per (subscriber, message) | |
 | Ordering | `None`; one subscriber's copies are enqueued in publication order, but that is not a guarantee | |
 | Delivery signal | none, and none is possible: `publish` never awaits a subscriber | none |
-| Backpressure | `Drop`: a copy that does not fit in `subscriber_buffer_bytes` for that subscriber is dropped and counted in `dropped()`; the publisher never blocks | a subscriber that stops reading fills its budget at the publisher and then loses messages |
+| Backpressure | `Drop`: a copy that does not fit in `subscriber_buffer_bytes` for that subscriber is dropped and counted in `dropped()`, and per topic and cause in `dropped_on(topic)` / `drops()` — budget, full queue, or no parked connection on a socket transport — so a starving signal can be named rather than inferred; the publisher never blocks | a subscriber that stops reading fills its budget at the publisher and then loses messages |
 | Payload | whole `Bytes`, at most `subscriber_buffer_bytes`; larger is `LimitExceeded` before fan-out | |
 
 Failure modes:
 
 | Event | Publisher | Subscriber |
 | --- | --- | --- |
-| Slow subscriber | drops for that subscriber only, `dropped()` grows | silently misses messages: nothing on the wire says so |
+| Slow subscriber | drops for that subscriber only, `dropped()` grows and `dropped_on(topic)` says which topic and why | silently misses messages: nothing on the wire says so |
 | Subscriber's connection lost | its filters and writer are removed | `recv` keeps waiting; `peer_count` drops |
 | Publisher's connection lost | — | `recv` keeps waiting; filters are remembered and re-sent on the next `connect` |
 | Too many filters on one connection | closes it with `LIMIT_EXCEEDED` | `connect`/`subscribe` fails |

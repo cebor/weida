@@ -340,7 +340,13 @@ async fn slow_subscriber_drops_not_blocks() {
     let mut fast_received = 0usize;
     // The whole loop sits inside the deadline: were `publish` to wait on the
     // slow subscriber, this would time out instead of dropping messages.
+    // A second topic goes out first, while every budget is still free, so it
+    // is delivered to both and never dropped — and its own count says so
+    // after the other topic has starved.
     within(async {
+        publisher.publish("fx.usd", &b"tiny"[..]).expect("publish");
+        let (topic, _) = recv_one(&fast).await;
+        assert_eq!(topic, "fx.usd");
         for _ in 0..COUNT {
             publisher
                 .publish("px.eur", payload.clone())
@@ -358,6 +364,22 @@ async fn slow_subscriber_drops_not_blocks() {
         publisher.dropped() > 0,
         "the slow subscriber should have lost messages"
     );
+    // Which signal starved, and why: the count is per topic and per cause,
+    // so a drop on `px.eur` is not a drop on `fx.usd`, and it was the byte
+    // budget and not a full queue or a missing parked connection.
+    let starved = publisher
+        .dropped_on("px.eur")
+        .expect("the dropped topic is counted");
+    assert_eq!(starved.total(), publisher.dropped());
+    assert!(starved.subscriber_budget > 0, "{starved:?}");
+    assert_eq!(starved.subscriber_queue, 0, "{starved:?}");
+    assert_eq!(starved.no_parked_connection, 0, "{starved:?}");
+    assert_eq!(
+        publisher.dropped_on("fx.usd"),
+        None,
+        "the other topic's count is untouched"
+    );
+    assert_eq!(publisher.drops().len(), 1);
 
     drop(fast);
     drop(slow);

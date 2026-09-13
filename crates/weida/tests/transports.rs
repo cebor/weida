@@ -391,6 +391,13 @@ async fn an_exhausted_reverse_pool_drops_the_copy_and_counts_it() {
         publisher.dropped() >= 1,
         "a pool of one, outrun by {published} publishes, must have dropped a copy"
     );
+    // And the count says which failure it was: not a subscriber that could
+    // not keep up, but a subscriber with nothing parked.
+    let starved = publisher
+        .dropped_on("px.eur")
+        .expect("the dropped topic is counted");
+    assert!(starved.no_parked_connection >= 1, "{starved:?}");
+    assert_eq!(starved.subscriber_budget, 0, "{starved:?}");
     // The subscription survives its drops: a copy published after the pool
     // has recovered still arrives.
     let arrived = within(async {

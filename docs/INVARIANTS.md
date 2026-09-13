@@ -59,7 +59,11 @@ instance count of [0010 §4.5] turned out to need nothing beyond `max_local_stre
 are the only ceiling, as on `AF_UNIX` (B-039). The pipe's chunk framing
 ([PROTOCOL.md](PROTOCOL.md) §2.1) allocates nothing for a chunk length: a reader takes at
 most the caller's buffer per read, and the one buffer the transport owns — the 8 KiB
-scratch of a draining reader — is a constant.
+scratch of a draining reader — is a constant. The publisher's per-topic drop table
+(B-067) is bounded by `max_sequence_scopes`, the same ceiling as the sequencer's per-topic
+table: the topics are the local application's, not a peer's, but a table nobody bounds is a
+table that grows for the life of the process, and at the cap a topic's drops count in the
+aggregate only.
 
 **The adapters are inside this invariant too, and had been read as if they were not.** The
 review pass of B-051 swept the adapter crates for the first time and found two structures a

@@ -80,6 +80,7 @@ pub use listener::PipeBinding;
 pub use listener::UnixBinding;
 pub use listener::{Binding, Listener, LocalBinding};
 pub use ordering::Gap;
+pub use pubsub::TopicDrops;
 // `Delivery` keeps its transfer-receipt meaning at this level, so the
 // dimension of the same name is re-exported under the name the guarantee
 // documents use for it.

@@ -102,12 +102,144 @@ struct SubEntry {
     budget: Arc<Semaphore>,
 }
 
-/// Everything registered for one publisher path.
+/// Why a published copy was dropped.
+///
+/// Three causes, because they are three different failures: the first two
+/// are the subscriber not keeping up, the third is the *local* transport
+/// having no connection to carry the copy
+/// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
+/// §4.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum DropCause {
+    /// The subscriber's byte budget (`Limits::subscriber_buffer_bytes`) had
+    /// no room for the payload.
+    SubscriberBudget,
+    /// The subscriber's writer queue was full of messages.
+    SubscriberQueue,
+    /// The subscriber had parked no connection for this copy: a socket
+    /// transport's fan-out rides connections the subscriber parks, and the
+    /// pool was empty.
+    NoParkedConnection,
+}
+
+/// What a publisher dropped on one topic, by cause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopicDrops {
+    /// The topic the dropped copies were published on.
+    pub topic: Arc<str>,
+    /// Copies dropped for an exhausted subscriber byte budget.
+    pub subscriber_budget: u64,
+    /// Copies dropped for a full subscriber queue.
+    pub subscriber_queue: u64,
+    /// Copies dropped because the subscriber had parked no connection.
+    pub no_parked_connection: u64,
+}
+
+impl TopicDrops {
+    /// All three causes summed.
+    pub fn total(&self) -> u64 {
+        self.subscriber_budget + self.subscriber_queue + self.no_parked_connection
+    }
+}
+
+/// Three counters, one per cause.
 #[derive(Default)]
+struct Causes {
+    budget: AtomicU64,
+    queue: AtomicU64,
+    no_parked: AtomicU64,
+}
+
+impl Causes {
+    fn record(&self, cause: DropCause) {
+        let counter = match cause {
+            DropCause::SubscriberBudget => &self.budget,
+            DropCause::SubscriberQueue => &self.queue,
+            DropCause::NoParkedConnection => &self.no_parked,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, topic: &Arc<str>) -> TopicDrops {
+        TopicDrops {
+            topic: Arc::clone(topic),
+            subscriber_budget: self.budget.load(Ordering::Relaxed),
+            subscriber_queue: self.queue.load(Ordering::Relaxed),
+            no_parked_connection: self.no_parked.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The drops on one publisher path: a total, and a count per topic and
+/// cause.
+///
+/// The per-topic table is bounded by `Limits::max_sequence_scopes`, the same
+/// ceiling the sequencer's per-topic table has and for the same reason: the
+/// topics are the publishing application's, but a table nobody bounds is a
+/// table that grows for the life of the process. At the cap a new topic's
+/// drops count in the total and nowhere else, which is what the sequencer
+/// does with a new scope.
+struct DropTable {
+    total: AtomicU64,
+    per_topic: RwLock<HashMap<Arc<str>, Causes>>,
+    max_topics: usize,
+}
+
+impl DropTable {
+    fn new(max_topics: usize) -> DropTable {
+        DropTable {
+            total: AtomicU64::new(0),
+            per_topic: RwLock::new(HashMap::new()),
+            max_topics,
+        }
+    }
+
+    /// Counts one dropped copy of a message on `topic`.
+    ///
+    /// A read lock on the common path — the topic is known — and a write
+    /// lock only for a topic's first drop. Drops are the exceptional path of
+    /// fan-out, so neither is on the path of a message that gets through.
+    fn record(&self, topic: &Arc<str>, cause: DropCause) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        {
+            let table = self.per_topic.read().expect("drop table poisoned");
+            if let Some(causes) = table.get(topic) {
+                causes.record(cause);
+                return;
+            }
+        }
+        let mut table = self.per_topic.write().expect("drop table poisoned");
+        if let Some(causes) = table.get(topic) {
+            causes.record(cause);
+        } else if table.len() < self.max_topics {
+            let causes = Causes::default();
+            causes.record(cause);
+            table.insert(Arc::clone(topic), causes);
+        }
+    }
+
+    fn on_topic(&self, topic: &str) -> Option<TopicDrops> {
+        let table = self.per_topic.read().expect("drop table poisoned");
+        table
+            .get_key_value(topic)
+            .map(|(topic, causes)| causes.snapshot(topic))
+    }
+
+    fn by_topic(&self) -> Vec<TopicDrops> {
+        let table = self.per_topic.read().expect("drop table poisoned");
+        table
+            .iter()
+            .map(|(topic, causes)| causes.snapshot(topic))
+            .collect()
+    }
+}
+
+/// Everything registered for one publisher path.
 struct PathState {
     subs: Vec<SubEntry>,
-    /// Messages dropped for a slow subscriber, summed over subscribers.
-    dropped: Arc<AtomicU64>,
+    /// Copies dropped for a subscriber that could not take them, by topic
+    /// and cause.
+    drops: Arc<DropTable>,
 }
 
 /// Subscriptions for every publisher path served by one listener.
@@ -152,7 +284,10 @@ impl SubRegistry {
         let mut paths = self.paths.write().expect("subscription lock poisoned");
         let mut per_conn = self.per_conn.write().expect("subscription lock poisoned");
 
-        let state = paths.entry(Arc::from(path)).or_default();
+        let state = paths.entry(Arc::from(path)).or_insert_with(|| PathState {
+            subs: Vec::new(),
+            drops: Arc::new(DropTable::new(self.limits.max_sequence_scopes)),
+        });
         if let Some(entry) = state.subs.iter_mut().find(|e| e.conn_id == conn_id) {
             if entry.filters.contains(&filter) {
                 return Ok(());
@@ -174,7 +309,7 @@ impl SubRegistry {
 
         let (tx, rx) = mpsc::channel(WRITER_QUEUE);
         let budget = Arc::new(Semaphore::new(self.limits.subscriber_buffer_bytes));
-        let dropped = Arc::clone(&state.dropped);
+        let drops = Arc::clone(&state.drops);
         state.subs.push(SubEntry {
             conn_id,
             filters: HashSet::from([filter]),
@@ -184,13 +319,8 @@ impl SubRegistry {
         // One writer task per (connection, path): it serializes this
         // subscriber's messages, which is what makes delivery FIFO per
         // subscriber even though each message rides its own QUIC stream.
-        ctx.exec.spawn(writer(
-            Arc::clone(ctx),
-            Arc::from(path),
-            rx,
-            budget,
-            dropped,
-        ));
+        ctx.exec
+            .spawn(writer(Arc::clone(ctx), Arc::from(path), rx, budget, drops));
         Ok(())
     }
 
@@ -257,7 +387,7 @@ impl SubRegistry {
                 continue;
             }
             let Ok(permit) = entry.budget.try_acquire_many(want) else {
-                state.dropped.fetch_add(1, Ordering::Relaxed);
+                state.drops.record(&topic, DropCause::SubscriberBudget);
                 tracing::debug!(path, %topic, "subscriber budget exhausted; message dropped");
                 continue;
             };
@@ -275,7 +405,7 @@ impl SubRegistry {
                 }
                 Err(_) => {
                     // Dropping `permit` returns the budget immediately.
-                    state.dropped.fetch_add(1, Ordering::Relaxed);
+                    state.drops.record(&topic, DropCause::SubscriberQueue);
                     tracing::debug!(path, %topic, "subscriber queue full; message dropped");
                 }
             }
@@ -301,13 +431,32 @@ impl SubRegistry {
             .map_or(0, |s| s.subs.iter().map(|e| e.filters.len()).sum())
     }
 
-    /// Messages dropped on `path` because a subscriber could not take them.
+    /// Messages dropped on `path` because a subscriber could not take them,
+    /// summed over topics and causes.
     pub(crate) fn dropped(&self, path: &str) -> u64 {
         self.paths
             .read()
             .expect("subscription lock poisoned")
             .get(path)
-            .map_or(0, |s| s.dropped.load(Ordering::Relaxed))
+            .map_or(0, |s| s.drops.total.load(Ordering::Relaxed))
+    }
+
+    /// The drops on `path` for one topic, or `None` if none was counted.
+    pub(crate) fn dropped_on(&self, path: &str, topic: &str) -> Option<TopicDrops> {
+        self.paths
+            .read()
+            .expect("subscription lock poisoned")
+            .get(path)
+            .and_then(|s| s.drops.on_topic(topic))
+    }
+
+    /// The drops on `path`, one entry per topic that lost a copy.
+    pub(crate) fn drops(&self, path: &str) -> Vec<TopicDrops> {
+        self.paths
+            .read()
+            .expect("subscription lock poisoned")
+            .get(path)
+            .map_or_else(Vec::new, |s| s.drops.by_topic())
     }
 }
 
@@ -329,7 +478,7 @@ async fn writer(
     path: Arc<str>,
     mut rx: mpsc::Receiver<PubMsg>,
     budget: Arc<Semaphore>,
-    dropped: Arc<AtomicU64>,
+    drops: Arc<DropTable>,
 ) {
     loop {
         let msg = tokio::select! {
@@ -352,7 +501,7 @@ async fn writer(
             // ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
             // §4.4). Counted exactly like an exhausted byte budget.
             Err(Error::NoParkedConnection) => {
-                dropped.fetch_add(1, Ordering::Relaxed);
+                drops.record(&msg.topic, DropCause::NoParkedConnection);
                 tracing::debug!(path = %path, "no parked connection; copy dropped");
             }
             Err(e) => {

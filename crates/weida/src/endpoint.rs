@@ -365,9 +365,26 @@ impl Publisher {
         self.state.registry.filter_count(&self.state.path)
     }
 
-    /// Messages dropped because a subscriber could not take them.
+    /// Messages dropped because a subscriber could not take them, summed
+    /// over topics and causes. "Something is being discarded"; for "which
+    /// signal is starving", see [`Publisher::drops`].
     pub fn dropped(&self) -> u64 {
         self.state.registry.dropped(&self.state.path)
+    }
+
+    /// What was dropped on `topic`, by cause, or `None` if nothing was.
+    ///
+    /// Maintained as the drops happen, so this is a lookup and not a scan.
+    /// The table holds at most `Limits::max_sequence_scopes` topics — the
+    /// same ceiling the sequencer's per-topic table has — and a topic beyond
+    /// it counts in [`Publisher::dropped`] only.
+    pub fn dropped_on(&self, topic: &str) -> Option<crate::TopicDrops> {
+        self.state.registry.dropped_on(&self.state.path, topic)
+    }
+
+    /// Every topic that lost a copy, with its counts by cause.
+    pub fn drops(&self) -> Vec<crate::TopicDrops> {
+        self.state.registry.drops(&self.state.path)
     }
 }
 
