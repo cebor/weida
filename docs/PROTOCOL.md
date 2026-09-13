@@ -472,6 +472,7 @@ configuration error, not a negotiation position.
 | `5` | `tstr` | `topic` | no | 256 B | Pub/Sub topic; opaque bytes, selected by the filter grammar of §6.4 |
 | `6` | `uint` | `sequence` | no | — | per-producer sequence number; coded, **written by no v0 sender** |
 | `7` | `bstr` | `producer` | no | exactly 32 B | producer identity, the raw digest; coded, **written by no v0 sender** |
+| `8` | `uint` | `achieved` | no | one of §6.5's `acknowledgement` values | the completion level the sender **achieved** for the message it is answering; the L2 publisher confirm |
 
 **Every key is optional at the decoder, and that is deliberate.** A decoder sees a byte
 slice, not a stream: it cannot tell an initiating half from a reply half, so it cannot
@@ -491,6 +492,28 @@ identity is the correlation. Nothing on the wire names an exchange.
 
 `topic` is meaningful only for the fan-out copies a publisher emits (§9.5). It is opaque
 bytes: weida never parses it, and no character in it is special.
+
+`achieved` is the L2 confirm, and it appears on a **reply half** only. A broker that has taken
+responsibility for a producer's message answers the exchange with DATA carrying
+`achieved = 2` (`Accepted`) and a FIN, no payload: an exchange already has a reply half, so a
+publisher confirm needs no frame kind of its own
+([decisions/0018](decisions/0018-minimal-broker.md) §4.6). Three rules bind it.
+
+- It is **achieved, never requested.** A level a peer *wants* is negotiated in HELLO (§6.5)
+  and the connection fails if it cannot be reached; this key reports what happened to one
+  message.
+- It is a statement about **one hop**, and it is never relayed. The producer's confirm says
+  nothing about what a consumer later does with the message
+  ([GUARANTEES.md](GUARANTEES.md) §2).
+- An **absent** key is not `acknowledgement = 0`. Absence is the v0 case: this hop claims
+  nothing beyond the transport receipt QUIC already gave. `0` is an explicit statement that
+  nothing is reported, which only a sender that negotiated it writes.
+
+A value this version does not define is a protocol violation at the decoder, not an unknown
+key to skip: the number decides what a producer believes about its message, so reading an
+unknown one as the weakest level would invent a claim. This is the one exception to §5's
+skip-the-unknown rule, and it is narrow — the *key* may be skipped by a decoder that does not
+know it; the *value* may not be guessed by one that does.
 
 `content_len` is advisory: the receiver MUST NOT reject a payload for disagreeing with it,
 and MUST NOT size an allocation from it.
@@ -638,8 +661,12 @@ Rules:
   (`durability` without `Stored`/`Replicated`, `replicas` without `Replicated`, `replicas`
   of `1`, a missing `dedup_window_ms` under `Bounded`) is a framing violation (§3.2). The
   levels reserved for the L2 broker — `acknowledgement` `2` to `5` — are legal to *declare*
-  and impossible to honour in v0, so a peer that requires one gets a failed negotiation
-  (§2.3), never a quieter success.
+  and impossible to honour **in the v0 core**, so a peer that requires one gets a failed
+  negotiation (§2.3), never a quieter success. `2` (`Accepted`) is the first to become
+  honourable: a process running `weida-broker` reaches it for a message it has taken into a
+  queue, and reports it in DATA key `8` (§6.2, B-201). `3` and `4` stay declare-only, with
+  their `durability` and `replicas` axes unchanged, until a store and a replica set exist to
+  make them true.
 - **`backpressure` `4` (Coalesce) with `ordering` `2` (PerProducer reassemble) is forbidden**,
   because it asks for two incompatible things at once: reassembly holds an arrival until its
   predecessors arrive, and a conflating hop is the reason some of them never will
@@ -707,6 +734,9 @@ DATA   {endpoint:"/t"}                       (initiating half)
 DATA   {}                                    (reply half)
        57 01 01  A0
 
+DATA   {achieved:2}                          (the L2 confirm, on a reply half)
+       57 01 03  A1 08 02
+
 HELLO  {versions:[0], max_header_bytes:16384, max_transfers:1024, caps:[], req_caps:[]}
        57 00 10  A5 00 81 00 01 19 40 00 02 19 04 00 03 80 04 80
 
@@ -758,6 +788,12 @@ omitted. This is the smallest legal request or push header.
 **Reply DATA vector** — magic `0x57`, kind `0x01` (DATA), `header_len = 0x01` (1 byte), the
 empty CBOR map. The bidi stream is the correlation, so a reply that carries no metadata
 carries no header fields either.
+
+**Confirm DATA vector** — magic `0x57`, kind `0x01` (DATA), `header_len = 0x03` (3 bytes),
+CBOR map of 1 entry: key `8` `achieved = 2` (`Accepted`). This is a whole publisher confirm:
+three header bytes, no payload, and a FIN. It is the cheapest frame in this table that says
+something a transport cannot, which is the argument for spending an exchange's reply half on
+it rather than a frame kind ([decisions/0018](decisions/0018-minimal-broker.md) §4.6).
 
 **Fan-out DATA vector** — magic `0x57`, kind `0x01` (DATA), `header_len = 0x0E` (14 bytes),
 CBOR map of 2 entries: key `0` `endpoint = "/md"`, key `5` `topic = "px.eur"`. This is the
@@ -917,6 +953,7 @@ connection error: the connection survives all of it.
 | --- | --- |
 | a puller or subscriber | accept and queue the transfer |
 | a raw acceptor | accept and queue the transfer |
+| a queue (L2) | admit into the queue, no confirm; `STOP_SENDING(REJECTED)` when the queue is at its byte bound |
 | a replier | `STOP_SENDING(UNSUPPORTED)` |
 | a publisher | `STOP_SENDING(UNSUPPORTED)` |
 | nothing | `STOP_SENDING(UNKNOWN_ENDPOINT)` |
@@ -927,11 +964,22 @@ connection error: the connection survives all of it.
 | --- | --- |
 | a replier | accept and queue the exchange |
 | a raw acceptor | accept and queue the exchange |
+| a queue (L2) | admit into the queue and confirm: DATA with the achieved level (§6.2 key `8`) + FIN on the reply half; ERROR `{REJECTED}` + FIN when the queue is at its byte bound |
 | a puller or subscriber | ERROR `{UNSUPPORTED}` + FIN on the reply half, `STOP_SENDING(UNSUPPORTED)` on the request half |
 | a publisher | same as above |
 | nothing | ERROR `{UNKNOWN_ENDPOINT}` + FIN on the reply half, `STOP_SENDING(UNKNOWN_ENDPOINT)` on the request half |
 
 A receiver MUST NOT reinterpret a misrouted stream as something the path does serve.
+
+**The queue rows are the same dispatch, not an exception to it.** A queue is an endpoint path
+like any other (`weida-broker` registers one acceptor per queue), so "exactly one answer per
+(stream kind, path)" still holds and `UNKNOWN_ENDPOINT` stays decidable. What differs is the
+*object* at the path: a publisher fans a message out to every matching subscriber, a queue
+hands each message to exactly one consumer. Neither the frame nor the filter encodes that
+difference — the registration does
+([decisions/0018](decisions/0018-minimal-broker.md) §4.5). There is no declare frame: a queue
+exists because the broker's configuration named it, and a path with no queue is
+`UNKNOWN_ENDPOINT` from the same table row as any other unregistered path.
 
 **This table is the authorization surface**, and that is a decision rather than an accident
 ([decisions/0015](decisions/0015-peer-authorization.md)). Dispatch answers "is this stream
@@ -1051,6 +1099,20 @@ each of unboundedly many paths.
 than by backpressure. That is deliberate and confined to fan-out: a publisher that blocked
 on its slowest subscriber would let one consumer degrade every other (master doc §17).
 
+Per broker (`weida_broker::BrokerConfig`), for a process that runs the L2 layer:
+
+| Field | Default | Bound enforced |
+| --- | --- | --- |
+| `queue_bytes` | 8 MiB | bytes one queue holds, charged as the payload plus the retained labels plus a fixed `PER_MESSAGE_OVERHEAD` (256 B) per message. A queue at the bound refuses admission — ERROR `{REJECTED}` on an exchange's reply half, `STOP_SENDING(REJECTED)` on a one-way stream — and never discards a message it has already confirmed ([decisions/0018](decisions/0018-minimal-broker.md) §4.8) |
+| `max_queues` | `64` | queues one broker registers; a configuration naming more is refused before any path is claimed |
+| `max_unacked` | `256` | deliveries one subscription may have outstanding, and the ceiling on any credit the broker will honour (enforced by B-202 and B-203) |
+
+These are a **third** profile rather than fields on `Limits`, because a queue is not a
+per-connection object: it outlives every connection that touches it, which is the whole point
+of a queue. The per-message overhead exists because a budget counting payload bytes only would
+bound nothing against a producer of empty messages — with it, `queue_bytes / 256` is also the
+ceiling on the message count.
+
 ### 10.1 Control and bulk profiles
 
 *Spec ahead of code, for the control half only.*
@@ -1086,16 +1148,21 @@ The following are deliberately absent from wire protocol version 0. Implementati
 NOT invent wire representations for them; they will be specified in later protocol
 versions.
 
-- **Application-level acknowledgements.** `Accepted`, `Stored(Written|Flushed)`,
-  `Replicated(n, flushed)` and `Processed` are broker-layer semantics — a transfer of
-  responsibility to a broker hop — with the exact conditions each certifies now fixed
+- **A frame kind for an application-level acknowledgement.** The levels themselves are no
+  longer all unreachable: `Accepted` and `Processed` are what an L2 broker issues, with the
+  exact conditions each certifies fixed
   ([decisions/0004](decisions/0004-durability-levels.md) §4.1-§4.4,
-  [GUARANTEES.md](GUARANTEES.md) §1) and scheduled for Phase 6. They are declarable in a
-  guarantee set (§6.5) and impossible to honour here, so a peer that requires one fails
-  negotiation (§2.3). The v0 core deliberately carries no such frame: without a broker to take
-  responsibility, such an acknowledgement would mean "arrived in RAM", which QUIC's own
-  transport receipt (§9.2) already states more honestly. That the receipt therefore cannot be
-  ordered against an application refusal is a decided position, not an omission
+  [GUARANTEES.md](GUARANTEES.md) §1), and `Accepted` is reachable today through
+  `weida-broker` — but **no frame carries one**, and none is needed: a confirm rides the
+  reply half of the producer's exchange as DATA key `8` (§6.2), and a consumer's outcome
+  rides the reply half of the delivery exchange
+  ([decisions/0018](decisions/0018-minimal-broker.md) §4.6). `Stored(Written|Flushed)` and
+  `Replicated(n, flushed)` remain undeclarable-and-unhonourable, so a peer that requires one
+  fails negotiation (§2.3): without a store there is nothing to survive a restart, and
+  reporting them for an in-memory buffer is prohibited rather than optimistic
+  ([GUARANTEES.md](GUARANTEES.md) §1). The v0 core itself still certifies nothing above the
+  transport receipt (§9.2), and that a receipt cannot be ordered against an application
+  refusal is a decided position, not an omission
   ([decisions/0005](decisions/0005-refusal-race.md), §9.2).
 - **Router/Dealer equivalents.** Not needed as wire constructs: an exchange is a stream, so
   unlimited concurrent unsynchronized requests and correctly matched replies both fall out

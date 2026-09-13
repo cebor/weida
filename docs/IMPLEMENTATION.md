@@ -21,11 +21,11 @@ chaotically across phases.
 | 3 | Brokerless messaging patterns | in progress |
 | 4 | Reliability | not started |
 | 5 | Persistence subsystem | not started |
-| 6 | Standalone broker | not started |
+| 6 | Standalone broker | first slice done |
 | 7 | Broker clustering | not started |
 | 8 | Web adapter | not started |
 | 9 | Legacy adapters | in progress |
-| 10 | Language bindings | not started |
+| 10 | Language bindings | in progress |
 | 11 | CLI and administration | first slice done |
 | 12 | Documentation/site/stabilization | not started |
 
@@ -1806,10 +1806,15 @@ Recorded deliberately, not discovered later.
   convention inside the payload; v0 offers neither.
 - **Capability codes unused.** HELLO carries `capabilities` and `required_capabilities`, but
   no code is assigned and the supported set is empty.
-- **Application acknowledgements are absent, not partial.** Accepted, Stored, Replicated and
-  Processed are reserved for the Phase 6 broker: no wire representation, no code point, no
-  `UNSUPPORTED` answer, because there is nothing to ask for. The core's only delivery signal
-  is the `Delivery` transport receipt ([GUARANTEES.md](GUARANTEES.md) §6).
+- **Application acknowledgements: one of four, and no frame.** `Accepted` exists —
+  `weida-broker` reports it for a message it has admitted into a queue, on the reply half of
+  the producer's exchange, as DATA key `8` ([PROTOCOL.md](PROTOCOL.md) §6.2). `Processed` has
+  its place decided and no code: the reply half of the delivery exchange, Phase 6's third
+  slice. `Stored` and `Replicated` have **no code point and nothing to ask for**, because
+  there is no store and no replica set to make them true, and reporting them for an in-memory
+  queue is prohibited rather than optimistic ([GUARANTEES.md](GUARANTEES.md) §1). Outside a
+  broker the core's only delivery signal is still the `Delivery` transport receipt
+  ([GUARANTEES.md](GUARANTEES.md) §6).
 - **No CI, no LICENSE, no publish metadata.** Not part of this increment; to be added on
   demand.
 - **A synchronous API wrapper exists now** (B-194): `weida::blocking` behind the non-default

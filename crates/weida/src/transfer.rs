@@ -22,6 +22,7 @@ use std::task::{Context, Poll};
 use crate::transport::{RecvHalf, SendHalf};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use weida_core::{Error, ErrorCode, PeerIdentity, TraceContext};
+use weida_protocol::header::Acknowledgement;
 use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes, encode_preamble};
 
 use crate::conn::{ConnHandle, Ctl, read_frame, write_error_frame};
@@ -37,6 +38,15 @@ pub struct TransferMeta {
     pub content_len: Option<u64>,
     /// Trace context to propagate. `None` generates a fresh root context.
     pub trace: Option<TraceContext>,
+    /// The completion level this side **achieved** for the message it is
+    /// answering (DATA key `8`).
+    ///
+    /// Only an L2 hop sets it, and only on a reply: it is the publisher
+    /// confirm of
+    /// [decisions/0018](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
+    /// §4.6. A v0 application leaves it `None`, which claims nothing beyond
+    /// the transport receipt.
+    pub achieved: Option<Acknowledgement>,
 }
 
 impl TransferMeta {
@@ -55,6 +65,16 @@ impl TransferMeta {
     /// Propagates an existing trace context.
     pub fn with_trace(mut self, trace: TraceContext) -> TransferMeta {
         self.trace = Some(trace);
+        self
+    }
+
+    /// States the completion level this side achieved.
+    ///
+    /// A claim about this hop only, and a claim a peer will act on: `weida`
+    /// itself never sets it, so anything here comes from an L2 layer that
+    /// took responsibility for the message.
+    pub fn with_achieved(mut self, achieved: Acknowledgement) -> TransferMeta {
+        self.achieved = Some(achieved);
         self
     }
 }
@@ -97,6 +117,14 @@ pub struct IncomingMeta {
     /// §7.5). `None` means either that ordering is off or that nothing is
     /// missing.
     pub gap: Option<Gap>,
+    /// The completion level the sender achieved for the message this transfer
+    /// answers (DATA key `8`), when it claimed one.
+    ///
+    /// On the reply half of an exchange with an L2 broker this is the
+    /// publisher confirm: `Some(Acknowledgement::Accepted)` means the broker
+    /// has taken responsibility for the message in memory. `None` is the v0
+    /// case and claims nothing beyond the transport receipt.
+    pub achieved: Option<Acknowledgement>,
 }
 
 impl IncomingMeta {
@@ -114,6 +142,7 @@ impl IncomingMeta {
             peer,
             sequence: header.sequence,
             gap: None,
+            achieved: header.achieved,
         }
     }
 
@@ -161,6 +190,7 @@ pub(crate) fn data_header(
         // the v0 runtime writes neither (`docs/PROTOCOL.md` §6.2).
         sequence: None,
         producer: None,
+        achieved: meta.achieved,
     };
     (header, trace)
 }

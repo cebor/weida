@@ -391,10 +391,12 @@ fn wire_bytes(endpoint: &str, meta: &TransferMeta, payload: usize) -> usize {
         tracestate: None,
         topic: None,
         // B-009 simulated keys 6 and 7 with the existing fields whose wire
-        // shape matched; the runtime still writes neither, so the frame this
-        // function measures is unchanged.
+        // shape matched; the runtime still writes neither, and key `8` is an
+        // L2 confirm no pattern here sends, so the frame this function
+        // measures is unchanged.
         sequence: None,
         producer: None,
+        achieved: meta.achieved,
     };
     encode_frame(FrameKind::Data, &header.encode()).len() + payload
 }

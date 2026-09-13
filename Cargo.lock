@@ -3014,6 +3014,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "weida-broker"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "weida",
+]
+
+[[package]]
 name = "weida-core"
 version = "0.1.0"
 

@@ -1,0 +1,23 @@
+[package]
+name = "weida-broker"
+description = "The minimal L2 broker: queues at endpoint paths, Accepted in, nothing durable"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+# The whole dependency list, deliberately: a broker is an ordinary weida
+# process and the layer below it is the public API, not its internals
+# (`docs/ARCHITECTURE.md` §4). Nothing in `weida` may depend on this crate,
+# and a brokerless deployment does not link it.
+weida.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Tests mint a throwaway identity and drive producers over the loopback.
+weida = { workspace = true, features = ["generate"] }
+tracing-subscriber.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -58,10 +58,27 @@ An implementation MUST NOT report one of these states unless the exact condition
 holds. In particular, `Accepted` MUST NOT be reported before the payload has actually been
 handed to the application, and `Stored` MUST NOT be reported for an in-memory buffer.
 
-These four states describe a responsibility transfer **to a broker hop**. They are reserved
-for the **L2 broker layer** (Phase 6) and carry no v0 wire representation: with no broker in
-the topology there is nobody to transfer responsibility *to*, and an acknowledgement that
-only says "the bytes are in the peer's RAM" is a claim QUIC already makes for free (§3).
+These four states describe a responsibility transfer **to a broker hop**, and they belong to
+the **L2 broker layer**. One of them is now issued by code in this repository, and the split
+is worth stating exactly:
+
+- **`Accepted`** is what `weida-broker` reports for a message it has admitted into a queue,
+  on the reply half of the producer's own exchange, encoded as DATA key `8`
+  ([PROTOCOL.md](PROTOCOL.md) §6.2,
+  [decisions/0018](decisions/0018-minimal-broker.md) §4.6).
+- **`Processed`** is the consumer's own statement about its own hop, on the reply half of the
+  delivery exchange. The broker **MUST NOT relay it** to the producer: guarantees are
+  hop-local (§2), so the producer's certificate stays `Accepted` however the consumer later
+  answers. A producer that needs to know a consumer succeeded uses an application reply.
+- **`Stored(*)`** and **`Replicated(n, flushed)`** are still unreachable, and not by
+  oversight: the first broker holds every queue in memory, so reporting them would be the
+  prohibited claim above rather than an optimistic one. They arrive with the store (Phase 5)
+  and the replica set (Phase 7) that make them true. A configuration asking for a level a hop
+  cannot reach is refused when it is configured, never silently degraded (§4).
+
+In the **v0 core**, with no broker in the topology, all four remain absent from the wire:
+there is nobody to transfer responsibility *to*, and an acknowledgement that only says "the
+bytes are in the peer's RAM" is a claim QUIC already makes for free (§3).
 
 ---
 

@@ -12,7 +12,7 @@
 //! what makes the documented frames byte-exact as published.
 
 use weida_core::ErrorCode;
-use weida_protocol::header::{GuaranteeSet, OrderingMode};
+use weida_protocol::header::{Acknowledgement, GuaranteeSet, HeaderError, OrderingMode};
 use weida_protocol::{DataHeader, ErrorHeader, FrameKind, Hello, SubscriptionHeader, encode_frame};
 
 /// Asserts one documented frame, and that its header half decodes back.
@@ -57,6 +57,42 @@ fn golden_data_reply_frame() {
         &[0x57, 0x01, 0x01, 0xA0],
     );
     assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
+}
+
+#[test]
+fn golden_data_confirm_frame() {
+    // The L2 publisher confirm: a reply half carrying the achieved level and
+    // nothing else. Three header bytes, and no frame kind of its own
+    // (`docs/decisions/0018-minimal-broker.md` §4.6).
+    let h = DataHeader {
+        achieved: Some(Acknowledgement::Accepted),
+        ..DataHeader::reply()
+    };
+    assert_frame(
+        "DATA confirm",
+        FrameKind::Data,
+        h.encode(),
+        &[0x57, 0x01, 0x03, 0xA1, 0x08, 0x02],
+    );
+    assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
+}
+
+#[test]
+fn an_undefined_achieved_level_is_refused_rather_than_read_as_the_weakest() {
+    // `A1 08 06`: key 8, value 6 — one past `Processed`. Skipping it or
+    // reading it as `None` would invent a claim about a producer's message,
+    // so the decoder refuses the header (`docs/PROTOCOL.md` §6.2).
+    let err = DataHeader::decode(&[0xA1, 0x08, 0x06]).expect_err("undefined level");
+    assert!(
+        matches!(
+            err,
+            HeaderError::UnknownLevel {
+                dimension: "achieved",
+                value: 6
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]

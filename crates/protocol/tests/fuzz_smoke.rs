@@ -15,7 +15,7 @@
 //! * every accepted value respects the documented caps.
 
 use weida_core::{ErrorCode, TraceContext};
-use weida_protocol::header::limits;
+use weida_protocol::header::{Acknowledgement, limits};
 use weida_protocol::{
     DataHeader, ErrorHeader, Hello, SubscriptionHeader, encode_frame, parse_preamble,
 };
@@ -133,6 +133,7 @@ fn fuzz_smoke_data_header_from_valid_bytes() {
             topic: Some("px.eur".into()),
             sequence: Some(u64::MAX),
             producer: Some([0xA5; 32]),
+            achieved: Some(Acknowledgement::Processed),
         },
     ];
     let mut accepted = 0usize;
@@ -365,6 +366,17 @@ fn arbitrary_data_header(rng: &mut Rng) -> DataHeader {
             Some(digest)
         } else {
             None
+        },
+        // Every defined level, and only those: an undefined one is a decode
+        // error rather than a header this generator may produce.
+        achieved: match rng.below(7) {
+            0 => Some(Acknowledgement::None),
+            1 => Some(Acknowledgement::TransportReceipt),
+            2 => Some(Acknowledgement::Accepted),
+            3 => Some(Acknowledgement::Stored),
+            4 => Some(Acknowledgement::Replicated),
+            5 => Some(Acknowledgement::Processed),
+            _ => None,
         },
     }
 }

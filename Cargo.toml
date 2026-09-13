@@ -6,6 +6,9 @@ members = [
     "crates/protocol",
     "crates/runtime",
     "crates/weida",
+    # L2, and a layer rather than a fork: it depends on `weida` and nothing
+    # depends on it (0018 §4.1).
+    "crates/broker",
     # The one crate that calls Win32; empty everywhere else.
     "crates/winpipe",
     # One directory per foreign protocol family, codec and library and bridge
@@ -47,6 +50,7 @@ weida-protocol = { path = "crates/protocol", version = "0.1.0" }
 weida-runtime = { path = "crates/runtime", version = "0.1.0" }
 weida-winpipe = { path = "crates/winpipe", version = "0.1.0" }
 weida = { path = "crates/weida", version = "0.1.0" }
+weida-broker = { path = "crates/broker", version = "0.1.0" }
 weida-zmtp = { path = "crates/zmq/weida-zmtp", version = "0.1.0" }
 weida-zmq = { path = "crates/zmq/weida-zmq", version = "0.1.0" }
 weida-sp = { path = "crates/nng/weida-sp", version = "0.1.0" }

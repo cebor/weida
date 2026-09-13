@@ -78,6 +78,7 @@ mod data_key {
     pub const TOPIC: u64 = 5;
     pub const SEQUENCE: u64 = 6;
     pub const PRODUCER: u64 = 7;
+    pub const ACHIEVED: u64 = 8;
 }
 
 /// ERROR keys.
@@ -661,7 +662,8 @@ pub enum HeaderError {
     DepthExceeded,
     /// Bytes remained after the header map.
     TrailingBytes,
-    /// A guarantee set named a level this version does not define.
+    /// A guarantee set, or a DATA header's achieved level, named a level this
+    /// version does not define.
     UnknownLevel {
         /// Dimension whose value was unknown.
         dimension: &'static str,
@@ -1168,6 +1170,28 @@ pub struct DataHeader {
     /// §4.4). The `sha256:<64 hex>` spelling is presentation only and never
     /// goes on the wire.
     pub producer: Option<[u8; limits::PRODUCER_BYTES]>,
+    /// The completion level the sender **achieved** for the message it is
+    /// answering (`docs/PROTOCOL.md` §6.2, key `8`).
+    ///
+    /// This is the L2 confirm, and it is a statement about one hop: a broker
+    /// that has taken responsibility for a message in memory writes
+    /// [`Acknowledgement::Accepted`] on the reply half of the producer's
+    /// exchange, which is what makes the reply a publisher confirm without a
+    /// frame kind of its own
+    /// ([decisions/0018](../../../docs/decisions/0018-minimal-broker.md)
+    /// §4.6). It is *achieved*, never requested — a level a peer wants is
+    /// negotiated in HELLO and refused there if it cannot be reached
+    /// ([0006](../../../docs/decisions/0006-guarantee-sets.md) §4.4) — and it
+    /// is never relayed: the producer's confirm says nothing about what a
+    /// consumer later does with the message
+    /// ([GUARANTEES.md] §2).
+    ///
+    /// A v0 sender leaves it absent, and an absent key is not
+    /// `Acknowledgement::None`: it says this hop makes no claim beyond the
+    /// transport receipt QUIC already gave.
+    ///
+    /// [GUARANTEES.md]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/GUARANTEES.md
+    pub achieved: Option<Acknowledgement>,
 }
 
 impl DataHeader {
@@ -1196,7 +1220,8 @@ impl DataHeader {
             + u64::from(self.tracestate.is_some())
             + u64::from(self.topic.is_some())
             + u64::from(self.sequence.is_some())
-            + u64::from(self.producer.is_some());
+            + u64::from(self.producer.is_some())
+            + u64::from(self.achieved.is_some());
         encode_with(|e| {
             e.map(count)?;
             if let Some(endpoint) = &self.endpoint {
@@ -1224,6 +1249,9 @@ impl DataHeader {
             }
             if let Some(producer) = &self.producer {
                 e.u64(data_key::PRODUCER)?.bytes(producer)?;
+            }
+            if let Some(achieved) = self.achieved {
+                e.u64(data_key::ACHIEVED)?.u64(achieved.to_wire())?;
             }
             Ok(())
         })
@@ -1253,6 +1281,19 @@ impl DataHeader {
                     data_key::TOPIC => header.topic = Some(m.text(key, limits::MAX_TOPIC_BYTES)?),
                     data_key::SEQUENCE => header.sequence = Some(m.u64()?),
                     data_key::PRODUCER => header.producer = Some(m.byte_array(key)?),
+                    // An unknown level is not a level: a peer naming one this
+                    // version does not define is refused rather than silently
+                    // read as the weakest, because the value decides what a
+                    // producer believes about its message.
+                    data_key::ACHIEVED => {
+                        let value = m.u64()?;
+                        header.achieved = Some(Acknowledgement::from_wire(value).ok_or(
+                            HeaderError::UnknownLevel {
+                                dimension: "achieved",
+                                value,
+                            },
+                        )?);
+                    }
                     _ => m.skip()?,
                 }
             }
@@ -1588,6 +1629,7 @@ mod tests {
             topic: Some("px.eur".into()),
             sequence: Some(u64::MAX),
             producer: Some([0x5A; limits::PRODUCER_BYTES]),
+            achieved: Some(Acknowledgement::Processed),
         };
         assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
     }
@@ -1616,6 +1658,7 @@ mod tests {
             topic: Some("k".into()),
             sequence: Some(9),
             producer: Some([0u8; limits::PRODUCER_BYTES]),
+            achieved: Some(Acknowledgement::Accepted),
         };
         let bytes = h.encode();
         let mut d = Decoder::new(&bytes);

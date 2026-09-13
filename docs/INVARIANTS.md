@@ -100,6 +100,26 @@ because a bound that can refuse the only message in a queue is a deadlock and no
 so the exposure is `max_bytes - 1 + max_message_size` and `ZMQ_MAXMSGSIZE` is what bounds
 the single-message case (B-096, `docs/libraries/zmq.md` §9).
 
+**And a payload-byte budget is not a bound either, if a message may be empty.** The L2
+broker's queue is the case: `weida_broker::BrokerConfig::queue_bytes` (8 MiB per queue)
+bounds what a queue holds, but a producer of zero-byte messages costs zero payload bytes and
+one live `QueuedMessage` each, so the byte budget alone would bound nothing at all. Each
+message is therefore charged `PER_MESSAGE_OVERHEAD` (256 B) plus its payload plus the labels
+the queue retains, which makes `queue_bytes / PER_MESSAGE_OVERHEAD` the ceiling on the
+message count as well. Two further bounds belong to that config rather than to `Limits`,
+because a queue outlives every connection that touches it: `max_queues` (checked before any
+path is claimed) and `max_unacked` (the ceiling on any credit the broker will honour). The
+payload is read under the queue's *remaining* budget, never under the producer's advisory
+`content_len`, so an over-budget message is refused rather than buffered and then rejected
+(B-201, [decisions/0018](decisions/0018-minimal-broker.md) §4.8).
+
+**The queue's refusal is the opposite choice from `weida-zmq`'s, and deliberately so.** A
+ZeroMQ queue that refused the only message in an empty queue would deadlock a pattern that
+has nowhere else to put it; a broker that accepted a message larger than the queue it is
+held in would break the bound it exists to keep, and the producer *does* have somewhere to
+put the refusal — it is an exchange, and `{REJECTED}` is an answer. Same invariant, two
+shapes, because the escape route differs.
+
 The hot-path invariant binds all three structures that now exist: a connection that
 negotiated `Ordering = None` and `Deduplication = None` — which is every connection that
 declares nothing, since `core` is the default guarantee set — allocates none of them. That
