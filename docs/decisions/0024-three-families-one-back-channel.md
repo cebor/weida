@@ -125,35 +125,51 @@ and MQTT all have is **this system's degenerate case**, not a different mechanis
 application asks for `fin_only` and gets what it had; nothing in the design has to argue that
 whole-message verdicts are obsolete.
 
-**4.4 The back channel is the reply half for the verdict and datagrams for progress.** Both, with
-the split decided by what each can promise:
+**4.4 The back channel is a reliable stream, and a transfer that orders cursors is an exchange.**
+The owner's requirement decides this: "auf die ack muss man sich trotzdem verlassen koennen,
+wenigstens auf das fin" — and a verdict that may be lost is not a verdict. So the terminal cursor
+rides a **stream**, and the cheapest stream is the one the transfer already has.
 
-- **The reply half of an exchange carries the terminal cursor reliably.** It is ordered, it is
-  already the correlation [0023 §4.3], and a verdict that may be lost is not a verdict.
-- **A QUIC datagram carries intermediate cursors unreliably**, which is sound because an absolute
-  cursor loses nothing to loss or reordering, and because quinn's own congestion behaviour drops
-  the *oldest* unsent datagram — the one the newest supersedes (§2).
+- **An exchange's reply half carries every cursor and the terminal verdict**, reliably and in
+  order. It is already the correlation [0023 §4.3], so nothing on the wire names the transfer,
+  and the shape already exists in the implementation: the broker's confirm *is* an exchange reply
+  carrying the achieved level as DATA key `8` (B-201).
+- **A transfer that orders cursors is therefore sent as an exchange**, not as a one-way transfer.
+  That is one bidirectional stream instead of one unidirectional stream — the same single stream,
+  a direction wider — and it changes **no pattern's semantics**, because Push/Pull's defining
+  property is that the *application* does not answer, while a cursor is a report rather than a
+  reply. Asking for a reliable answer is asking for a stream that can carry one.
+- **A producer that orders nothing keeps its one-way transfer** and gets the transport receipt and
+  nothing more, exactly as [0018 §4.6] says.
 
-This resolves a gap [0023 §4.3] left open and named as a trade: "a one-way transfer gets no
-cursors, because it has no reply half". With datagrams it can have **progress** without giving up
-its shape — a Push producer may watch a consumer's stages advance — and it still gets no reliable
-terminal verdict, because that is what an exchange is for. The trade moves from "all or nothing"
-to "progress yes, certainty no", which is the honest position for a fire-and-forget send.
+**Datagrams are rejected, and the reason is worth keeping.** An earlier draft of this note put
+progress cursors on QUIC datagrams, and the analysis stands as far as it went: an absolute cursor
+can afford loss, and quinn discards the *oldest* unsent datagram, which is the one a newer cursor
+makes redundant. But weigh what that bought. A datagram is not on a stream, so it needed the
+connection-local stream id anyway — **the addressing cost was identical**. What it saved was
+per-cursor overhead; what it cost was the one property the mechanism must have. When the only
+advantage is cost and the requirement is reliability, the reliable carrier wins outright.
 
-Three rules keep this from becoming a second protocol:
+**The fallback, if per-transfer reply halves ever cost too much.** At very high fan-out — millions
+of small messages, each ordering cursors — a reply half per transfer is a reader per in-flight
+transfer. The alternative is then a **single long-lived back-channel stream per connection**
+carrying cursor frames tagged with the connection-local stream id they report about, which
+amortizes stream setup and keeps reliability. It is deliberately *not* the default, because it
+reintroduces addressing that [ARCHITECTURE §1] removed on purpose: "the correlation machinery
+existed only because replies rode separate streams… machinery whose entire job was to undo a
+choice made one layer down". A separate back-channel stream makes that choice again, so it needs a
+measurement to justify it (§4.8), not a preference.
 
-1. **A datagram cursor is never load-bearing.** Nothing waits on one, no guarantee is expressed
-   through one, and a peer that never receives a single datagram behaves correctly — it merely
-   learns less. This is the rule that lets the channel be unreliable at all.
-2. **Datagrams are negotiated by availability, not by promise.** `max_datagram_size()` returning
-   `None` means the peer disabled them or does not support them; a reporter then falls back to the
-   reply half where one exists, and to silence where none does. No negotiation failure, because
-   nothing was promised.
-3. **A datagram cursor carries the connection-level addressing a stream would have carried
-   implicitly.** This is the one real cost: a datagram is not on a stream, so it must name what it
-   reports about. The identifier is a **connection-local stream id**, which QUIC already assigns
-   and both ends already know — not a new transfer identifier, and not visible in any API
-   ([PROTOCOL §6.2]'s removal of `transfer_id` stands).
+Two rules survive from the datagram draft unchanged, because they are about the cursor and not
+about its carrier:
+
+1. **Nothing waits on a cursor.** No guarantee is expressed through one, and a peer that receives
+   none behaves correctly — it merely learns less. This is what keeps the back channel out of the
+   critical path however it travels.
+2. **Coalescing is free**, because the cursors are absolute: a reporter may drop every
+   intermediate cursor and the receiver still ends at the same offset per level [0023 §4.3b].
+   Reliability and batching are therefore not in tension — the stream delivers what is sent, and
+   the reporter decides how much that is.
 
 **4.5 Materialization is a per-hop choice, and this is the headline.** The video case states the
 property exactly: the uploader is satisfied by the **first hop's** transport receipt, and that hop
@@ -182,11 +198,12 @@ B-237, B-238). `Delivery` keeps its exact meaning, transport state stays hidden
 [0023 §4.1], and adapter honesty is untouched — a foreign protocol that has one whole-message
 ack maps to `fin_only` and says so.
 
-**4.8 Status is `provisional`, and what would change it.** The datagram half is the part with a
-measurement attached: if progress cursors on datagrams turn out to be dropped so often under load
-that applications treat them as absent, the mode collapses into `coalesced` on the reply half and
-one-way transfers go back to having no cursors. The number to measure is delivered fraction under
-congestion at a realistic datagram send-buffer size.
+**4.8 Status is `provisional`, and what would change it.** The carrier is the part with a
+measurement attached. §4.4's fallback becomes the default if a reply half per transfer proves too
+expensive at high fan-out; the numbers to measure are memory and scheduling cost per in-flight
+exchange against the same workload sent as one-way transfers, at a fan-out where the reader count
+is the dominant term. Until that measurement exists, the default is the stream the transfer
+already has.
 
 ## 5. Consequences and follow-ups
 
@@ -195,11 +212,11 @@ congestion at a realistic datagram send-buffer size.
   describe crate boundaries.
 - **[PATTERNS.md](../PATTERNS.md)** gains the sentence that the families overlap and why, next to
   §1.11's "a message is a stream that reached FIN".
-- **[PROTOCOL.md](../PROTOCOL.md)** gains the datagram back channel: the cursor payload of kind
-  `6` reused verbatim, plus the connection-local stream id of §4.4.3, and the statement that a
-  datagram is never load-bearing.
-- **[0023](0023-completion-is-a-cursor.md) §4.3** is amended: its "a one-way transfer gets no
-  cursors" becomes "no reliable terminal cursor; progress may travel by datagram".
+- **[PROTOCOL.md](../PROTOCOL.md)** states that cursors travel only on an exchange's reply half,
+  that a transfer ordering cursors is therefore an exchange, and that nothing waits on a cursor.
+  No datagram extension is used, so §4's stream-shape table stays as it is.
+- **[0023](0023-completion-is-a-cursor.md) §4.3** keeps its rule — a one-way transfer gets no
+  cursors — and gains the consequence: ordering cursors makes the transfer an exchange.
 - **Backlog.** Three items, links relative to `docs/BACKLOG.md`.
 
 ### B-239 — The three ack modes, including `fin_only`
@@ -207,10 +224,10 @@ kind: code | size: 60 | status: blocked | needs: [B-233]
 acceptance: a sender states per message which levels it wants and in which mode — `per_chunk`, `coalesced { bytes, interval }`, `fin_only` ([0024](decisions/0024-three-families-one-back-channel.md) §4.3) — and the reporting side honours it, with `coalesced` proved lossless: a reporter that coalesces 100 advances into 3 frames leaves the receiver with the same final offset per level as one that reports all 100, because cursors are absolute. `fin_only` produces **exactly one** cursor frame per level and is the mode an adapter with a whole-message ack maps to; a test asserts that `fin_only` plus a `Stored` level is byte-for-byte the classic confirm, so the migration story is real rather than asserted.
 note: the mode is configuration, not protocol: the frame of B-233 is unchanged by all three.
 
-### B-240 — Progress cursors over QUIC datagrams
-kind: code | size: 90 | status: blocked | needs: [B-239]
-acceptance: intermediate cursors travel as QUIC datagrams carrying the kind `6` payload plus the connection-local stream id they report about ([0024](decisions/0024-three-families-one-back-channel.md) §4.4); a **one-way transfer** therefore gets progress where it previously got nothing, and still no terminal verdict. Three properties pinned: a peer with datagrams disabled (`max_datagram_size()` is `None`) behaves correctly and merely learns less; a dropped or reordered datagram changes no outcome, because the receiver keeps the maximum per level; and **nothing waits on a datagram** — a test with every datagram discarded must still complete every transfer and every guarantee.
-note: quinn drops the oldest unsent datagram to make room for the newest, which is exactly the one an absolute cursor makes redundant — the congestion policy and the cursor algebra agree, and the test for the dropped case is therefore cheap to write.
+### B-240 — Ordering cursors makes a transfer an exchange
+kind: code | size: 60 | status: blocked | needs: [B-239]
+acceptance: a send that orders cursors opens a **bidirectional** stream and reads its reply half, where a one-way send opens a unidirectional one — decided by the request, not by the pattern ([0024](decisions/0024-three-families-one-back-channel.md) §4.4). Proved on Push/Pull, the pattern where it is surprising: the same `push` call with cursors ordered yields the same delivery semantics, the same round-robin selection and the same refusal behaviour, plus a reliable terminal cursor; with none ordered it is byte-for-byte today's one-way transfer. A test asserts the stream **kind** in both cases, because that is the whole mechanism, and one asserts that a stalled or unread back channel blocks no transfer — nothing waits on a cursor.
+note: no datagram extension and no new addressing: the reply half is already the correlation, and the broker's existing confirm (DATA key `8` on a reply half, B-201) is the shape this generalizes.
 
 ### B-241 — ARCHITECTURE §1: three vocabularies instead of an onion
 kind: spec | size: 30 | status: done | needs: []
@@ -219,8 +236,9 @@ note: done. The onion was never wrong about dependencies and always wrong as a u
 
 ## 6. What this note does not decide
 
-- **The datagram wire format's exact fields.** B-240's work: the kind `6` payload is settled, the
-  envelope that names the stream is not.
+- **Whether the per-connection back-channel stream of §4.4 is ever built.** It is the named
+  fallback with a measurement attached (§4.8), not a plan, and it is the only place a
+  connection-local stream id would appear on the wire.
 - **Whether a broker ever *requires* cursors.** It prescribes which levels it reports; whether it
   refuses a producer that asks for none is a broker policy question, and queue admission
   [0018 §4.6] does not need one.
@@ -243,7 +261,9 @@ BUS); [amqp10.md](../research/amqp10.md) §6 (whole-delivery settlement, the `fi
 
 External, read 2026-09-13: quinn 0.11.11 `src/connection.rs` — `send_datagram` ("unreliable,
 unordered… may be lost or delivered out of order", oldest-first discard of unsent datagrams),
-`send_datagram_wait`, `max_datagram_size` (`None` when unsupported or disabled, "a little over a
-kilobyte at minimum" when the peer's limit is large); quinn-proto 0.11
-`src/config/transport.rs` — `datagram_receive_buffer_size(None)` disables incoming datagrams and
-forbids the peer larger ones, `datagram_send_buffer_size` drops older datagrams when full.
+`max_datagram_size` (`None` when unsupported or disabled, "a little over a kilobyte at minimum"
+when the peer's limit is large); quinn-proto 0.11 `src/config/transport.rs` —
+`datagram_receive_buffer_size(None)` disables incoming datagrams, `datagram_send_buffer_size`
+drops older datagrams when full. Read while evaluating datagrams as the back channel and
+**recorded because the option was rejected**: the properties are real, they are simply not worth a
+verdict that may be lost (§4.4).
