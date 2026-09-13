@@ -184,7 +184,7 @@ Three things, and only three:
   gate yet and were run by hand this session.
 - **12 items are `ready`, two are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
   B-068, a licence and a publication target) and **one is `parked`** (A5's control tier by
-  0011 §4.3). Of **221** filed items, **203 are `done`**, and the remaining twelve `ready` are exactly two
+  0011 §4.3). Of **221** filed items, **204 are `done`**, and the remaining twelve `ready` are exactly two
   kinds: **ten code slices of the two phases the user chooses between** (B-201..B-203, the
   broker of [0018](decisions/0018-minimal-broker.md); B-211..B-217, the JVM binding of
   [0019](decisions/0019-jvm-binding.md)), and **two sentences in a file this loop does not
