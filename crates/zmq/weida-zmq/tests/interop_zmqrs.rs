@@ -96,16 +96,39 @@ fn context() -> Context {
     Context::new(ContextConfig::default()).expect("context")
 }
 
-/// An endpoint nobody is listening on yet, for the half of the matrix where
-/// zmq.rs binds: its `bind` takes a port, and only our own `bind` can report
-/// one back.
-async fn free_endpoint() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("a free port");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-    format!("tcp://127.0.0.1:{port}")
+/// How many OS-chosen ports one bind may lose to another test before the
+/// machine, rather than the race, is the explanation.
+const PROBES: usize = 8;
+
+/// Binds *their* socket to a loopback port the OS picked, retrying on
+/// `AddrInUse` with a fresh probe, and returns the endpoint both sides use.
+///
+/// Only our own `bind` can report a port back; zmq.rs's takes a concrete one,
+/// so the port has to be probed by binding `127.0.0.1:0`, reading it and
+/// letting go — and between letting go and their bind, another test binary of
+/// the suite can take it. That window cannot be closed while their bind needs
+/// a number, so it is retried instead; the bound keeps a machine with no free
+/// ports from looking like a flake.
+async fn bound_by_them(socket: &mut impl Socket) -> String {
+    let mut taken = None;
+    for _ in 0..PROBES {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free port");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let endpoint = format!("tcp://127.0.0.1:{port}");
+        match within(socket.bind(&endpoint)).await {
+            Ok(_) => return endpoint,
+            Err(zeromq::ZmqError::Network(error))
+                if error.kind() == std::io::ErrorKind::AddrInUse =>
+            {
+                taken = Some(port);
+            }
+            Err(error) => panic!("zmq.rs binds {endpoint}: {error}"),
+        }
+    }
+    panic!("{PROBES} probed ports in a row were taken, the last of them {taken:?}");
 }
 
 /// The text of a single-frame message of ours.
@@ -173,11 +196,8 @@ async fn our_rep_answers_a_zmq_rs_req() {
 #[tokio::test]
 async fn our_req_is_answered_by_a_zmq_rs_rep() {
     let context = context();
-    let endpoint = free_endpoint().await;
     let mut responder = zeromq::RepSocket::new();
-    within(responder.bind(&endpoint))
-        .await
-        .expect("zmq.rs binds");
+    let endpoint = bound_by_them(&mut responder).await;
 
     let mut requester = ReqSocket::new(&context).expect("req");
     requester.connect(&endpoint).expect("connect");
@@ -237,9 +257,8 @@ async fn our_router_routes_a_zmq_rs_dealer() {
 #[tokio::test]
 async fn our_dealer_talks_to_a_zmq_rs_router() {
     let context = context();
-    let endpoint = free_endpoint().await;
     let mut router = zeromq::RouterSocket::new();
-    within(router.bind(&endpoint)).await.expect("zmq.rs binds");
+    let endpoint = bound_by_them(&mut router).await;
 
     let mut dealer = DealerSocket::new(&context).expect("dealer");
     dealer.connect(&endpoint).expect("connect");
@@ -293,9 +312,8 @@ async fn our_pull_drains_a_zmq_rs_push() {
 #[tokio::test]
 async fn our_push_feeds_a_zmq_rs_pull() {
     let context = context();
-    let endpoint = free_endpoint().await;
     let mut puller = zeromq::PullSocket::new();
-    within(puller.bind(&endpoint)).await.expect("zmq.rs binds");
+    let endpoint = bound_by_them(&mut puller).await;
 
     let mut pusher = PushSocket::new(&context).expect("push");
     pusher.connect(&endpoint).expect("connect");
@@ -359,11 +377,8 @@ async fn our_pub_reaches_a_zmq_rs_sub() {
 #[tokio::test]
 async fn our_sub_receives_from_a_zmq_rs_pub() {
     let context = context();
-    let endpoint = free_endpoint().await;
     let mut publisher = zeromq::PubSocket::new();
-    within(publisher.bind(&endpoint))
-        .await
-        .expect("zmq.rs binds");
+    let endpoint = bound_by_them(&mut publisher).await;
 
     let mut subscriber = SubSocket::with_options(
         &context,
@@ -433,11 +448,8 @@ async fn our_xpub_serves_a_zmq_rs_xsub() {
 #[tokio::test]
 async fn our_xsub_subscribes_to_a_zmq_rs_xpub() {
     let context = context();
-    let endpoint = free_endpoint().await;
     let mut publisher = zeromq::XPubSocket::new();
-    within(publisher.bind(&endpoint))
-        .await
-        .expect("zmq.rs binds");
+    let endpoint = bound_by_them(&mut publisher).await;
 
     let mut subscriber = XSubSocket::with_options(
         &context,
@@ -507,11 +519,8 @@ async fn a_heartbeat_is_suppressed_against_a_three_zero_peer() {
 #[tokio::test]
 async fn the_command_subscription_form_is_not_understood_by_zmq_rs() {
     let context = context();
-    let endpoint = free_endpoint().await;
     let mut publisher = zeromq::PubSocket::new();
-    within(publisher.bind(&endpoint))
-        .await
-        .expect("zmq.rs binds");
+    let endpoint = bound_by_them(&mut publisher).await;
 
     // The default form: the command goes out and nothing comes back.
     let mut commanding = SubSocket::new(&context).expect("sub");
