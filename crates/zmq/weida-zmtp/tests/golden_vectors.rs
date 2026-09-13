@@ -269,13 +269,21 @@ fn golden_unknown_command_names_are_refused_by_name() {
 /// Asserts one CURVE command vector, the way [`assert_command`] does for the
 /// other mechanisms: the whole frame encodes to `expected`, and `expected`
 /// decodes back to the same command.
+///
+/// The frame kind is part of the vector: a `MESSAGE` travels behind a
+/// message header and the four handshake commands behind command headers,
+/// which is the mixture §10.1 publishes and libzmq requires.
 #[track_caller]
 fn assert_curve(command: CurveCommand<'_>, expected: &[u8]) {
     let frame_bytes = command.encode().expect("encode");
     assert_eq!(frame_bytes, expected, "{}: frame bytes", command.name());
 
     let (header, body, used) = frame::decode(expected, CAP).expect("decode");
-    assert_eq!(header.kind, FrameKind::Command, "{}", command.name());
+    let want = match command {
+        CurveCommand::Message { .. } => FrameKind::Message { more: false },
+        _ => FrameKind::Command,
+    };
+    assert_eq!(header.kind, want, "{}: frame kind", command.name());
     assert_eq!(used, expected.len(), "{}: octets consumed", command.name());
     assert_eq!(
         header.len as usize,
@@ -410,7 +418,10 @@ fn golden_curve_ready_and_message_are_at_their_minima() {
         ]),
     );
 
-    // `message = %d7 "MESSAGE" nonce message-box`, 8 + 8 + 17 = 33 = 0x21.
+    // `message = %d7 "MESSAGE" nonce message-box`, 8 + 8 + 17 = 33 = 0x21,
+    // behind a **message** frame header (`00`) and not a command one: the
+    // body is a command body, but the form libzmq accepts is a message
+    // frame, and the command-framed `MESSAGE` closes the connection.
     // The box is never empty: its plaintext starts with the flags octet that
     // carries MORE, so even a zero-length message payload is 17 octets.
     let message_box = run(0xE7, curve::MESSAGE_BOX_MIN_LEN);
@@ -420,7 +431,7 @@ fn golden_curve_ready_and_message_are_at_their_minima() {
             message_box: &message_box,
         },
         &vector(&[
-            b"\x04\x21",
+            b"\x00\x21",
             b"\x07MESSAGE",
             b"\x00\x00\x00\x00\x00\x00\x00\x04",
             &message_box,
