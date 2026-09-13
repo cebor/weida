@@ -163,16 +163,17 @@ Two things, the first one changed shape:
   green at **1680 tests** with 37 ignored on Linux and at 1658 on Windows, and the tree is
   clean. The tree has **no known red**, on either platform, in any configuration, including
   the four that are not in the gate yet.
-- **19 items are `ready`, none is `blocked`** and **one is `parked`** (A5's control tier by
-  0011 §4.3). Of 190 filed items, 170 are `done`; B-189, the NNG survey interop hang on
+- **18 items are `ready`, none is `blocked`** and **one is `parked`** (A5's control tier by
+  0011 §4.3). Of 190 filed items, 171 are `done`; B-189, the NNG survey interop hang on
   Windows, closed the same evening as a test race, not a library bug.
 - **Of the six the night left behind**, four are closed this session: **B-182** (with B-188:
   the NNG survey flake was a library bug the second platform exposed every time), **B-183**
   and **B-185** (the two binding parity documents, `nng-py.md` and `mqtt-py.md`, now beside
   the other three) and **B-176** (the adapters index says what the tree has). Two stand:
   **B-184** (the gate change above, §6) and **B-180** (an exact count in `weida`'s drain
-  test waited for only approximately). One is new: **B-190**, `weida-nng-py`'s wheel has
-  never been built — the gap B-187 closed for NATS, found by its own parity document.
+  test waited for only approximately). One was filed and closed the same hour: **B-190**,
+  `weida-nng-py`'s wheel, built and run with no toolchain like the four others' — the gap
+  its own parity document found.
 - **The older loose ends**, unchanged by tonight: B-060, B-061, B-064..B-068 (requirement-driven
   work), B-096 and B-099 (a byte ceiling for the per-peer queues and the peer count that is
   its other half), B-104, B-106, B-107, B-109, B-110 (five small ones, under two hours
