@@ -292,9 +292,21 @@ impl Draining {
     }
 
     /// Starts the drain and returns once its admission flag is certainly set.
-    fn begin(&self, deadline: Duration) -> tokio::task::JoinHandle<weida::Drained> {
+    ///
+    /// `Runtime::drain` stops admission before its first await, so polling
+    /// the future **once** here is the ordering: after it, a dial or a stream
+    /// is late by construction, and no timer has to be outrun. The rest of
+    /// the drain runs on a task, as a caller's would.
+    async fn begin(&self, deadline: Duration) -> tokio::task::JoinHandle<weida::Drained> {
         let runtime = self.runtime.clone();
-        tokio::spawn(async move { runtime.drain(deadline).await })
+        let mut drain = Box::pin(runtime.drain(deadline));
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx))).await;
+        assert!(
+            first.is_pending(),
+            "a drain with a stalled receipt outstanding cannot finish on its first poll"
+        );
+        tokio::spawn(drain)
     }
 }
 
@@ -317,8 +329,7 @@ async fn a_draining_binding_refuses_a_new_connection() {
         .await
         .expect("a dial before the drain must be accepted");
 
-    let drain = server.begin(Duration::from_secs(2));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let drain = server.begin(Duration::from_secs(2)).await;
 
     let err = within(pusher.connect(&format!("{}/late", server.url)))
         .await
@@ -369,8 +380,7 @@ async fn a_draining_runtime_refuses_a_late_stream_on_an_open_connection() {
         .await
         .expect("a transfer before the drain is acknowledged");
 
-    let drain = server.begin(Duration::from_secs(2));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let drain = server.begin(Duration::from_secs(2)).await;
 
     let mut late = within(pusher.open(TransferMeta::default()))
         .await
