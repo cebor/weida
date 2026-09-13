@@ -6,9 +6,9 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `626d5eb`, 2026-09-13 ~20:45 UTC. Tree clean, gate green on **two
-platforms**: Linux **1682 tests** (218 at the start of the session, 764 before the four
-parallel workstreams) and a Windows 11 VM at the same commit with 1660 across 119 binaries,
+**Snapshot:** main `0d8c35a`, 2026-09-13 ~22:30 UTC. Tree clean, gate green on **two
+platforms**: Linux **1687 tests** (218 at the start of the session, 764 before the four
+parallel workstreams) and a Windows 11 VM at the same commit with 1665 across 119 binaries,
 each with 37 ignored — the interop suites that need a library or a broker the machine does
 not have — plus the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`,
 `weida-nng`'s `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
