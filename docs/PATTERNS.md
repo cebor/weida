@@ -270,6 +270,53 @@ transfer is one channel pair (inproc) or one OS connection (`AF_UNIX`).
 
 ---
 
+### 1.11 An interrupted stream: cancel, reschedule, reconnect — never a resend
+
+A message can be batched and retried because it is complete before it is sent. A **stream is
+unfinished by definition** until its FIN, so the interesting failure is not "was it delivered"
+but "what does a half-sent stream mean". weida answers that in one sentence and then hands the
+decision over:
+
+> **Within a connection, QUIC retransmits; when the connection ends, an unfinished stream is
+> gone, and weida does not resend it.**
+
+What the two sides observe is already exact. The sender gets `ConnectionLost` before FIN and `Ok`
+after it (§1.1, the pattern tables below); the receiver never sees an unfinished stream as
+complete — `AsyncRead` fails with `ConnectionReset`, `collect` with `Error::Canceled`, **never**
+`Ok(0)` (§1.5). "Half a frame is not a frame" (§4.1) is the rule, not a special case.
+
+What happens next is the **application's** choice, and there are exactly three, one of which is
+usually wrong:
+
+| Answer | When it is right | What it costs |
+| --- | --- | --- |
+| **cancel** — the transfer is abandoned | the payload was only useful whole and only useful now: a video frame, a live tail, a snapshot that is already stale | nothing; this is the default, because it is what the transport already did |
+| **reschedule** — the work is re-derived and sent as a *new* stream | the sender still holds or can regenerate the source, and the receiver is idempotent or does not care | the sender keeps the source, or can produce it again |
+| **reconnect and continue** — a new stream carries the remainder | the payload is large, immutable and expensive to re-send, and the receiver reported **how far it got** | an application-level identity for "the same payload", plus a receiver that persisted a prefix. Both are the application's; weida supplies neither |
+
+The third is the one that needs the cursors of
+[decisions/0023](decisions/0023-completion-is-a-cursor.md): a receiver that reports "durable up to
+*N*" is telling the sender what it may skip, and the sender decides. weida does **not** decide,
+does not remember a payload, and does not re-open a stream on anyone's behalf — a library that
+did would be rebuilding retries, which are Phase 4 and, in every system this repository surveyed,
+application-level (ZeroMQ's Lazy Pirate and Titanic are recipes, not features).
+
+Which answer a pattern needs follows from the pattern, not from the transport:
+
+| Pattern | The usual answer | Why |
+| --- | --- | --- |
+| Req/Rep | **reschedule** | a request has a reply half, so the requester learns the outcome and can re-issue; `Indeterminate` is exactly the case where re-issuing must be safe ([FAILURE_MODEL.md](FAILURE_MODEL.md)) |
+| Push/Pull | **reschedule**, and only the sender can | the puller cannot ask: a one-way transfer has no reply half. This is the trade the pattern is |
+| Pub/Sub | **cancel** | the copy is per subscriber and best effort by definition; a dropped copy is counted, not retried ([GUARANTEES.md](GUARANTEES.md) §6) |
+| a queue (L2) | **cancel on the way in, reschedule on the way out** | an inbound stream that never reached FIN was never a message, so nothing was admitted and nothing was confirmed; a delivery that broke is redelivered, because the queue still holds the message |
+
+That last row is the whole bridge from the stream primitives to the message world: **a message is
+a stream that reached FIN.** A queue's unit is a completed stream, which is why an interrupted
+admission needs no vocabulary of its own — there is nothing to talk about yet — and why a
+redelivery is an ordinary new stream rather than a continuation.
+
+---
+
 ## 2. Req/Rep
 
 One bidirectional stream per exchange. The requester writes the request on its half and reads

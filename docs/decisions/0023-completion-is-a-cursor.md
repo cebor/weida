@@ -154,11 +154,23 @@ configuration and never less. Every cursor system has this number — Kafka's co
 AMQP's credit top-up threshold — and naming it here is what keeps it from being invented per
 slice.
 
-**4.6 What this makes possible, stated because it is the reason to do it.** Resumption. A store
-that reports `Stored(Written)` up to *N* can be asked to continue from *N* after a restart, and a
-consumer that settled up to *N* is redelivered from *N* rather than from zero. Neither is
-expressible with a whole-message verdict, and both are what "all user payloads may remain streams
-end-to-end" [INVARIANTS] has to mean at L2 if it means anything.
+**4.6 A cursor reports responsibility; it is not a recovery mechanism.** This replaces what the
+first draft of this sub-section claimed — "resumption" — and the correction is the owner's: within
+a connection QUIC retransmits, and **when the connection ends there is no resend above it**. A
+cursor therefore buys exactly one thing: it tells the layer above **how far responsibility got**,
+so that the application's own transaction logic can act on a number instead of a guess. Whether it
+then cancels, re-derives the work, or opens a new stream carrying the remainder is the
+application's decision, and which of the three is right follows from the pattern rather than from
+the protocol ([PATTERNS.md](../PATTERNS.md) §1.11).
+
+What that decision needs, weida deliberately does not supply: an application-level identity for
+"the same payload" and a receiver that persisted a prefix. A library that supplied them would be
+rebuilding retries, which are Phase 4 and, in every system surveyed here, application-level.
+
+So the honest statement of the value is narrower than the first draft's and survives contact with
+the failure model: a whole-message verdict tells an interrupted sender **nothing**, and a cursor
+tells it a number. For a 1 GiB transfer that is the difference between "unknown" and "900 MiB of
+this is durable at the far end" — and what to do with that is the sender's business.
 
 **4.7 What does not change.** L0 gains nothing and loses nothing: two stream kinds, `Delivery`,
 refusal by stop code, cancellation. The ZeroMQ analogies are untouched, because none of them has
@@ -199,10 +211,10 @@ kind: code | size: 60 | status: blocked | needs: [B-233, the Phase 5 store]
 acceptance: a hop with a store reports `Stored(Written)` and, where it flushes, `Stored(Flushed)` up to a byte offset on the reply half, at a granularity from its own configuration — "every *N* bytes or every *T* milliseconds, whichever comes first", with a default and the rule that more often is always allowed and less often never ([0023](decisions/0023-completion-is-a-cursor.md) §4.5). A peer that negotiated `TransportReceipt` receives **no** cursor frames at all; a peer that negotiated `Stored` and talks to a hop with no store fails the negotiation rather than being sent nothing ([0006](decisions/0006-guarantee-sets.md) §4.4).
 note: the granularity number is the whole of the configuration surface, and it is named here so that no slice invents its own.
 
-### B-235 — Resumption: continue at the cursor instead of starting over
-kind: code | size: 90 | status: blocked | needs: [B-234]
-acceptance: the property the cursor exists for, proved twice. A producer whose transfer was interrupted after *N* durable bytes continues at *N* rather than re-sending the prefix; a consumer that settled up to *N* and then died is redelivered **from *N***, not from zero, and the redelivery says so ([0023](decisions/0023-completion-is-a-cursor.md) §4.6). Both tests use a payload larger than any window so the prefix is real, and both assert the bytes rather than a counter.
-note: this is the item that makes [0023](decisions/0023-completion-is-a-cursor.md) worth its frame; without it a cursor is a progress bar.
+### B-235 — What an interrupted stream means, per pattern
+kind: spec | size: 45 | status: done | needs: []
+acceptance: [PATTERNS.md](PATTERNS.md) gains the section a stream-shaped system needs and did not have: a stream is unfinished by definition, so the question is not "was it delivered" but what a half-sent stream means — **within a connection QUIC retransmits, and when the connection ends weida does not resend**. The three answers an application has (cancel, reschedule, reconnect-and-continue) with when each is right and what it costs, and which one each pattern usually needs: Req/Rep reschedules because it has a reply half, Push/Pull reschedules and only the sender can, Pub/Sub cancels because a copy is best effort by definition, and a queue cancels on the way in and redelivers on the way out.
+note: done, docs-only, and it replaces an item that was wrong: the first draft filed "resumption" as a protocol feature, which presumes a resend layer this system deliberately does not have. The correction came from the owner, and the sentence that makes the whole bridge is now in the document: **a message is a stream that reached FIN** — so a queue's unit is a completed stream, an interrupted admission needs no vocabulary of its own because nothing was a message yet, and a redelivery is an ordinary new stream rather than a continuation.
 
 ## 6. What this note does not decide
 
@@ -212,10 +224,11 @@ note: this is the item that makes [0023](decisions/0023-completion-is-a-cursor.m
   put it in the data API.
 - **Whether a store can always report a prefix offset.** §4.8's second reopening condition; a
   content-addressed store whose unit is an object may only be able to report whole objects.
-- **How a resumed transfer is addressed.** B-235's mechanism: continuing at *N* needs the
-  receiver to know which transfer is being continued, and the stream that carried the first
-  attempt is gone. That is the one place a new identifier might genuinely be needed, and it is
-  deliberately left to the item rather than guessed at here.
+- **Anything that looks like a resend.** There is no protocol-level continuation, and this note
+  does not add one: an application that wants to carry a remainder opens an ordinary new stream
+  and needs its own identity for "the same payload" ([PATTERNS.md](../PATTERNS.md) §1.11). The
+  first draft of this note filed that as an item and it was wrong — the mechanism it presumed
+  does not exist and is not wanted.
 - **Cursors between brokers.** Whether replication reports offsets to the leader or the leader
   infers them, which is [0020 §4.5]'s ordering rule seen from the other side.
 - **Anything about L0.** No transport cursor, no quinn change, no new field on `Delivery`.
