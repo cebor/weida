@@ -26,7 +26,7 @@ chaotically across phases.
 | 8 | Web adapter | not started |
 | 9 | Legacy adapters | in progress |
 | 10 | Language bindings | not started |
-| 11 | CLI and administration | not started |
+| 11 | CLI and administration | first slice done |
 | 12 | Documentation/site/stabilization | not started |
 
 Phases 0, 1 and 2 are complete. Phase 3 is under way: its first increment (Push/Pull and
@@ -54,6 +54,25 @@ byte budget, and the bounded close budget; `weida` uses it and its public API is
 weida's frames — so it is neither a phase nor a slice of one, but the crate boundary the two
 product lines share. `weida-runtime` depends on `weida-core` and `tokio` and on nothing
 else.
+
+**Phase 11's first slice is the `weida` binary** (B-060, `crates/weida/src/bin/weida.rs`),
+out of order for the same narrow reason Phase 9 is: it needs nothing from phases 4-10 and it
+is what a reader of this tree hits first, because until it existed the fastest way to find
+out whether an endpoint was reachable was to write and compile a program. Four verbs —
+`serve` (`--echo`, `--sink`, `--pub`), `request`, `send`, `sub` — over the same library the
+examples use, with the payload on stdin and stdout and nothing else on them, addresses and
+receipts on stderr, and exit codes that name the error vocabulary a script can branch on
+(`3` refused, `4` unknown endpoint, `5` no reply, `6` untrusted, `7` connection lost; `1`
+for everything else, deliberately including `Indeterminate`, which must not become a
+matchable number). Two things it does *not* do are decisions rather than omissions: a
+**bind** address is parsed by the binary rather than by `Address::parse`, because a bind
+address may say port `0` and carries no fingerprint — the one it prints is its output; and
+`weida+inproc://` is refused with a sentence naming why, since an in-process bus cannot be
+reached from another process and a CLI that pretended otherwise would only ever talk to
+itself. Standard input and output go through `std`, not tokio's `io-std` and `fs`: those
+features are not in the library's dependency set and a binary is not a reason to widen what
+every downstream crate compiles. What remains of the phase — administration, introspection
+of a running runtime, anything that needs a broker — is untouched.
 
 ### Phase 0 — Architecture/specification
 

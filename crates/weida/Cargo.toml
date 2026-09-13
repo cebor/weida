@@ -42,6 +42,14 @@ tokio = { workspace = true, features = ["io-std"] }
 criterion.workspace = true
 futures.workspace = true
 
+# `weida send|request|sub|serve` (B-060). `serve` mints a self-signed identity
+# when no `--identity` file is given, so the binary needs the `generate`
+# feature; a downstream build with the feature off skips it rather than
+# failing to compile.
+[[bin]]
+name = "weida"
+required-features = ["generate"]
+
 [[bench]]
 name = "echo"
 harness = false

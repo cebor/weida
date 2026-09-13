@@ -81,6 +81,26 @@ hand.
 | `crates/nats/weida-nats-py` | `weida-nats-py` | binding | the Python NATS surface: publish with headers, subscriptions as iterators, queue groups, `request` with a mandatory timeout, asyncio and synchronous |
 | `crates/interop/cross-tests` | `weida-cross-tests` | weida | no library code: one message in through one foreign protocol and out through the other, which belongs to neither family |
 
+## Quick start, without writing a program
+
+```
+$ cargo run -q -p weida --bin weida -- serve --echo 'weida://127.0.0.1:7443/echo'
+weida://sha256:22ed30a8…9f25@127.0.0.1:7443/echo
+```
+
+```
+$ printf 'hello weida' | cargo run -q -p weida --bin weida -- request 'weida://sha256:22ed30a8…9f25@127.0.0.1:7443/echo'
+hello weida
+```
+
+Four verbs: `serve` (with `--echo`, `--sink` or `--pub`), `request`, `send` and `sub`. The
+payload is on stdin and stdout and nothing else is, so `weida request … | sha256sum` means
+what it looks like; addresses, receipts and topics go to stderr. The address `serve` printed
+is the whole client configuration, exactly as in the section below. Every transport works
+the same way — `weida+unix://%2Ftmp%2Fs.sock/echo` for a socket, `weida+pipe://NAME/echo` for
+a Windows pipe — and the exit code names the error a script can act on: `3` refused, `4`
+unknown endpoint, `5` no reply, `6` untrusted, `7` connection lost.
+
 ## Identity in one line
 
 A weida peer is its public key. The server generates an identity and prints an address that
