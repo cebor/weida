@@ -32,19 +32,19 @@
 //! rather than being rejected, and `ZMQ_PROBE_ROUTER` is set on the *peer*
 //! rather than on the ROUTER.
 
-use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use weida_zmtp::SocketType;
 
 use crate::context::Context;
-use crate::engine::PeerId;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::identity::RoutingKey;
-use crate::message::{Message, Multipart};
+use crate::message::Multipart;
 use crate::options::SocketOptions;
 use crate::pipe::{MuteAction, Sent};
 use crate::socket::{SocketCore, socket_endpoints};
+use crate::split::{self, DealerRecv, DealerSend, RouterRecv, RouterSend, Routing};
 
 /// A DEALER socket: REQ without the lockstep.
 #[derive(Debug)]
@@ -77,29 +77,7 @@ impl DealerSocket {
     /// peer's queue is full and when there is no peer at all, bounded by
     /// `ZMQ_SNDTIMEO`.
     pub async fn send(&mut self, message: impl Into<Multipart>) -> Result<()> {
-        let limit = self.core.options().send_timeout;
-        let exec = self.core.exec().clone();
-        let message = message.into();
-        let delivered = match limit {
-            None => self.core.send_round_robin(message).await?,
-            Some(limit) => match exec
-                .within(limit, self.core.send_round_robin(message))
-                .await
-            {
-                Some(result) => result?,
-                None => {
-                    return Err(Error::EAGAIN(
-                        format!("no peer took the message within {limit:?} (ZMQ_SNDTIMEO)").into(),
-                    ));
-                }
-            },
-        };
-        if delivered.peer.is_none() {
-            return Err(Error::EAGAIN(
-                "no peer took the message; a DEALER never discards one".into(),
-            ));
-        }
-        Ok(())
+        split::send_never_dropping(&self.core, message.into()).await
     }
 
     /// The `ZMQ_DONTWAIT` form: `EAGAIN` rather than a wait.
@@ -113,32 +91,13 @@ impl DealerSocket {
         message: impl Into<Multipart>,
         limit: Duration,
     ) -> Result<()> {
-        let exec = self.core.exec().clone();
-        match exec
-            .within(limit, self.core.send_round_robin(message.into()))
-            .await
-        {
-            Some(result) => result.map(|_| ()),
-            None => Err(Error::EAGAIN(
-                format!("no peer took the message within {limit:?}").into(),
-            )),
-        }
+        split::send_within(&self.core, message.into(), limit).await
     }
 
     /// Receives the next message from any peer, fair-queued, bounded by
     /// `ZMQ_RCVTIMEO`.
     pub async fn recv(&mut self) -> Result<Multipart> {
-        let limit = self.core.options().recv_timeout;
-        let exec = self.core.exec().clone();
-        match limit {
-            None => self.core.recv_fair().await.map(|(_, message)| message),
-            Some(limit) => match exec.within(limit, self.core.recv_fair()).await {
-                Some(result) => result.map(|(_, message)| message),
-                None => Err(Error::EAGAIN(
-                    format!("nothing arrived within {limit:?} (ZMQ_RCVTIMEO)").into(),
-                )),
-            },
-        }
+        split::recv_fair(&self.core).await
     }
 
     /// The `ZMQ_DONTWAIT` form: `EAGAIN` when nothing is queued.
@@ -148,13 +107,24 @@ impl DealerSocket {
 
     /// Receives under an explicit wall-clock bound.
     pub async fn recv_timeout(&mut self, limit: Duration) -> Result<Multipart> {
-        let exec = self.core.exec().clone();
-        match exec.within(limit, self.core.recv_fair()).await {
-            Some(result) => result.map(|(_, message)| message),
-            None => Err(Error::EAGAIN(
-                format!("nothing arrived within {limit:?}").into(),
-            )),
-        }
+        split::recv_fair_within(&self.core, limit).await
+    }
+
+    /// Splits the socket into a sending half and a receiving half, usable
+    /// at the same time from two tasks.
+    ///
+    /// The two directions of a DEALER are independent — round-robin out,
+    /// fair-queue in, no alternation between them — so a task parked in
+    /// `recv` need not hold up a `send`. The connections stay open while
+    /// either half lives and close when the last one is dropped, as the
+    /// whole socket would ([`crate::split`]).
+    pub fn split(self) -> (DealerSend, DealerRecv) {
+        (
+            DealerSend {
+                core: self.core.clone(),
+            },
+            DealerRecv { core: self.core },
+        )
     }
 }
 
@@ -177,12 +147,9 @@ socket_endpoints!(DealerSocket);
 #[derive(Debug)]
 pub struct RouterSocket {
     core: SocketCore,
-    /// Routing id to peer, and back. Two maps because both directions are
-    /// hot: inbound needs the id of a peer, outbound the peer of an id.
-    by_key: HashMap<RoutingKey, PeerId>,
-    by_peer: HashMap<PeerId, RoutingKey>,
-    /// The counter behind a generated routing id; see [`RoutingKey`].
-    next_generated: u32,
+    /// The routing table, shared with the halves once split; see
+    /// [`crate::split`].
+    routing: Arc<Mutex<Routing>>,
 }
 
 impl RouterSocket {
@@ -202,9 +169,7 @@ impl RouterSocket {
         options.pipe.incoming.mute = MuteAction::Block;
         Ok(RouterSocket {
             core: SocketCore::new(context, SocketType::Router, options)?,
-            by_key: HashMap::new(),
-            by_peer: HashMap::new(),
-            next_generated: 1,
+            routing: Arc::new(Mutex::new(Routing::new())),
         })
     }
 
@@ -214,35 +179,17 @@ impl RouterSocket {
     /// bounded by `ZMQ_RCVTIMEO`. The id is the peer's announced `Identity`
     /// where it announced one and a generated key otherwise.
     pub async fn recv(&mut self) -> Result<Multipart> {
-        let limit = self.core.options().recv_timeout;
-        let exec = self.core.exec().clone();
-        match limit {
-            None => self.await_message().await,
-            Some(limit) => match exec.within(limit, self.await_message()).await {
-                Some(result) => result,
-                None => Err(Error::EAGAIN(
-                    format!("nothing arrived within {limit:?} (ZMQ_RCVTIMEO)").into(),
-                )),
-            },
-        }
+        split::router_recv(&self.core, &self.routing).await
     }
 
     /// The `ZMQ_DONTWAIT` form: `EAGAIN` when nothing is queued.
     pub fn try_recv(&mut self) -> Result<Multipart> {
-        self.learn_peers();
-        let (peer, message) = self.core.try_recv_fair()?;
-        Ok(self.with_routing_id(peer, message))
+        split::router_try_recv(&self.core, &self.routing)
     }
 
     /// Receives under an explicit wall-clock bound.
     pub async fn recv_timeout(&mut self, limit: Duration) -> Result<Multipart> {
-        let exec = self.core.exec().clone();
-        match exec.within(limit, self.await_message()).await {
-            Some(result) => result,
-            None => Err(Error::EAGAIN(
-                format!("nothing arrived within {limit:?}").into(),
-            )),
-        }
+        split::router_recv_within(&self.core, &self.routing, limit).await
     }
 
     /// Sends `message`, whose **first frame is the routing id** of the peer
@@ -257,54 +204,7 @@ impl RouterSocket {
     /// Fails with `EINVAL` when the message carries nothing but its routing
     /// id: a ROUTER strips that frame, and what is left would be no message.
     pub async fn send(&mut self, message: impl Into<Multipart>) -> Result<Sent> {
-        self.learn_peers();
-        let (key, body) = split_routing_id(message.into())?;
-        let mandatory = self.core.options().router_mandatory;
-
-        let Some(peer) = self.by_key.get(&key).copied() else {
-            return self.unroutable(&key, mandatory);
-        };
-        let Some(pipe) = self.core.pipe_of(peer) else {
-            return self.unroutable(&key, mandatory);
-        };
-        let queue = pipe.outgoing();
-        if queue.has_room() {
-            queue.try_send(body)?;
-            return Ok(Sent::Queued);
-        }
-        if !mandatory {
-            // "0 discards silently when it cannot be routed **or the peer's
-            // SNDHWM is reached**."
-            tracing::debug!(
-                key = ?key,
-                "dropped a message: the peer's queue is at its high-water mark"
-            );
-            return Ok(Sent::Dropped);
-        }
-        // ZMQ_ROUTER_MANDATORY without ZMQ_DONTWAIT: wait for room, bounded
-        // by ZMQ_SNDTIMEO.
-        let limit = self.core.options().send_timeout;
-        let queued = crate::socket::within(self.core.exec(), limit, async {
-            loop {
-                queue.wait_for_room().await;
-                if queue.is_closed() {
-                    return Err(Error::EHOSTUNREACH(
-                        "the peer went away while its queue was full".into(),
-                    ));
-                }
-                if queue.has_room() {
-                    return Ok(());
-                }
-            }
-        })
-        .await;
-        match queued {
-            Ok(()) => {
-                queue.try_send(body)?;
-                Ok(Sent::Queued)
-            }
-            Err(e) => Err(e),
-        }
+        split::router_send(&self.core, &self.routing, message.into()).await
     }
 
     /// The `ZMQ_DONTWAIT` form.
@@ -313,28 +213,7 @@ impl RouterSocket {
     /// a full queue is `EAGAIN` and an unknown id `EHOSTUNREACH`, which is
     /// the pair libzmq documents for the option under `ZMQ_DONTWAIT`.
     pub fn try_send(&mut self, message: impl Into<Multipart>) -> Result<Sent> {
-        self.learn_peers();
-        let (key, body) = split_routing_id(message.into())?;
-        let mandatory = self.core.options().router_mandatory;
-
-        let Some(peer) = self.by_key.get(&key).copied() else {
-            return self.unroutable(&key, mandatory);
-        };
-        let Some(pipe) = self.core.pipe_of(peer) else {
-            return self.unroutable(&key, mandatory);
-        };
-        let queue = pipe.outgoing();
-        if queue.has_room() {
-            queue.try_send(body)?;
-            return Ok(Sent::Queued);
-        }
-        if mandatory {
-            Err(Error::EAGAIN(
-                "this peer's queue is at its high-water mark (ZMQ_ROUTER_MANDATORY)".into(),
-            ))
-        } else {
-            Ok(Sent::Dropped)
-        }
+        split::router_try_send(&self.core, &self.routing, message.into())
     }
 
     /// The routing ids this ROUTER can address right now.
@@ -343,143 +222,44 @@ impl RouterSocket {
     /// after the peer's handshake — and, without `ZMQ_PROBE_ROUTER` on the
     /// peer, that is all it knows until the peer speaks.
     pub fn peers(&mut self) -> Vec<RoutingKey> {
-        self.learn_peers();
-        let mut keys: Vec<RoutingKey> = self.by_key.keys().cloned().collect();
-        keys.sort();
-        keys
+        split::lock(&self.routing).keys(&self.core)
     }
 
-    async fn await_message(&mut self) -> Result<Multipart> {
-        self.learn_peers();
-        let (peer, message) = self.core.recv_fair().await?;
-        Ok(self.with_routing_id(peer, message))
-    }
-
-    fn with_routing_id(&mut self, peer: PeerId, message: Multipart) -> Multipart {
-        let key = self.key_for(peer);
-        let mut frames = Vec::with_capacity(message.len() + 1);
-        frames.push(Message::from(key.as_bytes()));
-        frames.extend(message.into_frames());
-        Multipart::new(frames).expect("a routing id plus at least one frame")
-    }
-
-    /// Gives every current peer a routing id, and forgets the ones that left.
+    /// Splits the socket into a sending half and a receiving half, usable
+    /// at the same time from two tasks.
     ///
-    /// This is also where a duplicate identity is resolved:
-    /// `ZMQ_ROUTER_HANDOVER` decides whether the newcomer takes the name and
-    /// the incumbent is disconnected, or the newcomer is rejected — libzmq's
-    /// default being to reject it.
-    fn learn_peers(&mut self) {
-        let live = self.core.engine().peers();
-        self.by_peer.retain(|peer, key| {
-            let alive = live.iter().any(|current| current.id == *peer);
-            if !alive {
-                self.by_key.remove(key);
-            }
-            alive
-        });
-        for peer in live {
-            if self.by_peer.contains_key(&peer.id) {
-                continue;
-            }
-            if !peer.announced {
-                // Its READY has not been read yet, so its own identity is
-                // not known: keying it now would key it by a generated id
-                // for the rest of its life.
-                continue;
-            }
-            let key = match &peer.identity {
-                Some(identity) => RoutingKey::announced(identity),
-                None => {
-                    let key = RoutingKey::generated(self.next_generated);
-                    self.next_generated = self.next_generated.wrapping_add(1).max(1);
-                    key
-                }
-            };
-            if let Some(incumbent) = self.by_key.get(&key).copied() {
-                if self.core.options().router_handover {
-                    tracing::debug!(
-                        key = ?key,
-                        %incumbent,
-                        "handing a routing id over to a newcomer (ZMQ_ROUTER_HANDOVER)"
-                    );
-                    self.core.engine().evict(incumbent);
-                    self.by_peer.remove(&incumbent);
-                } else {
-                    tracing::warn!(
-                        key = ?key,
-                        %incumbent,
-                        "rejected a peer claiming a routing id already in use"
-                    );
-                    self.core.engine().evict(peer.id);
-                    continue;
-                }
-            }
-            self.by_key.insert(key.clone(), peer.id);
-            self.by_peer.insert(peer.id, key);
-        }
+    /// The two directions of a ROUTER are independent; what they share is
+    /// the routing table, which both halves hold behind a lock that is
+    /// never held across an await ([`crate::split`]).
+    pub fn split(self) -> (RouterSend, RouterRecv) {
+        (
+            RouterSend {
+                core: self.core.clone(),
+                routing: Arc::clone(&self.routing),
+            },
+            RouterRecv {
+                core: self.core,
+                routing: self.routing,
+            },
+        )
     }
 
-    /// This peer's routing id, learning it if the handshake has completed
-    /// since the last reconciliation — which it usually has, because a
-    /// message from a peer is proof that its `READY` was read.
-    fn key_for(&mut self, peer: PeerId) -> RoutingKey {
-        if let Some(key) = self.by_peer.get(&peer) {
-            return key.clone();
-        }
-        self.learn_peers();
-        if let Some(key) = self.by_peer.get(&peer) {
-            return key.clone();
-        }
-        self.assign(peer)
-    }
-
-    fn assign(&mut self, peer: PeerId) -> RoutingKey {
-        let key = RoutingKey::generated(self.next_generated);
-        self.next_generated = self.next_generated.wrapping_add(1).max(1);
-        self.by_key.insert(key.clone(), peer);
-        self.by_peer.insert(peer, key.clone());
-        key
-    }
-
-    fn unroutable(&self, key: &RoutingKey, mandatory: bool) -> Result<Sent> {
-        if mandatory {
-            Err(Error::EHOSTUNREACH(
-                format!("no peer holds the routing id {key:?} (ZMQ_ROUTER_MANDATORY)").into(),
-            ))
-        } else {
-            // "ROUTER sockets do have a somewhat brutal way of dealing with
-            // messages they can't send anywhere: they drop them silently."
-            tracing::debug!(key = ?key, "dropped a message for a routing id nobody holds");
-            Ok(Sent::Dropped)
-        }
+    /// How many routing ids the table holds right now, for the test that
+    /// pins its shrinking half.
+    #[cfg(test)]
+    fn routing_len(&self) -> usize {
+        split::lock(&self.routing).len()
     }
 }
 
 socket_endpoints!(RouterSocket);
-
-/// Takes the routing id off the front of an outbound ROUTER message.
-fn split_routing_id(message: Multipart) -> Result<(RoutingKey, Multipart)> {
-    let mut frames = message.into_frames();
-    if frames.len() < 2 {
-        return Err(Error::EINVAL(
-            "a ROUTER message is a routing id followed by the message; this one has only the \
-             routing id"
-                .into(),
-        ));
-    }
-    let key = RoutingKey::from_wire(frames.remove(0).as_slice());
-    Ok((
-        key,
-        Multipart::new(frames).expect("at least one frame left"),
-    ))
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::context::ContextConfig;
     use crate::identity::RoutingId;
+    use crate::message::Message;
     use crate::pipe::{PipeConfig, QueueConfig};
 
     fn context() -> Context {
@@ -870,8 +650,9 @@ mod tests {
         }
 
         wait_for(|| router.peers().is_empty()).await;
-        assert!(
-            router.by_peer.is_empty(),
+        assert_eq!(
+            router.routing_len(),
+            0,
             "both directions of the map must shrink with the peers"
         );
     }

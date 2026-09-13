@@ -335,6 +335,15 @@ returning.
 peer a ZAP handler refused, and `ENOCOMPATPROTO` for a dialog that malfunctioned — a peer
 announcing a mechanism or socket type this side cannot pair with, or a malformed handshake.
 
+**One API libzmq does not have, because C does not need it**: `split(self)` on DEALER,
+ROUTER, PAIR, XPUB and XSUB, returning a sending and a receiving half onto the same
+connections. libzmq's socket is a pointer any thread may use one at a time; a Rust socket is
+a `Send`, non-`Sync` handle, and one task parked in `recv()` would otherwise hold the whole
+socket — so the concurrency libzmq permits needed a type to say it (B-177). REQ and REP have
+no `split`: 28/REQREP alternates, so two independent halves would promise what the protocol
+forbids. Each half is still one operation at a time, and a ROUTER's two halves share one
+routing table behind a lock that is never held across an `await`.
+
 **Six bounds that are not libzmq options at all.** libzmq bounds a message count per queue and
 nothing else; every number below exists because no remote input may cause unbounded allocation
 ([INVARIANTS.md](../INVARIANTS.md)), and each is a named constant rather than a magic value:

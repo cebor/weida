@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
+use weida_py_core::Errno;
 use weida_zmq::{Device, Multipart, ProxyStatistics, Result};
 
 use crate::errors::errno_of;
@@ -81,13 +82,15 @@ impl Device for Erased {
 }
 
 /// A future that leases one Python socket and hands it over as a device.
-pub type Leasing = Pin<Box<dyn Future<Output = Erased> + Send + 'static>>;
+///
+/// `Err` when the socket was split and its slot retired.
+pub type Leasing = Pin<Box<dyn Future<Output = Result<Erased, Errno>> + Send + 'static>>;
 
 /// Builds the leasing future for one socket class. Called from the socket
 /// macro, which is the only place that has the slot.
 pub fn leasing<S: Device + Send + 'static>(slot: &Arc<Slot<S>>) -> Leasing {
     let slot = Arc::clone(slot);
-    Box::pin(async move { Erased(Box::new(Leased(slot.acquire().await))) })
+    Box::pin(async move { Ok(Erased(Box::new(Leased(slot.acquire().await?)))) })
 }
 
 /// Takes a socket of this module as a device end.
@@ -200,10 +203,10 @@ pub fn proxy<'py>(
     let backend = device_of(backend)?;
     let capture = capture.map(device_of).transpose()?;
     bridge.awaitable(py, async move {
-        let mut frontend = frontend.await;
-        let mut backend = backend.await;
+        let mut frontend = frontend.await?;
+        let mut backend = backend.await?;
         let mut capture = match capture {
-            Some(capture) => Some(capture.await),
+            Some(capture) => Some(capture.await?),
             None => None,
         };
         weida_zmq::proxy(&mut frontend, &mut backend, capture.as_mut())
@@ -233,11 +236,11 @@ pub fn proxy_steerable<'py>(
     let control = device_of(control)?;
     let capture = capture.map(device_of).transpose()?;
     bridge.awaitable(py, async move {
-        let mut frontend = frontend.await;
-        let mut backend = backend.await;
-        let mut control = control.await;
+        let mut frontend = frontend.await?;
+        let mut backend = backend.await?;
+        let mut control = control.await?;
         let mut capture = match capture {
-            Some(capture) => Some(capture.await),
+            Some(capture) => Some(capture.await?),
             None => None,
         };
         weida_zmq::proxy_steerable(&mut frontend, &mut backend, capture.as_mut(), &mut control)

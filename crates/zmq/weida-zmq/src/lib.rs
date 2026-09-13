@@ -193,6 +193,7 @@ pub mod pubsub;
 pub mod reqrep;
 pub mod session;
 pub mod socket;
+pub mod split;
 pub mod subscriptions;
 pub mod transport;
 pub mod xpubxsub;
@@ -242,6 +243,10 @@ pub use pubsub::{PubSocket, Published, SubSocket};
 pub use reqrep::{RepSocket, ReqSocket};
 pub use session::{Incoming, Negotiated, Wire, ZmtpSession};
 pub use socket::{Delivered, SocketCore};
+pub use split::{
+    DealerRecv, DealerSend, PairRecv, PairSend, RouterRecv, RouterSend, XPubPublish, XPubRecv,
+    XSubRecv, XSubSend,
+};
 pub use subscriptions::{
     DEFAULT_MAX_SUBSCRIPTION_BYTES, DEFAULT_MAX_SUBSCRIPTIONS, SubscriptionForm, Subscriptions,
 };

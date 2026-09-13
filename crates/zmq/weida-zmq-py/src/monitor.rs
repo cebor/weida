@@ -168,7 +168,7 @@ impl PyMonitor {
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let slot = Arc::clone(&self.monitor);
         self.bridge.awaitable(py, async move {
-            match slot.acquire().await.recv().await {
+            match slot.acquire().await?.recv().await {
                 Ok(event) => Ok(PyMonitorEvent::of(&event)),
                 // The socket is gone: for an `async for`, that is the end.
                 Err(weida_zmq::Error::ENOTSOCK(_)) => Err(Errno::new(
@@ -194,8 +194,8 @@ impl PyMonitor {
         let monitor = Arc::clone(&self.monitor);
         let socket = Arc::clone(pair.slot());
         self.bridge.awaitable(py, async move {
-            let events = monitor.acquire().await.resubscribe();
-            let mut pair = socket.acquire().await;
+            let events = monitor.acquire().await?.resubscribe();
+            let mut pair = socket.acquire().await?;
             weida_zmq::serve_pair(events, &mut pair)
                 .await
                 .map_err(errno_of)
@@ -204,7 +204,11 @@ impl PyMonitor {
 
     /// `ZMQ_DONTWAIT`: the next event if one is queued.
     fn recv_nowait(&self, py: Python<'_>) -> PyResult<PyMonitorEvent> {
-        let Some(mut monitor) = self.monitor.try_acquire() else {
+        let Some(mut monitor) = self
+            .monitor
+            .try_acquire()
+            .map_err(|errno| crate::errors::to_py(py, &errno))?
+        else {
             return Err(crate::errors::to_py(
                 py,
                 &Errno::new(

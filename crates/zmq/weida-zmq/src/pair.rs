@@ -33,6 +33,7 @@ use crate::message::Multipart;
 use crate::options::SocketOptions;
 use crate::pipe::MuteAction;
 use crate::socket::{SocketCore, socket_endpoints};
+use crate::split::{self, PairRecv, PairSend};
 
 /// A PAIR socket: one peer, both directions, no reconnect.
 #[derive(Debug)]
@@ -89,29 +90,7 @@ impl PairSocket {
     ///
     /// Bounded by `ZMQ_SNDTIMEO`; never discards.
     pub async fn send(&mut self, message: impl Into<Multipart>) -> Result<()> {
-        let limit = self.core.options().send_timeout;
-        let exec = self.core.exec().clone();
-        let message = message.into();
-        let delivered = match limit {
-            None => self.core.send_round_robin(message).await?,
-            Some(limit) => match exec
-                .within(limit, self.core.send_round_robin(message))
-                .await
-            {
-                Some(result) => result?,
-                None => {
-                    return Err(Error::EAGAIN(
-                        format!("the peer did not take it within {limit:?} (ZMQ_SNDTIMEO)").into(),
-                    ));
-                }
-            },
-        };
-        if delivered.peer.is_none() {
-            return Err(Error::EAGAIN(
-                "the peer did not take it; a PAIR socket never discards".into(),
-            ));
-        }
-        Ok(())
+        split::send_never_dropping(&self.core, message.into()).await
     }
 
     /// The `ZMQ_DONTWAIT` form.
@@ -125,31 +104,12 @@ impl PairSocket {
         message: impl Into<Multipart>,
         limit: Duration,
     ) -> Result<()> {
-        let exec = self.core.exec().clone();
-        match exec
-            .within(limit, self.core.send_round_robin(message.into()))
-            .await
-        {
-            Some(result) => result.map(|_| ()),
-            None => Err(Error::EAGAIN(
-                format!("the peer did not take it within {limit:?}").into(),
-            )),
-        }
+        split::send_within(&self.core, message.into(), limit).await
     }
 
     /// Receives the next message from the peer, bounded by `ZMQ_RCVTIMEO`.
     pub async fn recv(&mut self) -> Result<Multipart> {
-        let limit = self.core.options().recv_timeout;
-        let exec = self.core.exec().clone();
-        match limit {
-            None => self.core.recv_fair().await.map(|(_, message)| message),
-            Some(limit) => match exec.within(limit, self.core.recv_fair()).await {
-                Some(result) => result.map(|(_, message)| message),
-                None => Err(Error::EAGAIN(
-                    format!("nothing arrived within {limit:?} (ZMQ_RCVTIMEO)").into(),
-                )),
-            },
-        }
+        split::recv_fair(&self.core).await
     }
 
     /// The `ZMQ_DONTWAIT` form.
@@ -159,19 +119,24 @@ impl PairSocket {
 
     /// Receives under an explicit wall-clock bound.
     pub async fn recv_timeout(&mut self, limit: Duration) -> Result<Multipart> {
-        let exec = self.core.exec().clone();
-        match exec.within(limit, self.core.recv_fair()).await {
-            Some(result) => result.map(|(_, message)| message),
-            None => Err(Error::EAGAIN(
-                format!("nothing arrived within {limit:?}").into(),
-            )),
-        }
+        split::recv_fair_within(&self.core, limit).await
+    }
+
+    /// Splits the socket into a sending half and a receiving half, usable
+    /// at the same time from two tasks.
+    ///
+    /// A PAIR is a double queue with no alternation between its directions,
+    /// so the two halves are independent ([`crate::split`]).
+    pub fn split(self) -> (PairSend, PairRecv) {
+        (
+            PairSend {
+                core: self.core.clone(),
+            },
+            PairRecv { core: self.core },
+        )
     }
 }
 
-// `connect` above is PAIR's own; everything else about an endpoint is every
-// socket's, and taking it from here is also what puts PAIR on the list the
-// thread-rule harness reads.
 socket_endpoints!(PairSocket, no_connect);
 
 #[cfg(test)]

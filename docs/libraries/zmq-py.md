@@ -128,17 +128,19 @@ in Rust, **67.7 µs** through `weida_zmq.sync`, **330 µs** through the asyncio 
 343 and 45.8 µs. The asyncio figure is one event-loop wakeup per `await`, and the fast path
 that would remove it for an operation that does not wait is filed rather than hinted at.
 
-## 9. Deliberate deviations, and the one limitation that is not deliberate
+## 9. Deliberate deviations
 
-1. **One operation at a time per socket** — *not* pyzmq's behaviour. A task parked in
-   `await sock.recv()` holds the socket, so a concurrent `await sock.send(...)` on that same
-   socket queues behind it. The reason is the library underneath: a `weida-zmq` socket is
-   `Send` and not `Sync` and its `send`/`recv` take `&mut self`, which is libzmq's thread rule
-   as a type. pyzmq allows the overlap. A workaround in the binding would be a second
-   implementation of the pattern, so the fix belongs in `weida-zmq` — splitting a socket into
-   send and recv halves for the types where the directions are independent (DEALER, ROUTER,
-   PAIR, XPUB, XSUB) — and is filed there. Until then: two sockets, which is what the patterns
-   are for, or one coroutine owning the socket.
+1. **One operation at a time per socket object, and `split()` where that is not enough.** A
+   task parked in `await sock.recv()` holds the socket, so a concurrent
+   `await sock.send(...)` on that *same object* queues behind it: a `weida-zmq` socket's
+   operations take `&self` on a handle that is not `Sync`, which is libzmq's thread rule as a
+   type. pyzmq allows the overlap, so the five socket types whose two directions are
+   independent have `await sock.split()` (B-177): it returns `(send_half, recv_half)` onto the
+   same connections, usable from two coroutines at once, and retires the object it was called
+   on (`ENOTSOCK` naming the split). DEALER, ROUTER, PAIR, XPUB and XSUB have it; REQ and REP
+   do not, because 28/REQREP's alternation is a single sequence and two halves would promise
+   an independence the protocol forbids. Each half is itself one operation at a time, for the
+   same reason.
 2. **Every awaiting call is a coroutine**, including `connect`, `unbind`, `last_endpoint` and
    `close`, which `weida-zmq` answers synchronously. They need the socket, the socket may be
    held by a parked receive, and a synchronous Python method that waited for it would block

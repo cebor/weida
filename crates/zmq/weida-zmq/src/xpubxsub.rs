@@ -27,38 +27,30 @@
 //! nobody holds any more. What that remembers is bounded by the same product
 //! as everything else: `max_peers` peers times `max_subscriptions` prefixes.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
 use weida_zmtp::SocketType;
 
 use crate::context::Context;
-use crate::engine::PeerId;
-use crate::error::{Error, Result};
-use crate::message::{Message, Multipart};
+use crate::error::Result;
+use crate::message::Multipart;
 use crate::options::SocketOptions;
 use crate::pipe::MuteAction;
 use crate::pubsub::Published;
 use crate::session::ZmtpSession;
 use crate::socket::{SocketCore, socket_endpoints};
-use crate::subscriptions::{self, Subscriptions};
+use crate::split::{self, XPubEvents, XPubPublish, XPubRecv, XSubRecv, XSubSend};
+use crate::subscriptions::Subscriptions;
 
 /// An XPUB socket: a PUB whose application sees the subscriptions.
 #[derive(Debug)]
 pub struct XPubSocket {
     core: SocketCore,
-    /// What each peer was last seen holding, so that a departure can be
-    /// turned into unsubscribes for the application.
-    remembered: HashMap<PeerId, Vec<Vec<u8>>>,
-    /// Unsubscribes synthesized for peers that have gone, waiting to be
-    /// handed over.
-    synthesized: VecDeque<Multipart>,
-    /// The peer whose subscription was delivered most recently, which is what
-    /// `ZMQ_XPUB_MANUAL`'s `subscribe` applies to — libzmq applies it to the
-    /// last pipe too.
-    last_subscriber: Option<PeerId>,
+    /// The receive-side memory: what each peer held, the synthesized
+    /// unsubscribes, and who spoke last. Lives with the receiving half once
+    /// split ([`crate::split`]).
+    events: XPubEvents,
 }
 
 impl XPubSocket {
@@ -72,35 +64,14 @@ impl XPubSocket {
         options.pipe.outgoing.mute = MuteAction::Drop;
         Ok(XPubSocket {
             core: SocketCore::new(context, SocketType::XPub, options)?,
-            remembered: HashMap::new(),
-            synthesized: VecDeque::new(),
-            last_subscriber: None,
+            events: XPubEvents::default(),
         })
     }
 
     /// Publishes to every subscriber whose subscriptions match the first
     /// frame — PUB's rule, and PUB's drop at the high-water mark.
     pub fn publish(&mut self, message: impl Into<Multipart>) -> Published {
-        let message = message.into();
-        let topic = message.frames()[0].as_slice().to_vec();
-        let mut report = Published {
-            delivered: 0,
-            dropped: 0,
-            unmatched: 0,
-        };
-        for peer in self.core.peers() {
-            if !peer.subscriptions.matches(&topic) {
-                report.unmatched += 1;
-                continue;
-            }
-            let queue = peer.pipe.outgoing();
-            if queue.has_room() && queue.try_send(message.clone()).is_ok() {
-                report.delivered += 1;
-            } else {
-                report.dropped += 1;
-            }
-        }
-        report
+        split::fan_out(&self.core, message.into(), true)
     }
 
     /// Receives the next subscription or message from a subscriber.
@@ -113,39 +84,17 @@ impl XPubSocket {
     ///
     /// Bounded by `ZMQ_RCVTIMEO`.
     pub async fn recv(&mut self) -> Result<Multipart> {
-        let limit = self.core.options().recv_timeout;
-        let exec = self.core.exec().clone();
-        match limit {
-            None => self.next_event().await,
-            Some(limit) => match exec.within(limit, self.next_event()).await {
-                Some(result) => result,
-                None => Err(Error::EAGAIN(
-                    format!("nothing arrived within {limit:?} (ZMQ_RCVTIMEO)").into(),
-                )),
-            },
-        }
+        self.events.recv(&self.core).await
     }
 
     /// The `ZMQ_DONTWAIT` form.
     pub fn try_recv(&mut self) -> Result<Multipart> {
-        self.reconcile();
-        if let Some(synthesized) = self.synthesized.pop_front() {
-            return Ok(synthesized);
-        }
-        let (peer, message) = self.core.try_recv_fair()?;
-        self.note(peer, &message);
-        Ok(message)
+        self.events.try_recv(&self.core)
     }
 
     /// Receives under an explicit wall-clock bound.
     pub async fn recv_timeout(&mut self, limit: Duration) -> Result<Multipart> {
-        let exec = self.core.exec().clone();
-        match exec.within(limit, self.next_event()).await {
-            Some(result) => result,
-            None => Err(Error::EAGAIN(
-                format!("nothing arrived within {limit:?}").into(),
-            )),
-        }
+        self.events.recv_within(&self.core, limit).await
     }
 
     /// Applies a subscription on this socket's own authority, for
@@ -156,24 +105,12 @@ impl XPubSocket {
     /// rule stated. Fails with `EINVAL` when no subscription has been
     /// delivered yet, because there is no peer to apply it to.
     pub fn subscribe(&mut self, prefix: impl AsRef<[u8]>) -> Result<()> {
-        let peer = self.subscriber()?;
-        if peer.subscriptions.subscribe(prefix.as_ref()).is_none() {
-            return Err(Error::EINVAL(
-                "that subscriber is at its subscription ceiling".into(),
-            ));
-        }
-        Ok(())
+        self.events.subscribe(&self.core, prefix.as_ref())
     }
 
     /// Removes a subscription on this socket's own authority.
     pub fn unsubscribe(&mut self, prefix: impl AsRef<[u8]>) -> Result<()> {
-        let peer = self.subscriber()?;
-        match peer.subscriptions.cancel(prefix.as_ref()) {
-            Some(_) => Ok(()),
-            None => Err(Error::EINVAL(
-                "that subscriber does not hold that subscription".into(),
-            )),
-        }
+        self.events.unsubscribe(&self.core, prefix.as_ref())
     }
 
     /// Sends one ZMTP `ERROR` to the subscriber whose subscription arrived
@@ -196,8 +133,7 @@ impl XPubSocket {
     /// `EINVAL` when no subscription has been delivered yet, so there is no
     /// subscriber to answer.
     pub fn refuse(&self, reason: &str) -> Result<()> {
-        self.subscriber()?.pipe.refuse(reason);
-        Ok(())
+        self.events.refuse(&self.core, reason)
     }
 
     /// Subscribers this socket has.
@@ -213,92 +149,23 @@ impl XPubSocket {
             .any(|peer| peer.subscriptions.matches(topic))
     }
 
-    async fn next_event(&mut self) -> Result<Multipart> {
-        loop {
-            self.reconcile();
-            if let Some(synthesized) = self.synthesized.pop_front() {
-                return Ok(synthesized);
-            }
-            if let Ok((peer, message)) = self.core.try_recv_fair() {
-                self.note(peer, &message);
-                return Ok(message);
-            }
-            // Nothing queued and nothing synthesized. An XPUB must wake on a
-            // peer **going away** as well as on a message, because a
-            // departure is an event it owes its application — so this waits
-            // for either and loops rather than parking on a receive.
-            self.core.wait_for_activity().await;
-        }
-    }
-
-    fn subscriber(&self) -> Result<crate::engine::Peer> {
-        let peers = self.core.peers();
-        let wanted = self.last_subscriber;
-        peers
-            .into_iter()
-            .find(|peer| Some(peer.id) == wanted)
-            .ok_or_else(|| {
-                Error::EINVAL(
-                    "no subscription has been delivered yet, so there is no subscriber to apply \
-                     this to"
-                        .into(),
-                )
-            })
-    }
-
-    /// Remembers what a peer holds, and which peer spoke last.
-    fn note(&mut self, peer: PeerId, message: &Multipart) {
-        if message.len() == 1
-            && subscriptions::read_message_form(message.frames()[0].as_slice()).is_some()
-        {
-            self.last_subscriber = Some(peer);
-        }
-        if let Some(current) = self
-            .core
-            .peers()
-            .into_iter()
-            .find(|current| current.id == peer)
-        {
-            self.remembered
-                .insert(peer, current.subscriptions.prefixes());
-        }
-    }
-
-    /// Turns departures into unsubscribes, and keeps the memory in step with
-    /// the live peers so that it cannot grow past `max_peers` entries.
-    fn reconcile(&mut self) {
-        let live = self.core.engine().peers();
-        for peer in &live {
-            if let Some(known) = self.remembered.get_mut(&peer.id) {
-                let current = peer.subscriptions.prefixes();
-                if !current.is_empty() {
-                    *known = current;
-                }
-            } else {
-                self.remembered
-                    .insert(peer.id, peer.subscriptions.prefixes());
-            }
-        }
-        let gone: Vec<PeerId> = self
-            .remembered
-            .keys()
-            .copied()
-            .filter(|id| !live.iter().any(|peer| peer.id == *id))
-            .collect();
-        for id in gone {
-            let prefixes = self.remembered.remove(&id).unwrap_or_default();
-            for prefix in prefixes {
-                // "SHALL, if the subscriber peer disconnects prematurely,
-                // generate a suitable unsubscribe request for the calling
-                // application."
-                self.synthesized.push_back(Multipart::single(Message::from(
-                    subscriptions::write_message_form(false, &prefix),
-                )));
-            }
-            if self.last_subscriber == Some(id) {
-                self.last_subscriber = None;
-            }
-        }
+    /// Splits the socket into a publishing half and a receiving half,
+    /// usable at the same time from two tasks.
+    ///
+    /// Publishing reads only the subscribers' tables; receiving owns the
+    /// socket's memory of them — and so `subscribe`, `unsubscribe` and
+    /// `refuse`, which act on the subscriber that spoke last, go with the
+    /// receiving half ([`crate::split`]).
+    pub fn split(self) -> (XPubPublish, XPubRecv) {
+        (
+            XPubPublish {
+                core: self.core.clone(),
+            },
+            XPubRecv {
+                core: self.core,
+                events: self.events,
+            },
+        )
     }
 }
 
@@ -340,32 +207,12 @@ impl XSubSocket {
     /// every publisher this socket connects or reconnects to later, because
     /// the set travels with the session.
     pub fn subscribe(&mut self, prefix: impl AsRef<[u8]>) -> Result<()> {
-        let prefix = prefix.as_ref();
-        if self.mine.subscribe(prefix).is_none() {
-            return Err(Error::EINVAL(
-                format!(
-                    "this socket already holds its ceiling of {} distinct subscriptions",
-                    self.mine.len()
-                )
-                .into(),
-            ));
-        }
-        self.forward(subscriptions::write_message_form(true, prefix));
-        Ok(())
+        split::xsub_subscribe(&self.core, &self.mine, prefix.as_ref())
     }
 
     /// Removes one subscription to `prefix`, forwarding the cancellation.
     pub fn unsubscribe(&mut self, prefix: impl AsRef<[u8]>) -> Result<()> {
-        let prefix = prefix.as_ref();
-        match self.mine.cancel(prefix) {
-            None => Err(Error::EINVAL(
-                "this socket is not subscribed to that prefix".into(),
-            )),
-            Some(_) => {
-                self.forward(subscriptions::write_message_form(false, prefix));
-                Ok(())
-            }
-        }
+        split::xsub_unsubscribe(&self.core, &self.mine, prefix.as_ref())
     }
 
     /// The prefixes this socket holds, each once.
@@ -384,36 +231,12 @@ impl XSubSocket {
     /// a subscription, since that is what the form means on this socket type
     /// — which is exactly how a proxy forwards what its XPUB read.
     pub fn send(&mut self, message: impl Into<Multipart>) -> Published {
-        let message = message.into();
-        let mut report = Published {
-            delivered: 0,
-            dropped: 0,
-            unmatched: 0,
-        };
-        for peer in self.core.peers() {
-            let queue = peer.pipe.outgoing();
-            if queue.has_room() && queue.try_send(message.clone()).is_ok() {
-                report.delivered += 1;
-            } else {
-                report.dropped += 1;
-            }
-        }
-        report
+        split::fan_out(&self.core, message.into(), false)
     }
 
     /// Receives the next published message, fair-queued across publishers.
     pub async fn recv(&mut self) -> Result<Multipart> {
-        let limit = self.core.options().recv_timeout;
-        let exec = self.core.exec().clone();
-        match limit {
-            None => self.core.recv_fair().await.map(|(_, message)| message),
-            Some(limit) => match exec.within(limit, self.core.recv_fair()).await {
-                Some(result) => result.map(|(_, message)| message),
-                None => Err(Error::EAGAIN(
-                    format!("nothing was published within {limit:?} (ZMQ_RCVTIMEO)").into(),
-                )),
-            },
-        }
+        split::recv_fair(&self.core).await
     }
 
     /// The `ZMQ_DONTWAIT` form.
@@ -423,20 +246,20 @@ impl XSubSocket {
 
     /// Receives under an explicit wall-clock bound.
     pub async fn recv_timeout(&mut self, limit: Duration) -> Result<Multipart> {
-        let exec = self.core.exec().clone();
-        match exec.within(limit, self.core.recv_fair()).await {
-            Some(result) => result.map(|(_, message)| message),
-            None => Err(Error::EAGAIN(
-                format!("nothing was published within {limit:?}").into(),
-            )),
-        }
+        split::recv_fair_within(&self.core, limit).await
     }
 
-    fn forward(&self, frame: Vec<u8>) {
-        let message = Multipart::single(Message::from(frame));
-        for peer in self.core.peers() {
-            let _ = peer.pipe.outgoing().try_send(message.clone());
-        }
+    /// Splits the socket into a sending half — subscriptions and upstream
+    /// messages — and a receiving half, usable at the same time from two
+    /// tasks ([`crate::split`]).
+    pub fn split(self) -> (XSubSend, XSubRecv) {
+        (
+            XSubSend {
+                core: self.core.clone(),
+                mine: self.mine,
+            },
+            XSubRecv { core: self.core },
+        )
     }
 }
 

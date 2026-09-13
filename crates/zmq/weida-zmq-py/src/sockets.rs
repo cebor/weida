@@ -12,22 +12,28 @@
 //! class list below reads as a table of capabilities and why no socket type
 //! has an implementation of its own here.
 //!
-//! # One operation at a time, per socket
+//! # One operation at a time, per socket object
 //!
-//! A `weida-zmq` socket is `Send` and **not** `Sync`, and its `send` and
-//! `recv` take `&mut self`: libzmq's "applications MUST NOT use a socket from
-//! multiple threads" expressed as a type. So each socket here lives in a
-//! [`Slot`](crate::lease::Slot) and every call leases it for as long as the
-//! operation runs. Two coroutines that use one socket therefore *queue*; they
-//! do not interleave and they do not race.
+//! A `weida-zmq` socket handle is `Send` and **not** `Sync`: libzmq's
+//! "applications MUST NOT use a socket from multiple threads" expressed as a
+//! type. So each socket here lives in a [`Slot`](crate::lease::Slot) and
+//! every call leases it for as long as the operation runs. Two coroutines
+//! that use one socket therefore *queue*; they do not interleave and they do
+//! not race.
 //!
 //! The consequence is worth stating plainly rather than discovering: a task
 //! parked in `await sock.recv()` holds the socket, so a concurrent
-//! `await sock.send(...)` on that same socket waits for the receive to finish
-//! or to be cancelled. Two sockets — which is what the patterns are for — or
-//! one coroutine owning the socket are the two ways round it, and both are
-//! also what the Rust API requires. `recv_nowait` and `send_nowait` report
-//! `EAGAIN` instead of queueing, because they were told not to wait.
+//! `await sock.send(...)` on that same object waits for the receive to finish
+//! or to be cancelled. `recv_nowait` and `send_nowait` report `EAGAIN`
+//! instead of queueing, because they were told not to wait.
+//!
+//! Where the two directions of a socket type are independent, that is not the
+//! only option: `await sock.split()` hands out a sending and a receiving half
+//! onto the same connections, usable from two coroutines at once
+//! ([`crate::halves`]). DEALER, ROUTER, PAIR, XPUB and XSUB have it; REQ and
+//! REP do not, because 28/REQREP's alternation is one sequence. Otherwise:
+//! two sockets, which is what the patterns are for, or one coroutine owning
+//! the socket.
 //!
 //! # Why every awaiting call is a coroutine
 //!
@@ -271,6 +277,38 @@ macro_rules! python_socket {
     };
 
     (@build $class:ident, $rust:ident, $python:literal, $kind:literal, $what:literal,
+     {$($acc:tt)*}, [split $send:ident $recv:ident $($rest:ident)*]) => {
+        python_socket!(@build $class, $rust, $python, $kind, $what, {
+            $($acc)*
+
+            /// Splits the socket into a sending half and a receiving half,
+            /// usable **at the same time** from two coroutines.
+            ///
+            /// This socket type's two directions are independent, so a task
+            /// parked in the receiving half's `recv` no longer holds up the
+            /// sending half's `send` — the limitation
+            /// [`crate::sockets`] describes for a whole socket. The
+            /// connections stay while either half lives.
+            ///
+            /// **This object is retired by the call**: every later method on
+            /// it raises `ENOTSOCK` naming the split, because the socket now
+            /// lives in its halves.
+            fn split<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+                let slot = Arc::clone(&self.socket);
+                let bridge = self.bridge.clone();
+                self.bridge.awaitable(py, async move {
+                    let socket = slot.retire().await?;
+                    let (send, recv) = socket.split();
+                    Ok::<_, Errno>((
+                        crate::halves::$send::new(send, bridge.clone()),
+                        crate::halves::$recv::new(recv, bridge),
+                    ))
+                })
+            }
+        }, [$($rest)*]);
+    };
+
+    (@build $class:ident, $rust:ident, $python:literal, $kind:literal, $what:literal,
      {$($pattern:tt)*}, []) => {
         #[doc = $what]
         #[pyclass(frozen, name = $python, module = "weida_zmq")]
@@ -344,7 +382,7 @@ macro_rules! python_socket {
                 let slot = Arc::clone(&self.socket);
                 self.bridge.awaitable(py, async move {
                     slot.acquire()
-                        .await
+                        .await?
                         .bind(&endpoint)
                         .await
                         .map(|bound| bound.to_string())
@@ -362,7 +400,7 @@ macro_rules! python_socket {
             ) -> PyResult<Bound<'py, PyAny>> {
                 let slot = Arc::clone(&self.socket);
                 self.bridge.awaitable(py, async move {
-                    slot.acquire().await.connect(&endpoint).map_err(errno_of)
+                    slot.acquire().await?.connect(&endpoint).map_err(errno_of)
                 })
             }
 
@@ -375,7 +413,7 @@ macro_rules! python_socket {
             ) -> PyResult<Bound<'py, PyAny>> {
                 let slot = Arc::clone(&self.socket);
                 self.bridge.awaitable(py, async move {
-                    slot.acquire().await.unbind(&endpoint).map_err(errno_of)
+                    slot.acquire().await?.unbind(&endpoint).map_err(errno_of)
                 })
             }
 
@@ -388,7 +426,7 @@ macro_rules! python_socket {
                 let slot = Arc::clone(&self.socket);
                 self.bridge.awaitable(py, async move {
                     slot.acquire()
-                        .await
+                        .await?
                         .disconnect(&endpoint)
                         .map(|discarded| Discarded {
                             outgoing: discarded.outgoing,
@@ -405,7 +443,7 @@ macro_rules! python_socket {
                 self.bridge.awaitable(py, async move {
                     Ok::<Option<String>, Errno>(
                         slot.acquire()
-                            .await
+                            .await?
                             .last_endpoint()
                             .map(|endpoint| endpoint.to_string()),
                     )
@@ -416,7 +454,7 @@ macro_rules! python_socket {
             fn peer_count<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
                 let slot = Arc::clone(&self.socket);
                 self.bridge.awaitable(py, async move {
-                    Ok::<usize, Errno>(slot.acquire().await.peer_count())
+                    Ok::<usize, Errno>(slot.acquire().await?.peer_count())
                 })
             }
 
@@ -428,7 +466,7 @@ macro_rules! python_socket {
                 self.bridge.awaitable(py, async move {
                     Ok::<Vec<crate::identity::PyPeer>, Errno>(
                         slot.acquire()
-                            .await
+                            .await?
                             .connections()
                             .iter()
                             .map(crate::identity::PyPeer::of)
@@ -453,7 +491,7 @@ macro_rules! python_socket {
                 let bridge = self.bridge.clone();
                 let events = crate::monitor::PyMonitor::events(events);
                 self.bridge.awaitable(py, async move {
-                    let installed = slot.acquire().await.monitor(events);
+                    let installed = slot.acquire().await?.monitor(events);
                     Ok::<crate::monitor::PyMonitor, Errno>(crate::monitor::PyMonitor::new(
                         installed, bridge,
                     ))
@@ -466,7 +504,7 @@ macro_rules! python_socket {
             fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
                 let slot = Arc::clone(&self.socket);
                 self.bridge.awaitable(py, async move {
-                    slot.acquire().await.close();
+                    slot.acquire().await?.close();
                     Ok::<(), Errno>(())
                 })
             }
@@ -518,7 +556,7 @@ python_socket!(
     "DealerSocket",
     "DEALER",
     "A DEALER socket: request-reply without the lockstep, round-robin out and fair-queued in.",
-    [send recv]
+    [send recv split PyDealerSend PyDealerRecv]
 );
 python_socket!(
     PyRouterSocket,
@@ -526,7 +564,7 @@ python_socket!(
     "RouterSocket",
     "ROUTER",
     "A ROUTER socket: every message carries the peer's routing id as its first frame.",
-    [report report_now recv]
+    [report report_now recv split PyRouterSend PyRouterRecv]
 );
 python_socket!(
     PyPubSocket,
@@ -550,7 +588,7 @@ python_socket!(
     "XPubSocket",
     "XPUB",
     "An XPUB socket: PUB, with its subscribers' subscriptions delivered to the application.",
-    [publish recv subscribe]
+    [publish recv subscribe split PyXPubPublish PyXPubRecv]
 );
 python_socket!(
     PyXSubSocket,
@@ -558,7 +596,7 @@ python_socket!(
     "XSubSocket",
     "XSUB",
     "An XSUB socket: SUB, with subscriptions sent upstream as messages.",
-    [publish recv subscribe]
+    [publish recv subscribe split PyXSubSend PyXSubRecv]
 );
 python_socket!(
     PyPushSocket,
@@ -582,7 +620,7 @@ python_socket!(
     "PairSocket",
     "PAIR",
     "A PAIR socket: exactly one peer, no reconnection, no routing.",
-    [send recv]
+    [send recv split PyPairSend PyPairRecv]
 );
 
 device_ends!(

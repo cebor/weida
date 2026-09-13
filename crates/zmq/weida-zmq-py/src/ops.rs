@@ -96,8 +96,8 @@ pub trait Subscribe: Send + 'static {
 }
 
 macro_rules! receives {
-    ($($socket:ident),+ $(,)?) => {
-        $(impl Receive for weida_zmq::$socket {
+    ($($socket:path),+ $(,)?) => {
+        $(impl Receive for $socket {
             fn receive(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
                 self.recv()
             }
@@ -117,20 +117,30 @@ macro_rules! receives {
 }
 
 receives!(
-    ReqSocket,
-    RepSocket,
-    DealerSocket,
-    RouterSocket,
-    SubSocket,
-    XPubSocket,
-    XSubSocket,
-    PullSocket,
-    PairSocket,
+    weida_zmq::ReqSocket,
+    weida_zmq::RepSocket,
+    weida_zmq::DealerSocket,
+    weida_zmq::RouterSocket,
+    weida_zmq::SubSocket,
+    weida_zmq::XPubSocket,
+    weida_zmq::XSubSocket,
+    weida_zmq::PullSocket,
+    weida_zmq::PairSocket,
+);
+
+// The receiving halves `split` hands out. Their methods are the whole
+// socket's under the same names, so the shape is the same delegation.
+receives!(
+    weida_zmq::split::DealerRecv,
+    weida_zmq::split::RouterRecv,
+    weida_zmq::split::PairRecv,
+    weida_zmq::split::XPubRecv,
+    weida_zmq::split::XSubRecv,
 );
 
 macro_rules! transmits {
-    ($($socket:ident),+ $(,)?) => {
-        $(impl Transmit for weida_zmq::$socket {
+    ($($socket:path),+ $(,)?) => {
+        $(impl Transmit for $socket {
             fn transmit(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send {
                 self.send(message)
             }
@@ -150,11 +160,18 @@ macro_rules! transmits {
     };
 }
 
-transmits!(ReqSocket, DealerSocket, PushSocket, PairSocket);
+transmits!(
+    weida_zmq::ReqSocket,
+    weida_zmq::DealerSocket,
+    weida_zmq::PushSocket,
+    weida_zmq::PairSocket,
+);
+
+transmits!(weida_zmq::split::DealerSend, weida_zmq::split::PairSend);
 
 macro_rules! reports {
-    ($($socket:ident),+ $(,)?) => {
-        $(impl Report for weida_zmq::$socket {
+    ($($socket:path),+ $(,)?) => {
+        $(impl Report for $socket {
             fn transmit(&mut self, message: Multipart) -> impl Future<Output = Result<Sent>> + Send {
                 self.send(message)
             }
@@ -162,9 +179,19 @@ macro_rules! reports {
     };
 }
 
-reports!(RepSocket, RouterSocket);
+reports!(
+    weida_zmq::RepSocket,
+    weida_zmq::RouterSocket,
+    weida_zmq::split::RouterSend,
+);
 
 impl ReportNow for weida_zmq::RouterSocket {
+    fn transmit_now(&mut self, message: Multipart) -> Result<Sent> {
+        self.try_send(message)
+    }
+}
+
+impl ReportNow for weida_zmq::split::RouterSend {
     fn transmit_now(&mut self, message: Multipart) -> Result<Sent> {
         self.try_send(message)
     }
@@ -190,21 +217,39 @@ impl Publish for weida_zmq::XSubSocket {
     }
 }
 
+impl Publish for weida_zmq::split::XPubPublish {
+    fn publish(&mut self, message: Multipart) -> Published {
+        weida_zmq::split::XPubPublish::publish(self, message)
+    }
+}
+
+impl Publish for weida_zmq::split::XSubSend {
+    fn publish(&mut self, message: Multipart) -> Published {
+        self.send(message)
+    }
+}
+
 macro_rules! subscribes {
-    ($($socket:ident),+ $(,)?) => {
-        $(impl Subscribe for weida_zmq::$socket {
+    ($($socket:path),+ $(,)?) => {
+        $(impl Subscribe for $socket {
             fn subscribe(&mut self, prefix: &[u8]) -> Result<()> {
-                weida_zmq::$socket::subscribe(self, prefix)
+                <$socket>::subscribe(self, prefix)
             }
 
             fn unsubscribe(&mut self, prefix: &[u8]) -> Result<()> {
-                weida_zmq::$socket::unsubscribe(self, prefix)
+                <$socket>::unsubscribe(self, prefix)
             }
         })+
     };
 }
 
-subscribes!(SubSocket, XSubSocket, XPubSocket);
+subscribes!(
+    weida_zmq::SubSocket,
+    weida_zmq::XSubSocket,
+    weida_zmq::XPubSocket,
+    weida_zmq::split::XSubSend,
+    weida_zmq::split::XPubRecv,
+);
 
 /// Applies the `ZMQ_SUBSCRIBE`/`ZMQ_UNSUBSCRIBE` rows a `SocketOptions`
 /// collected, at construction.
@@ -321,7 +366,7 @@ pub fn recv<'py, S: Receive>(
     let limit = limit(py, timeout)?;
     let slot = Arc::clone(socket);
     bridge.awaitable(py, async move {
-        let mut socket = slot.acquire().await;
+        let mut socket = slot.acquire().await?;
         let received = match limit {
             Some(limit) => socket.receive_within(limit).await,
             None => socket.receive().await,
@@ -332,7 +377,10 @@ pub fn recv<'py, S: Receive>(
 
 /// `sock.recv_nowait()`.
 pub fn recv_nowait<S: Receive>(py: Python<'_>, socket: &Arc<Slot<S>>) -> PyResult<PyMultipart> {
-    let Some(mut socket) = socket.try_acquire() else {
+    let Some(mut socket) = socket
+        .try_acquire()
+        .map_err(|errno| crate::errors::to_py(py, &errno))?
+    else {
         return Err(busy(py));
     };
     socket
@@ -353,7 +401,7 @@ pub fn send<'py, S: Transmit>(
     let limit = limit(py, timeout)?;
     let slot = Arc::clone(socket);
     bridge.awaitable(py, async move {
-        let mut socket = slot.acquire().await;
+        let mut socket = slot.acquire().await?;
         match limit {
             Some(limit) => socket.transmit_within(message, limit).await,
             None => socket.transmit(message).await,
@@ -369,7 +417,10 @@ pub fn send_nowait<S: Transmit>(
     message: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     let message = message_from(message)?;
-    let Some(mut socket) = socket.try_acquire() else {
+    let Some(mut socket) = socket
+        .try_acquire()
+        .map_err(|errno| crate::errors::to_py(py, &errno))?
+    else {
         return Err(busy(py));
     };
     socket
@@ -388,7 +439,7 @@ pub fn send_reporting<'py, S: Report>(
     let slot = Arc::clone(socket);
     bridge.awaitable(py, async move {
         slot.acquire()
-            .await
+            .await?
             .transmit(message)
             .await
             .map(PySent::of)
@@ -403,7 +454,10 @@ pub fn send_reporting_nowait<S: ReportNow>(
     message: &Bound<'_, PyAny>,
 ) -> PyResult<PySent> {
     let message = message_from(message)?;
-    let Some(mut socket) = socket.try_acquire() else {
+    let Some(mut socket) = socket
+        .try_acquire()
+        .map_err(|errno| crate::errors::to_py(py, &errno))?
+    else {
         return Err(busy(py));
     };
     socket
@@ -422,7 +476,7 @@ pub fn publish<'py, S: Publish>(
     let message = message_from(message)?;
     let slot = Arc::clone(socket);
     bridge.awaitable(py, async move {
-        Ok::<PyPublished, Errno>(PyPublished::of(slot.acquire().await.publish(message)))
+        Ok::<PyPublished, Errno>(PyPublished::of(slot.acquire().await?.publish(message)))
     })
 }
 
@@ -433,7 +487,10 @@ pub fn publish_nowait<S: Publish>(
     message: &Bound<'_, PyAny>,
 ) -> PyResult<PyPublished> {
     let message = message_from(message)?;
-    let Some(mut socket) = socket.try_acquire() else {
+    let Some(mut socket) = socket
+        .try_acquire()
+        .map_err(|errno| crate::errors::to_py(py, &errno))?
+    else {
         return Err(busy(py));
     };
     Ok(PyPublished::of(socket.publish(message)))
@@ -448,7 +505,7 @@ pub fn subscribe<'py, S: Subscribe>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let slot = Arc::clone(socket);
     bridge.awaitable(py, async move {
-        slot.acquire().await.subscribe(&prefix).map_err(errno_of)
+        slot.acquire().await?.subscribe(&prefix).map_err(errno_of)
     })
 }
 
@@ -461,6 +518,6 @@ pub fn unsubscribe<'py, S: Subscribe>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let slot = Arc::clone(socket);
     bridge.awaitable(py, async move {
-        slot.acquire().await.unsubscribe(&prefix).map_err(errno_of)
+        slot.acquire().await?.unsubscribe(&prefix).map_err(errno_of)
     })
 }

@@ -69,6 +69,7 @@ use pyo3::prelude::*;
 mod context;
 mod devices;
 mod errors;
+mod halves;
 mod identity;
 mod lease;
 mod monitor;
@@ -126,6 +127,7 @@ fn weida_zmq(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<sockets::PyPushSocket>()?;
     module.add_class::<sockets::PyPullSocket>()?;
     module.add_class::<sockets::PyPairSocket>()?;
+    halves::install(module)?;
     sync::install(module)?;
     module.add("__all__", every_name())?;
     Ok(())
@@ -158,6 +160,16 @@ fn every_name() -> Vec<&'static str> {
         "PushSocket",
         "PullSocket",
         "PairSocket",
+        "DealerSend",
+        "DealerRecv",
+        "RouterSend",
+        "RouterRecv",
+        "PairSend",
+        "PairRecv",
+        "XPubPublish",
+        "XPubRecv",
+        "XSubSend",
+        "XSubRecv",
         "ZmqError",
         "CurveKey",
         "RoutingId",

@@ -26,6 +26,7 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
@@ -129,7 +130,7 @@ macro_rules! socket_endpoints {
             /// wildcard port.
             ///
             /// The returned future is `Send` and borrows nothing — see
-            /// [`SocketCore::bind`][$crate::socket::SocketCore::bind] — so
+            /// [`Shared::bind`][$crate::socket::Shared::bind] — so
             /// `socket.bind(endpoint).await` works on a multi-thread
             /// executor as well as under `block_on`.
             pub fn bind(
@@ -212,17 +213,57 @@ macro_rules! socket_endpoints {
 pub(crate) use socket_endpoints;
 
 /// The half of a socket that is the same for every pattern.
+///
+/// Two layers, and the split is what lets a socket be shared **between its
+/// own two halves** and nothing else. [`Shared`] underneath is `Sync`: the
+/// engine, the reactor and two atomic cursors, and every send and receive
+/// is a method on it taking `&self`, so their futures are `Send` and a
+/// multi-thread executor may drive them. `SocketCore` is a `!Sync` handle
+/// onto it — the `PhantomData<Cell<()>>` is libzmq's thread rule as a type,
+/// a compile error rather than a paragraph — and it dereferences to
+/// [`Shared`], so a pattern writes `self.core.recv_fair()` and gets a future
+/// borrowing only the `Sync` inside.
+///
+/// `Clone` is what a socket's two halves are made of
+/// ([`DealerSocket::split`][crate::DealerSocket::split]): each half holds a
+/// handle, the engine stays alive while either does, and it closes when the
+/// last one goes. The cursors are shared too, which is right: a rotation is
+/// a property of the socket, not of the half that happens to advance it.
+#[derive(Clone)]
 pub struct SocketCore {
-    engine: Engine,
-    exec: Exec,
-    socket_type: SocketType,
-    /// Where the round-robin stands. A socket is `!Sync`, so this needs no
-    /// synchronisation — which is half the point of the rule.
-    cursor: usize,
+    shared: Shared,
     /// libzmq's thread rule, as a type: `Cell` is `Send` and not `Sync`, so
     /// this core — and every socket holding one — may cross threads and may
     /// not be shared across them.
     not_sync: PhantomData<Cell<()>>,
+}
+
+impl std::ops::Deref for SocketCore {
+    type Target = Shared;
+
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
+}
+
+/// The `Sync` inside of a [`SocketCore`]: what both halves of a socket use.
+///
+/// Not a socket — it has no thread rule — and not constructible outside
+/// this module; it is reached through a `SocketCore`'s `Deref` and exists
+/// so that the async methods below borrow something `Send`.
+#[derive(Clone)]
+pub struct Shared {
+    engine: Engine,
+    exec: Exec,
+    socket_type: SocketType,
+    /// Where the outbound round-robin stands. Relaxed atomics: a socket is
+    /// used from one task per direction, so this is never contended, and an
+    /// atomic is what lets the method take `&self`.
+    send_cursor: Arc<AtomicUsize>,
+    /// Where the fair-queued receive stands. Its own cursor, so that a
+    /// receiving half and a sending half do not disturb each other's
+    /// rotation.
+    recv_cursor: Arc<AtomicUsize>,
 }
 
 impl SocketCore {
@@ -239,13 +280,7 @@ impl SocketCore {
         options.validate_for(socket_type)?;
         let session: Arc<dyn Session> = Arc::new(ZmtpSession::new(socket_type));
         let engine = Engine::new(context, options, session)?;
-        Ok(SocketCore {
-            exec: context.exec().clone(),
-            engine,
-            socket_type,
-            cursor: 0,
-            not_sync: PhantomData,
-        })
+        Ok(SocketCore::over(context, engine, socket_type))
     }
 
     /// Creates the engine for a socket of `socket_type` with a session the
@@ -263,15 +298,24 @@ impl SocketCore {
     ) -> Result<SocketCore> {
         options.validate_for(socket_type)?;
         let engine = Engine::new(context, options, session)?;
-        Ok(SocketCore {
-            exec: context.exec().clone(),
-            engine,
-            socket_type,
-            cursor: 0,
-            not_sync: PhantomData,
-        })
+        Ok(SocketCore::over(context, engine, socket_type))
     }
 
+    fn over(context: &Context, engine: Engine, socket_type: SocketType) -> SocketCore {
+        SocketCore {
+            shared: Shared {
+                exec: context.exec().clone(),
+                engine,
+                socket_type,
+                send_cursor: Arc::new(AtomicUsize::new(0)),
+                recv_cursor: Arc::new(AtomicUsize::new(0)),
+            },
+            not_sync: PhantomData,
+        }
+    }
+}
+
+impl Shared {
     /// The socket type this socket announces in its `READY`.
     pub const fn socket_type(&self) -> SocketType {
         self.socket_type
@@ -350,12 +394,13 @@ impl SocketCore {
     /// for room on *whichever* peer frees first, and for a peer at all when
     /// there is none — "SHALL block on sending… when it has no connected
     /// peers".
-    pub async fn send_round_robin(&mut self, message: Multipart) -> Result<Delivered> {
+    pub async fn send_round_robin(&self, message: Multipart) -> Result<Delivered> {
         let mute = self.options().pipe.outgoing.mute;
         loop {
             let peers = self.peers();
             if let Some((index, queue)) = self.next_with_room(&peers) {
-                self.cursor = index.wrapping_add(1);
+                self.send_cursor
+                    .store(index.wrapping_add(1), Ordering::Relaxed);
                 queue.try_send(message)?;
                 return Ok(Delivered {
                     peer: Some(peers[index].id),
@@ -378,12 +423,13 @@ impl SocketCore {
     /// The `ZMQ_DONTWAIT` form: never waits, and reports `EAGAIN` when no
     /// peer has room — whatever the mute action, because a caller who asked
     /// not to block asked for the refusal.
-    pub fn try_send_round_robin(&mut self, message: Multipart) -> Result<PeerId> {
+    pub fn try_send_round_robin(&self, message: Multipart) -> Result<PeerId> {
         let peers = self.peers();
         let Some((index, queue)) = self.next_with_room(&peers) else {
             return Err(mute_error(peers.is_empty()));
         };
-        self.cursor = index.wrapping_add(1);
+        self.send_cursor
+            .store(index.wrapping_add(1), Ordering::Relaxed);
         queue.try_send(message)?;
         Ok(peers[index].id)
     }
@@ -393,7 +439,7 @@ impl SocketCore {
     /// Reports `EHOSTUNREACH` when that peer is gone, which is what a socket
     /// type with `ZMQ_ROUTER_MANDATORY` surfaces and what one without turns
     /// into a drop.
-    pub async fn send_to(&mut self, peer: PeerId, message: Multipart) -> Result<Sent> {
+    pub async fn send_to(&self, peer: PeerId, message: Multipart) -> Result<Sent> {
         let Some(pipe) = self.pipe_of(peer) else {
             return Err(Error::EHOSTUNREACH(
                 format!("{peer} is gone; its queue was destroyed with it").into(),
@@ -412,7 +458,7 @@ impl SocketCore {
     /// "Fair-queued" is the rotation the manual names for every receiving
     /// socket type: the cursor advances past whoever was served, so one busy
     /// peer cannot starve the others (§4.1).
-    pub async fn recv_fair(&mut self) -> Result<(PeerId, Multipart)> {
+    pub async fn recv_fair(&self) -> Result<(PeerId, Multipart)> {
         loop {
             if let Some(taken) = self.take_fair() {
                 return Ok(taken);
@@ -422,8 +468,8 @@ impl SocketCore {
         }
     }
 
-    /// The `ZMQ_DONTWAIT` form of [`SocketCore::recv_fair`].
-    pub fn try_recv_fair(&mut self) -> Result<(PeerId, Multipart)> {
+    /// The `ZMQ_DONTWAIT` form of [`Shared::recv_fair`].
+    pub fn try_recv_fair(&self) -> Result<(PeerId, Multipart)> {
         match self.take_fair() {
             Some(taken) => Ok(taken),
             None => Err(Error::EAGAIN("nothing is queued from any peer".into())),
@@ -436,7 +482,7 @@ impl SocketCore {
     /// REQ's rule, in the specification's words: "SHALL accept an incoming
     /// message only from the last peer that it sent a request to. SHALL
     /// discard silently any messages received from other peers" (§4.2).
-    pub async fn recv_from(&mut self, peer: PeerId) -> Result<Multipart> {
+    pub async fn recv_from(&self, peer: PeerId) -> Result<Multipart> {
         loop {
             let peers = self.engine.peers();
             for other in &peers {
@@ -468,7 +514,7 @@ impl SocketCore {
     /// For a socket type whose `recv` has more to report than messages — an
     /// XPUB turns a departure into an unsubscribe — so it must wake on both
     /// and decide for itself.
-    pub async fn wait_for_activity(&mut self) {
+    pub async fn wait_for_activity(&self) {
         let peers = self.engine.peers();
         wait_for_message(&self.engine, &peers).await;
     }
@@ -479,22 +525,31 @@ impl SocketCore {
             return None;
         }
         (0..peers.len()).find_map(|offset| {
-            let index = (self.cursor.wrapping_add(offset)) % peers.len();
+            let index = (self
+                .send_cursor
+                .load(Ordering::Relaxed)
+                .wrapping_add(offset))
+                % peers.len();
             let queue = peers[index].pipe.outgoing();
             queue.has_room().then_some((index, queue))
         })
     }
 
     /// One fair-queued take, advancing the cursor past whoever was served.
-    fn take_fair(&mut self) -> Option<(PeerId, Multipart)> {
+    fn take_fair(&self) -> Option<(PeerId, Multipart)> {
         let peers = self.engine.peers();
         if peers.is_empty() {
             return None;
         }
         for offset in 0..peers.len() {
-            let index = (self.cursor.wrapping_add(offset)) % peers.len();
+            let index = (self
+                .recv_cursor
+                .load(Ordering::Relaxed)
+                .wrapping_add(offset))
+                % peers.len();
             if let Ok(message) = peers[index].pipe.incoming().try_recv() {
-                self.cursor = index.wrapping_add(1);
+                self.recv_cursor
+                    .store(index.wrapping_add(1), Ordering::Relaxed);
                 return Some((peers[index].id, message));
             }
         }
