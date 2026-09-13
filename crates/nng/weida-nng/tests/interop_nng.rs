@@ -491,7 +491,12 @@ async fn survey_interoperates_in_both_roles() {
         answer.push_back(b"nng");
         peer.send(answer).expect("answer");
     });
+    let arrival = std::time::Instant::now();
     while surveyor.pipe_count() == 0 {
+        assert!(
+            arrival.elapsed() < PATIENCE,
+            "the NNG respondent never connected"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     surveyor
@@ -508,11 +513,21 @@ async fn survey_interoperates_in_both_roles() {
         let url = url.clone();
         tokio::task::spawn_blocking(move || {
             let peer = nng_cooked(Protocol::Surveyor0);
-            peer.set_opt::<survey::SurveyTime>(Some(PATIENCE))
+            // A survey sent before the respondent's pipe exists reaches
+            // nobody, which is the pattern, so NNG surveys again until one
+            // answers. The survey time is what paces that loop, and it
+            // MUST be well under our respondent's receive timeout: with the
+            // two equal, a first survey that missed the pipe left our
+            // receive and NNG's next survey racing on the same clock, and
+            // on Windows — where the dial takes longer — our side lost
+            // often enough to file B-189.
+            peer.set_opt::<survey::SurveyTime>(Some(Duration::from_millis(250)))
                 .expect("SurveyTime");
             peer.listen(&url).expect("listen");
-            // Survey until a respondent has arrived: a survey sent before
-            // the pipe exists reaches nobody, which is the pattern.
+            // Bounded, because a `spawn_blocking` that never returns holds
+            // the runtime's shutdown, and the test then hangs instead of
+            // failing on the receive that actually timed out.
+            let started = std::time::Instant::now();
             loop {
                 peer.send(nng::Message::from(&b"anybody"[..]))
                     .expect("send");
@@ -520,6 +535,10 @@ async fn survey_interoperates_in_both_roles() {
                     assert_eq!(&answer[..], b"here");
                     return;
                 }
+                assert!(
+                    started.elapsed() < 2 * PATIENCE,
+                    "no respondent answered any survey"
+                );
             }
         })
     };
