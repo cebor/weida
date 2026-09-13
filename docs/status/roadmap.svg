@@ -12,7 +12,7 @@
       .phase   { fill:#263238; font-size:14px; font-weight:bold; }
     </style>
   </defs>
-  <text x="20" y="28" class="phase">Roadmap (LOOP.md §9) — state at main f3a3cbe, 1680 tests</text>
+  <text x="20" y="28" class="phase">Roadmap (LOOP.md §9) — state at main 626d5eb, 1682 tests</text>
 
   <!-- legend -->
   <g transform="translate(500,14)">
@@ -40,7 +40,7 @@
 
   <!-- what Phase A still owes, in the colour the legend promises -->
   <g transform="translate(20,128)">
-    <rect x="0"   y="0" width="430" height="18" rx="3" class="done"/><text x="8" y="13" class="sub">Phase A complete: B-039 landed on a Windows VM gate beside the Linux one (1658 / 1680 tests)</text>
+    <rect x="0"   y="0" width="430" height="18" rx="3" class="done"/><text x="8" y="13" class="sub">Phase A complete: B-039 landed on a Windows VM gate beside the Linux one (1660 / 1682 tests)</text>
     <rect x="440" y="0" width="430" height="18" rx="3" class="parked"/> <text x="448" y="13" class="sub">A5's per-peer control connection — parked by 0011 §4.3, with a revival condition</text>
   </g>
 
