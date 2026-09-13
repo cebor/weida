@@ -1812,8 +1812,19 @@ Recorded deliberately, not discovered later.
   is the `Delivery` transport receipt ([GUARANTEES.md](GUARANTEES.md) §6).
 - **No CI, no LICENSE, no publish metadata.** Not part of this increment; to be added on
   demand.
-- **No synchronous API wrapper.** The async API is the only surface. A blocking facade is a
-  binding-layer concern (Phase 10).
+- **A synchronous API wrapper exists now** (B-194): `weida::blocking` behind the non-default
+  `blocking` feature, in the shape the four protocol libraries of
+  [0013](decisions/0013-competitor-libraries.md) already had — every method a `block_on`
+  around the asynchronous endpoint's own, over a [`Runtime::owned`] reactor the caller never
+  sees, with payloads as `Vec<u8>` and an explicit byte ceiling on every receive. The entry
+  this replaced said a blocking facade was "a binding-layer concern (Phase 10)", and that was
+  wrong twice: the bindings are built on the facades rather than the reverse, and the
+  repository's own `weida` binary was an async program for no reason a script cares about.
+  What it adds beyond wrapping is one refusal: a call from inside a Tokio runtime would block
+  the worker that has to drive what it waits for, so every entry point checks
+  `Handle::try_current` and fails with `Error::Runtime` naming the fix rather than deadlocking.
+
+  [`Runtime::owned`]: https://git.doodleshnookie.net/tuco86/weida/blob/main/crates/weida/src/runtime.rs
 - **Fuzz runs need a nightly toolchain.** `cargo-fuzz` requires nightly, which is installed
   and was used: the `weida-protocol` targets ran 200 000 iterations each, the `weida-zmtp`
   targets and the five `weida-sp` targets 20 000 each, with no findings. On a host without

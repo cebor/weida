@@ -39,6 +39,9 @@
 //! payloads implement both the `tokio::io` and the `futures-io` traits for
 //! the same reason.
 
+#[cfg(feature = "blocking")]
+pub mod blocking;
+
 mod config;
 mod conn;
 mod dedup;

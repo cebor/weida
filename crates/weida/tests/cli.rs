@@ -36,7 +36,8 @@ struct Served {
     /// What is left of its stdout after the address line — a `--sink` writes
     /// every payload it receives there. Handed back by the reader thread, so
     /// the buffered bytes are not lost with it; `None` once a test has taken
-    /// it.
+    /// it. Read by the `--sink` tests on both platforms, each through its
+    /// own local transport.
     stdout: Option<BufReader<std::process::ChildStdout>>,
 }
 
@@ -173,6 +174,22 @@ fn help_and_version_are_answers_rather_than_errors() {
     }
 }
 
+/// Reads `want` bytes from a running server's own stdout, bounded.
+fn sunk(server: &mut Served, want: usize) -> Vec<u8> {
+    let mut stdout = server.stdout.take().expect("the served stdout");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; want];
+        let read = stdout.read_exact(&mut buf);
+        let _ = tx.send(read.map(|()| buf));
+    });
+    match rx.recv_timeout(DEADLINE) {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(e)) => panic!("reading the sink's stdout: {e}"),
+        Err(_) => panic!("the sink printed nothing within {DEADLINE:?}"),
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_send_reaches_a_sink_over_a_unix_socket() {
@@ -200,17 +217,27 @@ fn a_send_reaches_a_sink_over_a_unix_socket() {
 
     // The sink writes what it received to its own stdout. It is still
     // running, so read exactly as many bytes as were sent.
-    let mut stdout = server.stdout.take().expect("the served stdout");
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = vec![0u8; b"over a unix socket".len()];
-        let read = stdout.read_exact(&mut buf);
-        let _ = tx.send(read.map(|()| buf));
-    });
-    match rx.recv_timeout(DEADLINE) {
-        Ok(Ok(buf)) => assert_eq!(buf, b"over a unix socket"),
-        Ok(Err(e)) => panic!("reading the sink's stdout: {e}"),
-        Err(_) => panic!("the sink printed nothing within {DEADLINE:?}"),
-    }
+    assert_eq!(
+        sunk(&mut server, b"over a unix socket".len()),
+        b"over a unix socket"
+    );
     let _ = std::fs::remove_file(&socket);
+}
+
+/// The same claim on the platform whose local transport is a named pipe: the
+/// verbs, the address and the framing are the transport's business and not
+/// the CLI's, which is the property B-039 made true and this asserts.
+#[cfg(windows)]
+#[test]
+fn a_send_reaches_a_sink_over_a_named_pipe() {
+    let url = format!("weida+pipe://weida-cli-{}/sink", std::process::id());
+    let mut server = Served::start(&["--sink", &url]);
+    assert_eq!(server.address, url, "a local address needs no fingerprint");
+
+    let (code, _) = run(&["send", &url], b"over a named pipe");
+    assert_eq!(code, 0);
+    assert_eq!(
+        sunk(&mut server, b"over a named pipe".len()),
+        b"over a named pipe"
+    );
 }

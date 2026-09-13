@@ -10,6 +10,10 @@ default = ["generate"]
 # `Identity::generate`: self-signed identities for pinning. Off for callers
 # that only ever load certificates issued elsewhere.
 generate = ["dep:rcgen"]
+# `weida::blocking`: the synchronous facade over the same engine, for a caller
+# with no executor (B-194). Off by default, like every other library's in this
+# tree, because an application that has a reactor wants the async surface.
+blocking = ["dep:futures"]
 
 [dependencies]
 weida-core.workspace = true
@@ -31,6 +35,9 @@ rustls-pki-types.workspace = true
 rustls-webpki.workspace = true
 ring.workspace = true
 rcgen = { workspace = true, optional = true }
+# The blocking facade drives this crate's own futures on the calling thread
+# with `futures::executor::block_on`; the async surface needs none of it.
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Tests, examples and benches generate throwaway identities even when a
