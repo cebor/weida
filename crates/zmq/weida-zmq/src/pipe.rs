@@ -524,6 +524,25 @@ impl Default for PipeConfig {
 /// why a message can be queued for a peer that never answers. Cloning shares
 /// the queues: the socket holds one clone and the connection engine the
 /// other, which is the only way a queue can be a rendezvous between them.
+///
+/// **A pipe is oriented from the socket's side, and that is why two sessions
+/// cannot be paired through this type.** [`Pipe::outgoing`] is the queue of
+/// messages headed *for* the peer and [`Pipe::incoming`] what arrived *from*
+/// it, and a session pumps against that orientation: it pops `outgoing` onto
+/// the wire and pushes what it reads into `incoming`. Two sessions driven
+/// against each other therefore need two pipes whose halves are **crossed** —
+/// one session's `outgoing` being the other's `incoming` — and
+/// [`Pipe::new`] is the only constructor there is: a `Pipe` cannot be
+/// assembled from two given queues, so the crossing is not expressible
+/// through the public API. Sharing one pipe between them, the obvious move,
+/// makes both sessions pop the same `outgoing` queue and push the same
+/// `incoming` one, so each message is raced by both readers and half of them
+/// arrive where nobody is looking. Nothing is broken by this: the engine
+/// pairs a session with a *socket*, one pipe per peer with the socket holding
+/// the other end, which is why every socket-level test over TCP delivers.
+/// `Pipe::crossed` is that pairing, for a test inside this crate that wants
+/// it; it exists under `cfg(test)` because nothing but a harness has any use
+/// for a pipe whose other end is not a socket.
 #[derive(Clone, Debug)]
 pub struct Pipe {
     outgoing: Arc<Queue>,
@@ -539,6 +558,35 @@ impl Pipe {
             incoming: Arc::new(Queue::new(config.incoming)),
             refusals: Arc::new(Refusals::default()),
         }
+    }
+
+    /// Two pipes with their halves crossed: what one side sends, the other
+    /// receives.
+    ///
+    /// The pairing the public API cannot express — see the type's own
+    /// documentation for why — and the whole of what a harness driving two
+    /// sessions against each other needs, since both halves are just
+    /// `Arc<Queue>` and the crossing is which `Arc` each end holds.
+    /// `config.outgoing` bounds the first pipe's outgoing direction and hence
+    /// the second's incoming one, and `config.incoming` the other way round.
+    /// The `ERROR` channels stay separate: a refusal is one connection's, and
+    /// there are two here.
+    #[cfg(test)]
+    pub(crate) fn crossed(config: PipeConfig) -> (Pipe, Pipe) {
+        let there = Arc::new(Queue::new(config.outgoing));
+        let back = Arc::new(Queue::new(config.incoming));
+        (
+            Pipe {
+                outgoing: Arc::clone(&there),
+                incoming: Arc::clone(&back),
+                refusals: Arc::new(Refusals::default()),
+            },
+            Pipe {
+                outgoing: back,
+                incoming: there,
+                refusals: Arc::new(Refusals::default()),
+            },
+        )
     }
 
     /// The queue of messages headed for this peer.
@@ -928,6 +976,40 @@ mod tests {
 
         assert_eq!(pipe.close(), (1, 0));
         assert!(same.incoming().is_closed());
+    }
+
+    /// Claim: crossed pipes carry in both directions — what one side puts
+    /// into `outgoing` is what the other takes out of `incoming`, which is
+    /// the pairing a harness for two sessions needs and the one `Pipe::new`
+    /// cannot produce. Sharing a single pipe instead makes both ends pop the
+    /// same queue, so half the traffic arrives where nobody is looking.
+    #[tokio::test]
+    async fn crossed_pipes_carry_in_both_directions() {
+        let (here, there) = Pipe::crossed(PipeConfig::default());
+
+        here.outgoing()
+            .send(message("to the other side"))
+            .await
+            .expect("queued");
+        assert_eq!(
+            there.incoming().recv().await.expect("arrived"),
+            message("to the other side")
+        );
+
+        there
+            .outgoing()
+            .send(message("and back"))
+            .await
+            .expect("queued");
+        assert_eq!(
+            here.incoming().recv().await.expect("arrived"),
+            message("and back")
+        );
+
+        // Each end's `ERROR` channel is its own: a refusal belongs to one
+        // connection, and a crossed pair stands in for two.
+        here.refuse("no");
+        assert!(there.refusals.reasons.lock().expect("refusals").is_empty());
     }
 
     /// Claim: a queue holds whole messages, so multipart survives the trip
