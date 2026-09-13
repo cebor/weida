@@ -1,6 +1,6 @@
 [package]
 name = "weida-py"
-description = "The Python binding of weida: asyncio Req/Rep and Push/Pull over QUIC, with the library's error vocabulary as exception classes"
+description = "The Python binding of weida: Req/Rep, Push/Pull and Pub/Sub over QUIC, asyncio and synchronous, with the library's error vocabulary as exception classes"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true

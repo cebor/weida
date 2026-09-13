@@ -45,21 +45,25 @@
 //! would be choosing how much memory a stranger may make a Python process
 //! allocate. A payload larger than the ceiling is `weida.LimitExceeded`.
 //!
-//! # What is here, and what the next slice adds
+//! # What is here, and what is not
 //!
-//! All three patterns are here: `Requester`/`Replier`, `Pusher`/`Puller` and
-//! `Publisher`/`Subscriber` (B-200, B-204), each with the whole-payload calls
-//! a Python caller reaches for first **and** the streamed forms for a payload
-//! that does not fit memory — `pusher.open()`, `requester.open()`,
-//! `publisher.open(topic)`, `puller.recv_stream()` and
-//! `subscriber.recv_stream()`. What is not here:
-//! the raw L0 surface (`Peer` and `Acceptor`) and a synchronous facade over
-//! `weida::blocking`, which is B-205 and follows the order every other
-//! binding in this tree used — the library's blocking facade first, then the
-//! binding's `sync` module (B-205): `weida.sync` is `weida::blocking` with
-//! argument conversion around it, for a process with no event loop, and it
-//! shares every value class with the asyncio surface. What is not here is
-//! the raw L0 surface, `Peer` and `Acceptor`.
+//! All three patterns, on both surfaces. Asyncio: `Requester`/`Replier`,
+//! `Pusher`/`Puller` and `Publisher`/`Subscriber` (B-200, B-204), each with
+//! the whole-payload calls a caller reaches for first **and** the streamed
+//! forms for a payload that does not fit memory — `pusher.open()`,
+//! `requester.open()`, `publisher.open(topic)`, `puller.recv_stream()` and
+//! `subscriber.recv_stream()`. Synchronous: `weida.sync` (B-205), which is
+//! `weida::blocking` with argument conversion around it, for a process with
+//! no event loop; it shares every value class with the asyncio surface and
+//! deliberately has no streamed form, because the facade takes whole
+//! payloads and a `sync` module that invented streaming would be inventing a
+//! second facade.
+//!
+//! What is absent, with the reason: the raw L0 surface — `Peer` and
+//! `Acceptor`, weida's own stream-level API — because every pattern above is
+//! built on it and a Python caller that wants a bare stream wants the Rust
+//! API; and type stubs, which `docs/libraries/weida-py.md` §10 names as the
+//! follow-up they are.
 //!
 //! # No protocol behaviour lives here
 //!
