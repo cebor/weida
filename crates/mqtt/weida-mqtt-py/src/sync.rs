@@ -33,7 +33,7 @@
 //! The classes a caller *passes* are the same objects in both surfaces —
 //! `weida_mqtt.Message`, `weida_mqtt.Subscription`, `weida_mqtt.ConnectOptions`
 //! — and so are the ones it gets back, `Delivery` and `Completion`. Only the
-//! four handles differ, because only they differ: `sync.Context`,
+//! three handles differ, because only they differ: `sync.Context`,
 //! `sync.Client` and `sync.Deliveries` block where their asynchronous
 //! counterparts return a coroutine.
 //!
