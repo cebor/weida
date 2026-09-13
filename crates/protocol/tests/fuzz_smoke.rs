@@ -17,7 +17,7 @@
 use weida_core::{ErrorCode, TraceContext};
 use weida_protocol::header::{Acknowledgement, limits};
 use weida_protocol::{
-    DataHeader, ErrorHeader, Hello, SubscriptionHeader, encode_frame, parse_preamble,
+    CreditHeader, DataHeader, ErrorHeader, Hello, SubscriptionHeader, encode_frame, parse_preamble,
 };
 
 const ITERATIONS: usize = 100_000;
@@ -307,6 +307,44 @@ fn fuzz_smoke_subscribe() {
         );
     }
     assert!(accepted > 0, "no subscription header ever decoded");
+    assert!(
+        accepted < ITERATIONS,
+        "the decoder accepted every input; it is too permissive"
+    );
+}
+
+#[test]
+fn fuzz_smoke_credit() {
+    let mut rng = Rng::new(0x0003_0018_0202_0005);
+    let seed = CreditHeader::new("/jobs", "px.eur", 1024).encode();
+    let mut accepted = 0usize;
+    for i in 0..ITERATIONS {
+        let input = if i % 2 == 0 {
+            rng.bytes(40)
+        } else {
+            let mut buf = seed.clone();
+            for _ in 0..=rng.below(3) {
+                rng.flip_bit(&mut buf);
+            }
+            buf
+        };
+        let Ok(header) = CreditHeader::decode(&input) else {
+            continue;
+        };
+        accepted += 1;
+        assert!(header.endpoint.len() <= limits::MAX_ENDPOINT_BYTES);
+        assert!(header.filter.len() <= limits::MAX_FILTER_BYTES);
+        // No limit is illegal: the whole `u64` range is a legal absolute
+        // limit, and a huge one is a consumer promising to take everything
+        // rather than a hostile number — the bound on what a broker holds is
+        // its own `queue_bytes`, not a peer's credit.
+        assert_eq!(
+            CreditHeader::decode(&header.encode()).as_ref(),
+            Ok(&header),
+            "decoding is not idempotent for {input:?}"
+        );
+    }
+    assert!(accepted > 0, "no credit header ever decoded");
     assert!(
         accepted < ITERATIONS,
         "the decoder accepted every input; it is too permissive"

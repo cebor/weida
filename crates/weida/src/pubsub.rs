@@ -34,52 +34,6 @@ use weida_protocol::codes;
 /// messages are tiny.
 const WRITER_QUEUE: usize = 1024;
 
-/// Does `topic` match `filter`?
-///
-/// The segmented grammar of `docs/PROTOCOL.md` §6.4: segments split on `.`,
-/// `*` for exactly one whole segment, a trailing `#` for zero or more, every
-/// other byte literal, and the empty filter matching everything.
-///
-/// The objection this function used to carry was that treating `*` as a
-/// wildcard "would make topics with a literal `*` unaddressable and would put
-/// a matching language in the hot path". Both halves were true and both are
-/// accepted deliberately
-/// ([decisions/0007](../../../docs/decisions/0007-topic-namespace.md) §4.6): a
-/// filter can no longer select a segment containing `.`, `*` or `#`
-/// literally — there is no escape character, and no sheet reports a use for
-/// one — while a byte prefix could not express a boundary at all, so
-/// `sensors.temp` also selected `sensors.temperature`. The hot-path half is
-/// answered by the shape rather than by the choice: `#` is legal only as the
-/// final segment, so this is one left-to-right walk with no backtracking, no
-/// allocation and work bounded by the 256 B filter cap.
-///
-/// A `topic` is never a pattern: `*` and `#` in a published topic are literal
-/// bytes here, exactly like any other.
-pub(crate) fn matches_filter(topic: &str, filter: &str) -> bool {
-    if filter.is_empty() {
-        return true;
-    }
-    let mut topic_segments = topic.split(filter::SEPARATOR);
-    let mut filter_segments = filter.split(filter::SEPARATOR);
-    loop {
-        let Some(pattern) = filter_segments.next() else {
-            // The filter is spent: it matches only if the topic is too.
-            return topic_segments.next().is_none();
-        };
-        // Only ever the final segment — `filter::validate` rejects anything
-        // else at the codec boundary — so everything left over matches.
-        if pattern == filter::REST {
-            return true;
-        }
-        let Some(segment) = topic_segments.next() else {
-            return false;
-        };
-        if pattern != filter::ONE_SEGMENT && pattern != segment {
-            return false;
-        }
-    }
-}
-
 /// One message queued for one subscriber.
 ///
 /// The DATA header is *not* pre-encoded and shared: each copy carries the
@@ -356,6 +310,30 @@ impl SubRegistry {
         Ok(())
     }
 
+    /// Counts one subscription against `max_subscriptions` without recording
+    /// a filter.
+    ///
+    /// For a subscription this registry does not serve: an L2 queue keeps its
+    /// consumers itself, but the bound is per connection over *all* paths, so
+    /// the count has to stay in one place or it bounds nothing
+    /// (`docs/PROTOCOL.md` §10).
+    pub(crate) fn reserve(&self, conn_id: usize) -> Result<(), Error> {
+        let mut per_conn = self.per_conn.write().expect("subscription lock poisoned");
+        let count = per_conn.entry(conn_id).or_insert(0);
+        if *count >= self.limits.max_subscriptions {
+            return Err(Error::LimitExceeded);
+        }
+        *count += 1;
+        Ok(())
+    }
+
+    /// Gives one reserved subscription back. An unknown connection is ignored:
+    /// UNSUBSCRIBE is idempotent.
+    pub(crate) fn release(&self, conn_id: usize) {
+        let mut per_conn = self.per_conn.write().expect("subscription lock poisoned");
+        decrement(&mut per_conn, conn_id, 1);
+    }
+
     /// Withdraws one filter. An unknown filter, path or connection is ignored:
     /// UNSUBSCRIBE is idempotent and races legitimately with teardown.
     pub(crate) fn unsubscribe(&self, path: &str, conn_id: usize, filter: &str) {
@@ -415,7 +393,7 @@ impl SubRegistry {
         let sequence = self.sequencer.next(&topic);
         let mut sent = 0usize;
         for entry in &state.subs {
-            if !entry.filters.iter().any(|f| matches_filter(&topic, f)) {
+            if !entry.filters.iter().any(|f| filter::matches(&topic, f)) {
                 continue;
             }
             let Ok(permit) = entry.budget.try_acquire_many(want) else {
@@ -463,7 +441,7 @@ impl SubRegistry {
         let sequence = self.sequencer.next(&topic);
         let mut targets = Vec::new();
         for entry in &state.subs {
-            if !entry.filters.iter().any(|f| matches_filter(&topic, f)) {
+            if !entry.filters.iter().any(|f| filter::matches(&topic, f)) {
                 continue;
             }
             // The permit for the ending — `Finish` or `Abort` — is taken
@@ -921,62 +899,62 @@ mod tests {
 
     #[test]
     fn a_literal_filter_matches_whole_segments_only() {
-        assert!(matches_filter("px.eur", "px.eur"));
-        assert!(!matches_filter("px.eur", "px.eur.spot"));
-        assert!(!matches_filter("fx.usd", "px.eur"));
+        assert!(filter::matches("px.eur", "px.eur"));
+        assert!(!filter::matches("px.eur", "px.eur.spot"));
+        assert!(!filter::matches("fx.usd", "px.eur"));
         // The boundary a byte prefix could not see: `px.` used to select
         // everything under `px`, and `sensors.temp` used to select
         // `sensors.temperature`.
-        assert!(!matches_filter("px.eur", "px."));
-        assert!(!matches_filter("sensors.temperature", "sensors.temp"));
+        assert!(!filter::matches("px.eur", "px."));
+        assert!(!filter::matches("sensors.temperature", "sensors.temp"));
     }
 
     #[test]
     fn the_empty_filter_and_the_rest_wildcard_take_everything() {
-        assert!(matches_filter("", ""));
-        assert!(matches_filter("anything.at.all", ""));
-        assert!(matches_filter("anything.at.all", "#"));
-        assert!(matches_filter("", "#"));
+        assert!(filter::matches("", ""));
+        assert!(filter::matches("anything.at.all", ""));
+        assert!(filter::matches("anything.at.all", "#"));
+        assert!(filter::matches("", "#"));
     }
 
     #[test]
     fn one_segment_wildcard_matches_exactly_one() {
-        assert!(matches_filter("px.eur", "px.*"));
-        assert!(matches_filter("sensors.a.temp", "sensors.*.temp"));
-        assert!(matches_filter("px.eur", "*.eur"));
+        assert!(filter::matches("px.eur", "px.*"));
+        assert!(filter::matches("sensors.a.temp", "sensors.*.temp"));
+        assert!(filter::matches("px.eur", "*.eur"));
         // Exactly one: neither none nor two.
-        assert!(!matches_filter("px", "px.*"));
-        assert!(!matches_filter("px.eur.spot", "px.*"));
+        assert!(!filter::matches("px", "px.*"));
+        assert!(!filter::matches("px.eur.spot", "px.*"));
     }
 
     #[test]
     fn the_rest_wildcard_matches_zero_or_more_trailing_segments() {
-        assert!(matches_filter("px", "px.#"));
-        assert!(matches_filter("px.eur", "px.#"));
-        assert!(matches_filter("px.eur.spot", "px.#"));
-        assert!(!matches_filter("fx", "px.#"));
-        assert!(!matches_filter("pxx", "px.#"));
+        assert!(filter::matches("px", "px.#"));
+        assert!(filter::matches("px.eur", "px.#"));
+        assert!(filter::matches("px.eur.spot", "px.#"));
+        assert!(!filter::matches("fx", "px.#"));
+        assert!(!filter::matches("pxx", "px.#"));
     }
 
     #[test]
     fn a_topic_is_never_a_pattern() {
         // `*` and `#` in a published topic are ordinary bytes.
-        assert!(matches_filter("px.*", "px.*"));
-        assert!(!matches_filter("px.*", "px.eur"));
-        assert!(matches_filter("px.#", "px.#"));
-        assert!(matches_filter("px.*", "*.*"));
+        assert!(filter::matches("px.*", "px.*"));
+        assert!(!filter::matches("px.*", "px.eur"));
+        assert!(filter::matches("px.#", "px.#"));
+        assert!(filter::matches("px.*", "*.*"));
     }
 
     #[test]
     fn empty_segments_match_only_empty_segments() {
-        assert!(matches_filter("px.", "px."));
-        assert!(!matches_filter("px.eur", "px."));
-        assert!(matches_filter("px.", "px.*"));
+        assert!(filter::matches("px.", "px."));
+        assert!(!filter::matches("px.eur", "px."));
+        assert!(filter::matches("px.", "px.*"));
     }
 
     #[test]
     fn matching_is_byte_exact_not_case_folded() {
-        assert!(!matches_filter("PX.EUR", "px.*"));
-        assert!(!matches_filter("px.eur", "PX.*"));
+        assert!(!filter::matches("PX.EUR", "px.*"));
+        assert!(!filter::matches("px.eur", "PX.*"));
     }
 }

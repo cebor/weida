@@ -124,6 +124,50 @@ impl Queue {
         Ok(())
     }
 
+    /// How many messages are held.
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// The topic of the message at `index`, or the empty topic when it has
+    /// none.
+    ///
+    /// The empty string is not a special case: a message with no topic is
+    /// matched by the empty filter — which matches every topic — and by no
+    /// other, which is exactly what an unlabelled message should be selected
+    /// by.
+    pub fn topic_at(&self, index: usize) -> Option<&str> {
+        let message = self.messages.get(index)?;
+        Some(message.topic.as_deref().unwrap_or(""))
+    }
+
+    /// Takes the message at `index`, keeping the order of the rest.
+    ///
+    /// Delivery selects **the first message some consumer may take**, not
+    /// strictly the head: with consumer-side filters a queue holds messages
+    /// for several filters at once, so a head nobody subscribes for would
+    /// otherwise block every message behind it forever. Scanning costs one
+    /// pass over a queue whose length is bounded by
+    /// `queue_bytes / PER_MESSAGE_OVERHEAD`, and the common case — one
+    /// consumer with the empty filter — stops at the first message.
+    pub fn take(&mut self, index: usize) -> Option<QueuedMessage> {
+        let message = self.messages.remove(index)?;
+        self.charged -= message.charge();
+        Some(message)
+    }
+
+    /// Puts a message back where it was.
+    ///
+    /// For a delivery whose write never landed: it was charged against this
+    /// budget a moment ago, so the charge is re-added rather than re-checked —
+    /// refusing here would discard a message the broker has already confirmed,
+    /// which is the one thing a queue may never do
+    /// (`docs/GUARANTEES.md` §1).
+    pub fn push_front(&mut self, message: QueuedMessage) {
+        self.charged += message.charge();
+        self.messages.push_front(message);
+    }
+
     /// What the queue holds.
     pub fn stats(&self) -> QueueStats {
         QueueStats {

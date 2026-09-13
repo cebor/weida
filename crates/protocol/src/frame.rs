@@ -27,6 +27,14 @@ pub enum FrameKind {
     Subscribe,
     /// Withdrawal of a previous SUBSCRIBE; header-only.
     Unsubscribe,
+    /// An L2 consumer's delivery limit for one subscription; header-only.
+    ///
+    /// The credit of
+    /// [decisions/0003](../../../docs/decisions/0003-credit-unit.md) §4.2: a
+    /// subscription and an **absolute** delivery limit, so a lost or
+    /// duplicated frame changes nothing. Only a queue serves it; a path with
+    /// no queue refuses the stream with `UNSUPPORTED`.
+    Credit,
 }
 
 impl FrameKind {
@@ -38,6 +46,7 @@ impl FrameKind {
             FrameKind::Error => 2,
             FrameKind::Subscribe => 3,
             FrameKind::Unsubscribe => 4,
+            FrameKind::Credit => 5,
         }
     }
 
@@ -51,6 +60,7 @@ impl FrameKind {
             2 => Some(FrameKind::Error),
             3 => Some(FrameKind::Subscribe),
             4 => Some(FrameKind::Unsubscribe),
+            5 => Some(FrameKind::Credit),
             _ => None,
         }
     }
@@ -69,6 +79,7 @@ impl fmt::Display for FrameKind {
             FrameKind::Error => "ERROR",
             FrameKind::Subscribe => "SUBSCRIBE",
             FrameKind::Unsubscribe => "UNSUBSCRIBE",
+            FrameKind::Credit => "CREDIT",
         };
         f.write_str(s)
     }
@@ -186,12 +197,13 @@ mod tests {
             (FrameKind::Error, 2),
             (FrameKind::Subscribe, 3),
             (FrameKind::Unsubscribe, 4),
+            (FrameKind::Credit, 5),
         ];
         for (kind, code) in all {
             assert_eq!(kind.to_u8(), code);
             assert_eq!(FrameKind::from_u8(code), Some(kind));
         }
-        for code in 5u8..=255 {
+        for code in 6u8..=255 {
             assert_eq!(FrameKind::from_u8(code), None, "kind {code}");
         }
     }
@@ -204,6 +216,7 @@ mod tests {
             FrameKind::Error,
             FrameKind::Subscribe,
             FrameKind::Unsubscribe,
+            FrameKind::Credit,
         ] {
             assert!(!k.has_payload(), "{k}");
         }
@@ -269,8 +282,10 @@ mod tests {
 
     #[test]
     fn unknown_kind_is_a_violation() {
-        let err = parse_preamble(&[MAGIC, 0x05, 0x00], CAP).unwrap_err();
-        assert_eq!(err, PreambleError::UnknownKind(5));
+        // Kind `6` is the first free one: `5` became CREDIT with the L2 queue
+        // (`docs/decisions/0018-minimal-broker.md` §4.6).
+        let err = parse_preamble(&[MAGIC, 0x06, 0x00], CAP).unwrap_err();
+        assert_eq!(err, PreambleError::UnknownKind(6));
         assert!(err.is_violation());
     }
 

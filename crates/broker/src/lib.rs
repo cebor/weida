@@ -28,13 +28,29 @@
 //! §4.3). A producer that needs to know a consumer processed its message uses
 //! an application reply.
 //!
+//! # Delivery, and what a consumer must do to get any
+//!
+//! A consumer is an ordinary [`weida::Subscriber`]: it subscribes to the
+//! queue's path with a filter and then **grants credit** with
+//! [`weida::Subscriber::grant`], an absolute delivery limit per subscription.
+//! Until it does, it receives nothing — initial credit is zero, the only
+//! default that cannot surprise a consumer with a flood. Each message goes to
+//! exactly one consumer with credit, as a one-way transfer; a queue with no
+//! credit anywhere keeps its messages, which is the temporal decoupling a
+//! queue exists for.
+//!
+//! Two properties are worth stating because they are what a credit scheme is
+//! bought for. The limit is **absolute and monotone at the broker**, so a
+//! duplicated or reordered grant changes nothing. And a consumer **pauses by
+//! restating the count it has already received**: delivery stops with no
+//! stream reset and no connection close, and a later, larger grant resumes it.
+//!
 //! # What this slice does not do
 //!
-//! **It delivers nothing.** Queues admit, confirm and hold; the credit frame a
-//! consumer grants and the delivery under it are B-202, and the consumer
-//! acknowledgement, redelivery and the queue drain are B-203. A queue with no
-//! consumer is the thing being built here on purpose: a confirm that arrives
-//! with nobody listening is the temporal decoupling a queue exists for.
+//! **A delivery has no outcome yet.** A delivered message leaves the queue
+//! immediately, because there is nothing to wait for: the consumer
+//! acknowledgement, the redelivery of what was not acknowledged, and
+//! `Broker::drain` are B-203.
 //!
 //! # Example
 //!
@@ -57,6 +73,7 @@
 //! ```
 
 mod broker;
+mod consumers;
 mod queue;
 
 pub use broker::{Achieved, Broker, BrokerConfig};

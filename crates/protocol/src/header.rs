@@ -93,16 +93,27 @@ mod subscription_key {
     pub const FILTER: u64 = 1;
 }
 
+/// CREDIT keys.
+mod credit_key {
+    pub const ENDPOINT: u64 = 0;
+    pub const FILTER: u64 = 1;
+    pub const LIMIT: u64 = 2;
+}
+
 /// The topic filter grammar of `docs/PROTOCOL.md` §6.4.
 ///
 /// A topic and a filter are byte strings split on [`filter::SEPARATOR`] into
 /// segments. The two wildcards are whole-segment tokens, and everything else
 /// is literal: there is no escape character, no normalization and no case
 /// folding ([decisions/0007](../../../docs/decisions/0007-topic-namespace.md)
-/// §4.2). The matcher lives with the fan-out it serves, in
-/// `weida::pubsub`; what belongs here is the rule that says which filters may
-/// exist at all, so an illegal one is refused at the codec boundary instead of
-/// reaching a matcher that would have to cope with it.
+/// §4.2). Both halves of the grammar live here: [`filter::validate`], the rule
+/// that says which filters may exist at all — so an illegal one is refused at
+/// the codec boundary rather than reaching a matcher that would have to cope
+/// with it — and [`filter::matches`], the matcher itself. The matcher used to
+/// sit with the fan-out it served, in `weida::pubsub`, and moved when a second
+/// layer needed it: an L2 queue selects a consumer with the same grammar
+/// (B-202), and a second implementation of a wildcard language is exactly the
+/// kind of drift one definition exists to prevent.
 pub mod filter {
     use super::HeaderError;
 
@@ -112,6 +123,52 @@ pub mod filter {
     pub const ONE_SEGMENT: &str = "*";
     /// Matches zero or more trailing segments; legal only as the last segment.
     pub const REST: &str = "#";
+
+    /// Does `topic` match `filter`?
+    ///
+    /// The segmented grammar of `docs/PROTOCOL.md` §6.4: segments split on `.`,
+    /// `*` for exactly one whole segment, a trailing `#` for zero or more, every
+    /// other byte literal, and the empty filter matching everything.
+    ///
+    /// The objection this function used to carry was that treating `*` as a
+    /// wildcard "would make topics with a literal `*` unaddressable and would put
+    /// a matching language in the hot path". Both halves were true and both are
+    /// accepted deliberately
+    /// ([decisions/0007](../../../../docs/decisions/0007-topic-namespace.md) §4.6): a
+    /// filter can no longer select a segment containing `.`, `*` or `#`
+    /// literally — there is no escape character, and no sheet reports a use for
+    /// one — while a byte prefix could not express a boundary at all, so
+    /// `sensors.temp` also selected `sensors.temperature`. The hot-path half is
+    /// answered by the shape rather than by the choice: `#` is legal only as the
+    /// final segment, so this is one left-to-right walk with no backtracking, no
+    /// allocation and work bounded by the 256 B filter cap.
+    ///
+    /// A `topic` is never a pattern: `*` and `#` in a published topic are literal
+    /// bytes here, exactly like any other.
+    pub fn matches(topic: &str, filter: &str) -> bool {
+        if filter.is_empty() {
+            return true;
+        }
+        let mut topic_segments = topic.split(SEPARATOR);
+        let mut filter_segments = filter.split(SEPARATOR);
+        loop {
+            let Some(pattern) = filter_segments.next() else {
+                // The filter is spent: it matches only if the topic is too.
+                return topic_segments.next().is_none();
+            };
+            // Only ever the final segment — `filter::validate` rejects anything
+            // else at the codec boundary — so everything left over matches.
+            if pattern == REST {
+                return true;
+            }
+            let Some(segment) = topic_segments.next() else {
+                return false;
+            };
+            if pattern != ONE_SEGMENT && pattern != segment {
+                return false;
+            }
+        }
+    }
 
     /// Checks `filter` against the grammar.
     ///
@@ -1431,6 +1488,92 @@ impl SubscriptionHeader {
         Ok(SubscriptionHeader {
             endpoint: endpoint.expect("presence checked above"),
             filter,
+        })
+    }
+}
+
+/// CREDIT header (kind `5`).
+///
+/// The L2 credit of
+/// [decisions/0003](../../../docs/decisions/0003-credit-unit.md) §4.2-§4.3:
+/// which subscription, and how many messages that subscription will accept in
+/// total. Three keys, all required — a subscription is `(endpoint, filter)`
+/// on the connection the frame arrives on, and an absent limit would be
+/// indistinguishable from a limit of zero, which is the pause.
+///
+/// **The limit is absolute and cumulative, not a delta.** It counts messages
+/// delivered on that subscription since it was created, so a lost frame costs
+/// nothing and a duplicated one changes nothing. It is also **monotone at the
+/// receiver**: a broker keeps the highest limit it has seen, which is what
+/// makes a reordered frame harmless on a transport that does not order the
+/// streams control frames ride. A consumer therefore pauses by restating the
+/// number it has already been delivered — AMQP 1.0's `link-credit = 0`
+/// against an absolute baseline [amqp10 §5.1] — and a fresh subscription's
+/// pause is the limit `0` it starts at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreditHeader {
+    /// Endpoint path of the queue the subscription is on.
+    pub endpoint: String,
+    /// Topic filter of the subscription. A decoded header's filter has passed
+    /// [`filter::validate`].
+    pub filter: String,
+    /// Messages this subscription will accept in total, counted from its
+    /// creation.
+    pub limit: u64,
+}
+
+impl CreditHeader {
+    /// A header granting `limit` to the subscription `(endpoint, filter)`.
+    pub fn new(endpoint: impl Into<String>, filter: impl Into<String>, limit: u64) -> CreditHeader {
+        CreditHeader {
+            endpoint: endpoint.into(),
+            filter: filter.into(),
+            limit,
+        }
+    }
+
+    /// Encodes the header.
+    pub fn encode(&self) -> Vec<u8> {
+        encode_with(|e| {
+            e.map(3)?;
+            e.u64(credit_key::ENDPOINT)?.str(&self.endpoint)?;
+            e.u64(credit_key::FILTER)?.str(&self.filter)?;
+            e.u64(credit_key::LIMIT)?.u64(self.limit)?;
+            Ok(())
+        })
+    }
+
+    /// Decodes the header.
+    pub fn decode(bytes: &[u8]) -> Result<CreditHeader, HeaderError> {
+        let mut d = Decoder::new(bytes);
+        let mut endpoint = None;
+        let mut filter = None;
+        let mut limit = None;
+        {
+            let mut m = MapReader::new(&mut d)?;
+            while let Some(key) = m.next_key()? {
+                match key {
+                    credit_key::ENDPOINT => {
+                        endpoint = Some(m.text(key, limits::MAX_ENDPOINT_BYTES)?)
+                    }
+                    credit_key::FILTER => filter = Some(m.text(key, limits::MAX_FILTER_BYTES)?),
+                    credit_key::LIMIT => limit = Some(m.u64()?),
+                    _ => m.skip()?,
+                }
+            }
+            m.require(credit_key::ENDPOINT)?;
+            m.require(credit_key::FILTER)?;
+            m.require(credit_key::LIMIT)?;
+        }
+        // Same boundary as SUBSCRIBE: a filter that does not name a
+        // subscription cannot grant credit to one.
+        let filter = filter.expect("presence checked above");
+        filter::validate(&filter)?;
+        finish(&d)?;
+        Ok(CreditHeader {
+            endpoint: endpoint.expect("presence checked above"),
+            filter,
+            limit: limit.expect("presence checked above"),
         })
     }
 }

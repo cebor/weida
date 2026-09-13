@@ -13,7 +13,9 @@
 
 use weida_core::ErrorCode;
 use weida_protocol::header::{Acknowledgement, GuaranteeSet, HeaderError, OrderingMode};
-use weida_protocol::{DataHeader, ErrorHeader, FrameKind, Hello, SubscriptionHeader, encode_frame};
+use weida_protocol::{
+    CreditHeader, DataHeader, ErrorHeader, FrameKind, Hello, SubscriptionHeader, encode_frame,
+};
 
 /// Asserts one documented frame, and that its header half decodes back.
 #[track_caller]
@@ -318,4 +320,46 @@ fn golden_hello_with_guarantees_frame() {
         ..Hello::v0(16384, 1024)
     };
     assert_eq!(explicit_core.encode(), Hello::v0(16384, 1024).encode());
+}
+
+#[test]
+fn golden_credit_frames() {
+    // The L2 credit frame: which subscription, and how many messages it will
+    // take in total (`docs/decisions/0003-credit-unit.md` §4.2).
+    let granting = CreditHeader::new("/jobs", "px.eur", 5);
+    assert_frame(
+        "CREDIT",
+        FrameKind::Credit,
+        granting.encode(),
+        &[
+            0x57, 0x05, 0x12, 0xA3, 0x00, 0x65, 0x2F, 0x6A, 0x6F, 0x62, 0x73, 0x01, 0x66, 0x70,
+            0x78, 0x2E, 0x65, 0x75, 0x72, 0x02, 0x05,
+        ],
+    );
+    assert_eq!(CreditHeader::decode(&granting.encode()).unwrap(), granting);
+
+    // The pause, and the value every subscription starts at: the empty filter
+    // is the whole-queue subscription, and `0` is a consumer that will take
+    // nothing until it says otherwise.
+    let paused = CreditHeader::new("/jobs", "", 0);
+    assert_frame(
+        "CREDIT zero",
+        FrameKind::Credit,
+        paused.encode(),
+        &[
+            0x57, 0x05, 0x0C, 0xA3, 0x00, 0x65, 0x2F, 0x6A, 0x6F, 0x62, 0x73, 0x01, 0x60, 0x02,
+            0x00,
+        ],
+    );
+    assert_eq!(CreditHeader::decode(&paused.encode()).unwrap(), paused);
+}
+
+#[test]
+fn a_credit_header_without_a_limit_is_refused() {
+    // `A2 00 62 2F 71 01 60`: endpoint and filter, no limit. An absent limit
+    // and a limit of zero would otherwise be the same frame, and zero is the
+    // pause — so the key is required rather than defaulted.
+    let err = CreditHeader::decode(&[0xA2, 0x00, 0x62, 0x2F, 0x71, 0x01, 0x60])
+        .expect_err("no limit key");
+    assert!(matches!(err, HeaderError::MissingKey(2)), "{err:?}");
 }

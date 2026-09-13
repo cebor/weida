@@ -69,7 +69,7 @@ pub use weida_core::{
     LossCause, PeerIdentity, PipeAddr, Result, StopReason, TraceContext, UnixAddr,
     WindowsPrincipal,
 };
-pub use weida_protocol::{ALPN, VERSION, codes};
+pub use weida_protocol::{ALPN, VERSION, codes, filter};
 
 pub use config::{ClientTls, Identity, Pem, RuntimeConfig, ServerTls, Trust};
 pub use drain::Drained;
@@ -88,7 +88,7 @@ pub use pubsub::{FanOut, TopicDrops};
 // dimension of the same name is re-exported under the name the guarantee
 // documents use for it.
 pub use runtime::Runtime;
-pub use stream::{Acceptor, Incoming, Peer};
+pub use stream::{Acceptor, Consumer, ConsumerId, CreditGrant, Incoming, Peer};
 pub use transfer::{
     Delivery, IncomingMeta, IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream,
     TransferMeta,

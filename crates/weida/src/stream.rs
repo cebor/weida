@@ -263,13 +263,143 @@ impl std::fmt::Debug for Peer {
     }
 }
 
-/// One inbound stream, whichever kind the peer opened.
+/// One inbound thing on a raw acceptor's path, whichever kind the peer sent.
+///
+/// The two stream kinds are what an [`Acceptor`] was built for. The three
+/// subscription events exist because an L2 queue is served on such a path
+/// (`weida-broker`): a consumer registers with SUBSCRIBE like a subscriber,
+/// grants credit with the frame of
+/// [0003](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
+/// §4.2, and its subscription ends with UNSUBSCRIBE or with its connection.
+/// They arrive **in the order the peer caused them** per connection, which is
+/// what lets a queue apply a grant to a subscription it has already seen.
 #[derive(Debug)]
 pub enum Incoming {
     /// A unidirectional stream: payload only, no reply half.
     Stream(IncomingTransfer),
     /// A bidirectional stream: an exchange that owes a reply or an ERROR.
     Exchange(IncomingRequest),
+    /// A consumer subscribed to this path with one filter.
+    ///
+    /// One event per SUBSCRIBE frame, so a consumer holding several filters
+    /// arrives several times with the same [`Consumer::id`].
+    Subscribed(Consumer),
+    /// A consumer stated the absolute delivery limit of one subscription.
+    Credit(CreditGrant),
+    /// A subscription ended: UNSUBSCRIBE, or the connection went away.
+    ///
+    /// A closed connection reports `filter: None` — it ends every
+    /// subscription that connection held, and the peer is gone, so there is
+    /// nothing to enumerate them against.
+    Unsubscribed {
+        /// Which consumer.
+        id: ConsumerId,
+        /// Which filter, or `None` for the whole connection.
+        filter: Option<String>,
+    },
+}
+
+/// Identifies one consuming connection on one path.
+///
+/// Stable for the life of the connection and never reused while it lives; it
+/// is the peer's QUIC connection id, so it says nothing about *who* the peer
+/// is — that is `IncomingMeta::peer`, proved in the handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConsumerId(pub(crate) usize);
+
+impl ConsumerId {
+    pub(crate) fn from_conn(conn_id: usize) -> ConsumerId {
+        ConsumerId(conn_id)
+    }
+}
+
+/// A consumer's absolute delivery limit for one subscription.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreditGrant {
+    /// Which consumer granted it.
+    pub id: ConsumerId,
+    /// Which subscription: the filter it was granted for.
+    pub filter: String,
+    /// Messages that subscription will accept in total, counted from its
+    /// creation.
+    ///
+    /// Absolute and cumulative, so a duplicate changes nothing. A receiver
+    /// keeps the **highest** limit it has seen for the subscription, which is
+    /// what makes a reordered grant harmless: control frames ride their own
+    /// unidirectional streams and QUIC does not order those relative to each
+    /// other.
+    pub limit: u64,
+}
+
+/// One subscribed consumer, and the way to deliver to it.
+///
+/// Delivery is a one-way transfer on a fresh unidirectional stream, addressed
+/// to the path the consumer subscribed on — the same shape a publisher's
+/// fan-out copy has, because a consumer *is* an ordinary subscriber on the
+/// wire (0018 §4.5). What differs is the selection: a queue picks one
+/// consumer, a publisher writes to all of them.
+#[derive(Clone)]
+pub struct Consumer {
+    conn: ConnHandle,
+    path: Arc<str>,
+    filter: String,
+}
+
+impl Consumer {
+    pub(crate) fn new(conn: ConnHandle, path: Arc<str>, filter: String) -> Consumer {
+        Consumer { conn, path, filter }
+    }
+
+    /// Which consuming connection this is.
+    pub fn id(&self) -> ConsumerId {
+        ConsumerId(self.conn.conn.stable_id())
+    }
+
+    /// The filter this subscription was created with.
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// The path it subscribed on.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Opens one delivery to this consumer.
+    ///
+    /// The transfer is addressed to the subscribed path, so it arrives at the
+    /// consumer's own route for it — a [`crate::Subscriber`], which needs no
+    /// new API to receive a queue's delivery. The topic a consumer filters on
+    /// travels in `meta`, so a delivery carries the label the producer gave
+    /// the message rather than one this hop invents.
+    pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
+        let mut send = self.conn.open_uni().await?;
+        let (header, trace) = crate::transfer::data_header(Some(&self.path), &meta, None);
+        crate::transfer::write_data_preamble(&mut send, &header).await?;
+        Ok(OutgoingTransfer::new(
+            send,
+            trace,
+            ConnHandle::clone(&self.conn),
+        ))
+    }
+
+    /// Delivers `body` as one whole transfer.
+    pub async fn deliver(&self, meta: TransferMeta, body: &[u8]) -> Result<(), Error> {
+        let mut transfer = self.open(meta).await?;
+        transfer.write_all(body).await?;
+        transfer.finish()?;
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for Consumer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Consumer")
+            .field("id", &self.id())
+            .field("path", &self.path)
+            .field("filter", &self.filter)
+            .finish()
+    }
 }
 
 /// The bound side of the stream core.

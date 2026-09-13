@@ -13,7 +13,8 @@ use common::{Certs, Server, raw};
 use weida::{Error, Runtime, RuntimeConfig, TransferMeta, codes};
 use weida_protocol::header::{GuaranteeSet, OrderingMode};
 use weida_protocol::{
-    DataHeader, ErrorHeader, FrameKind, Hello, MAGIC, SubscriptionHeader, encode_preamble,
+    CreditHeader, DataHeader, ErrorHeader, FrameKind, Hello, MAGIC, SubscriptionHeader,
+    encode_frame, encode_preamble,
 };
 
 /// Generous ceiling: every assertion below should settle in milliseconds.
@@ -87,16 +88,70 @@ async fn an_unknown_frame_kind_closes_the_connection() {
 }
 
 #[tokio::test]
-async fn the_first_retired_frame_kind_is_now_unknown() {
-    // Kind 5 was SUBSCRIBE before the renumbering. A peer speaking the old
-    // layout must fail loudly rather than have its frames reinterpreted.
+async fn a_credit_frame_for_a_path_with_no_queue_is_ignored() {
+    // Kind 5 is CREDIT as of B-202. A peer may send one for any path, and a
+    // path with no queue behind it has nothing to honour — so the frame is
+    // dropped and the connection survives. Closing on it would let any peer
+    // kill a connection with a legal frame, and there is no reply half to
+    // refuse on ([PROTOCOL.md](../../docs/PROTOCOL.md) §4).
+    let server = Server::start().await;
+    let _replier = server.listener.replier("/rpc").expect("replier");
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    let credit = CreditHeader::new("/rpc", "", 7);
+    raw::send_raw(&conn, &encode_frame(FrameKind::Credit, &credit.encode())).await;
+
+    // Still usable: an exchange on the same connection is answered, which no
+    // closed connection could do.
+    let (mut send, mut recv) = raw::open_exchange(&conn, &DataHeader::addressed("/rpc")).await;
+    send.write_all(b"ping").await.expect("write request");
+    send.finish().expect("finish request");
+    let served = tokio::spawn(async move {
+        let request = _replier.accept().await.expect("accept");
+        let mut reply = request
+            .reply(weida::TransferMeta::default())
+            .await
+            .expect("reply");
+        reply.write_all(b"pong").await.expect("write reply");
+        reply.finish().expect("finish reply");
+    });
+    let mut answer = Vec::new();
+    within(async {
+        let mut scratch = [0u8; 256];
+        while let Ok(Some(n)) = recv.read(&mut scratch).await {
+            answer.extend_from_slice(&scratch[..n]);
+        }
+    })
+    .await;
+    within(served).await.expect("served");
+    assert!(
+        answer.ends_with(b"pong"),
+        "the connection did not survive the credit frame: {answer:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_credit_header_closes_the_connection() {
+    // A legal *kind* with an illegal header is still a framing violation: the
+    // three keys of §6.6 are required, and a filter that breaks §6.4's grammar
+    // is refused at the codec boundary.
     let server = Server::start().await;
     let endpoint = raw::client_endpoint(&server.certs);
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
         .await
         .expect("handshake");
+    raw::send_hello(&conn).await;
 
-    raw::send_raw(&conn, &[MAGIC, 5, 0x00]).await;
+    // `A1 00 62 2F 71`: endpoint only, no filter and no limit.
+    raw::send_raw(
+        &conn,
+        &encode_frame(FrameKind::Credit, &[0xA1, 0x00, 0x62, 0x2F, 0x71]),
+    )
+    .await;
     assert_eq!(
         within(raw::closed_code(&conn)).await,
         codes::PROTOCOL_VIOLATION

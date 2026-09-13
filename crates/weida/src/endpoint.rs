@@ -18,7 +18,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
 use weida_core::{Error, TraceContext};
-use weida_protocol::{FrameKind, SubscriptionHeader};
+use weida_protocol::{CreditHeader, FrameKind, SubscriptionHeader};
 
 use crate::config::ClientTls;
 use crate::conn::{ConnHandle, Ctl, write_control};
@@ -553,6 +553,48 @@ impl Subscriber {
     pub async fn recv(&self) -> Result<IncomingTransfer, Error> {
         let mut queue = self.state.queue.lock().await;
         queue.recv().await.ok_or(Error::NotConnected)
+    }
+
+    /// States how many messages this subscriber will accept in total on the
+    /// subscription `filter`, and sends it to every connected peer.
+    ///
+    /// This is the L2 credit of
+    /// [0003](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
+    /// §4.2, and it matters only where a **queue** serves the path: a
+    /// publisher fans a message out to every matching subscriber and consults
+    /// no credit, while a queue delivers to one consumer and delivers nothing
+    /// at all until that consumer has granted some.
+    ///
+    /// **The limit is absolute and cumulative**, counted from the
+    /// subscription's creation — not a delta and not a window — so a lost
+    /// grant costs nothing and a duplicated one changes nothing. A broker
+    /// keeps the **highest** limit it has seen for a subscription, which is
+    /// what makes a reordered grant harmless: every control frame rides its
+    /// own unidirectional stream, and QUIC does not order those against each
+    /// other.
+    ///
+    /// Two consequences worth stating, because they are the whole usage
+    /// pattern:
+    ///
+    /// - **An unmentioned subscription has a limit of zero**: a consumer that
+    ///   subscribes and grants nothing receives nothing. That is the only
+    ///   default that cannot surprise a consumer with a flood.
+    /// - **To pause, restate what you have already received.** `grant(f, n)`
+    ///   where `n` is the number of deliveries taken so far stops further
+    ///   delivery without resetting a stream or closing the connection; a
+    ///   later, larger grant resumes it. Granting *less* than that is ignored
+    ///   by the broker, which is the same statement as "monotone" above.
+    pub async fn grant(&self, filter: &str, limit: u64) -> Result<(), Error> {
+        weida_protocol::filter::validate(filter)?;
+        let mut targets = Vec::new();
+        self.state.peer.for_each_live(|conn, path| {
+            targets.push((ConnHandle::clone(conn), path.to_owned()));
+        });
+        for (conn, path) in targets {
+            let header = CreditHeader::new(&path, filter, limit).encode();
+            write_control(&conn.conn, FrameKind::Credit, &header).await?;
+        }
+        Ok(())
     }
 
     async fn broadcast(&self, kind: FrameKind, filter: &str) -> Result<(), Error> {

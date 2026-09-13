@@ -3,8 +3,8 @@
 //! A Listener is one externally reachable messaging namespace, not one socket
 //! (master doc §3): several bindings may serve the same set of endpoints.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -46,12 +46,22 @@ pub(crate) enum Route {
 /// clone, and the guard is never held across an `await`.
 pub(crate) struct Namespace {
     routes: RwLock<HashMap<Arc<str>, Route>>,
+    /// Which raw paths each connection holds a subscription on.
+    ///
+    /// Only L2 consumers appear here: a Pub/Sub subscription is the
+    /// [`SubRegistry`]'s business, and a queue's is this table's, because the
+    /// thing that must happen when the connection closes is different — a
+    /// publisher forgets a subscriber, a queue is *told*, so it can requeue
+    /// what that consumer owed (0018 §4.7). Bounded by the same
+    /// `max_subscriptions` count the registry enforces.
+    consumers: RwLock<HashMap<usize, HashSet<Arc<str>>>>,
 }
 
 impl Namespace {
     pub(crate) fn new() -> Namespace {
         Namespace {
             routes: RwLock::new(HashMap::new()),
+            consumers: RwLock::new(HashMap::new()),
         }
     }
 
@@ -90,6 +100,50 @@ impl Namespace {
             .write()
             .expect("namespace lock poisoned")
             .remove(path);
+    }
+
+    /// Records that `conn_id` consumes on `path`.
+    pub(crate) fn note_consumer(&self, conn_id: usize, path: &str) {
+        self.consumers
+            .write()
+            .expect("namespace lock poisoned")
+            .entry(conn_id)
+            .or_default()
+            .insert(Arc::from(path));
+    }
+
+    /// Forgets one (connection, path) pair; the last one removes the entry.
+    pub(crate) fn forget_consumer(&self, conn_id: usize, path: &str) {
+        let mut consumers = self.consumers.write().expect("namespace lock poisoned");
+        if let Some(paths) = consumers.get_mut(&conn_id) {
+            paths.remove(path);
+            if paths.is_empty() {
+                consumers.remove(&conn_id);
+            }
+        }
+    }
+
+    /// Takes every path `conn_id` consumed on, with the route serving it.
+    ///
+    /// Called once, when the connection closes: the entry is removed, so a
+    /// queue is told exactly once that a consumer is gone.
+    pub(crate) fn take_consumer_routes(&self, conn_id: usize) -> Vec<(Arc<str>, Route)> {
+        let taken = self
+            .consumers
+            .write()
+            .expect("namespace lock poisoned")
+            .remove(&conn_id);
+        let Some(paths) = taken else {
+            return Vec::new();
+        };
+        let routes = self.routes.read().expect("namespace lock poisoned");
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                let route = routes.get(&path)?.clone_sender();
+                Some((path, route))
+            })
+            .collect()
     }
 }
 
@@ -511,6 +565,7 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
                 let conn_id = ctx.conn.stable_id();
                 let reason = ctx.conn.closed().await;
                 self.subs.remove_connection(conn_id);
+                crate::conn::drop_consumers(&ctx).await;
                 tracing::debug!(%reason, "local connection closed");
             }
             Accepted::Transfer(token, stream, principal) => {
@@ -636,6 +691,7 @@ async fn accept_local(
             let conn_id = ctx.conn.stable_id();
             let reason = ctx.conn.closed().await;
             subs.remove_connection(conn_id);
+            crate::conn::drop_consumers(&ctx).await;
             tracing::debug!(%reason, "local connection closed");
         });
     }
@@ -766,7 +822,7 @@ async fn accept_connections(endpoint: quinn::Endpoint, listener: Arc<ListenerInn
                         tracing::debug!(%remote, "connection accepted");
                         // The handle must outlive the connection: it owns the
                         // actor's control channel.
-                        let _ctx = ConnCtx::spawn(
+                        let ctx = ConnCtx::spawn(
                             Link::Quic(conn.clone()),
                             limits,
                             namespace,
@@ -780,6 +836,7 @@ async fn accept_connections(endpoint: quinn::Endpoint, listener: Arc<ListenerInn
                         // it; otherwise connection churn would grow the
                         // registry.
                         subs.remove_connection(conn_id);
+                        crate::conn::drop_consumers(&ctx).await;
                         peers.release(peer);
                         tracing::debug!(%remote, %reason, "connection closed");
                     }

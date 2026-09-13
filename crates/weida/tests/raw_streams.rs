@@ -46,6 +46,10 @@ async fn acceptor_receives_both_stream_kinds() {
                     reply.finish().expect("finish reply");
                     kinds.push(("exchange", body));
                 }
+                // The three subscription events an L2 queue is served with
+                // (B-202). This test drives no consumer, so seeing one is a
+                // routing bug rather than something to handle.
+                other => panic!("unexpected event on a raw acceptor: {other:?}"),
             }
         }
         kinds.sort();

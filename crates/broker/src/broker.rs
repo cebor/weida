@@ -5,9 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use tokio::task::JoinSet;
 use weida::{
-    Acceptor, Acknowledgement, Error, ErrorCode, Incoming, IncomingMeta, IncomingRequest,
-    IncomingTransfer, Listener, TransferMeta,
+    Acceptor, Acknowledgement, ConsumerId, Error, ErrorCode, Incoming, IncomingMeta,
+    IncomingRequest, IncomingTransfer, Listener, TransferMeta,
 };
+
+use crate::consumers::Consumers;
 
 use crate::queue::{Queue, QueueStats, QueuedMessage, Refusal};
 
@@ -102,10 +104,14 @@ impl BrokerConfig {
     }
 }
 
-/// One queue and the acceptor that feeds it.
+/// One queue, its consumers, and the acceptor that feeds both.
 struct Served {
     acceptor: Acceptor,
     queue: Mutex<Queue>,
+    /// Two locks rather than one, and never held together across an `await`:
+    /// a delivery takes a message under one and a turn under the other, then
+    /// writes with neither held.
+    consumers: Mutex<Consumers>,
 }
 
 struct Inner {
@@ -153,6 +159,7 @@ impl Broker {
                 Arc::new(Served {
                     acceptor,
                     queue: Mutex::new(Queue::new(config.queue_bytes)),
+                    consumers: Mutex::new(Consumers::default()),
                 }),
             );
         }
@@ -170,6 +177,30 @@ impl Broker {
     pub fn stats(&self, path: &str) -> Option<QueueStats> {
         let served = self.inner.queues.get(path)?;
         Some(served.queue.lock().expect("queue mutex poisoned").stats())
+    }
+
+    /// How many subscriptions a queue serves, or `None` when no queue is
+    /// registered on `path`.
+    pub fn consumer_count(&self, path: &str) -> Option<usize> {
+        let served = self.inner.queues.get(path)?;
+        Some(
+            served
+                .consumers
+                .lock()
+                .expect("consumer mutex poisoned")
+                .len(),
+        )
+    }
+
+    /// Deliveries counted against one subscription's credit, or `None` when
+    /// the queue or the subscription is unknown.
+    pub fn delivered(&self, path: &str, id: ConsumerId, filter: &str) -> Option<u64> {
+        let served = self.inner.queues.get(path)?;
+        served
+            .consumers
+            .lock()
+            .expect("consumer mutex poisoned")
+            .delivered(id, filter)
     }
 
     /// Serves every queue until the listener goes away.
@@ -197,18 +228,137 @@ impl std::fmt::Debug for Broker {
     }
 }
 
-/// One queue's accept loop.
+/// One queue's event loop: admission, subscriptions, credit, delivery.
+///
+/// Everything the peer causes on this path arrives through one channel and in
+/// the order it was caused, so the loop needs no lock of its own between
+/// events: a grant cannot overtake the SUBSCRIBE it belongs to on the same
+/// connection, and a delivery scan runs after whichever event could have made
+/// one possible.
 async fn serve_queue(served: Arc<Served>) {
     loop {
         match served.acceptor.accept().await {
-            Ok(Incoming::Exchange(request)) => admit_exchange(&served, request).await,
-            Ok(Incoming::Stream(transfer)) => admit_transfer(&served, transfer).await,
+            Ok(Incoming::Exchange(request)) => {
+                admit_exchange(&served, request).await;
+                pump(&served).await;
+            }
+            Ok(Incoming::Stream(transfer)) => {
+                admit_transfer(&served, transfer).await;
+                pump(&served).await;
+            }
+            Ok(Incoming::Subscribed(consumer)) => {
+                tracing::debug!(
+                    path = served.acceptor.path(),
+                    filter = consumer.filter(),
+                    "a consumer subscribed; credit is zero until it grants some"
+                );
+                served
+                    .consumers
+                    .lock()
+                    .expect("consumer mutex poisoned")
+                    .subscribe(consumer);
+                // No scan: a fresh subscription has no credit, so nothing it
+                // could take.
+            }
+            Ok(Incoming::Credit(grant)) => {
+                let raised = served
+                    .consumers
+                    .lock()
+                    .expect("consumer mutex poisoned")
+                    .grant(grant.id, &grant.filter, grant.limit);
+                if raised {
+                    pump(&served).await;
+                }
+            }
+            Ok(Incoming::Unsubscribed { id, filter }) => {
+                served
+                    .consumers
+                    .lock()
+                    .expect("consumer mutex poisoned")
+                    .remove(id, filter.as_deref());
+            }
             Err(e) => {
                 tracing::debug!(path = served.acceptor.path(), error = %e, "queue stopped serving");
                 return;
             }
         }
     }
+}
+
+/// Delivers as far as credit and messages allow.
+///
+/// One message to one consumer, each as a one-way transfer, until either the
+/// queue is empty or no matching subscription has credit left. That is the
+/// whole scheduling policy: a queue stops at the limit its consumers stated
+/// and resumes when one of them raises it
+/// ([0003](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0003-credit-unit.md)
+/// §4.2).
+///
+/// **Serialized with admission, deliberately and at a cost.** A queue is one
+/// order and one budget, so its events are one loop; the cost is that a
+/// consumer whose flow-control window is full holds this queue's producers up
+/// while a write waits. Nothing here invents a timeout to paper over it: the
+/// answer is the acknowledgement deadline and the requeue of B-203, which is
+/// where an unresponsive consumer stops being this loop's problem.
+async fn pump(served: &Served) {
+    loop {
+        let Some(next) = next_delivery(served) else {
+            return;
+        };
+        let (id, filter, consumer, message) = next;
+        let meta = TransferMeta {
+            content_type: message.content_type.clone(),
+            content_len: Some(message.body.len() as u64),
+            trace: message.trace,
+            topic: message.topic.clone(),
+            achieved: None,
+        };
+        match consumer.deliver(meta, &message.body).await {
+            Ok(()) => {}
+            Err(e) => {
+                // The write never landed: give the credit back and put the
+                // message where it was, at the head of the queue. A consumer
+                // whose connection is gone is removed by its own
+                // `Unsubscribed` event, so this does not spin on it.
+                tracing::debug!(
+                    path = served.acceptor.path(),
+                    error = %e,
+                    "a delivery failed; requeuing the message"
+                );
+                served
+                    .consumers
+                    .lock()
+                    .expect("consumer mutex poisoned")
+                    .undo(id, &filter);
+                served
+                    .queue
+                    .lock()
+                    .expect("queue mutex poisoned")
+                    .push_front(message);
+                return;
+            }
+        }
+    }
+}
+
+/// Takes the first message some consumer may have, and that consumer's turn.
+///
+/// Both locks are taken here and released before the caller writes, always in
+/// this order — queue, then consumers — so two queues cannot deadlock against
+/// each other. A message is taken **only** when a consumer for it exists: a
+/// queue with no credit keeps its messages, which is the point of a queue.
+fn next_delivery(served: &Served) -> Option<(ConsumerId, String, weida::Consumer, QueuedMessage)> {
+    let mut queue = served.queue.lock().expect("queue mutex poisoned");
+    let mut consumers = served.consumers.lock().expect("consumer mutex poisoned");
+    for index in 0..queue.len() {
+        let topic = queue.topic_at(index).expect("index is in range").to_owned();
+        let Some((id, filter, consumer)) = consumers.take_turn(&topic) else {
+            continue;
+        };
+        let message = queue.take(index).expect("index is in range");
+        return Some((id, filter, consumer, message));
+    }
+    None
 }
 
 /// Admits a producer's exchange and confirms it, or refuses it on the reply

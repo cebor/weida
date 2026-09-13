@@ -38,6 +38,15 @@ pub struct TransferMeta {
     pub content_len: Option<u64>,
     /// Trace context to propagate. `None` generates a fresh root context.
     pub trace: Option<TraceContext>,
+    /// Topic this transfer is labelled with (DATA key `5`).
+    ///
+    /// Opaque bytes, selected by the filter grammar of `docs/PROTOCOL.md`
+    /// §6.4. A publisher's fan-out sets it per copy and does not read this
+    /// field; what it is here for is the **other** sender that needs a label:
+    /// a producer sending to an L2 queue, whose consumers each filter on it
+    /// (0018 §4.5). A topic is never a pattern — `*` in one is an ordinary
+    /// byte.
+    pub topic: Option<String>,
     /// The completion level this side **achieved** for the message it is
     /// answering (DATA key `8`).
     ///
@@ -65,6 +74,12 @@ impl TransferMeta {
     /// Propagates an existing trace context.
     pub fn with_trace(mut self, trace: TraceContext) -> TransferMeta {
         self.trace = Some(trace);
+        self
+    }
+
+    /// Labels the transfer with a topic.
+    pub fn with_topic(mut self, topic: impl Into<String>) -> TransferMeta {
+        self.topic = Some(topic.into());
         self
     }
 
@@ -185,7 +200,7 @@ pub(crate) fn data_header(
         content_type: meta.content_type.clone(),
         traceparent: Some(trace.to_traceparent()),
         tracestate,
-        topic: None,
+        topic: meta.topic.clone(),
         // Keys 6 and 7 are specified ahead of code: the codec carries them,
         // the v0 runtime writes neither (`docs/PROTOCOL.md` §6.2).
         sequence: None,

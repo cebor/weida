@@ -274,7 +274,7 @@ answers a `SUB` on its own connection, a RabbitMQ consumer tag is channel-scoped
 only the peer is peer-scoped** [0011 §4.2]. SUBSCRIBE and UNSUBSCRIBE name an endpoint path
 (§6.4), so they ride that path's connection and are **not** control-tier traffic: moving them
 to a per-peer connection would separate a subscription from the only route to its subscriber.
-The reserved credit frame of §11 is granted per subscription, so it is path-scoped for the same
+The credit frame of §6.6 is granted per subscription, so it is path-scoped for the same
 reason [0011 §4.3].
 
 What remains coupled is stated rather than hidden: since a path's connection carries both its
@@ -324,9 +324,9 @@ a defect because it lets a remote peer choose the allocation size.
 ### 3.2 Conditions that MUST close the connection with PROTOCOL_VIOLATION
 
 - Magic byte not equal to `0x57`.
-- Unknown `kind` value, i.e. anything in `5..=255`. Kind `5` is *reserved* for the L2 credit
-  frame (§11) and is unknown at wire version 0 like any other: a reservation is a promise not
-  to reuse the number, not a permission to send it.
+- Unknown `kind` value, i.e. anything in `6..=255`. Kind `5` was reserved for the L2 credit
+  frame and is now defined (§6.6): the reservation was a promise not to reuse the number, and
+  the promise was kept when the number was spent.
 - `header_len` greater than the local `limits.max_header_bytes` (§3.1).
 - CBOR parse failure of the header.
 - A required key missing from the header.
@@ -357,17 +357,22 @@ connection-fatal framing violation.
 | `2` | ERROR | header only, FIN directly after the header | **reply half of a bidi stream only** |
 | `3` | SUBSCRIBE | header only, FIN directly after the header | uni |
 | `4` | UNSUBSCRIBE | header only, FIN directly after the header | uni |
+| `5` | CREDIT | header only, FIN directly after the header | uni |
 
-Kinds `5..=255` are reserved and MUST close the connection with `PROTOCOL_VIOLATION`. This
+Kinds `6..=255` are reserved and MUST close the connection with `PROTOCOL_VIOLATION`. This
 is not a forward-compatibility hook: a receiver cannot know whether an unknown stream kind
-carries payload it would have to drain. Kind `5` additionally carries a *name* already —
-the L2 credit frame of [decisions/0003](decisions/0003-credit-unit.md) §4.2, on the control
-connection of §2.5 — so that nothing else claims the number; it is still unknown, and still
-fatal, at wire version 0 (§11).
+carries payload it would have to drain.
 
-HELLO, ERROR, SUBSCRIBE and UNSUBSCRIBE are header-only frames: the sender MUST FIN the
-stream immediately after the header. Receiver handling of bytes appearing after the header
-on a header-only stream is unspecified in v0; a receiver MAY ignore them and MAY stop
+**Kind `5` is known as of B-202**, and it is the L2 credit of
+[decisions/0003](decisions/0003-credit-unit.md) §4.2: a consumer's absolute delivery limit
+for one subscription (§6.6). A peer that does not run a queue **ignores** it rather than
+closing the connection — credit is idempotent state, not a transfer, and the frame has no
+reply half to refuse on — which is the same position SUBSCRIBE takes for a path no publisher
+has claimed. Kind `6` is now the first free number.
+
+HELLO, ERROR, SUBSCRIBE, UNSUBSCRIBE and CREDIT are header-only frames: the sender MUST FIN
+the stream immediately after the header. Receiver handling of bytes appearing after the
+header on a header-only stream is unspecified in v0; a receiver MAY ignore them and MAY stop
 reading the stream after the header.
 
 For DATA, everything after the header up to FIN is opaque user payload. The protocol
@@ -376,9 +381,9 @@ a DATA stream.
 
 ### 4.1 Which frame may open which stream
 
-- A **uni stream** MUST open with HELLO, DATA, SUBSCRIBE or UNSUBSCRIBE. An ERROR frame on a
-  uni stream is a violation (§3.2): an ERROR is the alternative to a reply, and it therefore
-  has meaning only where a reply would have gone.
+- A **uni stream** MUST open with HELLO, DATA, SUBSCRIBE, UNSUBSCRIBE or CREDIT. An ERROR
+  frame on a uni stream is a violation (§3.2): an ERROR is the alternative to a reply, and it
+  therefore has meaning only where a reply would have gone.
 - A **bidi stream** MUST open with DATA on its initiating half. Any other kind there is a
   violation.
 - The **reply half** of a bidi stream MUST carry either DATA or ERROR, exactly one frame,
@@ -490,8 +495,10 @@ There is no `transfer_id`, no `role` and no `correlation_id`. The stream carries
 its kind says whether a reply is expected, its direction says which side initiated, and its
 identity is the correlation. Nothing on the wire names an exchange.
 
-`topic` is meaningful only for the fan-out copies a publisher emits (§9.5). It is opaque
-bytes: weida never parses it, and no character in it is special.
+`topic` is meaningful on the fan-out copies a publisher emits (§9.5) **and** on a message sent
+to a queue, whose consumers each select on it with the filter grammar of §6.4 (§9.4,
+[decisions/0018](decisions/0018-minimal-broker.md) §4.5). It is opaque bytes: weida never
+parses it, and no character in it is special.
 
 `achieved` is the L2 confirm, and it appears on a **reply half** only. A broker that has taken
 responsibility for a producer's message answers the exchange with DATA carrying
@@ -694,6 +701,50 @@ Rules:
   without breaking this one — and it is also why a peer MUST NOT infer agreement from a key it
   skipped: what binds is the intersection of §2.3, computed over the dimensions both sides
   know.
+
+
+### 6.6 CREDIT (kind 5)
+
+| Key | CBOR type | Name | Required at the decoder | Cap | Meaning |
+| --- | --- | --- | --- | --- | --- |
+| `0` | `tstr` | `endpoint` | **yes** | 512 B | path of the queue the subscription is on |
+| `1` | `tstr` | `filter` | **yes** | 256 B | topic filter of the subscription; the empty filter is the whole queue |
+| `2` | `uint` | `limit` | **yes** | — | messages this subscription will accept in total, counted from its creation |
+
+All three keys are required. `endpoint` and `filter` are what names a subscription — the same
+pair SUBSCRIBE carries (§6.4), on the connection the frame arrives on
+([decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.3) — and an absent `limit`
+would be indistinguishable from `0`, which is the pause. The filter is validated against §6.4's
+grammar at the decoder, exactly as a SUBSCRIBE's is.
+
+**The limit is absolute and cumulative: a total, not a delta and not a window.** It counts
+deliveries on that subscription since the subscription was created, so a lost frame costs
+nothing and a duplicated one changes nothing
+([decisions/0003](decisions/0003-credit-unit.md) §4.3). Three rules follow, and together they
+are the whole scheme:
+
+1. **Initial credit is zero.** A consumer that subscribes and grants nothing receives nothing.
+   It is the only default that cannot surprise a consumer with a flood, and it is AMQP 1.0's
+   ([decisions/0018](decisions/0018-minimal-broker.md) §4.4).
+2. **A receiver keeps the highest limit it has seen** for a subscription. Every control frame
+   rides its own unidirectional stream and QUIC orders no stream against another, so a grant
+   that arrives late would otherwise lower a limit the consumer has already raised. Keeping the
+   maximum is what makes a *reordered* grant harmless, not just a duplicated one.
+3. **A consumer pauses by restating what it has already been delivered.** That is AMQP 1.0's
+   `link-credit = 0` expressed against an absolute baseline: delivery stops with no stream
+   reset and no connection close, and a later, larger grant resumes it. A fresh subscription's
+   pause is the `0` it starts at. Granting *less* than the delivered count is ignored, which is
+   rule 2 seen from the other side.
+
+A large limit is not a hostile number: what a broker holds is bounded by its own `queue_bytes`
+(§10), not by what a consumer promises to take, and a consumer that states `u64::MAX` has said
+"send me everything" rather than "allocate something". What a broker *does* cap is the number
+of deliveries it lets go **unsettled** at once — `weida-broker`'s `max_unacked` — and that cap
+becomes observable only once a delivery has an outcome to wait for, which is the consumer
+acknowledgement of [decisions/0018](decisions/0018-minimal-broker.md) §4.3. A receiver MUST NOT
+deliver beyond the limit it has accepted, and a limit it declines to honour in full is not an
+error to report: the consumer observes it as delivery stopping, which is exactly what credit
+means.
 
 ---
 
@@ -1105,7 +1156,7 @@ Per broker (`weida_broker::BrokerConfig`), for a process that runs the L2 layer:
 | --- | --- | --- |
 | `queue_bytes` | 8 MiB | bytes one queue holds, charged as the payload plus the retained labels plus a fixed `PER_MESSAGE_OVERHEAD` (256 B) per message. A queue at the bound refuses admission — ERROR `{REJECTED}` on an exchange's reply half, `STOP_SENDING(REJECTED)` on a one-way stream — and never discards a message it has already confirmed ([decisions/0018](decisions/0018-minimal-broker.md) §4.8) |
 | `max_queues` | `64` | queues one broker registers; a configuration naming more is refused before any path is claimed |
-| `max_unacked` | `256` | deliveries one subscription may have outstanding, and the ceiling on any credit the broker will honour (enforced by B-202 and B-203) |
+| `max_unacked` | `256` | deliveries one subscription may have **unsettled** at once. A consumer's credit limit is cumulative and is honoured in full (§6.6); this bounds what may be in flight without an outcome, so it becomes binding with the consumer acknowledgement of B-203 |
 
 These are a **third** profile rather than fields on `Limits`, because a queue is not a
 per-connection object: it outlives every connection that touches it, which is the whole point
@@ -1125,7 +1176,7 @@ per-connection profile so that a second one can be added without moving anything
 
 | Profile | Sized for | Fields that would differ from the table above |
 | --- | --- | --- |
-| `control` | a handful of short frames at a time, never a payload | small `stream_receive_window` and `connection_receive_window`; a `max_concurrent_uni_streams` budget that only has to cover HELLO, SUBSCRIBE, UNSUBSCRIBE and the reserved credit frame of §11; `max_concurrent_bidi_streams` may be `0` |
+| `control` | a handful of short frames at a time, never a payload | small `stream_receive_window` and `connection_receive_window`; a `max_concurrent_uni_streams` budget that only has to cover HELLO, SUBSCRIBE, UNSUBSCRIBE and CREDIT; `max_concurrent_bidi_streams` may be `0` |
 | `bulk` | payload transfers on one path | the windows and stream budgets of the table above, which are also the byte and message credit a consumer grants ([decisions/0003](decisions/0003-credit-unit.md) §4.1) |
 
 The control numbers are not chosen here, and deliberately not in the code either: a profile
@@ -1199,14 +1250,14 @@ versions.
   resumption. The peer's proved fingerprint identifies it across connections and carries no
   retained state; resumption is L2 work
   ([decisions/0008](decisions/0008-session-identity.md) §4.5, §4.6).
-- **The L2 credit frame.** Frame kind `5` is **reserved** for the broker-layer credit frame of
-  [decisions/0003](decisions/0003-credit-unit.md) §4.2-§4.3: an absolute delivery limit per
-  subscription, idempotent under loss or duplication. It names a subscription, so it is
-  path-scoped and rides that path's connection rather than a control connection, which amends
-  0003 §4.2 ([decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.3). Its
-  fields are fixed with the Phase 6 broker design. A wire-version-0 receiver has no such frame
-  and MUST therefore treat kind `5` as unknown and close with `PROTOCOL_VIOLATION` (§3.2); the
-  reservation only forbids anyone else from taking the number.
+- ~~**The L2 credit frame.**~~ **Specified and implemented** as of B-202: kind `5`, the fields
+  of [decisions/0003](decisions/0003-credit-unit.md) §4.2-§4.3, encoded in §6.6. It names a
+  subscription, so it is path-scoped and rides that path's connection rather than a control
+  connection, which amends 0003 §4.2
+  ([decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.3). It is listed here so
+  the change is visible from the section that used to forbid it: a v0 receiver treated kind `5`
+  as unknown, and now every receiver knows it — a peer with no queue ignores it rather than
+  closing (§4).
 - **Multiple replies per exchange.** Exactly one reply or one ERROR per reply half; a second
   is not representable.
 - **Persistence.** No wire concept of durability, storage acknowledgement or recovery.

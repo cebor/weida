@@ -83,9 +83,11 @@ The RabbitMQ-analog layer: queues, publisher confirms, consumer acknowledgements
 redelivery — three slices, of which the **first exists**. `weida-broker` registers a queue on
 each endpoint path its configuration names, admits a producer's message into memory and
 answers the exchange's reply half with the level it achieved: `Accepted`, and nothing above
-it. Nothing is durable, so `Stored` and `Replicated` stay unreachable by construction, and
-nothing is delivered yet: the consumer's credit (frame kind `5`) and the acknowledgement that
-lets a queue forget a message are the two slices after it
+it. A consumer registers with SUBSCRIBE, states an absolute delivery limit with frame kind `5`
+(B-202) and receives each message as a one-way transfer — exactly one consumer per message,
+which is the difference from a publisher's fan-out. Nothing is durable, so `Stored` and
+`Replicated` stay unreachable by construction, and a delivery still has no *outcome*: the
+consumer acknowledgement that lets a queue forget or redeliver a message is the slice after it
 ([decisions/0018](decisions/0018-minimal-broker.md)). The acknowledgement vocabulary
 **Accepted / Stored / Replicated / Processed** belongs to this layer; `Accepted` now has a
 wire representation — DATA key `8` on a reply half — and the other three do not
@@ -527,9 +529,9 @@ not its internals — and **nothing in this workspace depends on it**, which is 
 brokerless deployment brokerless.
 
 What it deliberately does not have: a store (so `Stored` is not expressible in its types, not
-merely unused), a declare frame (a queue exists because the configuration named it), and, in
-this first slice, delivery — a consumer's credit and its acknowledgement are the two slices
-after it ([decisions/0018](decisions/0018-minimal-broker.md) §4.2, §4.5).
+merely unused), a declare frame (a queue exists because the configuration named it), and a
+delivery *outcome* — the consumer acknowledgement and the redelivery it makes possible are the
+slice after this one ([decisions/0018](decisions/0018-minimal-broker.md) §4.2, §4.3, §4.5).
 
 ### Dependency direction
 

@@ -17,8 +17,8 @@ use tokio::sync::{mpsc, watch};
 use weida_core::{Error, ErrorCode, Limits, LossCause, PeerIdentity};
 use weida_protocol::header::GuaranteeSet;
 use weida_protocol::{
-    Agreed, DataHeader, ErrorHeader, FrameKind, Hello, MAX_PREAMBLE_LEN, Preamble, PreambleError,
-    SubscriptionHeader, codes, encode_frame, negotiate, parse_preamble,
+    Agreed, CreditHeader, DataHeader, ErrorHeader, FrameKind, Hello, MAX_PREAMBLE_LEN, Preamble,
+    PreambleError, SubscriptionHeader, codes, encode_frame, negotiate, parse_preamble,
 };
 
 use crate::dedup::DedupWindow;
@@ -26,7 +26,7 @@ use crate::listener::{Namespace, Route};
 use crate::ordering::{GapDetector, Reassembler, Sequencer};
 use crate::pubsub::SubRegistry;
 use crate::runtime::{Exec, Shared};
-use crate::stream::Incoming;
+use crate::stream::{Consumer, ConsumerId, CreditGrant, Incoming};
 use crate::transfer::{IncomingMeta, IncomingRequest, IncomingTransfer};
 use crate::transport::{Link, RecvHalf, SendHalf};
 
@@ -496,8 +496,9 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
         // that sends one here has not understood the grouping [0012 §4.1].
         FrameKind::Hello => violation(ctx, "HELLO is legal only on the control connection"),
         FrameKind::Error => violation(ctx, "ERROR is legal only in answer to a request"),
-        FrameKind::Subscribe => handle_subscription(ctx, &header, true),
-        FrameKind::Unsubscribe => handle_subscription(ctx, &header, false),
+        FrameKind::Subscribe => handle_subscription(ctx, &header, true).await,
+        FrameKind::Unsubscribe => handle_subscription(ctx, &header, false).await,
+        FrameKind::Credit => handle_credit(ctx, &header).await,
         FrameKind::Data => {
             ctx.negotiated().await?;
             let decoded = match DataHeader::decode(&header) {
@@ -632,8 +633,9 @@ async fn handle_stream(
             ctx,
             "ERROR is legal only on the reply half of a bidirectional stream",
         ),
-        FrameKind::Subscribe => handle_subscription(ctx, &header, true),
-        FrameKind::Unsubscribe => handle_subscription(ctx, &header, false),
+        FrameKind::Subscribe => handle_subscription(ctx, &header, true).await,
+        FrameKind::Unsubscribe => handle_subscription(ctx, &header, false).await,
+        FrameKind::Credit => handle_credit(ctx, &header).await,
     }
 }
 
@@ -648,7 +650,19 @@ fn violation(ctx: &ConnHandle, reason: &str) -> Result<(), Error> {
 /// Both carry the same header, and both are already parked behind negotiation
 /// by `handle_stream`, so a subscription that overtakes the peer's HELLO is
 /// delayed rather than refused.
-fn handle_subscription(ctx: &ConnHandle, header: &[u8], subscribe: bool) -> Result<(), Error> {
+///
+/// **Where it lands depends on what serves the path.** A publisher's path
+/// keeps its subscription in the [`crate::pubsub::SubRegistry`], which is
+/// what fans a published message out. A raw acceptor's path — an L2 queue —
+/// gets the subscription as an event instead, because a queue delivers to
+/// *one* consumer and therefore has to know them individually
+/// (`docs/decisions/0018-minimal-broker.md` §4.5). The per-connection
+/// `max_subscriptions` bound is the same number either way.
+async fn handle_subscription(
+    ctx: &ConnHandle,
+    header: &[u8],
+    subscribe: bool,
+) -> Result<(), Error> {
     let header = match SubscriptionHeader::decode(header) {
         Ok(h) => h,
         Err(e) => return violation(ctx, &e.to_string()),
@@ -662,29 +676,115 @@ fn handle_subscription(ctx: &ConnHandle, header: &[u8], subscribe: bool) -> Resu
         );
         return Ok(());
     };
+    let conn_id = ctx.conn.stable_id();
+
+    if let Some(Route::Raw(queue)) = ctx.namespace.lookup(&header.endpoint) {
+        if subscribe {
+            if subs.reserve(conn_id).is_err() {
+                return too_many_subscriptions(ctx);
+            }
+            ctx.namespace.note_consumer(conn_id, &header.endpoint);
+            let consumer = Consumer::new(
+                Arc::clone(ctx),
+                Arc::from(header.endpoint.as_str()),
+                header.filter,
+            );
+            if queue.send(Incoming::Subscribed(consumer)).await.is_err() {
+                tracing::debug!(endpoint = %header.endpoint, "acceptor went away; subscription dropped");
+            }
+        } else {
+            subs.release(conn_id);
+            ctx.namespace.forget_consumer(conn_id, &header.endpoint);
+            let gone = Incoming::Unsubscribed {
+                id: ConsumerId::from_conn(conn_id),
+                filter: Some(header.filter),
+            };
+            if queue.send(gone).await.is_err() {
+                tracing::debug!(endpoint = %header.endpoint, "acceptor went away; unsubscribe dropped");
+            }
+        }
+        return Ok(());
+    }
 
     if subscribe {
         if subs
             .subscribe(&header.endpoint, ctx, header.filter)
             .is_err()
         {
-            // SUBSCRIBE arrives on a unidirectional stream, so there is no
-            // reply half to answer with an ERROR frame; the connection is the
-            // only granularity available.
-            tracing::debug!(
-                max = ctx.limits.max_subscriptions,
-                "subscription limit reached; closing the connection"
-            );
-            ctx.conn.close(
-                codes::LIMIT_EXCEEDED,
-                "too many subscriptions on one connection",
-            );
-            return Err(Error::LimitExceeded);
+            return too_many_subscriptions(ctx);
         }
     } else {
-        subs.unsubscribe(&header.endpoint, ctx.conn.stable_id(), &header.filter);
+        subs.unsubscribe(&header.endpoint, conn_id, &header.filter);
     }
     Ok(())
+}
+
+/// SUBSCRIBE arrives on a unidirectional stream, so there is no reply half to
+/// answer with an ERROR frame; the connection is the only granularity
+/// available.
+fn too_many_subscriptions(ctx: &ConnHandle) -> Result<(), Error> {
+    tracing::debug!(
+        max = ctx.limits.max_subscriptions,
+        "subscription limit reached; closing the connection"
+    );
+    ctx.conn.close(
+        codes::LIMIT_EXCEEDED,
+        "too many subscriptions on one connection",
+    );
+    Err(Error::LimitExceeded)
+}
+
+/// Applies a CREDIT frame: an L2 consumer's absolute delivery limit.
+///
+/// Only a queue can honour one, so only a raw acceptor's path receives it. A
+/// path with no queue **ignores** it rather than closing the connection or
+/// resetting the stream: credit is idempotent state, not a transfer, and the
+/// frame has no reply half to refuse on — the same position SUBSCRIBE takes
+/// for a path no publisher has claimed yet.
+async fn handle_credit(ctx: &ConnHandle, header: &[u8]) -> Result<(), Error> {
+    let header = match CreditHeader::decode(header) {
+        Ok(h) => h,
+        Err(e) => return violation(ctx, &e.to_string()),
+    };
+    let Some(Route::Raw(queue)) = ctx.namespace.lookup(&header.endpoint) else {
+        tracing::debug!(
+            endpoint = %header.endpoint,
+            "ignoring a credit frame: no queue serves this path"
+        );
+        return Ok(());
+    };
+    let grant = Incoming::Credit(CreditGrant {
+        id: ConsumerId::from_conn(ctx.conn.stable_id()),
+        filter: header.filter,
+        limit: header.limit,
+    });
+    if queue.send(grant).await.is_err() {
+        tracing::debug!(endpoint = %header.endpoint, "acceptor went away; credit dropped");
+    }
+    Ok(())
+}
+
+/// Tells every queue this connection consumed on that the consumer is gone.
+///
+/// Called once, when the connection closes. A queue needs this and a
+/// publisher does not: a publisher forgets a subscriber, while a queue owes
+/// something for what it handed that consumer and has to decide what to do
+/// with it (0018 §4.7). The table is emptied by the same call, so a second
+/// close reports nothing.
+pub(crate) async fn drop_consumers(ctx: &ConnHandle) {
+    let conn_id = ctx.conn.stable_id();
+    for (path, route) in ctx.namespace.take_consumer_routes(conn_id) {
+        let Route::Raw(queue) = route else {
+            continue;
+        };
+        let gone = Incoming::Unsubscribed {
+            id: ConsumerId::from_conn(conn_id),
+            filter: None,
+        };
+        if queue.send(gone).await.is_err() {
+            tracing::debug!(%path, "acceptor went away before its consumer did");
+        }
+    }
 }
 
 fn handle_hello(
