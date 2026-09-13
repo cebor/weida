@@ -38,6 +38,8 @@ type Boxed<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 /// One end of a device, with its futures boxed.
 pub trait ErasedDevice: Send {
+    /// Whether this end ever delivers a message.
+    fn receives(&self) -> bool;
     /// Receives one whole message.
     fn recv(&mut self) -> Boxed<'_, Multipart>;
     /// Sends one whole message.
@@ -48,6 +50,10 @@ pub trait ErasedDevice: Send {
 struct Leased<S: Device + Send + 'static>(Lease<S>);
 
 impl<S: Device + Send + 'static> ErasedDevice for Leased<S> {
+    fn receives(&self) -> bool {
+        Device::receives(&*self.0)
+    }
+
     fn recv(&mut self) -> Boxed<'_, Multipart> {
         Box::pin(Device::recv(&mut *self.0))
     }
@@ -61,6 +67,10 @@ impl<S: Device + Send + 'static> ErasedDevice for Leased<S> {
 pub struct Erased(Box<dyn ErasedDevice>);
 
 impl Device for Erased {
+    fn receives(&self) -> bool {
+        self.0.receives()
+    }
+
     async fn recv(&mut self) -> Result<Multipart> {
         self.0.recv().await
     }

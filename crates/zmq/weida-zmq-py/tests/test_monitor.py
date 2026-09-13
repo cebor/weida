@@ -173,10 +173,9 @@ def test_an_xsub_xpub_proxy_with_a_capture_socket():
 def test_a_steerable_proxy_pauses_resumes_reports_and_terminates():
     async def steered():
         context = weida_zmq.Context(worker_threads=4)
-        # DEALER on both ends, because a device reads *both* sides: a PUSH
-        # backend cannot be read, and this library reports that as ENOTSUP
-        # rather than as a side that never speaks (filed against weida-zmq;
-        # the zguide's streamer device is PULL/PUSH).
+        # DEALER on both ends, so that both directions of the steering are
+        # observable; the streamer's one-way ends are covered by
+        # `test_a_streamer_device_forwards`.
         frontend = weida_zmq.DealerSocket(context)
         backend = weida_zmq.DealerSocket(context)
         await frontend.bind("inproc://steer.in")
@@ -237,3 +236,43 @@ def test_req_and_rep_are_not_device_ends():
             await weida_zmq.proxy(request, reply)
 
     run(refused())
+
+
+def test_a_streamer_device_forwards():
+    """The zguide's streamer: PULL in, PUSH out (B-178).
+
+    A PUSH end cannot be read, and the device does not try: it is a side that
+    never delivers rather than an ``ENOTSUP`` at the first poll. The capture
+    socket is a PUSH too, so nothing on this device receives but the
+    frontend.
+    """
+
+    async def streamer():
+        context = weida_zmq.Context(worker_threads=4)
+        frontend = weida_zmq.PullSocket(context)
+        backend = weida_zmq.PushSocket(context)
+        capture = weida_zmq.PushSocket(context)
+        await frontend.bind("inproc://streamer.in")
+        await backend.bind("inproc://streamer.out")
+        await capture.bind("inproc://streamer.capture")
+
+        producer = weida_zmq.PushSocket(context)
+        await producer.connect("inproc://streamer.in")
+        consumer = weida_zmq.PullSocket(context)
+        await consumer.connect("inproc://streamer.out")
+        trace = weida_zmq.PullSocket(context)
+        await trace.connect("inproc://streamer.capture")
+
+        running = asyncio.create_task(weida_zmq.proxy(frontend, backend, capture))
+
+        await producer.send(b"job 1")
+        assert await consumer.recv(timeout=5.0) == [b"job 1"]
+        assert await trace.recv(timeout=5.0) == [b"job 1"]
+        assert not running.done(), "a streamer does not die at its first poll"
+        running.cancel()
+        try:
+            await running
+        except asyncio.CancelledError:
+            pass
+
+    run(streamer())

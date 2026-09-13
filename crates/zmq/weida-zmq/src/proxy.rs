@@ -68,9 +68,11 @@ pub const CONTROL_STATISTICS: &[u8] = b"STATISTICS";
 /// One end of a device: something that can receive and send a whole message.
 ///
 /// Implemented for the socket types a proxy is built from. A socket type
-/// that cannot do one half reports `ENOTSUP` for it — a PULL socket does not
-/// send and a PUSH socket does not receive, which is `zmq_socket(3)`'s own
-/// table rather than a limitation here.
+/// that cannot do one half says so: [`Device::receives`] is `false` for a
+/// PUSH or a PUB, and the proxy then never reads that side — it is a side
+/// that never delivers, which is what the zguide's streamer (PULL in, PUSH
+/// out) needs — while a `send` toward a PULL or a SUB reports `ENOTSUP`,
+/// which is `zmq_socket(3)`'s own table rather than a limitation here.
 /// The futures are **`Send`**, and that is written out rather than left to
 /// `async fn` in a trait: a socket is `!Sync` but it is `Send`, and a
 /// `&mut socket` future is therefore `Send` too, so a device may be driven on
@@ -78,6 +80,14 @@ pub const CONTROL_STATISTICS: &[u8] = b"STATISTICS";
 /// `weida-zmq-py`'s `proxy` among them. An `async fn` in a trait promises no
 /// such bound and cannot be spawned at all.
 pub trait Device {
+    /// Whether this end ever delivers a message. `false` for a socket type
+    /// that only sends, so a proxy does not wait on a receive that can only
+    /// fail. A method rather than a constant, because a device end whose
+    /// type is erased — `weida-zmq-py`'s — only knows at run time.
+    fn receives(&self) -> bool {
+        true
+    }
+
     /// Receives one whole message, waiting for one.
     fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send;
 
@@ -108,6 +118,10 @@ macro_rules! one_way_device {
     };
     ($socket:ty, publish_only) => {
         impl Device for $socket {
+            fn receives(&self) -> bool {
+                false
+            }
+
             fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
                 std::future::ready(Err(Error::ENOTSUP(
                     concat!(
@@ -193,6 +207,10 @@ one_way_device!(SubSocket, recv_only);
 one_way_device!(PubSocket, publish_only);
 
 impl Device for PushSocket {
+    fn receives(&self) -> bool {
+        false
+    }
+
     fn recv(&mut self) -> impl Future<Output = Result<Multipart>> + Send {
         std::future::ready(Err(Error::ENOTSUP(
             "a PUSH socket does not receive, so it can only be the backend a device writes".into(),
@@ -202,6 +220,11 @@ impl Device for PushSocket {
     fn send(&mut self, message: Multipart) -> impl Future<Output = Result<()>> + Send {
         PushSocket::send(self, message)
     }
+}
+
+/// A device with two ends that never deliver has nothing to do.
+fn nothing_to_read() -> Error {
+    Error::ENOTSUP("neither side of this device receives, so it would forward nothing".into())
 }
 
 /// One direction's traffic.
@@ -379,6 +402,12 @@ impl Steer {
 /// `zmq_proxy`: moves messages both ways until a socket ends, copying every
 /// one to `capture` if there is one.
 ///
+/// A side that does not receive — a PUSH or a PUB — is never read, so the
+/// zguide's streamer, PULL in and PUSH out, forwards instead of failing at
+/// its first poll; both sides not receiving is `ENOTSUP`, because such a
+/// device would forward nothing. The steerable form has no such refusal:
+/// its control socket is always read, so a `TERMINATE` still ends it.
+///
 /// Runs until one of the sockets reports an error — which is what closing a
 /// socket or terminating the context looks like from in here — and returns
 /// the counters it reached.
@@ -394,22 +423,24 @@ pub async fn proxy<F: Device, B: Device, C: Device>(
 ) -> Result<ProxyStatistics> {
     let mut statistics = ProxyStatistics::default();
     let mut capture = capture;
+    let (front_receives, back_receives) = (frontend.receives(), backend.receives());
     loop {
         tokio::select! {
-            arrived = frontend.recv() => {
+            arrived = frontend.recv(), if front_receives => {
                 let message = arrived?;
                 statistics.frontend_in.record(&message);
                 capture_copy(&mut capture, &message).await?;
                 statistics.backend_out.record(&message);
                 backend.send(message).await?;
             }
-            arrived = backend.recv() => {
+            arrived = backend.recv(), if back_receives => {
                 let message = arrived?;
                 statistics.backend_in.record(&message);
                 capture_copy(&mut capture, &message).await?;
                 statistics.frontend_out.record(&message);
                 frontend.send(message).await?;
             }
+            else => return Err(nothing_to_read()),
         }
     }
 }
@@ -433,6 +464,7 @@ pub async fn proxy_steerable<F: Device, B: Device, C: Device, S: Device>(
 ) -> Result<ProxyStatistics> {
     let mut statistics = ProxyStatistics::default();
     let mut capture = capture;
+    let (front_receives, back_receives) = (frontend.receives(), backend.receives());
     let mut paused = false;
     loop {
         tokio::select! {
@@ -444,14 +476,14 @@ pub async fn proxy_steerable<F: Device, B: Device, C: Device, S: Device>(
                     Steer::Terminate => return Ok(statistics),
                 }
             }
-            arrived = frontend.recv(), if !paused => {
+            arrived = frontend.recv(), if front_receives && !paused => {
                 let message = arrived?;
                 statistics.frontend_in.record(&message);
                 capture_copy(&mut capture, &message).await?;
                 statistics.backend_out.record(&message);
                 backend.send(message).await?;
             }
-            arrived = backend.recv(), if !paused => {
+            arrived = backend.recv(), if back_receives && !paused => {
                 let message = arrived?;
                 statistics.backend_in.record(&message);
                 capture_copy(&mut capture, &message).await?;
@@ -642,6 +674,118 @@ mod tests {
             .expect("a reply");
         assert_eq!(reply.frames()[0].as_slice(), b"done");
         device.abort();
+    }
+
+    /// Claim: the zguide's streamer — PULL in, PUSH out — forwards, and so
+    /// does the same pair the other way round; a side that cannot receive is
+    /// a side that never delivers, not a failure at the first poll. The
+    /// steerable form and a send-only capture socket get the same treatment.
+    #[tokio::test]
+    async fn a_streamer_forwards_through_a_side_that_never_receives() {
+        let context = context();
+        // PULL frontend, PUSH backend: the streamer as the guide draws it.
+        let mut frontend = PullSocket::new(&context).expect("pull");
+        let front = frontend.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut backend = PushSocket::new(&context).expect("push");
+        let back = backend.bind("tcp://127.0.0.1:0").await.expect("bind");
+        // The capture socket is a PUSH too: it only ever sends.
+        let mut capture = PushSocket::new(&context).expect("push");
+        let tap = capture.bind("tcp://127.0.0.1:0").await.expect("bind");
+
+        let mut producer = PushSocket::new(&context).expect("push");
+        producer.connect(&front.to_string()).expect("connect");
+        let mut consumer = PullSocket::new(&context).expect("pull");
+        consumer.connect(&back.to_string()).expect("connect");
+        let mut watcher = PullSocket::new(&context).expect("pull");
+        watcher.connect(&tap.to_string()).expect("connect");
+
+        let device =
+            tokio::spawn(
+                async move { proxy(&mut frontend, &mut backend, Some(&mut capture)).await },
+            );
+
+        producer
+            .send(Multipart::single("job 1"))
+            .await
+            .expect("send");
+        let crossed = tokio::time::timeout(std::time::Duration::from_secs(10), consumer.recv())
+            .await
+            .expect("the job crossed the streamer")
+            .expect("a job");
+        assert_eq!(crossed.frames()[0].as_slice(), b"job 1");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), watcher.recv())
+            .await
+            .expect("the capture socket saw it")
+            .expect("a copy");
+        assert_eq!(seen.frames()[0].as_slice(), b"job 1");
+        assert!(
+            !device.is_finished(),
+            "a streamer does not die at its first poll"
+        );
+        device.abort();
+
+        // The same pair the other way round: PUSH frontend, PULL backend.
+        // Traffic flows backend to frontend and nothing is read from the
+        // PUSH.
+        let mut frontend = PushSocket::new(&context).expect("push");
+        let front = frontend.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut backend = PullSocket::new(&context).expect("pull");
+        let back = backend.bind("tcp://127.0.0.1:0").await.expect("bind");
+        let mut control = PairSocket::new(&context).expect("pair");
+        control
+            .bind("inproc://proxy.streamer.control")
+            .await
+            .expect("bind control");
+        let mut steer = PairSocket::new(&context).expect("pair");
+        steer
+            .connect("inproc://proxy.streamer.control")
+            .expect("connect control");
+        let mut consumer = PullSocket::new(&context).expect("pull");
+        consumer.connect(&front.to_string()).expect("connect");
+        let mut producer = PushSocket::new(&context).expect("push");
+        producer.connect(&back.to_string()).expect("connect");
+
+        let device = tokio::spawn(async move {
+            proxy_steerable::<_, _, PushSocket, _>(&mut frontend, &mut backend, None, &mut control)
+                .await
+        });
+        producer
+            .send(Multipart::single("job 2"))
+            .await
+            .expect("send");
+        let crossed = tokio::time::timeout(std::time::Duration::from_secs(10), consumer.recv())
+            .await
+            .expect("the job crossed the reversed streamer")
+            .expect("a job");
+        assert_eq!(crossed.frames()[0].as_slice(), b"job 2");
+        steer
+            .send(Multipart::single(CONTROL_TERMINATE.to_vec()))
+            .await
+            .expect("terminate");
+        let statistics = tokio::time::timeout(std::time::Duration::from_secs(10), device)
+            .await
+            .expect("the proxy terminated")
+            .expect("the task")
+            .expect("the counters");
+        assert_eq!(statistics.backend_in.messages, 1);
+        assert_eq!(statistics.frontend_out.messages, 1);
+        assert_eq!(
+            statistics.frontend_in.messages, 0,
+            "a PUSH frontend is never read"
+        );
+    }
+
+    /// Claim: a device whose two ends both never deliver is refused rather
+    /// than parked forever.
+    #[tokio::test]
+    async fn a_device_with_nothing_to_read_is_refused() {
+        let context = context();
+        let mut frontend = PushSocket::new(&context).expect("push");
+        let mut backend = PubSocket::new(&context).expect("pub");
+        let err = proxy::<_, _, PairSocket>(&mut frontend, &mut backend, None)
+            .await
+            .expect_err("nothing to forward");
+        assert_eq!(err.errno(), "ENOTSUP", "{err}");
     }
 
     /// Claim: the control socket steers — `PAUSE` stops the traffic,
