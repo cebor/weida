@@ -164,8 +164,8 @@ Two things, the first one changed shape:
   clean. The tree has **no known red**, on either platform, in any configuration, including
   the four that are not in the gate yet.
 - **22 items are `ready`, none is `blocked`** and **one is `parked`** (A5's control tier by
-  0011 §4.3). Of 189 filed items, 166 are `done`. B-189, the NNG survey interop hang on
-  Windows, is the newest `ready` item and the only Windows-specific one left.
+  0011 §4.3). Of 189 filed items, 167 are `done`; B-189, the NNG survey interop hang on
+  Windows, closed the same evening as a test race, not a library bug.
 - **The six the night left behind**, all filed with their evidence: **B-184** (the gate change
   above, §6), **B-182** (done with B-188: the NNG survey flake was a library bug the second
   platform exposed every time), **B-180** (the same shape in `weida`'s drain test), **B-183**
