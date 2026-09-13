@@ -72,6 +72,7 @@ mod exec;
 #[cfg(windows)]
 mod pipe;
 mod registry;
+mod resolve;
 #[cfg(unix)]
 mod unix;
 
@@ -80,5 +81,6 @@ pub use exec::{Exec, OwnedReactor};
 #[cfg(windows)]
 pub use pipe::{BoundPipe, client_principal, connect_pipe, server_principal};
 pub use registry::NameRegistry;
+pub use resolve::{Resolved, Resolver, SharedResolver, SystemResolver};
 #[cfg(unix)]
 pub use unix::{BoundUnixSocket, peer_credentials};

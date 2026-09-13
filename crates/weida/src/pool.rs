@@ -116,7 +116,8 @@ impl ClientPool {
         // A portless authority is a set (0020 §4.2); which port that set
         // listens on is not a guess but a constant, and whether a set is
         // allowed at all is the runtime's configuration.
-        let port = dial_port(*port, config.discovery, host)?;
+        let written_port = *port;
+        let port = dial_port(written_port, config.discovery, host)?;
         let peer: PeerKey = (host.to_owned(), port, Arc::clone(tls), expected);
         let key: ConnKey = (peer.clone(), path.clone());
         let mut state = self.state.lock().await;
@@ -139,8 +140,9 @@ impl ClientPool {
 
         let (client_config, refused) = tls::client_config(tls, expected, &config.limits)?;
 
-        let addrs = exec
-            .resolve(host, port, config.max_resolved_addresses)
+        let addrs = config
+            .resolver
+            .resolve(exec, host, written_port, config.max_resolved_addresses)
             .await?;
         // Every address, in the resolver's order, until one answers. The first
         // is not necessarily reachable: `localhost` commonly resolves to `::1`

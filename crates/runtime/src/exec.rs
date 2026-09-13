@@ -1,6 +1,5 @@
 //! The one surface onto the async runtime: tasks, timers and DNS.
 
-use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
@@ -111,69 +110,35 @@ impl Exec {
     /// it held is released. This is the only place an await is bounded on
     /// wall-clock time, for the same reason [`Exec::sleep`] lives here: the
     /// timer belongs to the runtime, not to the caller.
+    /// Resolves `host:port` through the **system** resolver.
+    ///
+    /// The convenience the competitor libraries use: a foreign-protocol client
+    /// dials what its own configuration names, and none of them has a reason
+    /// to let an application replace name resolution. weida's own dial path
+    /// goes through [`crate::Resolver`] instead, because a `weida://`
+    /// authority may name a set and what a set means is the deployment's
+    /// decision (`docs/decisions/0020-cluster-and-discovery.md` §4.2).
+    ///
+    /// One implementation, two entry points: this delegates to
+    /// [`crate::SystemResolver`].
+    pub async fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+        max_addresses: usize,
+    ) -> Result<Vec<std::net::SocketAddr>, Error> {
+        use crate::resolve::Resolver;
+        crate::resolve::SystemResolver
+            .resolve(self, host, Some(port), max_addresses)
+            .await
+    }
+
     pub async fn within<F: Future>(&self, limit: Duration, future: F) -> Option<F::Output> {
         let deadline = self.sleep(limit);
         tokio::select! {
             output = future => Some(output),
             () = deadline => None,
         }
-    }
-
-    /// Resolves `host:port` to every address the resolver offers, in its
-    /// order, at most `max_addresses` of them.
-    ///
-    /// An address that is already an IP literal is not resolved at all: it is
-    /// parsed in place, with no allocation, no task and no join handle. Every
-    /// pinned deployment dials literals — the address carries the peer's
-    /// fingerprint, not a name — and the round trip through the runtime cost
-    /// 12 % of a cold handshake when it applied to them too
-    /// (`docs/IMPLEMENTATION.md` §4, B-012, B-025).
-    ///
-    /// A real hostname keeps the task: `lookup_host` needs a Tokio context,
-    /// and awaiting the join handle does not. That is also what keeps a
-    /// stalled resolver from stalling the library — libzmq's named
-    /// architectural mistake was synchronous DNS, where "when DNS was
-    /// unavailable, the whole library, including the sockets that haven't
-    /// used DNS, just hung" (`docs/research/zeromq.md` §13).
-    ///
-    /// All of the addresses are returned rather than the first, because the
-    /// first is not necessarily reachable: `localhost` commonly resolves to
-    /// both `::1` and `127.0.0.1`, and a server bound to one of them is
-    /// unreachable through the other. The caller tries them in order.
-    ///
-    /// `max_addresses` is mandatory and is the caller's number, not a
-    /// constant here: a resolver answer is remote input, so the count is
-    /// capped (`docs/INVARIANTS.md`), and where that cap comes from belongs
-    /// to the consumer's own configuration rather than to this crate.
-    pub async fn resolve(
-        &self,
-        host: &str,
-        port: u16,
-        max_addresses: usize,
-    ) -> Result<Vec<SocketAddr>, Error> {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            return Ok(vec![SocketAddr::new(ip, port)]);
-        }
-        let query = (host.to_owned(), port);
-        let looked_up = self
-            .spawn(async move {
-                tokio::net::lookup_host(query)
-                    .await
-                    .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
-            })
-            .await
-            .map_err(|e| Error::Runtime(format!("name resolution task failed: {e}")))?;
-        let addrs: Vec<SocketAddr> = looked_up
-            .map_err(|e| Error::InvalidAddress(format!("cannot resolve {host}:{port}: {e}")))?
-            .into_iter()
-            .take(max_addresses)
-            .collect();
-        if addrs.is_empty() {
-            return Err(Error::InvalidAddress(format!(
-                "{host}:{port} resolved to no addresses"
-            )));
-        }
-        Ok(addrs)
     }
 }
 
@@ -235,42 +200,6 @@ mod tests {
         let joined = exec.spawn(async { 7u8 });
         assert_eq!(futures::executor::block_on(joined).expect("task"), 7);
         drop(reactor);
-    }
-
-    #[tokio::test]
-    async fn resolves_ip_literals_without_dns() {
-        let exec = Exec::current().expect("ambient runtime");
-        assert_eq!(
-            exec.resolve("127.0.0.1", 7443, 8).await.unwrap(),
-            vec![SocketAddr::from(([127, 0, 0, 1], 7443))]
-        );
-        let v6 = exec.resolve("::1", 7443, 8).await.unwrap();
-        assert_eq!(v6.len(), 1);
-        assert_eq!(v6[0].port(), 7443);
-        assert!(v6[0].is_ipv6());
-    }
-
-    /// Claim: a hostname yields every address the resolver offers, in its
-    /// order and no more than the cap. `localhost` is the case that matters —
-    /// it commonly resolves to both `::1` and `127.0.0.1`, and dialling only
-    /// the first reaches a server bound to the other never.
-    #[tokio::test]
-    async fn a_hostname_resolves_to_every_address_up_to_the_cap() {
-        let exec = Exec::current().expect("ambient runtime");
-        let all = exec.resolve("localhost", 7443, 8).await.unwrap();
-        assert!(!all.is_empty());
-        assert!(all.iter().all(|a| a.port() == 7443));
-
-        let capped = exec.resolve("localhost", 7443, 1).await.unwrap();
-        assert_eq!(capped.len(), 1, "the cap must bound the answer");
-        assert_eq!(capped[0], all[0], "and it must keep the resolver's order");
-    }
-
-    #[tokio::test]
-    async fn an_unresolvable_host_is_an_address_error() {
-        let exec = Exec::current().expect("ambient runtime");
-        let err = exec.resolve("host.invalid.", 7443, 8).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
     }
 
     #[tokio::test]

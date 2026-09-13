@@ -138,9 +138,24 @@ already has: `tokio::net::lookup_host`, which returns every address a name answe
 
 SRV would add one thing — a **per-node port** — and cost a DNS client, because neither std nor
 tokio resolves SRV: it needs a resolver crate (`hickory-resolver`) and a dependency decision of
-its own. So B-218 shipped the A/AAAA path with no new dependency, and the SRV half is filed
-separately (B-226) with that cost named. A deployment whose nodes listen on *different* ports is
-the case that needs it; a Kubernetes Service is not.
+its own.
+
+**And that per-node port is a real deployment, not a corner case.** The owner's: a cloud load
+balancer hands out **one address** and forwards several ports to several backends. A/AAAA cannot
+express it at all — one address, one port for the whole set — while SRV is exactly that shape: one
+record per port on one host. So SRV is not a Kubernetes refinement; it is what a load-balanced
+deployment needs, and Kubernetes is the case that happens not to need it.
+
+**The answer is therefore a seam rather than a choice between the two** (B-228): a
+[`Resolver`](../../crates/runtime/src/resolve.rs) trait the application may replace, with the
+system resolver as the default. This is the shape this workspace already uses for the decisions
+that belong to the application — `Trust` decides what a dial believes, `weida-amqp` takes the
+caller's `rustls::ClientConfig` — and it settles the dependency question by not taking it:
+shipping only A/AAAA would make the load-balancer deployment unreachable, shipping a DNS stack
+would put one in every dependency graph to serve one deployment shape, and a seam does neither. An
+SRV resolver over `hickory-resolver` behind a non-default feature is then a convenience we *may*
+ship (B-226), not a prerequisite, and a deployment can answer from a service registry, the cloud
+provider's API or a table in a configuration file just as well.
 
 **Readiness filtering is a property we get and rely on.** A restarting node loses its DNS record,
 so discovery needs no gossip layer and no health protocol of its own. What it does *not* give is

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use weida_core::{Error, Fingerprint, Limits};
 use weida_protocol::header::GuaranteeSet;
+use weida_runtime::SharedResolver;
 
 /// Whether a dialled authority may name a **set** of nodes.
 ///
@@ -119,6 +120,16 @@ pub struct RuntimeConfig {
     pub guarantees: GuaranteeSet,
     /// Whether an authority may name a set of nodes ([`Discovery`]).
     pub discovery: Discovery,
+    /// What a name means.
+    ///
+    /// The system resolver by default — A and AAAA, one port for the whole
+    /// set. Replace it to answer from DNS SRV, a service registry or a table:
+    /// a cloud load balancer that forwards several ports from one address is
+    /// the deployment the system resolver **cannot** express, and
+    /// [`weida_runtime::Resolver`] is how it brings its own answer
+    /// ([decisions/0020](../../../docs/decisions/0020-cluster-and-discovery.md)
+    /// §4.2).
+    pub resolver: SharedResolver,
     /// How long a dial waits on one resolved address before trying the next.
     ///
     /// Only the addresses *before* the last one are bounded by it: a name
@@ -144,6 +155,7 @@ impl Default for RuntimeConfig {
             guarantees: GuaranteeSet::CORE,
             connect_attempt_timeout: Duration::from_millis(250),
             discovery: Discovery::default(),
+            resolver: SharedResolver::default(),
         }
     }
 }

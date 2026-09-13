@@ -71,6 +71,7 @@ pub use weida_core::{
     WindowsPrincipal,
 };
 pub use weida_protocol::{ALPN, VERSION, codes, filter};
+pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
 
 pub use config::{ClientTls, Discovery, Identity, Pem, RuntimeConfig, ServerTls, Trust};
 pub use drain::Drained;
