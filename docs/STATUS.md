@@ -163,8 +163,9 @@ Two things, the first one changed shape:
   green at **1680 tests** with 37 ignored on Linux and at 1658 on Windows, and the tree is
   clean. The tree has **no known red**, on either platform, in any configuration, including
   the four that are not in the gate yet.
-- **15 items are `ready`, none is `blocked`** and **one is `parked`** (A5's control tier by
-  0011 §4.3). Of 190 filed items, 174 are `done`; B-189, the NNG survey interop hang on
+- **9 items are `ready`, one is `blocked`** (B-061, CI: the Forgejo host cannot run this gate,
+  a runner is a decision) and **one is `parked`** (A5's control tier by 0011 §4.3). Of 190
+  filed items, 179 are `done`; B-189, the NNG survey interop hang on
   Windows, closed the same evening as a test race, not a library bug.
 - **Of the six the night left behind**, four are closed this session: **B-182** (with B-188:
   the NNG survey flake was a library bug the second platform exposed every time), **B-183**
@@ -174,12 +175,12 @@ Two things, the first one changed shape:
   **B-184**, the gate change above (§6). One was filed and closed the same hour: **B-190**,
   `weida-nng-py`'s wheel, built and run with no toolchain like the four others' — the gap
   its own parity document found.
-- **The older loose ends**, unchanged by tonight: B-060, B-061, B-064..B-068 (requirement-driven
-  work), B-096 and B-099 (a byte ceiling for the per-peer queues and the peer count that is
-  its other half), B-104, B-106, B-107, B-109, B-110 (five small ones, under two hours
-  together), and B-177 (found by W1 from inside the binding: concurrent send and receive on
-  one `weida-zmq` socket); B-178, the device whose end cannot receive, and B-179, the loop
-  wakeup a ready operation no longer pays, closed tonight.
+- **The older loose ends**: B-060, B-064..B-066 and B-068 (requirement-driven work; B-067,
+  the per-topic drop counters, closed tonight), B-096 and B-099 (a byte ceiling for the
+  per-peer queues and the peer count that is its other half), B-107 (a LOOP §6 sentence, yours
+  like B-184), and B-177 (concurrent send and receive on one `weida-zmq` socket). Closed
+  tonight beside them: B-104, B-106, B-109, B-110 (the four small ZeroMQ-family items, two
+  worktrees in parallel), B-178 and B-179.
 - **What moves the roadmap next** is yours to choose: **Phase D**, the L2 broker, which is also
   where MQTT's and AMQP's server halves live and where the credit of 0003 gets a consumer on
   both ends; or **Phase C's Java row**, now that the Python row is four bindings wide and
