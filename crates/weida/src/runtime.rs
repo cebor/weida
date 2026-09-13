@@ -120,14 +120,43 @@ impl RuntimeInner {
     /// §4.1, §4.2).
     #[cfg(unix)]
     pub(crate) async fn connect_unix(&self, socket: &str) -> Result<ConnHandle, Error> {
-        let link = crate::unix::dial(
-            std::path::Path::new(socket),
+        let link = crate::grouped::dial::<tokio::net::UnixStream>(
+            std::path::PathBuf::from(socket),
             self.config.limits.max_local_streams,
             self.config.limits.max_parked_reverse,
         )
         .await?;
         let handle = ConnCtx::spawn(
-            Link::Unix(link),
+            Link::Unix(Box::new(link)),
+            self.config.limits,
+            Arc::new(crate::listener::Namespace::new()),
+            None,
+            self.exec.clone(),
+            self.config.guarantees,
+            self.shared(),
+        );
+        handle.negotiated().await?;
+        Ok(handle)
+    }
+
+    /// Dials a named pipe, with no pool and no TLS: the same grouping as on
+    /// `AF_UNIX`, over `\\.\pipe\<name>` [0012 §4.1, §4.2].
+    #[cfg(windows)]
+    pub(crate) async fn connect_pipe(
+        &self,
+        addr: &weida_core::PipeAddr,
+    ) -> Result<ConnHandle, Error> {
+        let link = crate::grouped::dial::<crate::pipe::PipeStream>(
+            crate::pipe::PipeEndpoint {
+                path: addr.os_path().into(),
+                exec: self.exec.clone(),
+            },
+            self.config.limits.max_local_streams,
+            self.config.limits.max_parked_reverse,
+        )
+        .await?;
+        let handle = ConnCtx::spawn(
+            Link::Pipe(Box::new(link)),
             self.config.limits,
             Arc::new(crate::listener::Namespace::new()),
             None,

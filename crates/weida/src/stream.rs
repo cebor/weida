@@ -233,6 +233,18 @@ impl Peer {
                     addr.socket
                 )));
             }
+            #[cfg(windows)]
+            Address::Pipe(addr) => {
+                let conn = self.runtime.connect_pipe(&addr).await?;
+                (conn, addr.path)
+            }
+            #[cfg(not(windows))]
+            Address::Pipe(addr) => {
+                return Err(Error::InvalidAddress(format!(
+                    "{}: named pipes are not available on this platform",
+                    addr.name
+                )));
+            }
         };
         self.peers.add(ConnHandle::clone(&conn), &path);
         Ok((conn, Arc::from(path.as_str())))

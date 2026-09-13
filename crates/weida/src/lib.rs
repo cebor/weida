@@ -44,9 +44,13 @@ mod conn;
 mod dedup;
 mod drain;
 mod endpoint;
+#[cfg(any(unix, windows))]
+mod grouped;
 mod inproc;
 mod listener;
 mod ordering;
+#[cfg(windows)]
+mod pipe;
 mod pool;
 mod pubsub;
 mod runtime;
@@ -59,7 +63,8 @@ mod unix;
 
 pub use weida_core::{
     Address, EndpointAddr, Error, ErrorCode, Fingerprint, InprocAddr, Limits, LocalPrincipal,
-    LossCause, PeerIdentity, Result, StopReason, TraceContext, UnixAddr,
+    LossCause, PeerIdentity, PipeAddr, Result, StopReason, TraceContext, UnixAddr,
+    WindowsPrincipal,
 };
 pub use weida_protocol::{ALPN, VERSION, codes};
 
@@ -69,6 +74,8 @@ pub use endpoint::{
     Endpoint, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher, Rep, Replier, Req, Requester,
     Sub, Subscriber,
 };
+#[cfg(windows)]
+pub use listener::PipeBinding;
 #[cfg(unix)]
 pub use listener::UnixBinding;
 pub use listener::{Binding, Listener, LocalBinding};

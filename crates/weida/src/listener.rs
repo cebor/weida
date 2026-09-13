@@ -245,15 +245,61 @@ impl Listener {
         };
         exec.spawn(accept_unix(
             listener,
-            Arc::clone(&self.inner.namespace),
-            Arc::clone(&self.inner.subs),
-            self.inner.runtime.config.limits,
-            exec.clone(),
-            self.inner.runtime.config.guarantees,
-            self.inner.runtime.shared(),
+            self.local_accept(|link| Link::Unix(Box::new(link))),
         ));
         tracing::info!(path = %path.display(), "unix binding listening");
         Ok(UnixBinding { inner: binding })
+    }
+
+    /// Binds a Windows named pipe, `\\.\pipe\<name>`, and serves it.
+    ///
+    /// The pipe is created with an owner-only descriptor, for local clients
+    /// only, and only if the name does not exist yet — the three answers a
+    /// pipe needs where a socket file needs a private directory
+    /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
+    /// §4.5). Connections are grouped into peers exactly as on `AF_UNIX`
+    /// ([decision 0012](../../../docs/decisions/0012-local-connection-grouping.md)).
+    #[cfg(windows)]
+    pub fn bind_pipe(&self, name: &str) -> Result<PipeBinding, Error> {
+        let addr = weida_core::PipeAddr::parse(&format!("{}://{name}/", weida_core::SCHEME_PIPE))?;
+        let exec = self.inner.runtime.exec.clone();
+        let (binding, first) = {
+            // Inside the runtime context, for the same reason as on unix.
+            let _guard = exec.enter();
+            weida_runtime::BoundPipe::bind(addr.os_path())?
+        };
+        let name = addr.name.clone();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        exec.spawn(accept_pipe(
+            binding,
+            first,
+            stop_rx,
+            self.local_accept(|link| Link::Pipe(Box::new(link))),
+        ));
+        tracing::info!(pipe = %name, "pipe binding listening");
+        Ok(PipeBinding {
+            name,
+            _stop: stop_tx,
+        })
+    }
+
+    /// What every accepted connection of a grouped local transport is
+    /// served with.
+    #[cfg(any(unix, windows))]
+    fn local_accept<S: crate::grouped::Stream>(
+        &self,
+        link: fn(crate::grouped::Grouped<S>) -> Link,
+    ) -> LocalAccept<S> {
+        LocalAccept {
+            groups: Arc::new(crate::grouped::Groups::default()),
+            namespace: Arc::clone(&self.inner.namespace),
+            subs: Arc::clone(&self.inner.subs),
+            limits: self.inner.runtime.config.limits,
+            exec: self.inner.runtime.exec.clone(),
+            guarantees: self.inner.runtime.config.guarantees,
+            shared: self.inner.runtime.shared(),
+            link,
+        }
     }
 
     /// Registers a replier for `path`.
@@ -374,96 +420,185 @@ impl UnixBinding {
     }
 }
 
-/// Accepts `AF_UNIX` connections: control connections become peers, transfer
-/// connections join the peer their token names
-/// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
-/// §4.1, §4.2).
-#[cfg(unix)]
-async fn accept_unix(
-    listener: tokio::net::UnixListener,
+/// One named-pipe binding: the pipe name, released when this drops.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct PipeBinding {
+    name: String,
+    /// Dropping it ends the accept loop, and with it the last listening
+    /// instance, which is what releases the name.
+    _stop: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(windows)]
+impl PipeBinding {
+    /// The pipe name bound, without the `\\.\pipe\` prefix.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// What one accepted local connection is served with.
+#[cfg(any(unix, windows))]
+struct LocalAccept<S: crate::grouped::Stream> {
+    groups: Arc<crate::grouped::Groups<S>>,
     namespace: Arc<Namespace>,
     subs: Arc<SubRegistry>,
     limits: Limits,
     exec: Exec,
     guarantees: GuaranteeSet,
     shared: Arc<Shared>,
+    /// Which `Link` variant a peer over this stream is.
+    link: fn(crate::grouped::Grouped<S>) -> Link,
+}
+
+#[cfg(any(unix, windows))]
+impl<S: crate::grouped::Stream> LocalAccept<S> {
+    fn clone_for(&self) -> LocalAccept<S> {
+        LocalAccept {
+            groups: Arc::clone(&self.groups),
+            namespace: Arc::clone(&self.namespace),
+            subs: Arc::clone(&self.subs),
+            limits: self.limits,
+            exec: self.exec.clone(),
+            guarantees: self.guarantees,
+            shared: Arc::clone(&self.shared),
+            link: self.link,
+        }
+    }
+
+    /// Serves one accepted connection: a control connection becomes a
+    /// peer, a transfer or reverse connection joins the peer its token
+    /// names ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
+    /// §4.1, §4.2, §4.4).
+    async fn serve(self, stream: S) {
+        use crate::grouped::{
+            Accepted, accept_control, admit_reverse, admit_transfer, read_accepted,
+        };
+        let accepted = match read_accepted(stream).await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::debug!(error = %e, "local connection preamble rejected");
+                return;
+            }
+        };
+        match accepted {
+            Accepted::Control(stream, principal) => {
+                let link = match accept_control(
+                    stream,
+                    principal,
+                    Arc::clone(&self.groups),
+                    self.limits.max_local_streams,
+                    self.limits.max_parked_reverse,
+                )
+                .await
+                {
+                    Ok(link) => link,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "local control connection failed");
+                        return;
+                    }
+                };
+                let ctx = ConnCtx::spawn(
+                    (self.link)(link),
+                    self.limits,
+                    self.namespace,
+                    Some(Arc::clone(&self.subs)),
+                    self.exec,
+                    self.guarantees,
+                    self.shared,
+                );
+                let conn_id = ctx.conn.stable_id();
+                let reason = ctx.conn.closed().await;
+                self.subs.remove_connection(conn_id);
+                tracing::debug!(%reason, "local connection closed");
+            }
+            Accepted::Transfer(token, stream, principal) => {
+                // The token names the group and the kernel says who is
+                // asking; an unbound connection is dispatched nowhere
+                // [0012 §4.2].
+                if !admit_transfer(&self.groups, &token, &principal, stream) {
+                    tracing::warn!(
+                        "local transfer connection refused: unknown or mismatched group"
+                    );
+                }
+            }
+            Accepted::Reverse(token, stream, principal) => {
+                // A connection parked for fan-out, under the same admission
+                // rule and the two bounds of [0012 §4.4].
+                if !admit_reverse(&self.groups, &token, &principal, stream) {
+                    tracing::debug!(
+                        "local reverse connection not parked: unknown group or pool full"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Accepts `AF_UNIX` connections and serves each one.
+#[cfg(unix)]
+async fn accept_unix(
+    listener: tokio::net::UnixListener,
+    serve: LocalAccept<tokio::net::UnixStream>,
 ) {
-    let groups = Arc::new(crate::unix::Groups::default());
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             tracing::debug!("unix binding closed; accept loop ending");
             return;
         };
-        if shared.drain.is_draining() {
+        if serve.shared.drain.is_draining() {
             // Admission stopped: the same rule as on every other binding
             // (`docs/decisions/0009-drain.md` §4.5).
             continue;
         }
-        let namespace = Arc::clone(&namespace);
-        let subs = Arc::clone(&subs);
-        let exec_for_conn = exec.clone();
-        let shared = Arc::clone(&shared);
-        let groups = Arc::clone(&groups);
-        exec.spawn(async move {
-            let accepted = match crate::unix::read_accepted(stream).await {
-                Ok(accepted) => accepted,
+        serve.exec.spawn(serve.clone_for().serve(stream));
+    }
+}
+
+/// Accepts named-pipe connections and serves each one.
+///
+/// A pipe instance is one connection: after each accept the next listening
+/// instance is created before the accepted one is served, so that a client
+/// arriving in between finds the pipe busy rather than absent
+/// (`docs/research/ipc.md` §3.1).
+#[cfg(windows)]
+async fn accept_pipe(
+    binding: weida_runtime::BoundPipe,
+    first: tokio::net::windows::named_pipe::NamedPipeServer,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+    serve: LocalAccept<crate::pipe::PipeStream>,
+) {
+    let mut listening = first;
+    loop {
+        let connected = tokio::select! {
+            connected = listening.connect() => connected,
+            _ = &mut stop => {
+                tracing::debug!("pipe binding dropped; accept loop ending");
+                return;
+            }
+        };
+        if let Err(e) = connected {
+            tracing::debug!(error = %e, "pipe accept failed; accept loop ending");
+            return;
+        }
+        let accepted = std::mem::replace(
+            &mut listening,
+            match binding.next_instance() {
+                Ok(next) => next,
                 Err(e) => {
-                    tracing::debug!(error = %e, "local connection preamble rejected");
+                    tracing::warn!(error = %e, "pipe instance not created; accept loop ending");
                     return;
                 }
-            };
-            match accepted {
-                crate::unix::Accepted::Control(stream, principal) => {
-                    let link = match crate::unix::accept_control(
-                        stream,
-                        principal,
-                        Arc::clone(&groups),
-                        limits.max_local_streams,
-                        limits.max_parked_reverse,
-                    )
-                    .await
-                    {
-                        Ok(link) => link,
-                        Err(e) => {
-                            tracing::debug!(error = %e, "local control connection failed");
-                            return;
-                        }
-                    };
-                    let ctx = ConnCtx::spawn(
-                        Link::Unix(link),
-                        limits,
-                        namespace,
-                        Some(Arc::clone(&subs)),
-                        exec_for_conn,
-                        guarantees,
-                        shared,
-                    );
-                    let conn_id = ctx.conn.stable_id();
-                    let reason = ctx.conn.closed().await;
-                    subs.remove_connection(conn_id);
-                    tracing::debug!(%reason, "local connection closed");
-                }
-                crate::unix::Accepted::Transfer(token, stream, principal) => {
-                    // The token names the group and the kernel says who is
-                    // asking; an unbound connection is dispatched nowhere
-                    // [0012 §4.2].
-                    if !crate::unix::admit_transfer(&groups, &token, principal, stream) {
-                        tracing::warn!(
-                            "local transfer connection refused: unknown or mismatched group"
-                        );
-                    }
-                }
-                crate::unix::Accepted::Reverse(token, stream, principal) => {
-                    // A connection parked for fan-out, under the same
-                    // admission rule and the two bounds of [0012 §4.4].
-                    if !crate::unix::admit_reverse(&groups, &token, principal, stream) {
-                        tracing::debug!(
-                            "local reverse connection not parked: unknown group or pool full"
-                        );
-                    }
-                }
-            }
-        });
+            },
+        );
+        if serve.shared.drain.is_draining() {
+            // Admission stopped: the accepted instance is dropped, which
+            // disconnects the client.
+            continue;
+        }
+        let stream = crate::pipe::PipeStream::accepted(accepted, serve.exec.clone());
+        serve.exec.spawn(serve.clone_for().serve(stream));
     }
 }
 

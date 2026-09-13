@@ -6,6 +6,8 @@ members = [
     "crates/protocol",
     "crates/runtime",
     "crates/weida",
+    # The one crate that calls Win32; empty everywhere else.
+    "crates/winpipe",
     # One directory per foreign protocol family, codec and library and bridge
     # together, because everything belonging to one protocol belongs together
     # (0013 §4.1).
@@ -42,6 +44,7 @@ version = "0.1.0"
 weida-core = { path = "crates/core", version = "0.1.0" }
 weida-protocol = { path = "crates/protocol", version = "0.1.0" }
 weida-runtime = { path = "crates/runtime", version = "0.1.0" }
+weida-winpipe = { path = "crates/winpipe", version = "0.1.0" }
 weida = { path = "crates/weida", version = "0.1.0" }
 weida-zmtp = { path = "crates/zmq/weida-zmtp", version = "0.1.0" }
 weida-zmq = { path = "crates/zmq/weida-zmq", version = "0.1.0" }

@@ -515,7 +515,7 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
                     let request = IncomingRequest::new(
                         IncomingTransfer::new(
                             recv,
-                            Arc::new(IncomingMeta::from_header(&decoded, ctx.peer)),
+                            Arc::new(IncomingMeta::from_header(&decoded, ctx.peer.clone())),
                         ),
                         send,
                         Arc::clone(ctx),
@@ -529,7 +529,7 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
                     let request = IncomingRequest::new(
                         IncomingTransfer::new(
                             recv,
-                            Arc::new(IncomingMeta::from_header(&decoded, ctx.peer)),
+                            Arc::new(IncomingMeta::from_header(&decoded, ctx.peer.clone())),
                         ),
                         send,
                         Arc::clone(ctx),
@@ -748,7 +748,7 @@ async fn handle_data(ctx: &ConnHandle, stream: RecvHalf, header: &[u8]) -> Resul
         return drain(stream).await;
     }
 
-    let meta = IncomingMeta::from_header(&header, ctx.peer);
+    let meta = IncomingMeta::from_header(&header, ctx.peer.clone());
 
     // Reassemble mode: hold this arrival if the numbers before it have not
     // come yet, and dispatch whatever run that completes. Held transfers are
@@ -867,7 +867,10 @@ async fn handle_bi(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Resu
 
     let route = ctx.namespace.lookup(&path);
     let request = IncomingRequest::new(
-        IncomingTransfer::new(recv, Arc::new(IncomingMeta::from_header(&header, ctx.peer))),
+        IncomingTransfer::new(
+            recv,
+            Arc::new(IncomingMeta::from_header(&header, ctx.peer.clone())),
+        ),
         send,
         Arc::clone(ctx),
     );

@@ -249,12 +249,14 @@ there is no key to present; the prover is the kernel instead, which is a stronge
 than a certificate makes about a process on the same machine. `IncomingMeta::peer` therefore
 carries either a **key** — the fingerprint above — or a **local principal**: `uid`/`gid`/`pid`
 from `SO_PEERCRED` on Linux, effective `uid` and groups from `LOCAL_PEERCRED` on macOS, which
-carries **no PID**, or the client's token through `ImpersonateNamedPipeClient` on Windows. An
-in-process peer is `None`, like an anonymous client, because there is nobody else to prove.
-Three rules travel with it: the credential is the one captured when the connection was made,
-not when a transfer was sent; a PID is an observation and MUST NOT be the thing authorized on;
-and the rule this amends is only the *count* — 0008 §4.1 said the fingerprint was the only
-identity, and what survives unchanged is that an identity is proved and never claimed.
+carries **no PID**, or on Windows a **`WindowsPrincipal`**, the account SID — the client's
+token through `ImpersonateNamedPipeClient` on the accepting side, the pipe object's owner on
+the dialling side — with the pid the pipe reports. An in-process peer is `None`, like an
+anonymous client, because there is nobody else to prove. Three rules travel with it: the
+credential is the one captured when the connection was made, not when a transfer was sent; a
+PID is an observation and MUST NOT be the thing authorized on; and the rule this amends is
+only the *count* — 0008 §4.1 said the fingerprint was the only identity, and what survives
+unchanged is that an identity is proved and never claimed.
 
 ### Endpoint
 
@@ -374,6 +376,9 @@ crates/
     core/                      →  weida-core        I/O-free model
     protocol/                  →  weida-protocol    wire codec, no I/O
     runtime/                   →  weida-runtime     reactor, resolver, OS hygiene
+    winpipe/                   →  weida-winpipe     the Win32 calls a named pipe needs;
+                                                    the one crate that may use `unsafe`,
+                                                    empty off Windows
     weida/                     →  weida             runtime + QUIC and local transports
                                                     + stream core + patterns
     zmq/weida-zmtp/            →  weida-zmtp        ZMTP 3.1 codec, no I/O and no
@@ -454,11 +459,30 @@ of it documented for a reader with no weida in the picture: `Exec` — `spawn`, 
 `Exec::owned` as the three reactor-ownership constructors and `OwnedReactor` as the
 background-shutdown discipline; `CloseBudget`, a finite budget the phases of one shutdown
 share; `NameRegistry<T>`, an in-process namespace of bound names under a byte budget,
-generic over what a bound name hands its acceptor; and on unix `BoundUnixSocket`, which
+generic over what a bound name hands its acceptor; on unix `BoundUnixSocket`, which
 carries the `AF_UNIX` bind hygiene of [0010](decisions/0010-local-transport.md) §4.5
 (`sun_path` budget, socket-type check, unlink-then-bind, explicit `0600`, node removed on
-drop), plus `peer_credentials`. Dependencies: `weida-core` for one error vocabulary, and
-`tokio`. Nothing else.
+drop), plus `peer_credentials`; and on Windows `BoundPipe`, which creates the instances of
+a named pipe with an owner-only DACL, `PIPE_REJECT_REMOTE_CLIENTS` and the first-instance
+flag, `connect_pipe`, which waits out `ERROR_PIPE_BUSY` on the runtime's timer, and
+`client_principal` / `server_principal`. Dependencies: `weida-core` for one error
+vocabulary, `tokio`, and on Windows `weida-winpipe`. Nothing else.
+
+### `weida-winpipe`
+
+The exception to `unsafe_code = "forbid"`, and the reason every other crate can keep it. A
+named pipe cannot be made private, and its peer cannot be identified, without four things
+`std` and `tokio` do not expose: a security descriptor on `CreateNamedPipe`,
+`ImpersonateNamedPipeClient` followed by a read of the impersonation token's user SID, the
+pipe object's owner SID, and the two process ids. This crate is those four things behind a
+safe surface — `OwnerOnlyDacl`, `create_instance`, `open_client`, `client_peer`,
+`server_peer` — and nothing else: no protocol, no address form, no peer type. Every `unsafe`
+block wraps one Win32 call and states what it relies on; `unsafe_op_in_unsafe_fn` is
+forbidden so none can hide inside an `unsafe fn`. The rule that unsafe code lives in a
+dependency rather than in the workspace ([0013](decisions/0013-competitor-libraries.md)
+§4.3's argument for `crypto_box` and `tokio-rustls`) is kept in spirit: no dependency
+exposes these calls safely, so the smallest possible crate does, and it is a dependency of
+`weida-runtime` only on Windows. Off Windows it is empty.
 
 ### `weida`
 
@@ -589,7 +613,7 @@ negotiation" a fact about the code rather than an intention.
 It is an **enum, not a trait object**. The set of transports is closed, small and decided
 in this crate, and the payload path must stay a direct call: dispatching `write_all`
 through a vtable would put an indirection on exactly the path that is otherwise free of
-task hops and locks. Adding `AF_UNIX` and named pipes is one variant each
+task hops and locks. `AF_UNIX` and named pipes are one variant each
 ([decisions/0010](decisions/0010-local-transport.md) §4.1) and no new concept.
 
 The first non-QUIC variant is the in-process transport, `crates/weida/src/inproc.rs`: a
@@ -599,6 +623,22 @@ stream. That pair *is* the stream, which is §4.2's "the OS connection is the st
 the only object an in-process transport has, and it is why `max_local_streams` bounds live
 transfers there. A local connection carries no TLS, so there is no key and no identity:
 `IncomingMeta::peer` is `None` [0010 §4.4].
+
+The two kernel-mediated variants share one implementation. `crates/weida/src/grouped.rs`
+is the grouping of [0012](decisions/0012-local-connection-grouping.md) — the preamble, the
+token registry, the admission rule, the reverse pool, the stream slots — written once over
+a `Stream` trait with exactly the eight things the two transports differ in: how a
+connection is dialled, how the kernel names its peer, how it splits into halves, when two
+principals are the same peer, what identity a principal is, and how a stream ends —
+`finish`, `reset`, `stop`. `unix.rs` implements it for `tokio::net::UnixStream` in forty
+lines, because a socket ends a stream by half-close and carries no code. `pipe.rs` is
+longer, because a pipe has no half-close: it carries each stream in chunks — payload, FIN,
+RESET with a code — over `tokio::io::split` halves ([PROTOCOL.md](PROTOCOL.md) §2.1), and
+a reader that stops drains the rest in the background rather than closing a handle the
+reply still needs. The chunk layer is the one thing on the pipe's wire that is not on the
+socket's, and it is the transport's, not the protocol's: above `transport.rs` nothing knows
+it exists. The `Link`, `SendHalf` and `RecvHalf` enums carry `Unix` and `Pipe` variants
+over the same generic types, gated on the platform.
 
 ### Connection driver
 

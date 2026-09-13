@@ -52,9 +52,14 @@ with the reverse pool of
 connection is a descriptor held open for a copy that may never come, so it is bounded
 twice: by the pool's own ceiling and by `max_local_streams`, which counts it like any
 other live local connection. The habit stays — a bound is named here before the
-allocation it caps exists, so that no implementation can land without one — and the next
-entry will be the named-pipe instance count of [0010 §4.5] if it turns out to need more
-than `max_local_streams`.
+allocation it caps exists, so that no implementation can land without one. The named-pipe
+instance count of [0010 §4.5] turned out to need nothing beyond `max_local_streams`: the
+"1-255" of `CreateNamedPipe` is the range of its `nMaxInstances` argument, and 255 is
+`PIPE_UNLIMITED_INSTANCES`, so the pipe is created unlimited and the per-peer stream slots
+are the only ceiling, as on `AF_UNIX` (B-039). The pipe's chunk framing
+([PROTOCOL.md](PROTOCOL.md) §2.1) allocates nothing for a chunk length: a reader takes at
+most the caller's buffer per read, and the one buffer the transport owns — the 8 KiB
+scratch of a draining reader — is a constant.
 
 **The adapters are inside this invariant too, and had been read as if they were not.** The
 review pass of B-051 swept the adapter crates for the first time and found two structures a

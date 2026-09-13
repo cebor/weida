@@ -59,6 +59,30 @@ pub struct LocalPrincipal {
     pub pid: Option<u32>,
 }
 
+/// A principal the **kernel** proved, on a Windows named pipe.
+///
+/// The client's token SID, read through `ImpersonateNamedPipeClient` on the
+/// serving side and captured once at connect time
+/// (`docs/research/ipc.md` §3.3, [0010 §4.4]). The same two rules as
+/// [`LocalPrincipal`]: the credential is the one taken at connect, and the
+/// PID is an observation that MUST NOT be authorized on — `GetNamedPipe
+/// ClientProcessId` reports it and nothing signs it.
+///
+/// A separate type rather than a third field set on [`LocalPrincipal`],
+/// because a SID and a uid are not comparable values and a caller that
+/// authorizes on one must be made to say which. The SID is an `Arc<str>`
+/// rather than a `String` so that a [`PeerIdentity`] stays a refcount bump
+/// to clone: it is copied into every incoming transfer's metadata, and a
+/// string allocation there would be one per message.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WindowsPrincipal {
+    /// The account SID in its string form (`S-1-5-21-...`).
+    pub sid: std::sync::Arc<str>,
+    /// The client process id, where the pipe reports one. An observation
+    /// only.
+    pub pid: Option<u32>,
+}
+
 /// Who the peer is, once it has been **proved**.
 ///
 /// Two kinds of proof, never a claim
@@ -68,12 +92,15 @@ pub struct LocalPrincipal {
 /// kernel attributed to the process on the other end of a local connection.
 /// An anonymous TLS client and an in-process peer have neither, and are
 /// reported as `None` rather than as an empty identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PeerIdentity {
     /// The peer's public-key fingerprint, proved by the TLS handshake.
     Key(Fingerprint),
     /// The peer's local principal, proved by the kernel.
     Local(LocalPrincipal),
+    /// The peer's Windows account, proved by the kernel through the pipe's
+    /// client token.
+    Windows(WindowsPrincipal),
 }
 
 impl PeerIdentity {
@@ -81,7 +108,7 @@ impl PeerIdentity {
     pub fn key(&self) -> Option<Fingerprint> {
         match self {
             PeerIdentity::Key(fp) => Some(*fp),
-            PeerIdentity::Local(_) => None,
+            PeerIdentity::Local(_) | PeerIdentity::Windows(_) => None,
         }
     }
 
@@ -89,7 +116,15 @@ impl PeerIdentity {
     pub fn local(&self) -> Option<LocalPrincipal> {
         match self {
             PeerIdentity::Local(principal) => Some(*principal),
-            PeerIdentity::Key(_) => None,
+            PeerIdentity::Key(_) | PeerIdentity::Windows(_) => None,
+        }
+    }
+
+    /// The proved Windows account, if this identity is one.
+    pub fn windows(&self) -> Option<&WindowsPrincipal> {
+        match self {
+            PeerIdentity::Windows(principal) => Some(principal),
+            PeerIdentity::Key(_) | PeerIdentity::Local(_) => None,
         }
     }
 }
@@ -101,6 +136,10 @@ impl fmt::Display for PeerIdentity {
             PeerIdentity::Local(p) => match p.pid {
                 Some(pid) => write!(f, "uid:{} gid:{} pid:{pid}", p.uid, p.gid),
                 None => write!(f, "uid:{} gid:{}", p.uid, p.gid),
+            },
+            PeerIdentity::Windows(p) => match p.pid {
+                Some(pid) => write!(f, "sid:{} pid:{pid}", p.sid),
+                None => write!(f, "sid:{}", p.sid),
             },
         }
     }

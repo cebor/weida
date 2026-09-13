@@ -176,6 +176,9 @@ pub enum Address {
     /// `weida+unix://<percent-encoded>/path` — `AF_UNIX`, the kernel proves
     /// the peer.
     Unix(UnixAddr),
+    /// `weida+pipe://<name>/path` — a Windows named pipe, the kernel proves
+    /// the peer.
+    Pipe(PipeAddr),
 }
 
 impl Address {
@@ -190,6 +193,9 @@ impl Address {
         if input.starts_with(SCHEME_UNIX) {
             return UnixAddr::parse(input).map(Address::Unix);
         }
+        if input.starts_with(SCHEME_PIPE) {
+            return PipeAddr::parse(input).map(Address::Pipe);
+        }
         EndpointAddr::parse(input).map(Address::Quic)
     }
 
@@ -199,6 +205,7 @@ impl Address {
             Address::Quic(a) => &a.path,
             Address::Inproc(a) => &a.path,
             Address::Unix(a) => &a.path,
+            Address::Pipe(a) => &a.path,
         }
     }
 }
@@ -311,6 +318,83 @@ impl fmt::Display for UnixAddr {
             }
         }
         f.write_str(&self.path)
+    }
+}
+
+/// URL scheme of the Windows named-pipe transport.
+pub const SCHEME_PIPE: &str = "weida+pipe";
+
+/// Longest pipe name accepted, in bytes.
+///
+/// The "entire pipe name string can be up to 256 characters long" — the
+/// name after `\\.\pipe\`, which is the part an address carries
+/// (`docs/research/ipc.md` §3.1).
+pub const MAX_PIPE_NAME_BYTES: usize = 256;
+
+/// The local pipe namespace every [`PipeAddr`] is mapped into.
+///
+/// Always `\\.\pipe\` and never a UNC path with a computer name: an address
+/// names a pipe on this machine only, which is the address-level half of
+/// `PIPE_REJECT_REMOTE_CLIENTS` [0010 §4.8].
+pub const PIPE_NAMESPACE: &str = r"\\.\pipe\";
+
+/// A parsed `weida+pipe://<pipe-name>/<path>` address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipeAddr {
+    /// The pipe's name **without** the `\\.\pipe\` prefix.
+    pub name: String,
+    /// Opaque endpoint identifier, starting with `/`.
+    pub path: String,
+}
+
+impl PipeAddr {
+    /// Parses `weida+pipe://<pipe-name>/<path>`.
+    ///
+    /// The name is everything up to the first `/`, so it cannot contain the
+    /// endpoint separator; a backslash is refused too, because in the pipe
+    /// namespace it is the path separator and would let an address name
+    /// something outside `\\.\pipe\`. The `sha256:…@` userinfo form is
+    /// refused for the same reason as on every local transport: there is no
+    /// key to pin [0010 §4.8].
+    pub fn parse(input: &str) -> Result<PipeAddr, Error> {
+        let invalid = |m: &str| Error::InvalidAddress(format!("{m}: {input:?}"));
+        let rest = input
+            .strip_prefix(SCHEME_PIPE)
+            .and_then(|r| r.strip_prefix("://"))
+            .ok_or_else(|| invalid("expected scheme weida+pipe://"))?;
+
+        let (name, path) = match rest.find('/') {
+            Some(i) => rest.split_at(i),
+            None => return Err(invalid("missing endpoint path")),
+        };
+        if name.contains('@') {
+            return Err(invalid("a local address carries no fingerprint"));
+        }
+        if name.is_empty() || name.len() > MAX_PIPE_NAME_BYTES {
+            return Err(invalid(&format!(
+                "pipe name must be 1..={MAX_PIPE_NAME_BYTES} bytes"
+            )));
+        }
+        if name.bytes().any(|b| b < 0x20 || b == b'\\') {
+            return Err(invalid("invalid byte in pipe name"));
+        }
+        validate_endpoint_path(path).map_err(|_| invalid("invalid endpoint path"))?;
+
+        Ok(PipeAddr {
+            name: name.to_owned(),
+            path: path.to_owned(),
+        })
+    }
+
+    /// The OS path of the pipe: `\\.\pipe\<name>`.
+    pub fn os_path(&self) -> String {
+        format!("{PIPE_NAMESPACE}{}", self.name)
+    }
+}
+
+impl fmt::Display for PipeAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{SCHEME_PIPE}://{}{}", self.name, self.path)
     }
 }
 
@@ -487,5 +571,44 @@ mod tests {
                 "expected rejection of {case:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_pipe_address_names_a_local_pipe_only() {
+        let a = PipeAddr::parse("weida+pipe://weida-jobs.v1/jobs").expect("parse");
+        assert_eq!(a.name, "weida-jobs.v1");
+        assert_eq!(a.path, "/jobs");
+        // Always the local namespace, never a UNC path with a computer name.
+        assert_eq!(a.os_path(), r"\\.\pipe\weida-jobs.v1");
+        assert_eq!(PipeAddr::parse(&a.to_string()).expect("reparse"), a);
+        assert!(matches!(
+            Address::parse("weida+pipe://x/y").expect("by scheme"),
+            Address::Pipe(_)
+        ));
+    }
+
+    #[test]
+    fn a_pipe_address_refuses_what_would_escape_or_authenticate() {
+        for case in [
+            // No key can be pinned on a local transport [0010 §4.8].
+            "weida+pipe://sha256:0000000000000000000000000000000000000000000000000000000000000000@x/jobs",
+            // A backslash is the pipe namespace's separator: it would name
+            // something outside `\\.\pipe\`.
+            r"weida+pipe://..\..\c$\boot.ini/jobs",
+            // Empty name, control byte, over the 256-byte cap, missing
+            // endpoint path.
+            "weida+pipe:///jobs",
+            "weida+pipe://a\u{1}b/jobs",
+            "weida+pipe://x",
+        ] {
+            assert!(
+                PipeAddr::parse(case).is_err(),
+                "expected rejection of {case:?}"
+            );
+        }
+        let long = "a".repeat(MAX_PIPE_NAME_BYTES + 1);
+        assert!(PipeAddr::parse(&format!("weida+pipe://{long}/jobs")).is_err());
+        let ok = "a".repeat(MAX_PIPE_NAME_BYTES);
+        assert!(PipeAddr::parse(&format!("weida+pipe://{ok}/jobs")).is_ok());
     }
 }

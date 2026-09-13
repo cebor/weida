@@ -45,6 +45,11 @@
 //!   `peer_credentials`, the kernel's answer to *who is on the other end*
 //!   ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
 //!   §4.5).
+//! - On Windows: `BoundPipe`, which creates the instances of a named pipe
+//!   with an owner-only DACL, local clients only and the first-instance
+//!   flag, `connect_pipe`, which opens the client end and waits out
+//!   `ERROR_PIPE_BUSY`, and `client_principal` / `server_principal`, the
+//!   kernel's answer to the same question in SID form (0010 §4.4, §4.5).
 //!
 //! # The grep
 //!
@@ -64,12 +69,16 @@
 
 mod budget;
 mod exec;
+#[cfg(windows)]
+mod pipe;
 mod registry;
 #[cfg(unix)]
 mod unix;
 
 pub use budget::CloseBudget;
 pub use exec::{Exec, OwnedReactor};
+#[cfg(windows)]
+pub use pipe::{BoundPipe, client_principal, connect_pipe, server_principal};
 pub use registry::NameRegistry;
 #[cfg(unix)]
 pub use unix::{BoundUnixSocket, peer_credentials};

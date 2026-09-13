@@ -229,7 +229,7 @@ async fn a_binding_that_requires_clients_learns_who_they_are() {
     let replier = listener.replier("/who").expect("replier");
     let seen = tokio::spawn(async move {
         let request = replier.accept().await.expect("accept");
-        let peer = request.meta().peer;
+        let peer = request.meta().peer.clone();
         let mut reply = request
             .reply(weida::TransferMeta::default())
             .await
@@ -279,7 +279,7 @@ async fn an_anonymous_client_is_seen_as_nobody() {
     let replier = server.listener.replier("/who").expect("replier");
     let seen = tokio::spawn(async move {
         let request = replier.accept().await.expect("accept");
-        request.meta().peer
+        request.meta().peer.clone()
     });
 
     let client = server.client_runtime();

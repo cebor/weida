@@ -267,7 +267,7 @@ impl PoolState {
             .find(|((p, _), handle)| p == peer && handle.conn.close_reason().is_none())
             // The pool is a QUIC structure, and what it compares is the key
             // the peer proved; a local principal never reaches it.
-            .map(|(_, handle)| handle.peer.and_then(|id| id.key()))
+            .map(|(_, handle)| handle.peer.as_ref().and_then(|id| id.key()))
     }
 }
 

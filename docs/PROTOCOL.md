@@ -81,7 +81,7 @@ handshake; it is not signalled at the weida protocol layer.
 
 **A local transport carries the same protocol without TLS**
 ([decisions/0010](decisions/0010-local-transport.md)). In-process channels, `AF_UNIX`
-`SOCK_STREAM` sockets and Windows named pipes in message mode carry the same frames (§4), the
+`SOCK_STREAM` sockets and Windows named pipes in byte mode carry the same frames (§4), the
 same headers (§6), the same HELLO exchange (§2.2) and the same negotiation (§2.3). Three
 differences, and only three:
 
@@ -103,10 +103,10 @@ differences, and only three:
   specified: a transfer addressed to a path whose pattern cannot serve it is refused with
   `UNSUPPORTED` (§9.4).
 - **The peer is proved by the kernel, not by a key.** `SO_PEERCRED` on Linux, `LOCAL_PEERCRED`
-  on macOS — which carries no PID — and the client's token through
-  `ImpersonateNamedPipeClient` on Windows; an in-process peer has no identity at all, because
-  there is nobody else to prove [0010 §4.4]. A PID is an observation and MUST NOT be
-  authorized on.
+  on macOS — which carries no PID — and on Windows the client's token SID through
+  `ImpersonateNamedPipeClient` on the accepting side and the pipe object's owner SID on the
+  dialling side; an in-process peer has no identity at all, because there is nobody else to
+  prove [0010 §4.4]. A PID is an observation and MUST NOT be authorized on.
 
 A local transport is named by its own URL scheme, never by `weida://`
 ([ARCHITECTURE.md](ARCHITECTURE.md) §3): the transport is part of the address, and there is no
@@ -129,11 +129,11 @@ of the transport and appears on no QUIC connection:
 
 A transfer connection is admitted only if the token names a live control
 connection **and** the kernel credentials of the new connection match that
-control connection's — the uid always, the pid where the platform reports one
-[0012 §4.2]. An unbound connection is dispatched nowhere. The token binds
-connections and resumes nothing: no subscriptions, no sequence position, no
-dedup window, and it is meaningless once the control connection closes, which
-is why it is not the session state §11 excludes [0012 §4.5].
+control connection's — the uid or SID always, the pid where the platform
+reports one [0012 §4.2]. An unbound connection is dispatched nowhere. The
+token binds connections and resumes nothing: no subscriptions, no sequence
+position, no dedup window, and it is meaningless once the control connection
+closes, which is why it is not the session state §11 excludes [0012 §4.5].
 
 A server has no way to *dial* a peer that dialled it, so a stream toward such
 a peer rides a connection that peer parked in advance: a subscriber over a
@@ -149,6 +149,26 @@ it** — the answer fan-out already gives an exhausted subscriber budget (§6.4,
 [GUARANTEES.md](GUARANTEES.md) §6), and never a stall of the publisher. A
 subscriber configured to park nothing therefore cannot receive fan-out at
 all, and is refused when it subscribes rather than left silent.
+
+**A named pipe carries each stream in chunks**, because a pipe has no half-close: a
+socket ends a stream by shutting down one direction, and a pipe handle closes whole,
+taking the reply direction with it. After the local preamble, everything written on a
+pipe connection is a sequence of chunks, and the end of a stream is a chunk:
+
+```text
+0x00 <u32 length, little-endian> <bytes>   payload
+0x01                                       FIN: the stream is complete
+0x02 <u64 code, little-endian>             RESET: the stream was abandoned, with why
+```
+
+A reader MUST treat FIN as the end of the stream, MUST report RESET with its code as it
+would report `RESET_STREAM` on QUIC, and MUST refuse a chunk kind it does not know. A
+writer MUST NOT write a FIN or RESET inside a payload chunk. The chunk layer carries what
+the socket cannot — a reset code — and lacks what the socket has: there is no reader-side
+refusal, because the only direction a reader could signal on is the one the reply owns. A
+pipe reader that stops therefore reads and discards the rest of the stream, and the writer
+learns of the refusal from the reply or from nothing, which is the socket's own named loss
+of [0012 §4.7] moved from the write to the receipt.
 
 ### 2.2 HELLO exchange
 
@@ -965,7 +985,7 @@ Per connection (`Limits`):
 | `max_sequence_scopes` | `1024` | producer scopes — paths and topics — a receiver tracks per connection for gap detection or reassembly under `PerProducer` ordering; the peer names the scopes, so at the cap a new one is simply not tracked |
 | `max_reorder_hold` | `256` | transfers a receiver holds back at once, over all scopes, under `PerProducer(reassemble)`; at the cap the oldest held transfer is released out of order with its gap reported (§6.5, [GUARANTEES.md](GUARANTEES.md) §3). A held transfer is an unread stream, so the bytes it pins are bounded again by `stream_receive_window` and `connection_receive_window` |
 | `max_dedup_entries` | `4096` | identities a receiver remembers per connection under `Bounded` deduplication; the negotiated window bounds how long an identity is kept and this bounds how many, evicting the oldest at the cap (§6.5) |
-| `max_local_streams` | `255` | live transfers on one **local** connection (§2.1), where the stream is the OS object and there is no multiplexing; an `open` at the cap waits for a live transfer to end, exactly as a QUIC `open` waits on the peer's stream budget, rather than refusing. The number is Windows' named-pipe instance limit, the tightest of the three platforms [0010 §4.2] |
+| `max_local_streams` | `255` | live transfers on one **local** connection (§2.1), where the stream is the OS object and there is no multiplexing; an `open` at the cap waits for a live transfer to end, exactly as a QUIC `open` waits on the peer's stream budget, rather than refusing. The number was chosen as Windows' named-pipe instance range [0010 §4.2]; the pipe itself is created with `PIPE_UNLIMITED_INSTANCES`, so this per-peer count is the only ceiling on every platform |
 | `max_parked_reverse` | `8` | connections a subscriber parks toward a peer it dialled, so that peer can open a stream back (§2.1); each is a descriptor held for a copy that may never come and each counts against `max_local_streams` on both sides. A publisher that finds none parked drops that copy and counts it; zero disables the pool, which makes subscribing over a socket transport an error rather than a silence [0012 §4.4] |
 
 Per runtime (`RuntimeConfig`):

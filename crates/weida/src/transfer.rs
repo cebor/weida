@@ -699,7 +699,7 @@ impl ReplyStream {
         match preamble.kind {
             FrameKind::Data => {
                 let header = DataHeader::decode(&header)?;
-                let meta = Arc::new(IncomingMeta::from_header(&header, self.conn.peer));
+                let meta = Arc::new(IncomingMeta::from_header(&header, self.conn.peer.clone()));
                 Ok(IncomingTransfer::new(recv, meta))
             }
             FrameKind::Error => {

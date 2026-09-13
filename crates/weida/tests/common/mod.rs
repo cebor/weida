@@ -194,6 +194,10 @@ pub enum Transport {
     /// proved by the kernel [0010 §4.4, §4.5].
     #[cfg(unix)]
     Unix,
+    /// A Windows named pipe: `weida+pipe://<name>/<path>`, no TLS, the peer
+    /// proved by the kernel [0010 §4.4, §4.5].
+    #[cfg(windows)]
+    Pipe,
 }
 
 /// A server reachable over either transport, so that one test body can be
@@ -211,6 +215,8 @@ pub struct Harness {
     local: Option<weida::LocalBinding>,
     #[cfg(unix)]
     unix: Option<(weida::UnixBinding, std::path::PathBuf)>,
+    #[cfg(windows)]
+    pipe: Option<weida::PipeBinding>,
 }
 
 impl Harness {
@@ -239,6 +245,8 @@ impl Harness {
                     local: None,
                     #[cfg(unix)]
                     unix: None,
+                    #[cfg(windows)]
+                    pipe: None,
                 }
             }
             Transport::Inproc => {
@@ -257,6 +265,8 @@ impl Harness {
                     local: Some(binding),
                     #[cfg(unix)]
                     unix: None,
+                    #[cfg(windows)]
+                    pipe: None,
                 }
             }
             #[cfg(unix)]
@@ -283,6 +293,24 @@ impl Harness {
                     unix: Some((binding, path)),
                 }
             }
+            #[cfg(windows)]
+            Transport::Pipe => {
+                static PIPE: AtomicU32 = AtomicU32::new(0);
+                let name = format!(
+                    "weida-test-{}-{}",
+                    std::process::id(),
+                    PIPE.fetch_add(1, Ordering::Relaxed)
+                );
+                let binding = listener.bind_pipe(&name).expect("bind pipe");
+                Harness {
+                    transport,
+                    runtime,
+                    listener,
+                    quic: None,
+                    local: None,
+                    pipe: Some(binding),
+                }
+            }
         }
     }
 
@@ -303,6 +331,10 @@ impl Harness {
                 .collect();
             return format!("weida+unix://{encoded}{path}");
         }
+        #[cfg(windows)]
+        if let Some(binding) = &self.pipe {
+            return format!("weida+pipe://{}{path}", binding.name());
+        }
         match (&self.quic, &self.local) {
             (Some((binding, _)), _) => {
                 format!("weida://127.0.0.1:{}{}", binding.local_addr().port(), path)
@@ -316,6 +348,12 @@ impl Harness {
     #[cfg(unix)]
     pub fn socket_path(&self) -> Option<&std::path::Path> {
         self.unix.as_ref().map(|(_, path)| path.as_path())
+    }
+
+    /// The pipe name, on the named-pipe harness.
+    #[cfg(windows)]
+    pub fn pipe_name(&self) -> Option<&str> {
+        self.pipe.as_ref().map(|binding| binding.name())
     }
 
     /// Trust for a dialling endpoint. On a local address there is no key to
@@ -344,11 +382,15 @@ impl Harness {
             listener,
             quic,
             local,
+            #[cfg(windows)]
+            pipe,
             ..
         } = self;
         drop(listener);
         drop(quic);
         drop(local);
+        #[cfg(windows)]
+        drop(pipe);
         runtime.shutdown().await;
     }
 }

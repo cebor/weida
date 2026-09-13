@@ -31,13 +31,17 @@ use crate::conn::{conn_error, read_error, write_error};
 use crate::inproc::{LocalConn, LocalRecv, LocalSend};
 
 /// One connection: a QUIC connection, one in-process link, or one peer's
-/// group of `AF_UNIX` connections
+/// group of local connections — `AF_UNIX` or named pipe
 /// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)).
 pub(crate) enum Link {
     Quic(quinn::Connection),
     Local(LocalConn),
+    /// Boxed: a grouped link carries its pools and channels inline and would
+    /// otherwise dwarf the other variants.
     #[cfg(unix)]
-    Unix(crate::unix::UnixLink),
+    Unix(Box<crate::grouped::Grouped<tokio::net::UnixStream>>),
+    #[cfg(windows)]
+    Pipe(Box<crate::grouped::Grouped<crate::pipe::PipeStream>>),
 }
 
 /// The writing half of one stream.
@@ -45,7 +49,9 @@ pub(crate) enum SendHalf {
     Quic(quinn::SendStream),
     Local(LocalSend),
     #[cfg(unix)]
-    Unix(crate::unix::LocalSend),
+    Unix(crate::grouped::LocalSend<tokio::net::UnixStream>),
+    #[cfg(windows)]
+    Pipe(crate::grouped::LocalSend<crate::pipe::PipeStream>),
 }
 
 /// The reading half of one stream.
@@ -53,7 +59,9 @@ pub(crate) enum RecvHalf {
     Quic(quinn::RecvStream),
     Local(LocalRecv),
     #[cfg(unix)]
-    Unix(crate::unix::LocalRecv),
+    Unix(crate::grouped::LocalRecv<tokio::net::UnixStream>),
+    #[cfg(windows)]
+    Pipe(crate::grouped::LocalRecv<crate::pipe::PipeStream>),
 }
 
 impl Link {
@@ -69,6 +77,8 @@ impl Link {
             Link::Local(_) => None,
             #[cfg(unix)]
             Link::Unix(conn) => conn.peer(),
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn.peer(),
         }
     }
 
@@ -85,6 +95,8 @@ impl Link {
             Link::Quic(_) | Link::Local(_) => false,
             #[cfg(unix)]
             Link::Unix(_) => true,
+            #[cfg(windows)]
+            Link::Pipe(_) => true,
         }
     }
 
@@ -102,6 +114,8 @@ impl Link {
             Link::Local(_) => true,
             #[cfg(unix)]
             Link::Unix(_) => true,
+            #[cfg(windows)]
+            Link::Pipe(_) => true,
         }
     }
 
@@ -118,6 +132,8 @@ impl Link {
             Link::Local(conn) => conn.slots_exhausted(),
             #[cfg(unix)]
             Link::Unix(conn) => conn.slots_exhausted(),
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn.slots_exhausted(),
         }
     }
 
@@ -129,6 +145,8 @@ impl Link {
             Link::Local(conn) => conn.stable_id(),
             #[cfg(unix)]
             Link::Unix(conn) => conn.stable_id(),
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn.stable_id(),
         }
     }
 
@@ -139,6 +157,8 @@ impl Link {
             Link::Local(conn) => conn.close_reason(),
             #[cfg(unix)]
             Link::Unix(conn) => conn.close_reason(),
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn.close_reason(),
         }
     }
 
@@ -151,6 +171,8 @@ impl Link {
             Link::Local(conn) => conn.close(code, reason),
             #[cfg(unix)]
             Link::Unix(conn) => conn.close(code, reason),
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn.close(code, reason),
         }
     }
 
@@ -161,6 +183,8 @@ impl Link {
             Link::Local(conn) => conn.closed().await,
             #[cfg(unix)]
             Link::Unix(conn) => conn.closed().await,
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn.closed().await,
         }
     }
 
@@ -174,6 +198,8 @@ impl Link {
             Link::Local(conn) => conn.open_uni().await.map(SendHalf::Local),
             #[cfg(unix)]
             Link::Unix(conn) => conn.open_uni().await.map(SendHalf::Unix),
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn.open_uni().await.map(SendHalf::Pipe),
         }
     }
 
@@ -187,6 +213,8 @@ impl Link {
         match self {
             #[cfg(unix)]
             Link::Unix(conn) => conn.open_control().map(SendHalf::Unix),
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn.open_control().map(SendHalf::Pipe),
             _ => self.open_uni().await,
         }
     }
@@ -204,6 +232,8 @@ impl Link {
         match self {
             #[cfg(unix)]
             Link::Unix(_) => true,
+            #[cfg(windows)]
+            Link::Pipe(_) => true,
             _ => false,
         }
     }
@@ -214,6 +244,8 @@ impl Link {
         match self {
             #[cfg(unix)]
             Link::Unix(conn) => conn.park_reverse().await,
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn.park_reverse().await,
             _ => Ok(0),
         }
     }
@@ -221,9 +253,12 @@ impl Link {
     /// Replaces parked connections as the peer spends them, until this
     /// connection closes.
     pub(crate) async fn maintain_reverse(&self) {
-        #[cfg(unix)]
-        if let Link::Unix(conn) = self {
-            conn.maintain_reverse().await;
+        match self {
+            #[cfg(unix)]
+            Link::Unix(conn) => conn.maintain_reverse().await,
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn.maintain_reverse().await,
+            _ => {}
         }
     }
 
@@ -243,6 +278,11 @@ impl Link {
                 .open_bi()
                 .await
                 .map(|(s, r)| (SendHalf::Unix(s), RecvHalf::Unix(r))),
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn
+                .open_bi()
+                .await
+                .map(|(s, r)| (SendHalf::Pipe(s), RecvHalf::Pipe(r))),
         }
     }
 
@@ -256,6 +296,8 @@ impl Link {
             Link::Local(conn) => conn.accept_uni().await.map(RecvHalf::Local),
             #[cfg(unix)]
             Link::Unix(conn) => conn.accept_uni().await.map(RecvHalf::Unix),
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn.accept_uni().await.map(RecvHalf::Pipe),
         }
     }
 
@@ -275,6 +317,11 @@ impl Link {
                 .accept_bi()
                 .await
                 .map(|(s, r)| (SendHalf::Unix(s), RecvHalf::Unix(r))),
+            #[cfg(windows)]
+            Link::Pipe(conn) => conn
+                .accept_bi()
+                .await
+                .map(|(s, r)| (SendHalf::Pipe(s), RecvHalf::Pipe(r))),
         }
     }
 }
@@ -286,6 +333,8 @@ impl SendHalf {
             SendHalf::Local(s) => s.write_all(buf).await,
             #[cfg(unix)]
             SendHalf::Unix(s) => s.write_all(buf).await,
+            #[cfg(windows)]
+            SendHalf::Pipe(s) => s.write_all(buf).await,
         }
     }
 
@@ -299,6 +348,8 @@ impl SendHalf {
             SendHalf::Local(s) => s.finish(),
             #[cfg(unix)]
             SendHalf::Unix(s) => s.finish(),
+            #[cfg(windows)]
+            SendHalf::Pipe(s) => s.finish(),
         }
     }
 
@@ -311,6 +362,8 @@ impl SendHalf {
             SendHalf::Local(s) => s.reset(code),
             #[cfg(unix)]
             SendHalf::Unix(s) => s.reset(code),
+            #[cfg(windows)]
+            SendHalf::Pipe(s) => s.reset(code),
         }
     }
 
@@ -338,6 +391,8 @@ impl SendHalf {
             SendHalf::Local(s) => Box::pin(s.stopped()),
             #[cfg(unix)]
             SendHalf::Unix(s) => Box::pin(s.stopped()),
+            #[cfg(windows)]
+            SendHalf::Pipe(s) => Box::pin(s.stopped()),
         }
     }
 }
@@ -350,6 +405,8 @@ impl RecvHalf {
             RecvHalf::Local(r) => r.read(buf).await,
             #[cfg(unix)]
             RecvHalf::Unix(r) => r.read(buf).await,
+            #[cfg(windows)]
+            RecvHalf::Pipe(r) => r.read(buf).await,
         }
     }
 
@@ -362,6 +419,8 @@ impl RecvHalf {
             RecvHalf::Local(r) => r.read_exact(buf).await,
             #[cfg(unix)]
             RecvHalf::Unix(r) => r.read_exact(buf).await,
+            #[cfg(windows)]
+            RecvHalf::Pipe(r) => r.read_exact(buf).await,
         }
     }
 
@@ -375,6 +434,8 @@ impl RecvHalf {
             RecvHalf::Local(r) => r.stop(code),
             #[cfg(unix)]
             RecvHalf::Unix(r) => r.stop(code),
+            #[cfg(windows)]
+            RecvHalf::Pipe(r) => r.stop(code),
         }
     }
 }
@@ -396,6 +457,11 @@ impl AsyncWrite for SendHalf {
                 Some(io) => Pin::new(io).poll_write(cx, buf),
                 None => Poll::Ready(Err(closed_io())),
             },
+            #[cfg(windows)]
+            SendHalf::Pipe(s) => match s.io_mut() {
+                Some(io) => Pin::new(io).poll_write(cx, buf),
+                None => Poll::Ready(Err(closed_io())),
+            },
         }
     }
 
@@ -411,6 +477,11 @@ impl AsyncWrite for SendHalf {
                 Some(io) => Pin::new(io).poll_flush(cx),
                 None => Poll::Ready(Ok(())),
             },
+            #[cfg(windows)]
+            SendHalf::Pipe(s) => match s.io_mut() {
+                Some(io) => Pin::new(io).poll_flush(cx),
+                None => Poll::Ready(Ok(())),
+            },
         }
     }
 
@@ -423,6 +494,11 @@ impl AsyncWrite for SendHalf {
             },
             #[cfg(unix)]
             SendHalf::Unix(s) => match s.io_mut() {
+                Some(io) => Pin::new(io).poll_shutdown(cx),
+                None => Poll::Ready(Ok(())),
+            },
+            #[cfg(windows)]
+            SendHalf::Pipe(s) => match s.io_mut() {
                 Some(io) => Pin::new(io).poll_shutdown(cx),
                 None => Poll::Ready(Ok(())),
             },
@@ -452,6 +528,11 @@ impl AsyncRead for RecvHalf {
             }
             #[cfg(unix)]
             RecvHalf::Unix(r) => match r.io_mut() {
+                Some(io) => AsyncRead::poll_read(Pin::new(io), cx, buf),
+                None => Poll::Ready(Ok(())),
+            },
+            #[cfg(windows)]
+            RecvHalf::Pipe(r) => match r.io_mut() {
                 Some(io) => AsyncRead::poll_read(Pin::new(io), cx, buf),
                 None => Poll::Ready(Ok(())),
             },

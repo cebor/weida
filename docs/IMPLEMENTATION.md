@@ -853,6 +853,83 @@ bench.
 question: a real `Rep0` answers this bridge's raw requester, which never retransmits. PAIR is
 not in any chain, so §11's hop-count disagreement is still open on the wire.
 
+**Delivered in the seventeenth increment — named pipes on Windows (B-039), which closes
+Phase A:**
+
+The third local transport of [0010](decisions/0010-local-transport.md) §4.1, and the one
+that waited for a runner rather than for a design. It was built and gated on a Windows 11
+VM (`win11-geselle`, MSVC, stable 1.98.1) beside the Linux gate: the same 0012 grouping over
+`\\.\pipe\<name>`, and the same three pattern bodies of `tests/transports.rs` run over
+it unchanged, plus the principal, the unknown-token refusal, the slot tests and two claims
+only a pipe can make.
+
+**The grouping was written once, and this is the increment that proved it.** `unix.rs`
+held 0012's whole mechanism bound to `tokio::net::UnixStream`; it is now
+`grouped.rs`, generic over a `Stream` trait with the eight things a transport contributes
+— dial, principal, split, same-peer, identity, `finish`, `reset`, `stop` — and `unix.rs`
+is the forty-line socket implementation. `Link`, `SendHalf` and `RecvHalf` gained a `Pipe`
+variant over the same generic types, boxed so the enum stays the size of its QUIC
+variant. The accept path is one generic `LocalAccept::serve`; the two loops around it —
+`accept()` on a listener, `connect()` on an instance that is replaced before it is served
+— are the only per-transport code in `listener.rs`.
+
+**A pipe has no half-close, so the pipe carries its streams in chunks.** A socket ends a
+stream by shutting down one direction; a pipe handle closes whole and would take the reply
+with it. Everything after the local preamble on a pipe connection is therefore chunked —
+`0x00` + length + payload, `0x01` FIN, `0x02` + code RESET ([PROTOCOL.md](PROTOCOL.md)
+§2.1) — at five bytes per write and nothing per byte, written through the same
+`AsyncWrite` polls as the payload. It carries what the socket could not, a reset code:
+`an_abandoned_request_over_a_pipe_is_a_named_cancellation` cancels a request mid-payload
+and the replier reads `Error::Canceled` rather than a truncated body. What it cannot carry
+is the reader's refusal, because the only direction a reader could write on is the one the
+reply owns; a stopped pipe reader **drains** the rest on the runtime instead, so the writer
+never blocks on a pipe nobody reads and learns of the refusal from the reply. That is
+0012 §4.7's named loss moved from the write to the receipt, and it is stated in the
+protocol document rather than discovered. **Byte mode, not message mode**, against 0010
+§4.5's letter and for its reason: the kernel's framing would go unused under 0012, and
+`mio` reads a message-mode pipe into a fixed buffer where a longer message is
+`ERROR_MORE_DATA` and an error.
+
+**Identity is a SID.** `PeerIdentity::Windows(WindowsPrincipal { sid, pid })`: the client's
+token SID through `ImpersonateNamedPipeClient` on the accepting side, read only after the
+first byte because a client that has not written cannot be impersonated, and reverted on
+every path by a guard; the pipe object's owner SID on the dialling side, which the
+creator's token set. The SID is an `Arc<str>` so that `PeerIdentity` — copied into every
+incoming transfer's metadata — stays a refcount bump to clone; `PeerIdentity` lost `Copy`
+for it, and six call sites gained a `.clone()`. Clients open with
+`SECURITY_IDENTIFICATION`, so a server may learn who a client is and may not act as it.
+`a_pipe_peer_presents_the_principal_the_kernel_proved` asserts the shape and that the pid
+is this process's.
+
+**The hygiene is `weida-runtime`'s, as on unix.** `BoundPipe::bind` creates the first
+instance with `FILE_FLAG_FIRST_PIPE_INSTANCE` — a name that exists is refused as
+`InvalidAddress`, which is the answer to pipe squatting — an owner-only DACL built from
+the process token's SID (`O:<sid>D:P(A;;GA;;;SY)(A;;GA;;;<sid>)`, the pipe's `0600`), and
+`PIPE_REJECT_REMOTE_CLIENTS`; `next_instance` recreates the same after every accept, so a
+client between accepts finds the pipe busy rather than absent; `connect_pipe` waits out
+`ERROR_PIPE_BUSY` on the runtime's timer for five seconds instead of blocking a thread in
+`WaitNamedPipe`, and reports a missing pipe as `ConnectionLost(PeerClosed)` so a caller
+redials. Three runtime tests pin the SID agreement, the taken-name refusal and the absent
+pipe. `PIPE_UNLIMITED_INSTANCES` turned out to be what "255" means, so the per-peer
+`max_local_streams` is the only ceiling on every platform and INVARIANTS closes its
+pending entry.
+
+**One crate may use `unsafe`, and it is thirteen kilobytes.** No dependency exposes a
+security descriptor on `CreateNamedPipe`, `ImpersonateNamedPipeClient` with a token read,
+`GetSecurityInfo` or the pipe pids safely — `interprocess` comes closest and stops before
+the SID — so `crates/winpipe` (`weida-winpipe`) wraps those eleven Win32 calls from
+`windows-sys` behind `OwnerOnlyDacl`, `create_instance`, `open_client`, `client_peer` and
+`server_peer`, each `unsafe` block one call with its precondition stated,
+`unsafe_op_in_unsafe_fn` forbidden, and the crate empty off Windows. Every other crate,
+`weida-runtime` included, keeps `unsafe_code = "forbid"`.
+
+**Verified.** Linux: fmt, clippy in both configurations, **1680 tests** with 37 ignored,
+rustdoc with `-D warnings`. Windows, same commit: build, fmt, clippy in both
+configurations, **1658 tests** across 119 binaries with 37 ignored, rustdoc. The address
+form is checked on both: `weida+pipe://<name>/<path>`, name 1..=256 bytes, no backslash,
+no `sha256:…@`, mapped to `\\.\pipe\<name>` and never a UNC path; on a platform without
+pipes the dial refuses it by name, as `weida+unix://` is refused on Windows.
+
 ---
 
 ## 2. Mandatory development loop per phase

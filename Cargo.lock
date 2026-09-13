@@ -3158,11 +3158,20 @@ dependencies = [
  "futures",
  "tokio",
  "weida-core",
+ "weida-winpipe",
 ]
 
 [[package]]
 name = "weida-sp"
 version = "0.1.0"
+
+[[package]]
+name = "weida-winpipe"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "weida-zmq"

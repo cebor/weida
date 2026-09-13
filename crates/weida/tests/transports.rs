@@ -87,8 +87,13 @@ async fn push_pull_delivery(h: &Harness) {
     match h.transport {
         #[cfg(unix)]
         Transport::Unix => {
-            let peer = received.meta().peer.expect("the kernel proved one");
+            let peer = received.meta().peer.clone().expect("the kernel proved one");
             assert!(peer.local().is_some() && peer.key().is_none());
+        }
+        #[cfg(windows)]
+        Transport::Pipe => {
+            let peer = received.meta().peer.clone().expect("the kernel proved one");
+            assert!(peer.windows().is_some() && peer.key().is_none());
         }
         _ => assert_eq!(received.meta().peer, None),
     }
@@ -190,7 +195,11 @@ async fn a_unix_peer_presents_the_principal_the_kernel_proved() {
     within(pusher.send(b"work item")).await.expect("send");
 
     let transfer = within(puller.recv()).await.expect("recv");
-    let peer = transfer.meta().peer.expect("a local peer is proved");
+    let peer = transfer
+        .meta()
+        .peer
+        .clone()
+        .expect("a local peer is proved");
     let principal = peer.local().expect("a principal, not a key");
     assert!(peer.key().is_none(), "a local peer presents no key");
     assert_eq!(
@@ -399,6 +408,176 @@ async fn an_exhausted_reverse_pool_drops_the_copy_and_counts_it() {
     h.shutdown().await;
 }
 
+/// The named pipe runs the same three bodies.
+#[cfg(windows)]
+#[tokio::test]
+async fn req_rep_over_pipe() {
+    req_rep_echo(&Harness::start(Transport::Pipe).await).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn push_pull_over_pipe() {
+    push_pull_delivery(&Harness::start(Transport::Pipe).await).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pub_sub_over_pipe() {
+    pub_sub_fan_out(&Harness::start(Transport::Pipe).await).await;
+}
+
+/// Claim: the peer a pipe connection presents is the account the **kernel**
+/// attributed to it — the client's token SID — and it is a principal rather
+/// than a key ([decisions/0010](../../docs/decisions/0010-local-transport.md)
+/// §4.4).
+///
+/// The SID is this process's own, because both ends are this test; what the
+/// assertion is for is the shape, and that the pid is reported and never
+/// authorized on.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_pipe_peer_presents_the_principal_the_kernel_proved() {
+    let h = Harness::start(Transport::Pipe).await;
+    let puller = h.listener.puller("/jobs").expect("puller");
+    let client = h.client();
+    let pusher = client.pusher(h.trust());
+    within(pusher.connect(&h.url("/jobs")))
+        .await
+        .expect("connect");
+    within(pusher.send(b"work item")).await.expect("send");
+
+    let transfer = within(puller.recv()).await.expect("recv");
+    let peer = transfer
+        .meta()
+        .peer
+        .clone()
+        .expect("a local peer is proved");
+    let principal = peer.windows().expect("an account, not a key");
+    assert!(peer.key().is_none() && peer.local().is_none());
+    assert!(
+        principal.sid.starts_with("S-1-"),
+        "a SID in its string form: {}",
+        principal.sid
+    );
+    assert_eq!(
+        principal.pid,
+        Some(std::process::id()),
+        "the pipe reports the client's pid; an observation, never authorized on"
+    );
+    within(transfer.collect(64)).await.expect("collect");
+    client.shutdown().await;
+    h.shutdown().await;
+}
+
+/// Claim: a transfer connection that does not name a live peer is dispatched
+/// nowhere — the same admission rule as on `AF_UNIX`, over a pipe
+/// ([decisions/0012](../../docs/decisions/0012-local-connection-grouping.md)
+/// §4.2).
+#[cfg(windows)]
+#[tokio::test]
+async fn a_pipe_transfer_connection_with_an_unknown_token_is_refused() {
+    use tokio::io::AsyncWriteExt;
+
+    let h = Harness::start(Transport::Pipe).await;
+    let puller = h.listener.puller("/jobs").expect("puller");
+    let path = format!(r"\\.\pipe\{}", h.pipe_name().expect("a pipe harness"));
+
+    // A transfer connection whose token names no peer: kind byte plus 16
+    // zero bytes, then a DATA frame for a path that exists, as one payload
+    // chunk.
+    let mut raw = tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(&path)
+        .expect("open");
+    let mut preamble = vec![0x02u8];
+    preamble.extend_from_slice(&[0u8; 16]);
+    raw.write_all(&preamble).await.expect("write preamble");
+    let header = weida_protocol::DataHeader::addressed("/jobs").encode();
+    let mut body = weida_protocol::encode_frame(weida_protocol::FrameKind::Data, &header);
+    body.extend_from_slice(b"injected");
+    let mut chunk = vec![0x00u8];
+    chunk.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    chunk.extend_from_slice(&body);
+    chunk.push(0x01);
+    raw.write_all(&chunk).await.expect("write chunk");
+    drop(raw);
+
+    let client = h.client();
+    let pusher = client.pusher(h.trust());
+    within(pusher.connect(&h.url("/jobs")))
+        .await
+        .expect("connect");
+    within(pusher.send(b"legitimate")).await.expect("send");
+
+    let transfer = within(puller.recv()).await.expect("recv");
+    assert_eq!(
+        within(transfer.collect(64)).await.expect("collect"),
+        b"legitimate".to_vec(),
+        "the refused connection must not have been dispatched"
+    );
+    client.shutdown().await;
+    h.shutdown().await;
+}
+
+/// Claim: a request abandoned mid-payload is reported to the replier as a
+/// cancellation, by name.
+///
+/// A pipe has no half-close and no reset, so the end of a stream and its
+/// abandonment are both chunks of the pipe transport's own framing; the
+/// abandonment carries the code, which is more than the socket can say. A
+/// framing that lost the reset marker would leave the replier reading until
+/// the connection died.
+#[cfg(windows)]
+#[tokio::test]
+async fn an_abandoned_request_over_a_pipe_is_a_named_cancellation() {
+    let h = Harness::start(Transport::Pipe).await;
+    let replier = h.listener.replier("/slow").expect("replier");
+    let handler = tokio::spawn(async move {
+        let mut request = replier.accept().await.expect("accept");
+        let mut body = request.take_body();
+        body.read_capped(64 * 1024).await
+    });
+
+    let client = h.client();
+    let requester = client.requester(h.trust());
+    within(requester.connect(&h.url("/slow")))
+        .await
+        .expect("connect");
+    let (mut request, _reply) = within(requester.open(TransferMeta::default()))
+        .await
+        .expect("open");
+    within(request.write_all(b"partial")).await.expect("write");
+    request.cancel();
+
+    let seen = within(handler).await.expect("handler");
+    assert!(
+        matches!(seen, Err(Error::Canceled)),
+        "the replier learns the request was abandoned: {seen:?}"
+    );
+    client.shutdown().await;
+    h.shutdown().await;
+}
+
+/// Claim: an unknown-name pipe is a closed peer, and the address rules of
+/// [0010 §4.8] hold for the pipe scheme too.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_pipe_address_is_checked_before_it_is_dialled() {
+    let client = weida::Runtime::new(weida::RuntimeConfig::default()).expect("runtime");
+    let pusher = client.pusher(weida::ClientTls::new(weida::Trust::by_address()));
+
+    let err = within(pusher.connect("weida+pipe://weida-nobody-serves-this/jobs"))
+        .await
+        .expect_err("no such pipe");
+    assert!(matches!(err, Error::ConnectionLost(_)), "{err:?}");
+
+    let err = within(pusher.connect(r"weida+pipe://..\admin$\x/jobs"))
+        .await
+        .expect_err("a backslash would leave the pipe namespace");
+    assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
+    client.shutdown().await;
+}
+
 #[tokio::test]
 async fn push_pull_over_quic() {
     push_pull_delivery(&Harness::start(Transport::Quic).await).await;
@@ -481,6 +660,14 @@ async fn sequential_exchanges_reclaim_their_slots_over_inproc() {
 #[tokio::test]
 async fn sequential_exchanges_reclaim_their_slots_over_unix() {
     let h = Harness::start(Transport::Unix).await;
+    sequential_exchanges_reclaim_their_slots(&h).await;
+    h.shutdown().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn sequential_exchanges_reclaim_their_slots_over_pipe() {
+    let h = Harness::start(Transport::Pipe).await;
     sequential_exchanges_reclaim_their_slots(&h).await;
     h.shutdown().await;
 }
@@ -577,6 +764,14 @@ async fn push_pull_waits_for_a_slot_over_inproc() {
 #[tokio::test]
 async fn push_pull_waits_for_a_slot_over_unix() {
     let h = Harness::start(Transport::Unix).await;
+    push_pull_waits_for_a_slot(&h).await;
+    h.shutdown().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn push_pull_waits_for_a_slot_over_pipe() {
+    let h = Harness::start(Transport::Pipe).await;
     push_pull_waits_for_a_slot(&h).await;
     h.shutdown().await;
 }
