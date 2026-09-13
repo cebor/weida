@@ -3147,6 +3147,7 @@ name = "weida-py"
 version = "0.1.0"
 dependencies = [
  "pyo3",
+ "tokio",
  "weida",
  "weida-core",
  "weida-py-core",
