@@ -15,7 +15,7 @@ version.workspace = true
 # The named-pipe handles this crate reads are tokio's, so that a consumer
 # holds one type and never a raw handle.
 tokio.workspace = true
-# Raw bindings, not the `windows` crate: this crate needs eleven functions,
+# Raw bindings, not the `windows` crate: this crate needs fifteen functions,
 # and the bindings crate is already in the tree through `mio`.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

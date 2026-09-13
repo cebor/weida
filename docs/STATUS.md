@@ -6,17 +6,18 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `5ca1329`, 2026-09-12 ~10:05 UTC. Tree clean, gate green, **1678 tests**
-(218 at the start of the session, 764 before the four parallel workstreams), with 37 ignored —
-the interop suites that need a library or a broker this machine does not have — plus the
-non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s `blocking`
-and `nng-interop`) and the four bindings' Python suites: **45** (MQTT), **36** (NATS) and
-**17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own items, and **every one of
-the four wheels built and smoke-tested with no Rust toolchain on `PATH`**. Fourteen decision
-notes (0001–0014), all
-`accepted`. **Twenty-three `[workspace] members`**, one directory per protocol family, read off
-`cargo metadata` rather than a hand-kept list: `weida-core`, `weida-protocol`,
-`weida-runtime`, `weida`, `crates/py/weida-py-core`, then
+**Snapshot:** main `f3a3cbe`, 2026-09-13 ~17:40 UTC. Tree clean, gate green on **two
+platforms**: Linux **1680 tests** (218 at the start of the session, 764 before the four
+parallel workstreams) and a Windows 11 VM at the same commit with 1658 across 119 binaries,
+each with 37 ignored — the interop suites that need a library or a broker the machine does
+not have — plus the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`,
+`weida-nng`'s `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
+(MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
+items, and **every one of the four wheels built and smoke-tested with no Rust toolchain on
+`PATH`**. Fourteen decision notes (0001–0014), all `accepted`. **Twenty-four `[workspace]
+members`**, one directory per protocol family, read off `cargo metadata` rather than a
+hand-kept list: `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`, `weida`,
+`crates/py/weida-py-core`, then
 `crates/zmq/{weida-zmtp, weida-zmq, weida-zmq-bridge, weida-zmq-py}`,
 `crates/nng/{weida-sp, weida-nng, weida-nng-bridge, weida-nng-py}`,
 `crates/mqtt/{weida-mqtt-codec, weida-mqtt, weida-mqtt-py}`,
@@ -35,11 +36,13 @@ by the two forwarders in the middle and by the shared foundation both stand on.
 
 ![Roadmap](status/roadmap.svg)
 
-Reading it: **Phase A is complete** except named pipes (A9), blocked on a Windows runner
-rather than on a design. The control-connection tier (A5) is not a gap: decision 0011 parks
-it with a revival condition, because no existing or reserved frame is peer-scoped. The last
-open question in it, what a local `open` does at its ceiling, is answered: it **waits for a
-slot**, so `Block` means the same thing on every transport (B-059).
+Reading it: **Phase A is complete.** Its last slice, named pipes (A9, B-039), waited for a
+Windows runner rather than for a design, and landed the day one existed: the same 0012
+grouping over `\\.\pipe\`, gated on the VM beside the Linux gate. The control-connection
+tier (A5) is not a gap: decision 0011 parks it with a revival condition, because no existing
+or reserved frame is peer-scoped. The last open question in it, what a local `open` does at
+its ceiling, is answered: it **waits for a slot**, so `Block` means the same thing on every
+transport (B-059).
 
 **Phase B is complete across all four slices, and Phase C's Python row with it** — sixty-six
 items of [0014](decisions/0014-parallel-libraries.md) in four parallel workstreams, each
@@ -79,12 +82,16 @@ AMQP 0-9-1 (RabbitMQ) is deliberately not a Phase B adapter: its clients come wi
 The load-bearing line is the **transport boundary**: `Link`, `SendHalf`, `RecvHalf` as enums in
 `crates/weida/src/transport.rs`. Everything above it — frames, HELLO, negotiation, the three
 patterns, ordering, dedup, drain — is transport-blind, and `tests/transports.rs` proves that by
-running one Req/Rep, one Push/Pull and one Pub/Sub body over QUIC, inproc and `AF_UNIX`
-unchanged. Everything below it is one variant each; Windows named pipes would be a fourth.
+running one Req/Rep, one Push/Pull and one Pub/Sub body over QUIC, inproc, `AF_UNIX` and, on
+Windows, named pipes unchanged. Below it the two kernel-mediated transports share one
+implementation of the 0012 grouping, generic over what a socket and a pipe differ in; the
+pipe's one addition is a chunk framing, because a pipe has no half-close.
 
 The **reactor is its own crate** now: `weida-runtime` holds `Exec`, the three reactor-ownership
-constructors, the capped resolver, the `AF_UNIX` hygiene and the name registry, and it depends
-on `weida-core` and `tokio` and nothing else — which is what lets a ZeroMQ user open a socket
+constructors, the capped resolver, the `AF_UNIX` and named-pipe hygiene and the name
+registry, and it depends on `weida-core`, `tokio` and — on Windows only — `weida-winpipe`,
+the one crate in the tree that may use `unsafe`, fifteen Win32 calls behind a safe surface —
+which is what lets a ZeroMQ user open a socket
 without linking quinn, rustls and weida's pattern layer. Above it the tree is **one directory
 per protocol family** (`crates/zmq/`, `crates/nng/`, `crates/interop/`) rather than one
 `adapters/` bucket, so the directory list answers "does this repository ship a ZeroMQ?". Each
@@ -133,12 +140,12 @@ other end.
 
 ## 6. What needs a human
 
-Two things, and the second one is new:
+Two things, the first one changed shape:
 
-1. **B-039, named pipes.** Blocked on a Windows runner by the loop's judgement: code the gate
-   cannot compile is code nobody verified. Decision 0012 already covers its shape. A Windows
-   route is being prepared outside this tree; `wine` here is a possible later smoke-test path
-   and not a substitute for a runner.
+1. **B-039 is done.** The Windows VM that unblocked it (`ssh win11-geselle`) is not in any
+   CI; the Windows gate is run by hand (`C:\work\gate.ps1`) beside the Linux one, and B-061's
+   CI would be where it stops being manual. The VM's storage threw `STATUS_IN_PAGE_ERROR`
+   three times mid-compile during the slice, each a corrupted artifact cleared by hand.
 2. **B-184, the gate's doc step, needs a change to [LOOP.md](LOOP.md) §6 that only you make.**
    The loop does not edit its own standing instructions. Two holes, both paid for tonight: the
    gate runs no per-crate `--no-default-features` rustdoc, so an intra-doc link to a
@@ -152,18 +159,19 @@ Two things, and the second one is new:
 
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
-  commits** since `184e439`, checked branch by branch rather than taken on report — the gate is green at
-  **1678 tests** with 37 ignored, and the tree is clean. The tree has **no known red**, in any
-  configuration, including the four that are not in the gate yet.
-- **22 items are `ready`, one is `blocked`** (B-039, §6) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of 187 filed items, 163 are `done`.
+  commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
+  green at **1680 tests** with 37 ignored on Linux and at 1658 on Windows, and the tree is
+  clean. The tree has **no known red**, on either platform, in any configuration, including
+  the four that are not in the gate yet.
+- **22 items are `ready`, none is `blocked`** and **one is `parked`** (A5's control tier by
+  0011 §4.3). Of 189 filed items, 166 are `done`. B-189, the NNG survey interop hang on
+  Windows, is the newest `ready` item and the only Windows-specific one left.
 - **The six the night left behind**, all filed with their evidence: **B-184** (the gate change
-  above, §6), **B-182** (an NNG survey test asserts an exact count it only waited for
-  approximately — a real flake, whose workstream is gone, so it has no owner), **B-180** (the
-  same shape in `weida`'s drain test), **B-183** and **B-185** (`weida-nng-py` and
-  `weida-mqtt-py` have no parity document, while the library index's "Planned:" line names
-  both — the other two bindings have theirs), and **B-176** (the adapters index still says
-  "bridges next" about bridges that exist).
+  above, §6), **B-182** (done with B-188: the NNG survey flake was a library bug the second
+  platform exposed every time), **B-180** (the same shape in `weida`'s drain test), **B-183**
+  and **B-185** (`weida-nng-py` and `weida-mqtt-py` have no parity document, while the
+  library index's "Planned:" line names both — the other two bindings have theirs), and
+  **B-176** (the adapters index still says "bridges next" about bridges that exist).
 - **The older loose ends**, unchanged by tonight: B-060, B-061, B-064..B-068 (requirement-driven
   work), B-096 and B-099 (a byte ceiling for the per-peer queues and the peer count that is
   its other half), B-104, B-106, B-107, B-109, B-110 (five small ones, under two hours

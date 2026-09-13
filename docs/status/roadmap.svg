@@ -12,7 +12,7 @@
       .phase   { fill:#263238; font-size:14px; font-weight:bold; }
     </style>
   </defs>
-  <text x="20" y="28" class="phase">Roadmap (LOOP.md §9) — state at main 5ca1329, 1678 tests</text>
+  <text x="20" y="28" class="phase">Roadmap (LOOP.md §9) — state at main f3a3cbe, 1680 tests</text>
 
   <!-- legend -->
   <g transform="translate(500,14)">
@@ -35,12 +35,12 @@
     <rect x="510" y="0" width="96" height="46" rx="4" class="done"/>   <text x="518" y="18" class="lbl">A6 reassembly</text><text x="518" y="34" class="sub">capped hold</text>
     <rect x="612" y="0" width="96" height="46" rx="4" class="done"/>   <text x="620" y="18" class="lbl">A7 topic filters</text><text x="620" y="34" class="sub">segmented * #</text>
     <rect x="714" y="0" width="96" height="46" rx="4" class="done"/>   <text x="722" y="18" class="lbl">A8 runtime</text><text x="722" y="34" class="sub">owned reactor</text>
-    <rect x="816" y="0" width="120" height="46" rx="4" class="partial"/><text x="824" y="18" class="lbl">A9 transports</text><text x="824" y="31" class="sub">inproc ✓ unix ✓</text><text x="824" y="42" class="sub">pipes ✗ (B-039)</text>
+    <rect x="816" y="0" width="120" height="46" rx="4" class="done"/><text x="824" y="18" class="lbl">A9 transports</text><text x="824" y="31" class="sub">inproc ✓ unix ✓</text><text x="824" y="42" class="sub">pipes ✓ (B-039)</text>
   </g>
 
-  <!-- what Phase A still owes, in the two colours the legend promises -->
+  <!-- what Phase A still owes, in the colour the legend promises -->
   <g transform="translate(20,128)">
-    <rect x="0"   y="0" width="430" height="18" rx="3" class="blocked"/><text x="8" y="13" class="sub">B-039 named pipes — blocked on a Windows runner, not on a design (0012 §4.6)</text>
+    <rect x="0"   y="0" width="430" height="18" rx="3" class="done"/><text x="8" y="13" class="sub">Phase A complete: B-039 landed on a Windows VM gate beside the Linux one (1658 / 1680 tests)</text>
     <rect x="440" y="0" width="430" height="18" rx="3" class="parked"/> <text x="448" y="13" class="sub">A5's per-peer control connection — parked by 0011 §4.3, with a revival condition</text>
   </g>
 

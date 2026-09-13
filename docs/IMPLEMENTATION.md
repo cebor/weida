@@ -867,7 +867,7 @@ only a pipe can make.
 held 0012's whole mechanism bound to `tokio::net::UnixStream`; it is now
 `grouped.rs`, generic over a `Stream` trait with the eight things a transport contributes
 — dial, principal, split, same-peer, identity, `finish`, `reset`, `stop` — and `unix.rs`
-is the forty-line socket implementation. `Link`, `SendHalf` and `RecvHalf` gained a `Pipe`
+is the eighty-line socket implementation. `Link`, `SendHalf` and `RecvHalf` gained a `Pipe`
 variant over the same generic types, boxed so the enum stays the size of its QUIC
 variant. The accept path is one generic `LocalAccept::serve`; the two loops around it —
 `accept()` on a listener, `connect()` on an instance that is replaced before it is served
@@ -917,7 +917,7 @@ pending entry.
 **One crate may use `unsafe`, and it is thirteen kilobytes.** No dependency exposes a
 security descriptor on `CreateNamedPipe`, `ImpersonateNamedPipeClient` with a token read,
 `GetSecurityInfo` or the pipe pids safely — `interprocess` comes closest and stops before
-the SID — so `crates/winpipe` (`weida-winpipe`) wraps those eleven Win32 calls from
+the SID — so `crates/winpipe` (`weida-winpipe`) wraps those fifteen Win32 calls from
 `windows-sys` behind `OwnerOnlyDacl`, `create_instance`, `open_client`, `client_peer` and
 `server_peer`, each `unsafe` block one call with its precondition stated,
 `unsafe_op_in_unsafe_fn` forbidden, and the crate empty off Windows. Every other crate,
