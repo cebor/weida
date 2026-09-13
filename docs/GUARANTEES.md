@@ -70,6 +70,10 @@ is worth stating exactly:
   delivery exchange. The broker **MUST NOT relay it** to the producer: guarantees are
   hop-local (§2), so the producer's certificate stays `Accepted` however the consumer later
   answers. A producer that needs to know a consumer succeeded uses an application reply.
+- **A queue with one replica can never report `Replicated`**, whatever it is configured with:
+  `Replicated(1, …)` is not a reportable state (§4), and a single-replica queue has no consensus
+  group to commit in ([decisions/0022](decisions/0022-consensus-topology.md) §4.3). It reports
+  `Accepted`, or `Stored(*)` once a store is under it.
 - **`Stored(*)`** and **`Replicated(n, flushed)`** are still unreachable, and not by
   oversight: the first broker holds every queue in memory, so reporting them would be the
   prohibited claim above rather than an optimistic one. They arrive with the store (Phase 5)

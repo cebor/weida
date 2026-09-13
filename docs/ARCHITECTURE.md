@@ -543,6 +543,14 @@ identity, and a snapshot that travels as a stream rather than as chunked calls. 
 wants replication then writes a state machine instead of a network layer
 ([decisions/0021](decisions/0021-consensus-openraft.md) §4.1).
 
+**One connection carries many groups.** Consensus is one group for the cluster plus one per
+replicated queue ([decisions/0022](decisions/0022-consensus-topology.md)), and because the
+transport is QUIC, every group between two nodes shares one connection as independent streams:
+adding a queue adds an election timer and a log, not a socket and not a congestion controller.
+That is where this design is structurally cheaper than the precedent rather than merely different
+— RabbitMQ's groups ride Erlang distribution, Kafka's replication one TCP connection per broker
+pair.
+
 It is the **one crate in this workspace whose public API exposes a foreign type on purpose**:
 openraft is re-exported, because a user implements openraft's own traits and two versions of them
 in one binary do not compose. The cost — openraft is pre-1.0 — is paid by naming one openraft

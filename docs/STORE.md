@@ -25,6 +25,12 @@ and different durability questions.
 | Read back by | recovery and replication | delivery |
 | Deleted by | `purge` after a snapshot (§2.7) | acknowledgement, or a queue's byte bound |
 
+**A node holds several logs, not one.** Consensus is one group for the cluster plus one per
+replicated queue ([decisions/0022](decisions/0022-consensus-topology.md) §4.1-§4.2), so the log
+half of this document is instantiated **per group** a node is a member of, and every bound in §4
+is per group rather than per node. The payload half is one store per node: bodies are content-
+addressed and shared (§3.2), and a body referenced by two queues is one payload.
+
 What the store is **not**: a queue. A queue is the in-memory structure of
 [0018](decisions/0018-minimal-broker.md) with its own byte budget; the store is what makes it
 survive a restart. And it is not a database — there are no queries, no indexes and no

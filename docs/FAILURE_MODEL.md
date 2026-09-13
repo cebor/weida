@@ -79,7 +79,7 @@ replicated quorum completes but broker dies before upstream ACK         [out of 
 consumer receives but crashes before processing                         [out of scope until Phase 4]
 consumer processes successfully then crashes before processed ACK        [out of scope until Phase 4]
 processed ACK reaches broker but broker crashes before storing state    [out of scope until Phase 6]
-network partition splits broker cluster                                 [out of scope until Phase 7]
+network partition splits broker cluster                                 [decided: 0022 §4.7, unbuilt]
 old shard owner returns after epoch changed                             [out of scope until Phase 7]
 disk becomes full during stream persistence                             [out of scope until Phase 5]
 persisted state becomes corrupt                                         [out of scope until Phase 5]
@@ -87,6 +87,17 @@ client reconnects through another broker                                [out of 
 retry reaches another replica                                           [out of scope until Phase 7]
 request side effect succeeds but reply disappears                       [partially covered in v0]
 ```
+
+**The partition row is decided even though it is unbuilt**, and the decision is what makes the
+topology worth its overhead: consensus is one group for the cluster plus one per replicated queue
+([decisions/0022](decisions/0022-consensus-topology.md) §4.1-§4.2), so a partition has two
+separable effects. With the **control group** below quorum, administration stops — nothing is
+created, deleted, reconfigured or moved — and **every existing queue keeps serving under its own
+group's quorum**. With a **queue's group** below quorum, that queue refuses admission and pauses
+delivery and nothing else on the cluster notices. A confirmed message is not lost while a majority
+of its own group survives; a permanently lost majority makes that one queue unavailable and needs
+operator action (§4.7).
+
 
 Notes on the covered ones:
 
