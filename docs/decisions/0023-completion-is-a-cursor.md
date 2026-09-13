@@ -120,10 +120,40 @@ correlation, so a cursor needs no identifier and Option D's `transfer_id` is not
 to: **zero or more CURSOR frames, then exactly one DATA or ERROR, then FIN.** Kind `6` — the
 number [0016 §4.10] recorded as the first free one — is spent on this.
 
-Its fields are the mirror of kind `5`: a level (the `acknowledgement` value of §6.5) and an
-**absolute byte offset**, monotone at the receiver, idempotent under loss and reordering. One
-encoding, two directions: credit is a cursor the receiver *grants*, a completion is a cursor the
-receiver *reports*.
+Its fields are the mirror of kind `5`: a level and an **absolute byte offset**, monotone per
+level at the receiver, idempotent under loss and reordering. One encoding, two directions: credit
+is a cursor the receiver *grants*, a completion is a cursor the receiver *reports*.
+
+**4.3a The level space is open, and weida interprets only its own half.** A fixed ladder cannot
+express what a consumer actually does — "written, then synced, then validated, then indexed" is
+several stages, and only the first two are weida's. So the level is a `uint` split once:
+
+| Range | Meaning | Who may interpret it |
+| --- | --- | --- |
+| `0..=15` | weida's own levels, the `acknowledgement` values of §6.5 | weida, and it is negotiated |
+| `16..` | **application-defined stages** | the application at each end; weida carries them |
+
+The rule that makes this safe is the one this protocol already applies twice — to `topic`
+("opaque bytes: weida never parses it") and to `tracestate` ("opaque to weida and MUST be
+forwarded unmodified"): **weida never interprets an application level.** It checks exactly two
+things — that the offset is monotone for that level, and that the level is a `uint` — and it
+neither refuses an unknown level nor assigns it a meaning. A hop that does not know a level
+forwards it or ignores it; it never fails on it, which is the same skip-the-unknown discipline
+§5 applies to header keys.
+
+The consequence for negotiation is a line worth writing down before someone tries the opposite:
+the `acknowledgement` dimension of §6.5 stays the **negotiated floor of what weida itself
+guarantees**, and an application stage is outside negotiation by construction — weida cannot
+promise a level whose meaning it does not know. A peer asks its counterpart for application
+stages the way it asks for anything application-level: in the application's own terms.
+
+**4.3b Which cursors are reported is the sender's order, and batching is free.** A sender states
+in its configuration which levels it wants back and how finely — "every *N* bytes or every *T*
+milliseconds", per level (§4.5). Batching needs no protocol support and loses nothing, because
+the cursors are **absolute**: a later cursor for a level supersedes every earlier one, so a
+reporter may coalesce freely and a lost intermediate cursor costs nothing. That is Nagle's
+argument without Nagle's hazard — there is no delayed-ack interaction to get wrong, because
+nothing waits on a cursor to make progress.
 
 Two consequences, both deliberate:
 
@@ -133,6 +163,10 @@ Two consequences, both deliberate:
 - **A cursor is never a refusal.** A hop that cannot continue sends the ERROR that terminates the
   reply half; cursors only ever move forward, which is what makes "keep the maximum" a complete
   rule.
+- **Several levels advance independently on one reply half.** A consumer that writes, then syncs,
+  then runs two application stages reports four cursors over the same bytes, each monotone in its
+  own level, and the terminal frame closes the exchange when the consumer is done with the
+  message. That is the multi-stage case, and it needs nothing beyond §4.3's shape.
 
 **4.4 `Processed` is not an end-to-end claim, and the note says so where the level is defined.**
 The owner is right that a producer wanting to know its message was processed is describing

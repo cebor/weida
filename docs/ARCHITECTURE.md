@@ -1013,9 +1013,12 @@ so that building them later is composition rather than design.
 | BUS | n peers, each a `Peer` plus an `Acceptor` on the same path | mapped, unimplemented |
 | SURVEYOR/RESPONDENT | fan-out of exchanges with a deadline | mapped, unimplemented |
 
-"Mapped, unimplemented" is a status, not a backlog entry. Each of the three maps onto stream
-kinds the wire already carries and primitives §6a already lists, so building one is a
-decision about API surface — is this vocabulary worth a type? — and not about the protocol.
+"Mapped, unimplemented" **was** a status rather than a backlog entry, and the question it left
+open — is this vocabulary worth a type? — has since been answered by the owner: **yes, the full
+family**. PAIR, BUS and SURVEYOR/RESPONDENT are filed (B-236, B-237, B-238), which also completes
+the nanomsg set, whose patterns are PAIR, REQREP, PUBSUB, PIPELINE, SURVEY and BUS. Each maps onto
+stream kinds the wire already carries and primitives §6a already lists, so each is API surface
+rather than protocol.
 PAIR in particular is a Req/Rep or Push/Pull peer with a narrower API, architecturally
 identical to what exists.
 
