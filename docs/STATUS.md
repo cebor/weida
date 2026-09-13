@@ -163,8 +163,8 @@ Two things, the first one changed shape:
   green at **1680 tests** with 37 ignored on Linux and at 1658 on Windows, and the tree is
   clean. The tree has **no known red**, on either platform, in any configuration, including
   the four that are not in the gate yet.
-- **17 items are `ready`, none is `blocked`** and **one is `parked`** (A5's control tier by
-  0011 §4.3). Of 190 filed items, 172 are `done`; B-189, the NNG survey interop hang on
+- **16 items are `ready`, none is `blocked`** and **one is `parked`** (A5's control tier by
+  0011 §4.3). Of 190 filed items, 173 are `done`; B-189, the NNG survey interop hang on
   Windows, closed the same evening as a test race, not a library bug.
 - **Of the six the night left behind**, four are closed this session: **B-182** (with B-188:
   the NNG survey flake was a library bug the second platform exposed every time), **B-183**
@@ -177,9 +177,9 @@ Two things, the first one changed shape:
 - **The older loose ends**, unchanged by tonight: B-060, B-061, B-064..B-068 (requirement-driven
   work), B-096 and B-099 (a byte ceiling for the per-peer queues and the peer count that is
   its other half), B-104, B-106, B-107, B-109, B-110 (five small ones, under two hours
-  together), and B-177, B-178, B-179 (found by W1 and W2 from inside the libraries: concurrent
-  send and receive on one `weida-zmq` socket, a device whose end cannot receive, and an
-  operation that does not wait still costing a loop wakeup).
+  together), and B-177 and B-179 (found by W1 from inside the binding: concurrent send and
+  receive on one `weida-zmq` socket, and an operation that does not wait still costing a loop
+  wakeup); B-178, the device whose end cannot receive, closed tonight.
 - **What moves the roadmap next** is yours to choose: **Phase D**, the L2 broker, which is also
   where MQTT's and AMQP's server halves live and where the credit of 0003 gets a consumer on
   both ends; or **Phase C's Java row**, now that the Python row is four bindings wide and
