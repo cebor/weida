@@ -1212,9 +1212,11 @@ pub struct DataHeader {
     /// Per-producer sequence number, for ordering and gap detection
     /// (`docs/PROTOCOL.md` §6.2, key `6`).
     ///
-    /// **Specified ahead of code**: the codec carries it, and no v0 sender
-    /// sets it. It is not a transfer identifier and correlates nothing — an
-    /// exchange is correlated by its stream.
+    /// Written by a publisher whose connection negotiated `PerProducer`
+    /// ordering, and by nothing under `core`: the number is assigned once per
+    /// published message, before fan-out, so a copy a subscriber lost shows up
+    /// as a hole in its own sequence. It is not a transfer identifier and
+    /// correlates nothing — an exchange is correlated by its stream.
     pub sequence: Option<u64>,
     /// Producer identity: the raw 32-byte digest (`docs/PROTOCOL.md` §6.2,
     /// key `7`).
@@ -1726,8 +1728,9 @@ mod tests {
 
     #[test]
     fn a_v0_header_carries_neither_new_key() {
-        // What the runtime actually writes: keys 6 and 7 are specified ahead
-        // of code, and no v0 sender sets them.
+        // What the runtime writes on a `core` connection: neither key 6 —
+        // which needs negotiated `PerProducer` ordering — nor key 7, which
+        // nothing in this repository sets.
         let mut h = DataHeader::addressed("/t");
         h.traceparent = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into());
         let bytes = h.encode();

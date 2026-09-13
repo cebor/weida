@@ -475,7 +475,7 @@ configuration error, not a negotiation position.
 | `3` | `tstr` | `traceparent` | no | 128 B | W3C Trace Context `traceparent` |
 | `4` | `tstr` | `tracestate` | no | 512 B | W3C Trace Context `tracestate`, opaque passthrough |
 | `5` | `tstr` | `topic` | no | 256 B | Pub/Sub topic; opaque bytes, selected by the filter grammar of §6.4 |
-| `6` | `uint` | `sequence` | no | — | per-producer sequence number; coded, **written by no v0 sender** |
+| `6` | `uint` | `sequence` | no | — | per-producer sequence number; **written by a publisher whose connection negotiated `PerProducer` ordering**, absent under `core` |
 | `7` | `bstr` | `producer` | no | exactly 32 B | producer identity, the raw digest; coded, **written by no v0 sender** |
 | `8` | `uint` | `achieved` | no | one of §6.5's `acknowledgement` values | the completion level the sender **achieved** for the message it is answering; the L2 publisher confirm |
 
@@ -528,12 +528,23 @@ and MUST NOT size an allocation from it.
 `traceparent` and `tracestate` carry W3C Trace Context. `tracestate` is opaque to weida and
 MUST be forwarded unmodified where trace context is propagated.
 
-**Keys `6` and `7` are coded but unused** (§11). They carry exact semantics so that nothing
-else takes the numbers and so that the two capabilities they enable have one definition
-rather than one per implementation. `weida-protocol` encodes and decodes both, and §8 pins
-their bytes; what no v0 *sender* does is set them, because the guarantee levels that give
-them meaning are not negotiated yet (§6.5). A decoder that meets one accepts it — the
-specification defines it — and a decoder that meets an unknown key still skips it under §5.
+**Key `6` is written, and key `7` is not** — a distinction worth stating, because both were
+"coded but unused" in earlier versions of this section and only one still is.
+
+`sequence` is set by a **publisher whose connection negotiated `PerProducer` ordering**: the
+number is assigned once per published message, before fan-out, so every subscriber's copy carries
+the same one and a copy a subscriber lost shows up as a hole in its own sequence
+(`crates/weida/src/pubsub.rs`, both the whole-message and the streamed path). Under `core` — what
+every peer that declares nothing offers and requires — no sender sets it, so a `core` connection
+sees the key never. That is not "unused": it is a key whose presence is decided by negotiation.
+
+`producer` is genuinely unwritten by anything in this repository, and deliberately: the receiver
+already knows the sending peer's proved fingerprint from the handshake, so the key names a
+producer only where it is *not* the connection peer — a relay, or a name an L2 subscription
+supplies ([decisions/0008](decisions/0008-session-identity.md) §4.4). `weida-protocol` encodes and
+decodes both and §8 pins their bytes, so a second implementation has one definition rather than
+one per implementation — and a decoder that meets either accepts it, while a decoder that meets
+an unknown key still skips it under §5.
 
 `sequence` is a monotonically increasing `uint` scoped to (producer, endpoint or topic)
 ([decisions/0001](decisions/0001-sequence-field.md) §7.1). It is not a transfer identifier and
@@ -800,7 +811,7 @@ ERROR  {code:5}                              (NO_REPLY, on a reply half)
 DATA   {endpoint:"/md", topic:"px.eur"}      (publisher fan-out copy)
        57 01 0E  A2 00 63 2F 6D 64 05 66 70 78 2E 65 75 72
 
-DATA   {endpoint:"/t", sequence:1}           (key 6; no v0 sender writes it)
+DATA   {endpoint:"/t", sequence:1}           (key 6, under negotiated PerProducer ordering)
        57 01 07  A2 00 62 2F 74 06 01
 
 DATA   {endpoint:"/t", sequence:1, producer:<32-byte digest>}   (keys 6 and 7)
@@ -853,8 +864,9 @@ carries `content_len` and `traceparent`; they are omitted here to keep the vecto
 
 **Sequenced DATA vector** — magic `0x57`, kind `0x01` (DATA), `header_len = 0x07` (7 bytes),
 CBOR map of 2 entries: key `0` `endpoint = "/t"`, key `6` `sequence = 1`. The sequence is a
-plain minimal `uint`, so the whole field costs two bytes here and six at `u64::MAX`. The
-vector fixes the encoding; no v0 sender writes the key (§6.2).
+plain minimal `uint`, so the whole field costs two bytes here and six at `u64::MAX`. A publisher
+writes it once its connection has negotiated `PerProducer` ordering and never under `core`
+(§6.2).
 
 **Relayed DATA vector** — magic `0x57`, kind `0x01` (DATA), `header_len = 0x2A` (42 bytes),
 CBOR map of 3 entries: key `0` `endpoint = "/t"`, key `6` `sequence = 1`, key `7` `producer`
@@ -888,8 +900,9 @@ byte, and the filter `px.*` selects this topic exactly as it selects `px.eur`.
 
 Every vector §8 once deferred has now landed with its codec. The DATA key `6` and `7`
 vectors and the extended HELLO below pin encodings rather than describe traffic:
-`weida-protocol` reads and writes all three, while no v0 sender sets the DATA keys and no v0
-peer declares a guarantee set.
+`weida-protocol` reads and writes all three; key `6` is written by a publisher under negotiated
+`PerProducer` ordering, key `7` by nothing here, and a peer that declares nothing offers and
+requires `core`.
 
 **HELLO vector** — magic `0x57`, kind `0x00` (HELLO), `header_len = 0x10` (16 bytes),
 CBOR map of 5 entries: key `0` `versions = [0]`, key `1` `max_header_bytes = 16384`,
@@ -1073,7 +1086,7 @@ stream, and QUIC does not order streams relative to each other. The per-pipe ord
 socket-oriented messaging systems does not carry over. A publisher's per-subscriber writer
 is serialized, so copies are *enqueued* in publication order, but the receiving application
 MUST NOT rely on observing them in that order. Per-producer ordering needs the sequence key
-of §6.2, which is specified ahead of code and written by no v0 implementation (§11); a
+of §6.2, which a publisher writes once the connection has negotiated it; a
 subscriber that has negotiated the detect level of `PerProducer` (§6.5) can then observe a
 drop instead of missing it silently, which is the whole reason the key exists
 ([decisions/0001](decisions/0001-sequence-field.md) §7.2).
