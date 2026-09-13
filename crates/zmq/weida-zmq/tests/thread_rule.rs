@@ -29,7 +29,11 @@
 //! the compile-fail case compile, and this test would go red.
 //!
 //! Run with `TRYBUILD=overwrite` to refresh the expected error after a
-//! deliberate change.
+//! deliberate change. The committed stderr quotes the `PhantomData`
+//! declaration from `core/src/marker.rs`, which rustc can only print when
+//! the `rust-src` component is installed — without it the same diagnostic
+//! is three lines shorter and the comparison fails (measured on the Windows
+//! runner, B-188). A gate host needs `rustup component add rust-src`.
 
 #[test]
 fn a_socket_is_send_and_not_sync() {

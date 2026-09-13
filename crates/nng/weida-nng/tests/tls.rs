@@ -198,6 +198,10 @@ async fn an_allow_list_on_the_alt_names_refuses_a_peer() {
     // The dial may or may not return before the refusal reaches it: the
     // refusal is a close, so what the dialler observes is a pipe that
     // existed and then did not. Either way the listener admitted nothing.
+    // The close is deliberately abrupt — the refusing side sends no TLS
+    // `close_notify` — and rustls reports that differently per platform:
+    // as a reset or abort on Linux, as an unexpected EOF (`ESYSERR`) on
+    // Windows. All of them are the same refusal seen from the other end.
     let dialled = req.dial(&url).await;
     for _ in 0..200 {
         if refusals.load(Ordering::SeqCst) >= 1 && req.pipe_count() == 0 {
@@ -209,7 +213,10 @@ async fn an_allow_list_on_the_alt_names_refuses_a_peer() {
         assert!(
             matches!(
                 error,
-                Error::ECONNRESET(_) | Error::ECONNABORTED(_) | Error::ETIMEDOUT(_)
+                Error::ECONNRESET(_)
+                    | Error::ECONNABORTED(_)
+                    | Error::ETIMEDOUT(_)
+                    | Error::ESYSERR(_)
             ),
             "{error:?}"
         );

@@ -170,7 +170,16 @@ impl SurveyorSocket {
     ///
     /// The only trace a discarded late response leaves: nothing is sent
     /// back and the respondent never learns it was too slow (§4, §6).
+    ///
+    /// A response is routed — and so judged late — when a receive drains
+    /// the pipes, and nothing drains them between surveys. So this reader
+    /// drains them itself before answering: a late answer that arrived
+    /// after the last receive gave up is counted here, not left in a pipe
+    /// for the next survey's receive to stumble over.
     pub fn discarded_late(&self) -> u64 {
+        while let Some((pipe, message)) = self.shared.core.try_take_any() {
+            route(&self.shared, pipe, message);
+        }
         self.shared.late.load(Ordering::Relaxed)
     }
 }

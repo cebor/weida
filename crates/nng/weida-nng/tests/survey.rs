@@ -94,19 +94,15 @@ async fn the_deadline_starts_at_the_send() {
         "the wait was {waited:?}: the clock must have started at the send, not at the receive"
     );
 
-    // The late answer is discarded, and nothing is sent back about it.
-    for _ in 0..100 {
-        if surveyor.discarded_late() >= 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(surveyor.discarded_late(), 1);
-
-    // And the survey is over: the next receive says so in the protocol's
-    // own vocabulary rather than timing out again (§8).
+    // The late answer is discarded, and nothing is sent back about it. A
+    // response is only routed — and therefore only counted late — by a
+    // receive that drains the pipes, so the receive comes first: it discards
+    // the answer and then says the survey is over in the protocol's own
+    // vocabulary rather than timing out again (§8). Polling the counter
+    // before that receive was a wait on nothing (B-182).
     let err = surveyor.recv().await.unwrap_err();
     assert!(matches!(err, Error::ESTATE(_)), "{err:?}");
+    assert_eq!(surveyor.discarded_late(), 1);
 }
 
 /// Claim: a respondent that declines by silence is **indistinguishable**

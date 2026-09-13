@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use weida_amqp::link::{LinkEvent, LinkOptions, LinkState};
-use weida_amqp::session::SessionOptions;
+use weida_amqp::session::{SessionOptions, SessionState};
 use weida_amqp::{
     Condition, Connection, ConnectionOptions, Source, State, Target, TerminusDurability,
     TerminusExpiryPolicy,
@@ -846,11 +846,32 @@ async fn a_frame_on_an_unattached_handle_ends_the_session() {
         .await
         .unwrap()
         .unwrap();
-    assert!(session.state().is_usable());
+    // The scripted server sends its bad transfer right behind its begin, so
+    // whether the client still sees `Begun` here is a race the transport
+    // decides (Windows delivers both frames in one read). The claim is the
+    // state after the server's turn: ended by us, with the condition named.
     tokio::time::timeout(DEADLINE, server)
         .await
         .unwrap()
         .unwrap();
+    let ended = tokio::time::timeout(DEADLINE, async {
+        loop {
+            match session.state() {
+                SessionState::Discarding(c) | SessionState::Ended(Some(c)) => break c,
+                other => {
+                    assert!(
+                        !matches!(other, SessionState::Ended(None)),
+                        "the session ended without naming the fault"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ended.condition, condition::SESSION_UNATTACHED_HANDLE);
+    assert!(!session.state().is_usable());
 }
 
 #[tokio::test]
