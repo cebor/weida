@@ -22,6 +22,7 @@ use weida::{Puller, Pusher, Replier, Requester, Runtime, TransferMeta};
 use weida_py_core::{Bridge, payload_of, py_bytes};
 
 use crate::errors::errno_of;
+use crate::streams::{PyIncomingStream, PyOutgoingStream, PyReply};
 use crate::values::PyIncomingMeta;
 
 /// Writes the wrapper, its constructor and the `connect` a dialling endpoint
@@ -117,6 +118,28 @@ impl PyRequester {
         })
     }
 
+    /// Opens a streamed exchange and returns `(request, reply)`.
+    ///
+    /// The two are independent streams, so a caller may read the reply while
+    /// still writing the request — which is the point of the architecture and
+    /// not an optimisation: a responder that answers while receiving has flow
+    /// control live in both directions.
+    fn open<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let endpoint = Arc::clone(&self.endpoint);
+        let bridge = self.bridge.clone();
+        let runtime = Arc::clone(&self._runtime);
+        self.bridge.awaitable(py, async move {
+            let (transfer, reply) = endpoint
+                .open(TransferMeta::default())
+                .await
+                .map_err(errno_of)?;
+            Ok((
+                PyOutgoingStream::new(transfer, bridge.clone(), Arc::clone(&runtime)),
+                PyReply::new(reply, bridge, runtime),
+            ))
+        })
+    }
+
     fn __repr__(&self) -> String {
         "<weida.Requester>".to_owned()
     }
@@ -172,6 +195,23 @@ impl PyPusher {
                 .delivered()
                 .await
                 .map_err(errno_of)
+        })
+    }
+
+    /// Opens a streamed transfer, for a payload that does not fit memory.
+    ///
+    /// The stream's `finish` is what waits for the receipt; `send` is the
+    /// whole-payload form of the same thing.
+    fn open<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let endpoint = Arc::clone(&self.endpoint);
+        let bridge = self.bridge.clone();
+        let runtime = Arc::clone(&self._runtime);
+        self.bridge.awaitable(py, async move {
+            let transfer = endpoint
+                .open(TransferMeta::default())
+                .await
+                .map_err(errno_of)?;
+            Ok(PyOutgoingStream::new(transfer, bridge, runtime))
         })
     }
 
@@ -355,6 +395,19 @@ impl PyPuller {
             let meta = PyIncomingMeta::of(transfer.meta());
             let payload = transfer.collect(max_bytes).await.map_err(errno_of)?;
             Ok((payload, meta))
+        })
+    }
+
+    /// Waits for the next transfer and returns it as a stream:
+    /// `(stream, meta)`, for a payload too large to hold.
+    fn recv_stream<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let endpoint = Arc::clone(&self.endpoint);
+        let bridge = self.bridge.clone();
+        let runtime = Arc::clone(&self._runtime);
+        self.bridge.awaitable(py, async move {
+            let transfer = endpoint.recv().await.map_err(errno_of)?;
+            let meta = PyIncomingMeta::of(transfer.meta());
+            Ok((PyIncomingStream::new(transfer, bridge, runtime), meta))
         })
     }
 

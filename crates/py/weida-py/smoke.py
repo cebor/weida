@@ -62,6 +62,30 @@ async def round_trip() -> None:
     assert payload == b"a sample", payload
     print(f"push/pull to {meta.endpoint}: {payload!r}")
 
+    # Fan-out, including the streamed form: a payload larger than a
+    # subscriber's whole budget, which `publish` refuses and `open` carries.
+    publisher = binding.publisher("/md")
+    subscriber = client.subscriber(weida.Trust.by_address())
+    await subscriber.connect(binding.url("/md"))
+    await subscriber.subscribe("px.#")
+    while publisher.filter_count() != 1:
+        await asyncio.sleep(0.005)
+    assert publisher.publish("px.eur", b"1.0812") == 1
+    payload, meta = await subscriber.recv(CAP)
+    assert (payload, meta.topic) == (b"1.0812", "px.eur"), (payload, meta.topic)
+    print(f"pub/sub on {meta.topic}: {payload!r}")
+
+    chunk = b"a" * (64 * 1024)
+    chunks = 160  # 10 MiB against an 8 MiB subscriber budget
+    reading = asyncio.create_task(subscriber.recv(16 * CAP))
+    fan = publisher.open("px.eur")
+    for _ in range(chunks):
+        assert await fan.write_within(chunk, 15.0) == 1
+    assert await fan.finish() == 1
+    streamed, _ = await reading
+    assert len(streamed) == len(chunk) * chunks, len(streamed)
+    print(f"streamed fan-out: {len(streamed)} bytes, more than the budget")
+
     # The address names the key, so a wrong key is refused rather than
     # trusted: the one security claim a wheel could silently lose.
     wrong = "weida://sha256:%s@%s/echo" % ("0" * 64, binding.local_addr())

@@ -47,14 +47,16 @@
 //!
 //! # What is here, and what the next slice adds
 //!
-//! Slice 1 (B-200) is the runtime, the binding, `Requester`/`Replier` and
-//! `Pusher`/`Puller`, with `Trust` and `Identity` as objects and
-//! `IncomingMeta` — including the proved peer — on every arrival. Pub/Sub
-//! and the streaming surface (`FanOut`, `OutgoingTransfer`, the raw `Peer`
-//! and `Acceptor`) are the second slice, named here rather than hinted at:
-//! a publisher whose fan-out cannot be streamed from Python would be the
-//! wrong half of [PATTERNS.md](../../../../docs/PATTERNS.md) §4.1 to expose
-//! first.
+//! All three patterns are here: `Requester`/`Replier`, `Pusher`/`Puller` and
+//! `Publisher`/`Subscriber` (B-200, B-204), each with the whole-payload calls
+//! a Python caller reaches for first **and** the streamed forms for a payload
+//! that does not fit memory — `pusher.open()`, `requester.open()`,
+//! `publisher.open(topic)`, `puller.recv_stream()` and
+//! `subscriber.recv_stream()`. What is not here:
+//! the raw L0 surface (`Peer` and `Acceptor`) and a synchronous facade over
+//! `weida::blocking`, which is B-205 and follows the order every other
+//! binding in this tree used — the library's blocking facade first, then the
+//! binding's `sync` module.
 //!
 //! # No protocol behaviour lives here
 //!
@@ -67,7 +69,9 @@ use pyo3::prelude::*;
 
 mod endpoints;
 mod errors;
+mod pubsub;
 mod runtime;
+mod streams;
 mod values;
 
 /// `weida`, as Python sees it.
@@ -84,6 +88,12 @@ fn weida(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<endpoints::PyRequest>()?;
     module.add_class::<endpoints::PyPusher>()?;
     module.add_class::<endpoints::PyPuller>()?;
+    module.add_class::<pubsub::PyPublisher>()?;
+    module.add_class::<pubsub::PySubscriber>()?;
+    module.add_class::<pubsub::PyFanOut>()?;
+    module.add_class::<streams::PyOutgoingStream>()?;
+    module.add_class::<streams::PyIncomingStream>()?;
+    module.add_class::<streams::PyReply>()?;
     module.add("VERSION", ::weida::VERSION)?;
     module.add("ALPN", ::weida::ALPN)?;
     module.add("__all__", every_name())?;
@@ -104,6 +114,12 @@ fn every_name() -> Vec<&'static str> {
         "Request",
         "Pusher",
         "Puller",
+        "Publisher",
+        "Subscriber",
+        "FanOut",
+        "OutgoingStream",
+        "IncomingStream",
+        "Reply",
         "VERSION",
         "ALPN",
         "WeidaError",

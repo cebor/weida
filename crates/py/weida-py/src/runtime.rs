@@ -32,6 +32,7 @@ use weida_py_core::Bridge;
 
 use crate::endpoints::{PyPuller, PyPusher, PyReplier, PyRequester};
 use crate::errors::{errno_of, raise, to_py};
+use crate::pubsub::{PyPublisher, PySubscriber};
 use crate::values::{PyIdentity, PyTrust};
 
 /// `weida.Runtime`: a reactor of this module's own and the endpoints on it.
@@ -125,6 +126,15 @@ impl PyRuntime {
         )
     }
 
+    /// A subscriber on this runtime.
+    fn subscriber(&self, trust: PyTrust) -> PySubscriber {
+        PySubscriber::new(
+            self.runtime.subscriber(trust.trust.clone()),
+            self.bridge.clone(),
+            Arc::clone(&self.runtime),
+        )
+    }
+
     /// Stops admitting work and waits up to `deadline` seconds for finished
     /// transfers to reach the peer's transport, returning
     /// `(delivered, outstanding)`.
@@ -209,6 +219,20 @@ impl PyBinding {
         let puller = raise(py, self.listener.puller(path))?;
         Ok(PyPuller::new(
             puller,
+            self.bridge.clone(),
+            Arc::clone(&self._runtime),
+        ))
+    }
+
+    /// Registers a publisher at `path`.
+    ///
+    /// # Errors
+    ///
+    /// As [`PyBinding::replier`].
+    fn publisher(&self, py: Python<'_>, path: &str) -> PyResult<PyPublisher> {
+        let publisher = raise(py, self.listener.publisher(path))?;
+        Ok(PyPublisher::new(
+            publisher,
             self.bridge.clone(),
             Arc::clone(&self._runtime),
         ))

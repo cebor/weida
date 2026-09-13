@@ -31,6 +31,10 @@ pyo3.workspace = true
 # obtain an identity: there is no PEM file in a fresh process.
 weida = { workspace = true, features = ["generate"] }
 weida-core.workspace = true
+# One thing: `tokio::sync::Mutex`, whose guard may be held across an await —
+# which is what a streamed transfer needs, since two coroutines may hold the
+# same handle and a write borrows it mutably. `std`'s may not.
+tokio.workspace = true
 
 [features]
 # Off by default, and enabled by maturin through `pyproject.toml`. With it on,

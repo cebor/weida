@@ -1,7 +1,8 @@
 # weida for Python
 
-QUIC-native messaging from asyncio, on the Rust implementation. Req/Rep and Push/Pull today;
-Pub/Sub and the streaming surface are the next slice.
+QUIC-native messaging from asyncio, on the Rust implementation: Req/Rep, Push/Pull and Pub/Sub,
+each with the whole-payload calls a caller reaches for first and the streamed forms for a
+payload that does not fit memory.
 
 ```python
 import asyncio
@@ -26,6 +27,20 @@ async def main():
 
 asyncio.run(main())
 ```
+
+```python
+# A payload larger than a subscriber's whole budget: `publish` refuses it,
+# `open` carries it, one stream per subscriber.
+fan = publisher.open("px.eur")
+for chunk in frames:
+    await fan.write_within(chunk, 5.0)   # waits for room, drops who has none
+await fan.finish()
+```
+
+`write_within(chunk, seconds)` waits up to `seconds` for a subscriber with no room and then
+drops *that* subscriber's copy; `write_now(chunk)` never waits, which is what a signal whose
+next chunk supersedes this one wants. Neither is a default, because the choice is the
+publisher's.
 
 ## A peer is its public key
 

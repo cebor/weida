@@ -11,8 +11,10 @@
 #   2. A **fresh** virtualenv, in a temporary directory, installs that wheel
 #      and nothing else. No broker, no server, no C library: weida is its own
 #      peer, which is what makes this the simplest of the six wheels to check.
-#   3. That virtualenv runs a Req/Rep round trip over QUIC and a Push/Pull
-#      transfer, with `PATH` scrubbed of `cargo`, `rustc` and `maturin`, so
+#   3. That virtualenv runs a Req/Rep round trip over QUIC, a Push/Pull
+#      transfer, a Pub/Sub message and a **streamed fan-out of 10 MiB against
+#      an 8 MiB subscriber budget** - the payload `publish` refuses and `open`
+#      carries - with `PATH` scrubbed of `cargo`, `rustc` and `maturin`, so
 #      "the wheel needs no Rust toolchain" is a fact this script establishes
 #      rather than an expectation.
 #
@@ -48,4 +50,4 @@ uv pip install --python "$fresh/venv" "$wheel"
 # No toolchain: the wheel is a compiled extension and a Python program that
 # installs it must not need a compiler to run it.
 PATH=/usr/bin:/bin "$fresh/venv/bin/python" "$here/smoke.py"
-echo "the wheel runs Req/Rep and Push/Pull over QUIC with no Rust toolchain on PATH"
+echo "the wheel runs all three patterns over QUIC, streamed fan-out included, with no Rust toolchain on PATH"

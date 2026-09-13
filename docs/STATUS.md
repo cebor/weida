@@ -19,7 +19,9 @@ items, and **every one of the four wheels built and smoke-tested with no Rust to
 binding) `provisional` — the first three because each answers an open question with a
 wire-affecting "no", the last two because they are the first step of a phase the user chooses.
 One binary, `weida` (B-060), beside the library, `weida::blocking` (B-194) beside the async API,
-and **`weida-py`** (B-200), the sixth Python binding in the tree and the first of weida itself. **Twenty-four `[workspace]
+and **`weida-py`** (B-200, B-204), the sixth Python binding in the tree, the first of weida
+itself, and the only one that reaches every pattern of its library including the streamed
+fan-out. **Twenty-four `[workspace]
 members`**, one directory per protocol family, read off `cargo metadata` rather than a
 hand-kept list: `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`, `weida`,
 `crates/py/weida-py-core`, then
@@ -180,11 +182,13 @@ Three things, and only three:
   green at **1700 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session.
-- **12 items are `ready`, two are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
+- **13 items are `ready`, two are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
   B-068, a licence and a publication target) and **one is `parked`** (A5's control tier by
-  0011 §4.3). Of **210** filed items, **195 are `done`**; of the twelve `ready`, ten are the code slices
-  B-198's and B-199's notes filed for the two phases the user chooses between, and two are
-  sentences in a file this loop does not write (§6, B-107 and B-184).
+  0011 §4.3). Of **212** filed items, **196 are `done`**; of the thirteen `ready`, ten are the code slices
+  B-198's and B-199's notes filed for the two phases the user chooses between, two are
+  sentences in a file this loop does not write (§6, B-107 and B-184), and one is the binding's
+  synchronous surface (B-205), which follows `weida::blocking` exactly as the other five
+  bindings followed their libraries'.
 - **The requirement-driven backlog is closed.** All five requests of
   [requirements/zeughaus-video.md](requirements/zeughaus-video.md) are answered where they were
   filed: streaming fan-out **built** (B-064, `Publisher::open`), conflation **answered without a
