@@ -73,12 +73,6 @@
 //! ```
 
 mod broker;
-// Raft-backed replication, behind the non-default `cluster` feature. The items
-// are exercised by this module's own tests and wired into the broker by B-225,
-// which is when the `dead_code` allowance goes away.
-#[cfg(feature = "cluster")]
-#[allow(dead_code)]
-mod consensus;
 mod consumers;
 mod queue;
 

@@ -1,20 +1,46 @@
-//! The consensus engine, and the only module in this workspace that names
-//! openraft.
+//! openraft plus the I/O it deliberately leaves out.
 //!
-//! [0021](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0021-consensus-openraft.md)
-//! decided that consensus is a dependency rather than a subsystem: the part of
-//! writing a Raft that matters is the invariant harness, and openraft already
-//! runs one tick by tick against the paper and the TLA+ spec. Two rules keep
-//! that decision from leaking:
+//! openraft is the Raft mechanics, the clock and the task driving; what it
+//! does **not** have is a transport and a store, and it says so by asking for
+//! them as traits. This crate fills the first half with weida — QUIC
+//! connections, exchanges, TLS-proved node identity and a streamed snapshot
+//! channel — so that building a replicated service is writing a state machine
+//! rather than writing a network layer
+//! ([0021](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0021-consensus-openraft.md)).
 //!
-//! - **No `openraft::` type appears in a public signature of this crate.**
-//!   Everything here is `pub(crate)` or private, exactly as `quinn` is handled
-//!   in `weida`. openraft's own README promises incompatible changes before
-//!   1.0, and a leaked type would make every such bump a breaking change of
-//!   weida's API and of every language binding on top of it.
-//! - **No other crate may depend on it.** `weida-core`, `weida-protocol`,
-//!   `weida-runtime` and `weida` may not, which the dependency direction of
-//!   `docs/ARCHITECTURE.md` §4 already forbids.
+//! # What exists today, stated before the table below promises anything
+//!
+//! **The transport is not written yet** (B-224). What is here is the engine
+//! wired to our types, a reference in-memory store, and a single-node group
+//! that elects itself and commits — the verified go/no-go of B-222. The table
+//! below is what the crate is *for*; the row that is missing is the one that
+//! makes it useful to anyone but a test.
+//!
+//! One design question is still open and belongs to that slice: this crate's
+//! [`TypeConfig`] fixes `D` and `R` to the example [`Command`] and [`Applied`],
+//! which is right for a probe and wrong for a library. An application must be
+//! able to declare its own request and response types while keeping **our**
+//! `NodeId`, `Node`, `Entry` and `SnapshotData`; whether that is a macro here
+//! or a documented call to openraft's own `declare_raft_types!` is decided
+//! with the transport, because the transport has to be generic over it anyway.
+//!
+//! # What this crate provides, and what is left to you
+//!
+//! | Provided here | Yours |
+//! | --- | --- |
+//! | the transport: one exchange per RPC on the ALPN `weida-raft/0` | the **state machine**: `apply`, and what a committed entry means |
+//! | node identity: the fingerprint a peer proves in the handshake ([0020](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0020-cluster-and-discovery.md) §4.4) | the request and response types (`D` and `R`) |
+//! | membership bootstrap, and the two-node configuration refused by name | the **log store**, until this crate ships the segmented one `docs/STORE.md` §7 specifies |
+//! | the snapshot channel as a stream, not a chunked RPC | what a snapshot of your state machine *is* |
+//!
+//! # openraft is re-exported, on purpose
+//!
+//! A user of this crate implements openraft's own traits, so it needs
+//! openraft's own types — and two versions of them in one binary do not
+//! compose. [`openraft`] is therefore re-exported and **is** the version this
+//! crate was built against. The coupling is stated rather than hidden:
+//! openraft is pre-1.0 and promises incompatible changes before 1.0, so a
+//! `weida-raft` release names one openraft minor line.
 //!
 //! # Where the tasks run, and why that is a construction-site rule
 //!
@@ -27,11 +53,11 @@
 //!
 //! So the rule this crate follows is: a [`Consensus`] is built and driven from
 //! inside its runtime's own `Exec`, which makes the ambient runtime the
-//! broker's runtime, which is where every task openraft spawns ends up. That
-//! is an invariant of *where* we call it, verified by a test, rather than a
-//! property of a type — and it is worth writing down because 0021 §4.2
-//! predicted a sixty-line delegation type that turned out to be unnecessary
-//! and impossible in that shape.
+//! caller's runtime, which is where every task openraft spawns ends up. That
+//! is an invariant of *where* it is called, verified by a test, rather than a
+//! property of a type.
+
+pub use openraft;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -57,16 +83,16 @@ use openraft::{
 /// queue registry, membership, leadership, the per-message commit record and
 /// consumer state — and B-225 is the slice that puts it there.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Command {
+pub enum Command {
     /// A no-op entry, which is what a leader commits to prove it leads.
     Noop,
 }
 
 /// What applying a [`Command`] answers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Applied {
+pub struct Applied {
     /// How many commands this state machine has applied, including this one.
-    pub(crate) count: u64,
+    pub count: u64,
 }
 
 /// The node id type.
@@ -77,11 +103,11 @@ pub(crate) struct Applied {
 /// transport (B-224) rather than to the go/no-go. Truncating a digest into a
 /// `u64` would be the wrong shortcut — etcd's rule is that an id identifies a
 /// node *for all time*, and a truncated digest collides.
-pub(crate) type NodeId = u64;
+pub type NodeId = u64;
 
 openraft::declare_raft_types!(
     /// The type configuration of a broker's consensus group.
-    pub(crate) TypeConfig:
+    pub TypeConfig:
         D = Command,
         R = Applied,
         NodeId = NodeId,
@@ -105,7 +131,7 @@ openraft::declare_raft_types!(
 /// of the Raft thesis made explicit in a signature, which is the part a
 /// hand-rolled store gets wrong.
 #[derive(Clone, Default)]
-pub(crate) struct MemoryStore {
+pub struct MemoryStore {
     inner: Arc<tokio::sync::Mutex<StoreState>>,
 }
 
@@ -338,7 +364,7 @@ impl RaftStateMachine<TypeConfig> for MemoryStore {
 /// that is never called, and "never called" is asserted rather than assumed:
 /// every method here is unreachable for a one-member membership.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct NoNetwork;
+pub struct NoNetwork;
 
 impl RaftNetworkFactory<TypeConfig> for NoNetwork {
     type Network = NoNetwork;
@@ -385,7 +411,7 @@ impl RaftNetwork<TypeConfig> for NoNetwork {
 ///
 /// Holds the engine and nothing else; the broker's own state lives in its
 /// queues until B-225 moves the replicated part into the log.
-pub(crate) struct Consensus {
+pub struct Consensus {
     raft: openraft::Raft<TypeConfig>,
     store: MemoryStore,
 }
@@ -397,7 +423,7 @@ impl Consensus {
     /// `AsyncRuntime::spawn` is an associated function with no handle to
     /// carry, so the tasks it spawns land on the *ambient* runtime. That is
     /// the construction-site invariant this module's header states.
-    pub(crate) async fn single_node(id: NodeId) -> Result<Consensus, String> {
+    pub async fn single_node(id: NodeId) -> Result<Consensus, String> {
         let config = openraft::Config {
             cluster_name: "weida".to_owned(),
             // Ticks are cheap in a test and this is not a tuning decision:
@@ -420,7 +446,7 @@ impl Consensus {
     }
 
     /// Proposes one command and returns once it is committed and applied.
-    pub(crate) async fn propose(&self, command: Command) -> Result<Applied, String> {
+    pub async fn propose(&self, command: Command) -> Result<Applied, String> {
         let answer = self
             .raft
             .client_write(command)
@@ -430,17 +456,17 @@ impl Consensus {
     }
 
     /// Who this group believes leads it.
-    pub(crate) async fn leader(&self) -> Option<NodeId> {
+    pub async fn leader(&self) -> Option<NodeId> {
         self.raft.current_leader().await
     }
 
     /// How many commands the state machine has applied.
-    pub(crate) async fn applied_count(&self) -> u64 {
+    pub async fn applied_count(&self) -> u64 {
         self.store.inner.lock().await.state.count
     }
 
     /// Stops the engine.
-    pub(crate) async fn shutdown(self) {
+    pub async fn shutdown(self) {
         let _ = self.raft.shutdown().await;
     }
 }

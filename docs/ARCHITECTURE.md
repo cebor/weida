@@ -391,6 +391,7 @@ crates/
     weida/                     →  weida             runtime + QUIC and local transports
                                                     + stream core + patterns
     broker/                    →  weida-broker      L2: queues at endpoint paths
+    raft/weida-raft/           →  weida-raft        openraft plus the I/O it lacks
     zmq/weida-zmtp/            →  weida-zmtp        ZMTP 3.1 codec, no I/O and no
                                                     weida dependency
     zmq/weida-zmq/             →  weida-zmq         the ZeroMQ implementation
@@ -533,6 +534,23 @@ merely unused), a declare frame (a queue exists because the configuration named 
 delivery *outcome* — the consumer acknowledgement and the redelivery it makes possible are the
 slice after this one ([decisions/0018](decisions/0018-minimal-broker.md) §4.2, §4.3, §4.5).
 
+### `weida-raft`
+
+openraft plus the I/O openraft deliberately leaves out. The engine is the Raft mechanics, the
+clock and the task driving; what it asks for as traits is a **transport** and a **store**, and
+this crate fills the first with weida — one exchange per RPC on its own ALPN, TLS-proved node
+identity, and a snapshot that travels as a stream rather than as chunked calls. A service that
+wants replication then writes a state machine instead of a network layer
+([decisions/0021](decisions/0021-consensus-openraft.md) §4.1).
+
+It is the **one crate in this workspace whose public API exposes a foreign type on purpose**:
+openraft is re-exported, because a user implements openraft's own traits and two versions of them
+in one binary do not compose. The cost — openraft is pre-1.0 — is paid by naming one openraft
+minor line per `weida-raft` release, the contract `tokio-rustls` has with `rustls`.
+
+`weida-broker` depends on it behind the non-default `cluster` feature; nothing in the core depends
+on it at all.
+
 ### Dependency direction
 
 ```text
@@ -544,7 +562,8 @@ weida ──────┘     weida-zmq ──→ weida-zmtp   (the codec, whi
 
 weida-zmq-bridge  →  weida + weida-zmtp     today
 weida-nng-bridge    →  weida + weida-sp       today
-weida-broker        →  weida                  L2; nothing depends on it
+weida-broker        →  weida + weida-raft     L2; nothing depends on it
+weida-raft          →  weida + openraft       consensus with I/O
 weida-zmq-bridge   →  weida + weida-zmq      B-094, on the library
 ```
 

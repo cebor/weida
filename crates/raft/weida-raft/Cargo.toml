@@ -1,0 +1,29 @@
+[package]
+name = "weida-raft"
+description = "openraft plus the I/O it deliberately leaves out: QUIC transport, TLS-proved node identity and a streamed snapshot channel, so a Raft service needs only its state machine"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# Re-exported, deliberately: a user of this crate writes `impl RaftStateMachine
+# for MyApp`, so it needs openraft's own types, and two versions of them in one
+# binary do not compose. `weida_raft::openraft` is the one this crate was built
+# against (0021 §4.1).
+openraft = { workspace = true }
+# The I/O half: connections, exchanges and streamed transfers.
+weida.workspace = true
+weida-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+weida = { workspace = true, features = ["generate"] }
+
+[lints.rust]
+unsafe_code = "forbid"

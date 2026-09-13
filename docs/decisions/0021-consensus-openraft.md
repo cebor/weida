@@ -131,21 +131,35 @@ what etcd/raft proved — but it is refused as *this* project's work, because th
 matters is the invariant harness and that work buys nothing a maintained crate does not already
 have.
 
-**4.1 One crate may name it, and no public signature may.** `weida-broker` gets openraft in its
-`[dependencies]`; `weida-core`, `weida-protocol`, `weida-runtime` and `weida` may not, which the
-dependency direction of [ARCHITECTURE §4] already forbids and this note makes explicit for the
-new dependency. No `openraft::` type appears in a `pub fn`, a `pub struct` field or a public type
-alias of `weida-broker` — exactly the treatment quinn gets in `weida`, where `Link`, `SendHalf`
-and `RecvHalf` are ours and `quinn::Connection` never crosses the boundary.
+**4.1 One crate names it, and that crate is `weida-raft`: openraft plus the I/O openraft
+deliberately leaves out.** This replaces what this sub-section first said — "a module inside
+`weida-broker`, no openraft type in a public signature" — and the owner's argument is what
+changed it: openraft is the mechanics without a transport and without a store, weida *is* a
+transport, and the two together are a thing worth having on its own. A service that wants Raft
+then writes a state machine instead of a network layer.
+
+So `crates/raft/weida-raft` depends on openraft and on `weida`; `weida-broker` depends on
+`weida-raft` (behind its `cluster` feature) and not on openraft directly; `weida-core`,
+`weida-protocol`, `weida-runtime` and `weida` depend on none of it, which the dependency
+direction of [ARCHITECTURE §4] already forbids.
+
+**And `weida-raft` re-exports openraft, in its public API, deliberately.** This is the opposite
+of the treatment quinn gets in `weida`, and the reason is that the relationship is the opposite: a
+`weida` caller never implements a quinn trait, while a `weida-raft` user **implements openraft's
+own traits** — `RaftStateMachine` is their application's core — so they need openraft's types, and
+two versions of them in one binary do not compose. Hiding it would make the crate unusable. What
+that costs is stated instead of avoided: openraft is pre-1.0, so a `weida-raft` release names one
+openraft minor line, and `weida_raft::openraft` is the version it was built against. That is the
+same contract `tokio-rustls` has with `rustls`, which this workspace already depends on.
 
 The reason is mechanical rather than aesthetic: openraft promises incompatible changes before
 1.0, and a leaked type would turn every such bump into a breaking change of weida's API — and of
 every language binding built on it, where the type would have no representation at all.
 
-**And it is optional: the `cluster` feature, off by default.** A broker that leads no cluster must
-not link a consensus engine, and with the weight §2 measured — 39 crates, among them a
-command-line parser — that is not a stylistic preference. `weida-broker` without `cluster` is what
-B-201 and B-202 built; with it, the consensus module exists. The cost is the one this repository
+**And it is optional for the broker: the `cluster` feature, off by default.** A broker that leads
+no cluster must not link a consensus engine, and with the weight §2 measured — 39 crates, among
+them a command-line parser — that is not a stylistic preference. `weida-broker` without `cluster`
+is what B-201 and B-202 built; with it, `weida-raft` comes along. The cost is the one this repository
 already knows: a non-default feature is invisible to the gate of [LOOP.md](../LOOP.md) §6 (B-107),
 so the two extra commands — `clippy` and `test` with `--features cluster` — are run by hand and
 recorded in each item's note until that gate names them.
@@ -248,8 +262,10 @@ would be openraft becoming unmaintained — in which case Option B is still ther
 
 ## 5. Consequences and follow-ups
 
-- **[ARCHITECTURE.md](../ARCHITECTURE.md) §4** gains the rule of §4.1 beside the dependency
-  direction it already states, and the `weida-broker` section gains openraft with the reason.
+- **[ARCHITECTURE.md](../ARCHITECTURE.md) §4** gains `weida-raft` in the crate map and its own
+  section: openraft plus the I/O it lacks, depended on by `weida-broker` and by nothing in the
+  core. The re-export rule of §4.1 belongs beside the dependency direction, because it is the one
+  place in this workspace where a foreign type is public on purpose.
 - **[IMPLEMENTATION.md](../IMPLEMENTATION.md)** non-goal 9 is honoured and gains a pointer to
   [0020 §4.5] as the place where "no bulk through Raft" is made concrete; §6's debt list gains
   the pre-1.0 dependency as a known risk with its mitigation (§4.1).
