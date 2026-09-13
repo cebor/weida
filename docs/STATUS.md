@@ -6,17 +6,18 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `07f8b6f`, 2026-09-14 ~03:30 UTC. Tree clean, gate green on **two
-platforms**: Linux **1700 tests** (218 at the start of the session, 764 before the four
-parallel workstreams) and a Windows 11 VM with 1665 across 119 binaries at `0d8c35a`,
+**Snapshot:** main `11ed59e`, 2026-09-14 ~06:20 UTC. Tree clean, gate green on **two
+platforms**: Linux **1704 tests** (218 at the start of the session, 764 before the four
+parallel workstreams) and a Windows 11 VM with **1682 across 123 binaries** at the same commit,
 each with 37 ignored — the interop suites that need a library or a broker the machine does
 not have — plus the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`,
 `weida-nng`'s `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
 items, and **every one of the four wheels built and smoke-tested with no Rust toolchain on
-`PATH`**. Sixteen decision notes (0001–0016): fourteen `accepted`, and 0015 (peer authorization) and
-0016 (conflation) `provisional`, because each answers a requirement's open question with a
-wire-affecting "no". One binary, `weida` (B-060), beside the library. **Twenty-four `[workspace]
+`PATH`**. Seventeen decision notes (0001–0017): fourteen `accepted`, and 0015 (peer authorization), 0016
+(conflation) and 0017 (the subscription verdict) `provisional`, because each answers an open
+question with a wire-affecting "no". One binary, `weida` (B-060), beside the library, and
+`weida::blocking` (B-194) beside the async API. **Twenty-four `[workspace]
 members`**, one directory per protocol family, read off `cargo metadata` rather than a
 hand-kept list: `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`, `weida`,
 `crates/py/weida-py-core`, then
@@ -177,9 +178,11 @@ Three things, and only three:
   green at **1700 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session.
-- **2 items are `ready`, two are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
+- **5 items are `ready`, two are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
   B-068, a licence and a publication target) and **one is `parked`** (A5's control tier by
-  0011 §4.3). Of 190 filed items, **185 are `done`**, and both `ready` ones are a sentence in a file this loop does not write (§6).
+  0011 §4.3). Of **200** filed items, **192 are `done`**; the `ready` five are two sentences in a file this
+  loop does not write (§6, B-107 and B-184) and three items B-198's and B-199's notes will
+  refine.
 - **The requirement-driven backlog is closed.** All five requests of
   [requirements/zeughaus-video.md](requirements/zeughaus-video.md) are answered where they were
   filed: streaming fan-out **built** (B-064, `Publisher::open`), conflation **answered without a
@@ -188,9 +191,13 @@ Three things, and only three:
   (B-067), and the dependency form blocked on the licence above (B-068).
 - **What this session closed**: B-177 (split a `weida-zmq` socket into halves — the library diff
   *removes* 691 lines while adding 493, because the pattern bodies the whole sockets had are now
-  shared), B-096 (a byte ceiling per peer queue, where a message count never was one), B-064,
-  B-060 (the `weida` binary, Phase 11's first slice), B-065, B-066, and the evidence passes on
-  B-107, B-184 and B-068.
+  shared), B-096 (a byte ceiling per peer queue, where a message count never was one), B-064
+  (streaming fan-out), B-060 (the `weida` binary, Phase 11's first slice) with B-195..B-197 on
+  top of it, B-194 (`weida::blocking`), B-065, B-066, B-193 and the two consequence passes
+  B-191/B-192, plus the evidence passes on B-107, B-184 and B-068. Ten items were filed to
+  replenish the backlog (B-191..B-200) and a review pass was logged at `db5c144`: 0 new
+  findings, and the allocation sweep's best answer is that the pipe transport's chunk header
+  declares a `u32` length and allocates **nothing** from it.
 - **What moves the roadmap next** is yours to choose: **Phase D**, the L2 broker, which is also
   where MQTT's and AMQP's server halves live and where the credit of 0003 gets a consumer on
   both ends; or **Phase C's Java row**, now that the Python row is four bindings wide and
