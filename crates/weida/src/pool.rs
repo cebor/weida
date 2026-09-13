@@ -30,12 +30,29 @@ use tokio::sync::Mutex;
 use weida_core::{EndpointAddr, Error, Fingerprint};
 use weida_protocol::codes;
 
-use crate::config::{ClientTls, RuntimeConfig};
+use crate::config::{ClientTls, Discovery, RuntimeConfig};
 use crate::conn::{ConnCtx, ConnHandle, conn_error};
 use crate::listener::Namespace;
 use crate::runtime::{Exec, Shared};
 use crate::tls;
 use crate::transport::Link;
+
+/// The port a dial uses, and the refusal a `Single` runtime owes a portless
+/// URL.
+///
+/// Separated out so the rule is testable without a socket: it is the whole of
+/// [0020](../../../docs/decisions/0020-cluster-and-discovery.md) §4.2's client
+/// half.
+fn dial_port(written: Option<u16>, discovery: Discovery, host: &str) -> Result<u16, Error> {
+    match (written, discovery) {
+        (Some(port), _) => Ok(port),
+        (None, Discovery::Aware) => Ok(weida_core::DEFAULT_PORT),
+        (None, Discovery::Single) => Err(Error::InvalidAddress(format!(
+            "{host} names no port, which means a set of nodes, and this runtime is \
+             configured `Discovery::Single`: write the port, or allow discovery"
+        ))),
+    }
+}
 
 pub(crate) struct ClientPool {
     state: Mutex<PoolState>,
@@ -95,7 +112,11 @@ impl ClientPool {
             path,
             peer: expected,
         } = addr;
-        let (host, port, expected) = (host.as_str(), *port, *expected);
+        let (host, expected) = (host.as_str(), *expected);
+        // A portless authority is a set (0020 §4.2); which port that set
+        // listens on is not a guess but a constant, and whether a set is
+        // allowed at all is the runtime's configuration.
+        let port = dial_port(*port, config.discovery, host)?;
         let peer: PeerKey = (host.to_owned(), port, Arc::clone(tls), expected);
         let key: ConnKey = (peer.clone(), path.clone());
         let mut state = self.state.lock().await;
@@ -290,6 +311,35 @@ fn bind_client_endpoint(exec: &Exec) -> Result<quinn::Endpoint, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Claim: a written port is used as written, a portless authority is the
+    /// discovery form and dials `DEFAULT_PORT`, and a `Single` runtime
+    /// **refuses** the portless form rather than resolving it — 0020 §4.2's
+    /// client half, which is the whole of what this slice decides.
+    #[test]
+    fn the_dial_port_follows_the_url_then_the_discovery_mode() {
+        assert_eq!(
+            dial_port(Some(9000), Discovery::Aware, "h").expect("written"),
+            9000
+        );
+        assert_eq!(
+            dial_port(Some(9000), Discovery::Single, "h").expect("written"),
+            9000,
+            "a written port is never overridden by the mode"
+        );
+        assert_eq!(
+            dial_port(None, Discovery::Aware, "jobs.example").expect("discovered"),
+            weida_core::DEFAULT_PORT
+        );
+
+        let refused = dial_port(None, Discovery::Single, "jobs.example")
+            .expect_err("a set is not one endpoint");
+        let message = refused.to_string();
+        assert!(
+            message.contains("jobs.example") && message.contains("Discovery::Single"),
+            "the refusal names the host and the reason: {message}"
+        );
+    }
 
     #[tokio::test]
     async fn the_client_socket_binds() {

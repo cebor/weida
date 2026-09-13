@@ -64,6 +64,7 @@ mod transport;
 #[cfg(unix)]
 mod unix;
 
+pub use weida_core::DEFAULT_PORT;
 pub use weida_core::{
     Address, EndpointAddr, Error, ErrorCode, Fingerprint, InprocAddr, Limits, LocalPrincipal,
     LossCause, PeerIdentity, PipeAddr, Result, StopReason, TraceContext, UnixAddr,
@@ -71,7 +72,7 @@ pub use weida_core::{
 };
 pub use weida_protocol::{ALPN, VERSION, codes, filter};
 
-pub use config::{ClientTls, Identity, Pem, RuntimeConfig, ServerTls, Trust};
+pub use config::{ClientTls, Discovery, Identity, Pem, RuntimeConfig, ServerTls, Trust};
 pub use drain::Drained;
 pub use endpoint::{
     Endpoint, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher, Rep, Replier, Req, Requester,

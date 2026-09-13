@@ -129,6 +129,19 @@ so that no implementation invents weighted random selection later. SVCB/HTTPS re
 **not** used, because the environment that motivates this does not serve them; a later note may
 add them as an alternative source of the same set.
 
+**Correction from implementing it (B-218): the A/AAAA half is the whole thing, and SRV is an
+enhancement.** A headless Service's A/AAAA answer already *is* the node set — "the set of IPs of
+all of the Pods selected by the Service" — and every Pod of one Service listens on the same
+container port, so the port SRV would supply is a constant. `DEFAULT_PORT` (7443, in
+`weida-core`) is therefore enough, and the discovery form works with the resolver the runtime
+already has: `tokio::net::lookup_host`, which returns every address a name answers with.
+
+SRV would add one thing — a **per-node port** — and cost a DNS client, because neither std nor
+tokio resolves SRV: it needs a resolver crate (`hickory-resolver`) and a dependency decision of
+its own. So B-218 shipped the A/AAAA path with no new dependency, and the SRV half is filed
+separately (B-226) with that cost named. A deployment whose nodes listen on *different* ports is
+the case that needs it; a Kubernetes Service is not.
+
 **Readiness filtering is a property we get and rely on.** A restarting node loses its DNS record,
 so discovery needs no gossip layer and no health protocol of its own. What it does *not* give is
 liveness within a TTL, which is why §4.3 exists.

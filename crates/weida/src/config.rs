@@ -13,6 +13,32 @@ use std::time::Duration;
 use weida_core::{Error, Fingerprint, Limits};
 use weida_protocol::header::GuaranteeSet;
 
+/// Whether a dialled authority may name a **set** of nodes.
+///
+/// The configuration knob of
+/// [0020](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0020-cluster-and-discovery.md)
+/// §4.1: awareness is a capability, never a requirement, so both values speak
+/// the same wire protocol and a peer behaves identically toward either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Discovery {
+    /// A URL without a port names a set: the host is resolved and every
+    /// address it answers with is a candidate, dialled on
+    /// [`weida_core::DEFAULT_PORT`].
+    ///
+    /// The default, and what a Kubernetes headless service answers with —
+    /// "the set of IPs of all of the Pods selected by the Service", filtered
+    /// by readiness.
+    #[default]
+    Aware,
+    /// Every authority names exactly one endpoint, and a URL without a port
+    /// is refused rather than resolved.
+    ///
+    /// For a deployment that puts one address in front of a cluster, and for
+    /// an adapter edge that has no way to express a redirect to its foreign
+    /// peer (0020 §4.1).
+    Single,
+}
+
 /// Configuration for one [`crate::Runtime`].
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -91,6 +117,8 @@ pub struct RuntimeConfig {
     /// (`docs/decisions/0006-guarantee-sets.md` §4.4). The default is `core`,
     /// which is what every v0 peer declares by declaring nothing.
     pub guarantees: GuaranteeSet,
+    /// Whether an authority may name a set of nodes ([`Discovery`]).
+    pub discovery: Discovery,
     /// How long a dial waits on one resolved address before trying the next.
     ///
     /// Only the addresses *before* the last one are bounded by it: a name
@@ -115,6 +143,7 @@ impl Default for RuntimeConfig {
             shutdown_timeout: Duration::from_secs(1),
             guarantees: GuaranteeSet::CORE,
             connect_attempt_timeout: Duration::from_millis(250),
+            discovery: Discovery::default(),
         }
     }
 }

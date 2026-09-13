@@ -37,13 +37,27 @@ pub fn validate_endpoint_path(path: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// A parsed `weida://[fingerprint@]host:port/path` address.
+/// The port a `weida://` URL means when it writes none.
+///
+/// A portless URL does not mean "guess": it means the authority names a **set**
+/// of nodes rather than one, which is what a Kubernetes headless service
+/// answers with, and every node of such a set listens on the same port
+/// ([decisions/0020](../../../docs/decisions/0020-cluster-and-discovery.md)
+/// §4.2).
+pub const DEFAULT_PORT: u16 = 7443;
+
+/// A parsed `weida://[fingerprint@]host[:port]/path` address.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EndpointAddr {
     /// Host as written: a DNS name or an IP literal without brackets.
     pub host: String,
-    /// Port; always explicit, there is no default.
-    pub port: u16,
+    /// Port as written, or `None` when the URL names none.
+    ///
+    /// `None` is not a missing value: it is the statement that the authority
+    /// names a **set** of equivalent nodes, resolved through DNS and dialled
+    /// on [`DEFAULT_PORT`] ([decisions/0020](../../../docs/decisions/0020-cluster-and-discovery.md)
+    /// §4.2). A written port means exactly one endpoint and no discovery.
+    pub port: Option<u16>,
     /// Opaque endpoint identifier, starting with `/`.
     pub path: String,
     /// The peer's public-key fingerprint, when the address names one.
@@ -54,11 +68,13 @@ pub struct EndpointAddr {
 }
 
 impl EndpointAddr {
-    /// Parses a `weida://[fingerprint@]host:port/path` URL.
+    /// Parses a `weida://[fingerprint@]host[:port]/path` URL.
     ///
-    /// The port is mandatory (no well-known port is claimed), IPv6 literals are
-    /// bracketed, the fingerprint is in [`Fingerprint`]'s text form, and the
-    /// path is validated by [`validate_endpoint_path`].
+    /// The port is **optional**, and its absence is meaningful rather than
+    /// lenient: it selects discovery, where the host names a set of nodes and
+    /// [`DEFAULT_PORT`] is the port (0020 §4.2). IPv6 literals are bracketed,
+    /// the fingerprint is in [`Fingerprint`]'s text form, and the path is
+    /// validated by [`validate_endpoint_path`].
     pub fn parse(input: &str) -> Result<EndpointAddr, Error> {
         let invalid = |m: &str| Error::InvalidAddress(format!("{m}: {input:?}"));
 
@@ -87,14 +103,17 @@ impl EndpointAddr {
                 .find(']')
                 .ok_or_else(|| invalid("unterminated IPv6 literal"))?;
             let host = &after[..close];
-            let port = after[close + 1..]
-                .strip_prefix(':')
-                .ok_or_else(|| invalid("missing port"))?;
-            (host, port)
+            let rest = &after[close + 1..];
+            match rest.strip_prefix(':') {
+                Some(port) => (host, Some(port)),
+                None if rest.is_empty() => (host, None),
+                None => return Err(invalid("expected ':port' after an IPv6 literal")),
+            }
         } else {
             match authority.rsplit_once(':') {
-                Some((h, p)) => (h, p),
-                None => return Err(invalid("missing port")),
+                Some((h, p)) => (h, Some(p)),
+                // No colon at all: a bare name, which is the discovery form.
+                None => (authority, None),
             }
         };
 
@@ -104,10 +123,16 @@ impl EndpointAddr {
         if host.bytes().any(|b| b < 0x20 || b == b'/' || b == b'@') {
             return Err(invalid("invalid byte in host"));
         }
-        let port: u16 = port_str.parse().map_err(|_| invalid("port is not a u16"))?;
-        if port == 0 {
-            return Err(invalid("port 0 is not connectable"));
-        }
+        let port = match port_str {
+            Some(text) => {
+                let port: u16 = text.parse().map_err(|_| invalid("port is not a u16"))?;
+                if port == 0 {
+                    return Err(invalid("port 0 is not connectable"));
+                }
+                Some(port)
+            }
+            None => None,
+        };
 
         validate_endpoint_path(path).map_err(|_| invalid("invalid endpoint path"))?;
 
@@ -132,10 +157,13 @@ impl fmt::Display for EndpointAddr {
         if let Some(peer) = &self.peer {
             write!(f, "{peer}@")?;
         }
-        if self.host_needs_brackets() {
-            write!(f, "[{}]:{}{}", self.host, self.port, self.path)
-        } else {
-            write!(f, "{}:{}{}", self.host, self.port, self.path)
+        match (self.host_needs_brackets(), self.port) {
+            (true, Some(port)) => write!(f, "[{}]:{}{}", self.host, port, self.path),
+            (true, None) => write!(f, "[{}]{}", self.host, self.path),
+            (false, Some(port)) => write!(f, "{}:{}{}", self.host, port, self.path),
+            // Round-trips: a printed address without a port parses back to one
+            // without a port, and means the same set.
+            (false, None) => write!(f, "{}{}", self.host, self.path),
         }
     }
 }
@@ -434,7 +462,7 @@ mod tests {
     fn parses_ipv4_authority() {
         let a = EndpointAddr::parse("weida://127.0.0.1:7443/transform").unwrap();
         assert_eq!(a.host, "127.0.0.1");
-        assert_eq!(a.port, 7443);
+        assert_eq!(a.port, Some(7443));
         assert_eq!(a.path, "/transform");
         assert_eq!(a.peer, None);
         assert_eq!(a.to_string(), "weida://127.0.0.1:7443/transform");
@@ -453,9 +481,52 @@ mod tests {
     fn parses_bracketed_ipv6_authority() {
         let a = EndpointAddr::parse("weida://[::1]:7443/x").unwrap();
         assert_eq!(a.host, "::1");
-        assert_eq!(a.port, 7443);
+        assert_eq!(a.port, Some(7443));
         assert_eq!(a.path, "/x");
         assert_eq!(a.to_string(), "weida://[::1]:7443/x");
+    }
+
+    /// Claim: a URL without a port is legal and means a **set** — the
+    /// discovery form of
+    /// [0020](../../../docs/decisions/0020-cluster-and-discovery.md) §4.2 —
+    /// and it round-trips through `Display` unchanged, because a printed
+    /// address that gained a port would mean something else.
+    #[test]
+    fn a_portless_url_is_the_discovery_form() {
+        let a = EndpointAddr::parse("weida://jobs.prod.svc.cluster.local/queue").expect("parse");
+        assert_eq!(a.host, "jobs.prod.svc.cluster.local");
+        assert_eq!(a.port, None);
+        assert_eq!(a.path, "/queue");
+        assert_eq!(a.peer, None);
+        assert_eq!(
+            a.to_string(),
+            "weida://jobs.prod.svc.cluster.local/queue",
+            "a portless address prints without a port"
+        );
+        assert_eq!(EndpointAddr::parse(&a.to_string()).expect("reparse"), a);
+    }
+
+    /// A bracketed IPv6 literal without a port is the same form, and a
+    /// bracket followed by anything but `:port` is still an error rather than
+    /// a host.
+    #[test]
+    fn a_portless_ipv6_literal_round_trips_and_a_malformed_one_does_not() {
+        let a = EndpointAddr::parse("weida://[::1]/x").expect("parse");
+        assert_eq!(a.host, "::1");
+        assert_eq!(a.port, None);
+        assert_eq!(a.to_string(), "weida://[::1]/x");
+        assert_eq!(EndpointAddr::parse(&a.to_string()).expect("reparse"), a);
+
+        assert!(EndpointAddr::parse("weida://[::1]x/y").is_err());
+    }
+
+    /// The pinned form works without a port too: the fingerprint identifies
+    /// the peer, the name identifies the set (0020 §4.4).
+    #[test]
+    fn a_portless_url_may_still_pin_a_fingerprint() {
+        let a = EndpointAddr::parse(&format!("weida://{FP}@jobs.example/queue")).expect("parse");
+        assert_eq!(a.port, None);
+        assert_eq!(a.peer, Some(FP.parse().expect("fingerprint")));
     }
 
     #[test]
@@ -475,7 +546,11 @@ mod tests {
     fn rejects_bad_addresses() {
         let cases = [
             "mq://127.0.0.1:7443/x",
-            "weida://127.0.0.1/x",
+            // `weida://127.0.0.1/x` used to be here, and is now the
+            // discovery form of 0020 §4.2: an authority without a port names
+            // a set, dialled on `DEFAULT_PORT`. For a literal there is
+            // nothing to resolve, so it is one node on the default port —
+            // coherent, and the rule that changed is a rule, not a leniency.
             "weida://127.0.0.1:7443",
             "weida://:7443/x",
             "weida://127.0.0.1:0/x",
