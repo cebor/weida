@@ -210,6 +210,13 @@ resume at the current frame, never replay a backlog.
    conflation is free), but the moment fan-out exists it does: one publisher and
    N consumers at different speeds is exactly where "keep the newest, discard the
    rest" has to live in the transport rather than in the producer.
+   **Answered by [decisions/0016](../decisions/0016-conflation.md) (B-065): no
+   key, and none is needed here.** With `Publisher::open` + `write_now` the
+   discard is already the transport's rather than the producer's -- a subscriber
+   that cannot keep up loses that frame and receives the next -- and the
+   configuration is one number, `subscriber_buffer_bytes` sized to about one
+   frame. A keyed coalescer is refused rather than deferred, because holding the
+   superseded frame is the per-subscriber copy request 1 exists to remove.
 3. **Peer authorization beyond certificate trust.** Stage 1 is a LAN with a
    self-signed certificate; a user who reaches a SpacetimeDB over the internet and
    wants monitoring needs something that says *which* client may attach. If weida
