@@ -63,6 +63,46 @@ acceptance: the eleven sections [libraries/README.md](libraries/README.md) fixes
 
 note: **blocked on a toolchain this workstation does not have.** `javac`, `java`, `gradle` and `mvn` are all absent, so a JNI slice can be neither compiled nor verified here, and installing a JDK is a `sudo pacman -S jdk17-openjdk gradle` the loop does not get to make. Unblocks the moment a JDK 17 and a build tool exist; nothing about the slices themselves is in question — [0019](decisions/0019-jvm-binding.md) decided them and B-217 filled in the competitor row they were waiting on.
 
+### B-218 — The discovery form: a portless URL resolves a node set
+kind: code | size: 60 | status: ready | needs: []
+acceptance: `weida://name/path` without a port resolves SRV `_weida._udp.name` and, on an empty answer, A/AAAA of the same name plus the default port, bounded by `max_resolved_addresses` and with SRV priority honoured and **weight ignored** ([0020](decisions/0020-cluster-and-discovery.md) §4.2); a URL with a port resolves nothing and dials exactly one endpoint. `Discovery::{Aware, Single}` on `RuntimeConfig` with `Aware` the default. Tests drive a stub resolver rather than DNS: a set of three answers dialled in priority order, an empty SRV answer falling through to A/AAAA, an answer longer than the bound truncated at it, and a portless URL under `Single` refused at parse with a message naming the reason.
+note: the one slice that is useful before any cluster exists — a portless URL against a headless service already selects one of several equivalent brokers.
+
+### B-219 — Trust is a set, and a redirect may only be followed inside it
+kind: code | size: 60 | status: ready | needs: [B-218]
+acceptance: `Trust` accumulating several pins is already expressible (`and_pin`); this item makes it the documented cluster form and proves the negative: a redirect to a node whose fingerprint is not in the set fails with `Error::Untrusted(fp)` and **does not retry**, and a DNS answer naming an untrusted host is not authority for anything ([0020](decisions/0020-cluster-and-discovery.md) §4.4). One shared cluster key is refused by documentation rather than by code, with the accounting reason (`max_connections_per_peer` would count the cluster as one peer).
+note: this is the half of "aware" that is a security property rather than a performance one.
+
+### B-220 — The not-the-leader answer, with a bound on following it
+kind: code | size: 90 | status: ready | needs: [B-219]
+acceptance: the redirect of [0020](decisions/0020-cluster-and-discovery.md) §4.3 on the wire — an ERROR code on an exchange's reply half plus a hint carrying `host`, `port` and the **term** it was learned in — with golden vectors in [PROTOCOL.md](PROTOCOL.md) §8's shape, the client following at most **two** hints per operation, an older term's hint discarded rather than followed, and a client that ignores the hint entirely still being served. Tests assert all four properties, including the loop bound, which is the thing AMQP 1.0 left unspecified.
+note: needs no cluster to test: a node that claims another node is the leader is one configuration flag.
+
+### B-221 — Payload replication as a stream, with the commit record after it
+kind: code | size: 90 | status: blocked | needs: [B-220, the Phase 5 store, B-222]
+acceptance: the leader streams a message body to each follower as an ordinary one-way transfer and the consensus log carries only the commit record — queue, offset, digest — never the bytes ([0020](decisions/0020-cluster-and-discovery.md) §4.5), with the ordering proved rather than assumed: a test that drops a follower's payload stream mid-write and asserts that **no commit record naming it is ever committed**, and a test that asserts `Replicated(n, flushed)` reports `n` achieved at the commit with the leader counted, per [0004](decisions/0004-durability-levels.md) §4.2.
+note: blocked on the store and on [0021](decisions/0021-consensus-openraft.md)'s first slice; this is the item where a mistake loses data that was reported replicated, so it gets the harshest test of the phase.
+
+### B-222 — `AsyncRuntime` over `Exec`, and openraft compiling inside `weida-broker`
+kind: code | size: 60 | status: ready | needs: []
+acceptance: openraft 0.9 in `crates/broker/Cargo.toml`, a `WeidaRuntime` implementing its nine associated types and eight functions over `weida-runtime`'s `Exec` — `spawn` entering the runtime's handle rather than calling `tokio::spawn`, which is [0013](decisions/0013-competitor-libraries.md) §4.2's rule — and a single-node `Raft` instance that elects itself leader and commits one entry, driven entirely through our own types. **No `openraft::` type in any public signature** of `weida-broker`, asserted by a test that only touches the public API. `cargo geiger` run once and its `unsafe` count for the new subtree recorded in the item's note.
+note: this is the go/no-go for [0021](decisions/0021-consensus-openraft.md): if `AsyncRuntime` cannot be implemented cleanly over `Exec`, the note is reopened in favour of its Option B.
+
+### B-223 — The store interface the consensus engine requires
+kind: spec | size: 45 | status: ready | needs: [B-222]
+acceptance: the Phase 5 store's interface written down **before** the store, as the thirteen methods of [0021](decisions/0021-consensus-openraft.md) §4.3 translated into requirements on a log: append, truncate backwards from a log id, purge forwards up to a log id, ranged and byte-limited reads, two durable cells with their ordering rule, and a snapshot that is a stream rather than a value. Each requirement names the failure it prevents, and the document states which of them an append-only file cannot satisfy without a rewrite path.
+note: filed because choosing a library inverted a sequencing assumption: the store is built first and its interface is decided by this note, not by the store.
+
+### B-224 — Raft traffic on its own ALPN
+kind: code | size: 90 | status: blocked | needs: [B-222, B-223]
+acceptance: `weida-raft/0` as a separate ALPN on its own connections, openraft's network trait implemented as one weida exchange per RPC — request on the initiating half, response on the reply half — encoded with minicbor in [PROTOCOL.md](PROTOCOL.md) §5's discipline rather than openraft's `serde` feature. A three-node cluster on loopback elects a leader, replicates entries and survives the leader being killed, with the client protocol untouched: a test asserts that a client connection carries no Raft frame and that a Raft connection carries no client frame.
+note: blocked on B-222's verdict and B-223's interface.
+
+### B-225 — What the log holds, and what a leader change preserves
+kind: code | size: 90 | status: blocked | needs: [B-224, the Phase 5 store]
+acceptance: the list of [0021](decisions/0021-consensus-openraft.md) §4.5 as the replicated state machine — queue registry, membership, leadership and term, the per-message commit record, and **consumer state**: subscriptions, credit grants and the settled/unsettled position of every delivery. The user-observable properties are the tests: an acknowledged delivery is never redelivered after a leader change, an unacknowledged one always is, and a `Replicated(n, flushed)` report is never stronger than what happened ([0004](decisions/0004-durability-levels.md) §4.2). Re-testing Raft's own invariants is explicitly **not** in scope: that is the dependency's test suite.
+note: this is where B-203's parked in-memory table of outstanding deliveries reappears as a replicated structure, which is why that item was stopped rather than finished.
+
 ### B-217 — The ZeroMQ sheet has no JVM implementation
 kind: research | size: 45 | status: done | needs: []
 acceptance: [research/zeromq.md](research/zeromq.md) §13 gains the JVM row it does not have — the sheet contains no occurrence of "Java" — naming each implementation, its licence, its version, whether it is a pure-Java implementation of ZMTP or a binding over libzmq, and what it does not implement, each with a source in §14's form. That row is what makes [0013](decisions/0013-competitor-libraries.md) §4.7 clause 4 answerable for the JVM binding; until it exists, [0019](decisions/0019-jvm-binding.md) §4.6's named loss stands.
