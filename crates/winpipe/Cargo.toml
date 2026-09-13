@@ -4,6 +4,11 @@ description = "The Win32 calls a named-pipe transport needs and nothing else: an
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # Empty on every platform but Windows: the crate exists so that the one
 # place this workspace has to call Win32 is a crate that does nothing else

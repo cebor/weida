@@ -3,6 +3,9 @@ name = "weida-amqp-codec-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
+# Its own workspace (see below), so nothing to inherit; unpublished, so the
+# manifest needs no registry metadata.
+license = "MIT OR Apache-2.0"
 
 [package.metadata]
 cargo-fuzz = true

@@ -4,6 +4,11 @@ description = "MQTT 5.0 wire codec: fixed header, Variable Byte Integers, the pr
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # No dependencies, deliberately: not even weida-core. The codec is the half of
 # the MQTT work that can be tested byte-for-byte against the OASIS standard, so

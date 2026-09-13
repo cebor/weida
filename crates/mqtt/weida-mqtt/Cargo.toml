@@ -4,6 +4,11 @@ description = "An MQTT 5.0 client in Rust: connection, session, QoS and subscrip
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # The machine room only: the reactor, the resolver and one OS-error vocabulary

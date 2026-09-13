@@ -4,6 +4,11 @@ description = "ZMTP 3.1 codec: greeting, framing, NULL handshake and commands, s
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # No dependencies, deliberately: not even weida-core. The codec is the half of
 # the adapter that can be tested byte-for-byte against a foreign specification,

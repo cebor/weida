@@ -4,6 +4,11 @@ description = "The Python binding of weida-zmq: asyncio ZeroMQ sockets on the Ru
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 # The Python module is `weida_zmq` — that is what `#[pymodule] fn weida_zmq`

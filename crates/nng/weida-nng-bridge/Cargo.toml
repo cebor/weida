@@ -4,6 +4,11 @@ description = "Bridges foreign nanomsg/NNG SP peers onto weida endpoints, termin
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # A forwarder necessarily depends on both sides: `weida` for the patterns
 # and `weida-nng` for the SP sockets. It depends on `weida-sp` too, but only

@@ -4,6 +4,11 @@ description = "The minimal L2 broker: queues at endpoint paths, Accepted in, not
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # The whole dependency list, deliberately: a broker is an ordinary weida

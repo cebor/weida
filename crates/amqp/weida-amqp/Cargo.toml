@@ -4,6 +4,11 @@ description = "An AMQP 1.0 client in Rust: connections, sessions and links, usab
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # The machine room only: the reactor, the resolver and the close budget, plus

@@ -43,6 +43,19 @@ members = [
 edition = "2024"
 rust-version = "1.88"
 version = "0.1.0"
+# Dual, in the Rust ecosystem's own form: the MIT arm is the permissive
+# minimum every downstream already accepts, and the Apache-2.0 arm is the one
+# that carries an explicit patent grant, which is what a corporate reviewer
+# needs in order to approve a dependency. Every crate this workspace builds on
+# — std, tokio, quinn, rustls, openraft — is licensed exactly this way, so our
+# terms are a superset of our own dependency graph's rather than a new
+# condition on top of it.
+license = "MIT OR Apache-2.0"
+repository = "https://git.doodleshnookie.net/tuco86/weida"
+homepage = "https://weida.doodleshnookie.net"
+# Five is the cap crates.io enforces, twenty bytes each.
+keywords = ["messaging", "quic", "broker", "async", "protocol"]
+categories = ["network-programming", "asynchronous"]
 
 [workspace.dependencies]
 weida-core = { path = "crates/core", version = "0.1.0" }

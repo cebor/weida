@@ -4,6 +4,11 @@ description = "Wire protocol codec (frames, headers, negotiation) for weida"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 weida-core.workspace = true

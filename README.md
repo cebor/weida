@@ -177,4 +177,17 @@ cargo bench                                      # codec and loopback QUIC throu
 cargo bench -p weida-zmq-bridge --bench interop # the bridge's cost against no bridge
 ```
 
-No license file yet.
+## License
+
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT License ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option. This is the Rust ecosystem's own form: the MIT arm is the permissive minimum,
+and the Apache-2.0 arm carries an explicit patent grant.
+
+Unless you state otherwise, any contribution intentionally submitted for inclusion in this
+work, as defined in the Apache-2.0 license, shall be dual-licensed as above, with no
+additional terms or conditions.

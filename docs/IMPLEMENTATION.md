@@ -1815,8 +1815,14 @@ Recorded deliberately, not discovered later.
   queue is prohibited rather than optimistic ([GUARANTEES.md](GUARANTEES.md) §1). Outside a
   broker the core's only delivery signal is still the `Delivery` transport receipt
   ([GUARANTEES.md](GUARANTEES.md) §6).
-- **No CI, no LICENSE, no publish metadata.** Not part of this increment; to be added on
-  demand.
+- **No CI.** Still absent: the gate runs on a workstation and on one Windows VM, by hand
+  (B-061 is blocked on a runner choice — the Forgejo host has 2 vCPUs, 3 GB RAM and a 600 s
+  job limit, which is less than one cold `cargo build --workspace`).
+- **Licence and publish metadata: done** (B-068). Dual `MIT OR Apache-2.0` with both texts at
+  the repository root, and `license`/`repository`/`homepage`/`keywords`/`categories` inherited
+  from `[workspace.package]` by all 26 publishable crates, so `cargo package --workspace`
+  prints no metadata warning. Nothing is published anywhere yet: the form is ready, the
+  decision to upload is separate.
 - **A synchronous API wrapper exists now** (B-194): `weida::blocking` behind the non-default
   `blocking` feature, in the shape the four protocol libraries of
   [0013](decisions/0013-competitor-libraries.md) already had — every method a `block_on`

@@ -4,6 +4,11 @@ description = "Reactor ownership, the task/timer/DNS surface and the local-trans
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # The shared vocabulary: `Error` for every failure this crate reports and

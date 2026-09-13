@@ -4,6 +4,11 @@ description = "Bridges foreign ZeroMQ peers onto weida endpoints, terminating bo
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # A separate crate from `weida-zmtp` on purpose: that one depends on nothing at
 # all, which is what lets its codec be checked against 37/ZMTP rather than

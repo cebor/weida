@@ -4,6 +4,11 @@ description = "AMQP 1.0 codec: the Part 1 type system, frames, performatives and
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 # No dependencies, deliberately: not even weida-core. The codec is the half of
 # the AMQP library that can be tested byte-for-byte against the OASIS text, so

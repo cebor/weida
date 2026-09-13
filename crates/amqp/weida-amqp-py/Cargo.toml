@@ -4,6 +4,11 @@ description = "The Python binding of weida-amqp: asyncio AMQP 1.0 connections, s
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 # The Python module is `weida_amqp` — that is what `#[pymodule] fn weida_amqp`

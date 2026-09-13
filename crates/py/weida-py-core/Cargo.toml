@@ -4,6 +4,11 @@ description = "The shared PyO3 foundation of every Python binding in this worksp
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # CPython, and the reactor ownership every binding inherits. **These two and
