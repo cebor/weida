@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="470" viewBox="0 0 960 470" font-family="Helvetica, Arial, sans-serif" font-size="12">
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="480" viewBox="0 0 960 480" font-family="Helvetica, Arial, sans-serif" font-size="12">
   <defs>
     <style>
       .done    { fill:#c8e6c9; stroke:#2e7d32; }
@@ -12,7 +12,7 @@
       .phase   { fill:#263238; font-size:14px; font-weight:bold; }
     </style>
   </defs>
-  <text x="20" y="28" class="phase">Roadmap (LOOP.md §9) — state at main 0d8c35a, 1687 tests</text>
+  <text x="20" y="28" class="phase">Roadmap (LOOP.md §9) — state at main 07f8b6f, 1700 tests</text>
 
   <!-- legend -->
   <g transform="translate(500,14)">
@@ -73,6 +73,11 @@
     <text x="8" y="34" class="sub">B1–B4 are done; MQTT's and AMQP's server halves live here, and AMQP 0-9-1 clients for RabbitMQ come with it (D2)</text>
   </g>
 
-  <text x="20" y="450" class="sub">Boxes follow the roadmap lines A1–A9, B1–B4, C, D of docs/LOOP.md §9. Item ids refer to docs/BACKLOG.md.</text>
-  <text x="20" y="464" class="sub">A forwarder exists for ZeroMQ and NNG only; 0014 §3.4 files none for MQTT, AMQP or NATS, because a forwarder follows the library it forwards.</text>
+  <!-- the one slice that belongs to no roadmap line -->
+  <g transform="translate(20,424)">
+    <rect x="0" y="0" width="676" height="18" rx="3" class="done"/><text x="8" y="13" class="sub">Beside the lines: the `weida` CLI — serve/request/send/sub over all three transports, exit codes per error (B-060)</text>
+  </g>
+
+  <text x="20" y="456" class="sub">Boxes follow the roadmap lines A1–A9, B1–B4, C, D of docs/LOOP.md §9. Item ids refer to docs/BACKLOG.md.</text>
+  <text x="20" y="468" class="sub">A forwarder exists for ZeroMQ and NNG only; 0014 §3.4 files none for MQTT, AMQP or NATS, because a forwarder follows the library it forwards.</text>
 </svg>

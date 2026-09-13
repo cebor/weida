@@ -6,15 +6,17 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `0d8c35a`, 2026-09-13 ~22:30 UTC. Tree clean, gate green on **two
-platforms**: Linux **1687 tests** (218 at the start of the session, 764 before the four
-parallel workstreams) and a Windows 11 VM at the same commit with 1665 across 119 binaries,
+**Snapshot:** main `07f8b6f`, 2026-09-14 ~03:30 UTC. Tree clean, gate green on **two
+platforms**: Linux **1700 tests** (218 at the start of the session, 764 before the four
+parallel workstreams) and a Windows 11 VM with 1665 across 119 binaries at `0d8c35a`,
 each with 37 ignored — the interop suites that need a library or a broker the machine does
 not have — plus the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`,
 `weida-nng`'s `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
 items, and **every one of the four wheels built and smoke-tested with no Rust toolchain on
-`PATH`**. Fourteen decision notes (0001–0014), all `accepted`. **Twenty-four `[workspace]
+`PATH`**. Sixteen decision notes (0001–0016): fourteen `accepted`, and 0015 (peer authorization) and
+0016 (conflation) `provisional`, because each answers a requirement's open question with a
+wire-affecting "no". One binary, `weida` (B-060), beside the library. **Twenty-four `[workspace]
 members`**, one directory per protocol family, read off `cargo metadata` rather than a
 hand-kept list: `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`, `weida`,
 `crates/py/weida-py-core`, then
@@ -116,8 +118,10 @@ a multipart refused at hop one, the smaller `max_message_bytes` deciding — are
 
 ![Tests over time](status/tests-over-time.svg)
 
-Every point is a merge into main behind the four-step gate of [LOOP.md](LOOP.md) §6. Two things
-the chart does not show: three review findings were caught **before** their merge by reading
+Every point is a merge into main behind the four-step gate of [LOOP.md](LOOP.md) §6. **The
+chart stops at the two-day stop it was drawn for** (`5ca1329`, 1678 tests); the sessions since
+took it to **1700** without changing its shape, so it is left as the picture of the parallel run
+rather than redrawn per merge. Two things it does not show: three review findings were caught **before** their merge by reading
 the branch (a reassembler counter that drifted on repeated sequence numbers, a runtime-wide
 mutex on the fire-and-forget path that cost 3 % in the header bench, a parked receipt that
 held an OS descriptor), and three of the four findings of the ZMTP interop run were mistakes in
@@ -140,47 +144,53 @@ other end.
 
 ## 6. What needs a human
 
-Two things, the first one changed shape:
+Three things, and only three:
 
-1. **B-039 is done.** The Windows VM that unblocked it (`ssh win11-geselle`) is not in any
-   CI; the Windows gate is run by hand (`C:\work\gate.ps1`) beside the Linux one, and B-061's
-   CI would be where it stops being manual. The VM's storage threw `STATUS_IN_PAGE_ERROR`
-   three times mid-compile during the slice, each a corrupted artifact cleared by hand.
-2. **B-184, the gate's doc step, needs a change to [LOOP.md](LOOP.md) §6 that only you make.**
-   The loop does not edit its own standing instructions. Two holes, both paid for tonight: the
-   gate runs no per-crate `--no-default-features` rustdoc, so an intra-doc link to a
-   `#[cfg(feature = ...)]` item is a hard error **only** in the configuration nobody runs —
-   one such link shipped in B-147 and another in B-165, and each survived three or four merges
-   invisibly; and the doc step can run against a stale target, which is why a worker's own
-   green run was silent on a break that was really there. The item names the commands; adding
-   them to §6 is the part that is yours.
+1. **A licence, and where this is published** (B-068, now `blocked`). `cargo package
+   --workspace --no-verify` succeeds for all 24 crates and every one of them warns `manifest
+   has no license, license-file, documentation, homepage or repository`. The `[workspace.package]`
+   block is one commit; the licence is the copyright holder's choice and the `repository`
+   field is a publication decision, since the remote is a self-hosted Forgejo. MSRV is already
+   answered (`1.88`). One thing that needed no decision was fixed in the same pass: `chacha20
+   0.10.1` was **yanked** in the registry and in our lockfile, reached through `rand` from both
+   `quinn-proto` and `async-nats`; the lockfile now holds `0.10.2`.
+2. **Two sentences in [LOOP.md](LOOP.md) §6** (B-184 and B-107). The loop does not edit its own
+   standing instructions, so the checks are run by hand and recorded in each item's note. They
+   are not theoretical: running B-184's own command this session found a third `cfg`-gated
+   intra-doc link — `Identity::generate` in `crates/weida/src/config.rs` — which failed
+   `cargo doc -p weida --no-default-features` and was invisible to every `--workspace` doc run
+   ever made here. It is fixed; the instruction that would have caught it is yours. B-107 is
+   the same shape for the `blocking` feature, re-verified this session at 245, 150 and 138
+   tests for `weida-zmq`, `weida-mqtt` and `weida-nng`.
+3. **The Windows gate is manual.** The VM that unblocked B-039 (`ssh win11-geselle`) is in no
+   CI, so `C:\work\gate.ps1` runs beside the Linux one by hand, and B-061's CI is where that
+   would stop being true — itself `blocked`, because the Forgejo host has 2 vCPUs, 3 GB of RAM
+   and a 600 s job limit. The VM's storage also throws `STATUS_IN_PAGE_ERROR` mid-compile
+   every few hours; each occurrence is a corrupted artifact cleared by hand, never a code
+   problem.
 
 ## 7. Where the loop stands
 
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1680 tests** with 37 ignored on Linux and at 1658 on Windows, and the tree is
-  clean. The tree has **no known red**, on either platform, in any configuration, including
-  the four that are not in the gate yet.
-- **9 items are `ready`, one is `blocked`** (B-061, CI: the Forgejo host cannot run this gate,
-  a runner is a decision) and **one is `parked`** (A5's control tier by 0011 §4.3). Of 190
-  filed items, 179 are `done`; B-189, the NNG survey interop hang on
-  Windows, closed the same evening as a test race, not a library bug.
-- **Of the six the night left behind**, four are closed this session: **B-182** (with B-188:
-  the NNG survey flake was a library bug the second platform exposed every time), **B-183**
-  and **B-185** (the two binding parity documents, `nng-py.md` and `mqtt-py.md`, now beside
-  the other three), **B-176** (the adapters index says what the tree has) and **B-180** (the
-  drain tests order the late stream by a poll of the drain, not a sleep). One stands:
-  **B-184**, the gate change above (§6). One was filed and closed the same hour: **B-190**,
-  `weida-nng-py`'s wheel, built and run with no toolchain like the four others' — the gap
-  its own parity document found.
-- **The older loose ends**: B-060, B-064..B-066 and B-068 (requirement-driven work; B-067,
-  the per-topic drop counters, closed tonight), B-096 and B-099 (a byte ceiling for the
-  per-peer queues and the peer count that is its other half), B-107 (a LOOP §6 sentence, yours
-  like B-184), and B-177 (concurrent send and receive on one `weida-zmq` socket). Closed
-  tonight beside them: B-104, B-106, B-109, B-110 (the four small ZeroMQ-family items, two
-  worktrees in parallel), B-178 and B-179.
+  green at **1700 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  any configuration, including the ten rustdoc and three `blocking` runs that are not in the
+  gate yet and were run by hand this session.
+- **3 items are `ready`, two are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
+  B-068, a licence and a publication target) and **one is `parked`** (A5's control tier by
+  0011 §4.3). Of 190 filed items, **184 are `done`**.
+- **The requirement-driven backlog is closed.** All five requests of
+  [requirements/zeughaus-video.md](requirements/zeughaus-video.md) are answered where they were
+  filed: streaming fan-out **built** (B-064, `Publisher::open`), conflation **answered without a
+  key** (B-065, [0016](decisions/0016-conflation.md)), peer authorization **answered "neither"**
+  (B-066, [0015](decisions/0015-peer-authorization.md)), per-topic drop counters **built**
+  (B-067), and the dependency form blocked on the licence above (B-068).
+- **What this session closed**: B-177 (split a `weida-zmq` socket into halves — the library diff
+  *removes* 691 lines while adding 493, because the pattern bodies the whole sockets had are now
+  shared), B-096 (a byte ceiling per peer queue, where a message count never was one), B-064,
+  B-060 (the `weida` binary, Phase 11's first slice), B-065, B-066, and the evidence passes on
+  B-107, B-184 and B-068.
 - **What moves the roadmap next** is yours to choose: **Phase D**, the L2 broker, which is also
   where MQTT's and AMQP's server halves live and where the credit of 0003 gets a consumer on
   both ends; or **Phase C's Java row**, now that the Python row is four bindings wide and

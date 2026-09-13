@@ -170,7 +170,17 @@ impl From<PathBuf> for Pem {
 /// requires one; when the fingerprint is what is trusted, nothing in the
 /// certificate is consulted.
 ///
-/// Generated identities ([`Identity::generate`]) are self-signed and made for
+// A link to a `#[cfg(feature = "generate")]` item is a hard rustdoc error in
+// the configuration that lacks the item, and no default-features doc run ever
+// shows it (B-184). So the sentence naming it is conditional too.
+#[cfg_attr(
+    feature = "generate",
+    doc = "Generated identities ([`Identity::generate`]) are self-signed and made for"
+)]
+#[cfg_attr(
+    not(feature = "generate"),
+    doc = "Generated identities (`Identity::generate`, behind the `generate` feature) are self-signed and made for"
+)]
 /// pinning. Identities issued by a certificate authority work the same way and
 /// can *additionally* be trusted through that authority ([`Trust::anchor`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
