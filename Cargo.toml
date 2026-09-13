@@ -31,6 +31,7 @@ members = [
     # The shared PyO3 foundation every Python binding sits on, with nothing
     # protocol-specific in it (0014 §2).
     "crates/py/weida-py-core",
+    "crates/py/weida-py",
     # Belongs to no single family: one protocol in, another out.
     "crates/interop/cross-tests",
 ]

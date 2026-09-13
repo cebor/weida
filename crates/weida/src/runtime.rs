@@ -416,6 +416,21 @@ impl Runtime {
     pub fn config(&self) -> &RuntimeConfig {
         &self.inner.config
     }
+
+    /// The executor this runtime drives its work on.
+    ///
+    /// Exposed for one caller and stated so that it is not mistaken for an
+    /// invitation: a **binding** needs it. `weida-py`'s asyncio bridge drives
+    /// this crate's futures on the runtime that owns the connections, and a
+    /// bridge that built an executor of its own would put two Tokio runtimes
+    /// in one process — the cost
+    /// [0013](../../../docs/decisions/0013-competitor-libraries.md) §4.2
+    /// names for not sharing one. Application code has no use for it: every
+    /// future this crate returns may be driven on any executor, which is the
+    /// contract `Exec` exists to keep.
+    pub fn exec(&self) -> &Exec {
+        &self.inner.exec
+    }
 }
 
 impl std::fmt::Debug for Runtime {

@@ -14,10 +14,12 @@ not have — plus the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `
 `weida-nng`'s `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
 items, and **every one of the four wheels built and smoke-tested with no Rust toolchain on
-`PATH`**. Seventeen decision notes (0001–0017): fourteen `accepted`, and 0015 (peer authorization), 0016
-(conflation) and 0017 (the subscription verdict) `provisional`, because each answers an open
-question with a wire-affecting "no". One binary, `weida` (B-060), beside the library, and
-`weida::blocking` (B-194) beside the async API. **Twenty-four `[workspace]
+`PATH`**. Nineteen decision notes (0001–0019): fourteen `accepted`, and 0015 (peer authorization), 0016
+(conflation), 0017 (the subscription verdict), 0018 (the minimal broker) and 0019 (the JVM
+binding) `provisional` — the first three because each answers an open question with a
+wire-affecting "no", the last two because they are the first step of a phase the user chooses.
+One binary, `weida` (B-060), beside the library, `weida::blocking` (B-194) beside the async API,
+and **`weida-py`** (B-200), the sixth Python binding in the tree and the first of weida itself. **Twenty-four `[workspace]
 members`**, one directory per protocol family, read off `cargo metadata` rather than a
 hand-kept list: `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`, `weida`,
 `crates/py/weida-py-core`, then
@@ -178,11 +180,11 @@ Three things, and only three:
   green at **1700 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session.
-- **5 items are `ready`, two are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
+- **12 items are `ready`, two are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
   B-068, a licence and a publication target) and **one is `parked`** (A5's control tier by
-  0011 §4.3). Of **200** filed items, **192 are `done`**; the `ready` five are two sentences in a file this
-  loop does not write (§6, B-107 and B-184) and three items B-198's and B-199's notes will
-  refine.
+  0011 §4.3). Of **210** filed items, **195 are `done`**; of the twelve `ready`, ten are the code slices
+  B-198's and B-199's notes filed for the two phases the user chooses between, and two are
+  sentences in a file this loop does not write (§6, B-107 and B-184).
 - **The requirement-driven backlog is closed.** All five requests of
   [requirements/zeughaus-video.md](requirements/zeughaus-video.md) are answered where they were
   filed: streaming fan-out **built** (B-064, `Publisher::open`), conflation **answered without a

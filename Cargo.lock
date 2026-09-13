@@ -3143,6 +3143,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "weida-py"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "weida",
+ "weida-core",
+ "weida-py-core",
+]
+
+[[package]]
 name = "weida-py-core"
 version = "0.1.0"
 dependencies = [

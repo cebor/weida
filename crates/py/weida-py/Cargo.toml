@@ -1,0 +1,45 @@
+[package]
+name = "weida-py"
+description = "The Python binding of weida: asyncio Req/Rep and Push/Pull over QUIC, with the library's error vocabulary as exception classes"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+# The Python module is `weida` — that is what `#[pymodule] fn weida` and
+# therefore the `PyInit_weida` symbol say, and what `module-name` in
+# pyproject.toml names the file maturin writes into the wheel. The *crate*
+# cannot be called that as well: rustdoc writes one directory per lib name and
+# `weida` already owns `weida`, so `cargo doc --workspace` would refuse the
+# collision.
+name = "weida_py"
+crate-type = ["cdylib"]
+# A cdylib has no rlib for rustdoc to link a doctest against, so the examples
+# in this crate's documentation are Python rather than Rust and are run by
+# `pytest`, not by `cargo test`.
+doctest = false
+
+[dependencies]
+# The shared foundation: exception families, the asyncio bridge, the bytes
+# boundary. Every binding in this workspace sits on it and none re-derives it
+# (`docs/decisions/0014-parallel-libraries.md` §2).
+weida-py-core.workspace = true
+pyo3.workspace = true
+# The library being bound — weida itself, which is what makes this the first
+# binding of the *product* rather than of a competitor implementation.
+# `generate` is on, because a Python caller that binds has no other way to
+# obtain an identity: there is no PEM file in a fresh process.
+weida = { workspace = true, features = ["generate"] }
+weida-core.workspace = true
+
+[features]
+# Off by default, and enabled by maturin through `pyproject.toml`. With it on,
+# the extension does not link libpython — which is right for a wheel and wrong
+# for `cargo test`, because a test binary is an executable and would be left
+# with undefined symbols.
+extension-module = ["pyo3/extension-module"]
+
+[lints.rust]
+# As in `weida-py-core`: PyO3's macros expand to `unsafe impl`s, so `forbid` is
+# not available. No `unsafe` is written by hand in this crate.
+unsafe_code = "allow"
