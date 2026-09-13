@@ -444,9 +444,26 @@ impl<'a> CurveCommand<'a> {
         Ok(())
     }
 
-    /// Builds the complete command frame, flags and size included. An
-    /// `INITIATE` is always a long frame: 257 octets is past the short size
-    /// field's 255.
+    /// Builds the complete frame, flags and size included. An `INITIATE` is
+    /// always a long frame: 257 octets is past the short size field's 255.
+    ///
+    /// **A `MESSAGE` is framed as a message, the other four as commands** —
+    /// this function frames what a peer accepts rather than what the grammar
+    /// names. 26/CURVEZMQ calls `MESSAGE` a command and gives it a command
+    /// body — `%d7 "MESSAGE"`, the short nonce, the box, which is what
+    /// [`encode_body`](Self::encode_body) writes — but that body travels
+    /// behind a **message** frame header, with the COMMAND bit clear, and a
+    /// command-framed `MESSAGE` closes the connection. Measured against
+    /// libzmq 4.3.5 in `weida-zmq`'s `tests/interop_libzmq.rs` and published
+    /// as `00 21` in `docs/adapters/zmtp.md` §10.1. The handshake commands
+    /// stay command frames as specified, so the two forms are mixed inside
+    /// one connection.
+    ///
+    /// The outer MORE flag is zero because the real one is the flags octet
+    /// inside the box, which only the sealing side can write; a caller that
+    /// wants the header in its own buffer uses
+    /// [`encode_body`](Self::encode_body) and frames it itself, the way
+    /// `weida-zmq`'s `CurveTransport::seal_frame` does.
     ///
     /// # Errors
     ///
@@ -454,7 +471,11 @@ impl<'a> CurveCommand<'a> {
     pub fn encode(&self) -> Result<Vec<u8>, CurveError> {
         let mut body = Vec::new();
         self.encode_body(&mut body)?;
-        Ok(frame::encode(FrameKind::Command, &body))
+        let kind = match self {
+            CurveCommand::Message { .. } => FrameKind::Message { more: false },
+            _ => FrameKind::Command,
+        };
+        Ok(frame::encode(kind, &body))
     }
 }
 
