@@ -922,6 +922,19 @@ connection error: the connection survives all of it.
 
 A receiver MUST NOT reinterpret a misrouted stream as something the path does serve.
 
+**This table is the authorization surface**, and that is a decision rather than an accident
+([decisions/0015](decisions/0015-peer-authorization.md)). Dispatch answers "is this stream
+servable here"; whether *this peer* may be served here is the acceptor's own decision, taken
+on the identity the handshake proved (`IncomingMeta::peer`) and the path the stream arrived
+at, and expressed with the refusals above and nothing new: a registered path MAY refuse an
+accepted stream with `REJECTED` (ERROR `{REJECTED}` on an exchange's reply half,
+`STOP_SENDING(REJECTED)` on a one-way stream), and an acceptor that prefers not to reveal
+that the path exists answers `UNKNOWN_ENDPOINT` instead — the two are indistinguishable to
+the peer on purpose. What an acceptor MUST NOT do: authorize on anything *claimed* rather
+than proved (a header field, the `producer` key of §6.2, a PID), read structure into an
+opaque path, or expect a one-way refusal to be observed at all
+([decisions/0005](decisions/0005-refusal-race.md)).
+
 The `NO_REPLY` rule is mandatory: an application that takes an exchange and drops it without
 answering MUST cause ERROR `{NO_REPLY}` on the reply half. Without it a requester would hang
 until the idle timeout.
@@ -1130,4 +1143,10 @@ versions.
   (master doc §82 leaves this for after the basic protocol is proven).
 - **Retries.** The protocol carries no retry or attempt metadata; retry is entirely an
   application concern in v0.
-- **Authentication beyond TLS.** No application-level authentication fields in HELLO.
+- **Authentication beyond TLS.** No application-level authentication fields in HELLO, and
+  [decisions/0015](decisions/0015-peer-authorization.md) makes that a decision with a reason
+  rather than an omission: the handshake proves a key, and *authorization* is the acceptor's
+  local decision on `(proved peer, dispatched path)`, expressed with §9.4's refusals. The
+  positive half is therefore already specified; what is absent is any credential on the wire.
+  A later version that wanted one would take **HELLO key `7`** — the first free key in §6.1 —
+  and pay the rest of the bill that note itemizes.

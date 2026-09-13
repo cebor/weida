@@ -192,13 +192,26 @@ A peer is named by the SHA-256 fingerprint of its public key (`Fingerprint`, tex
 only what the address names (`weida://sha256:…@host:port/path`) — and a binding may require a
 client identity with `ServerTls::require_client`. Whatever arrives on a stream carries the
 peer's identity in `IncomingMeta::peer`: `PeerIdentity::Key(fingerprint)` over QUIC, `None`
-for an anonymous client, and `PeerIdentity::Local { uid, gid, pid }` over `AF_UNIX`, where
-the **kernel** is the prover instead of TLS and a PID is an observation that must not be
-authorized on [0010 §4.4]. In process there is no identity at all, because there is no
-boundary to prove anything across. Whichever it is, it comes from the transport and never
-from a header, so it can be authorized on but not forged. A peer outside the terms fails
-`connect` with `Error::Untrusted(fingerprint)`, carrying what
-answered so an operator can pin it after checking it out of band.
+for an anonymous client, `PeerIdentity::Local { uid, gid, pid }` over `AF_UNIX` and
+`PeerIdentity::Windows { sid, pid }` over a named pipe, where the **kernel** is the prover
+instead of TLS and a PID is an observation that must not be authorized on [0010 §4.4]. In
+process there is no identity at all, because there is no boundary to prove anything across.
+Whichever it is, it comes from the transport and never from a header, so it can be authorized
+on but not forged. A peer outside the terms fails `connect` with
+`Error::Untrusted(fingerprint)`, carrying what answered so an operator can pin it after
+checking it out of band.
+
+**Authorizing on it is the application's, and the shape is decided**
+([decisions/0015](decisions/0015-peer-authorization.md)): the handshake carries no
+application credential and will not grow one, so a handler authorizes on `meta().peer`
+together with the path the stream dispatched to, and refuses with `Rejected` — or, to keep
+the path invisible, by not registering it. A **token** flow, where the grant comes from a
+third party rather than from the key, needs two things and they are both existing pieces: a
+companion Req/Rep path the client posts the token to, and `ServerTls::require_client`, so
+that the verdict can be held against a proved fingerprint. Without client identity a verdict
+lives no longer than the connection it was given on, and a *subscription* cannot present a
+token at all, because SUBSCRIBE has no reply half ([PROTOCOL.md](PROTOCOL.md) §6.4) — the one
+cost that answer has, named here rather than discovered.
 
 *`crates/weida/tests/identity.rs`, all ten.*
 

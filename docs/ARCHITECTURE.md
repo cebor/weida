@@ -795,12 +795,26 @@ a peer is only ever accepted for a key it proved it holds. The provider is named
 rather than taken from the rustls process default: a library must not install global state in
 its host application.
 
-**Authentication is not authorization.** A completed handshake says which key answered and
-nothing about what that peer may do. Deciding that is the application's job, on
+**Authentication is not authorization**, and since
+[decisions/0015](decisions/0015-peer-authorization.md) that is a decision rather than a
+description of what happens to be missing. A completed handshake says which key answered and
+nothing about what that peer may do. Deciding that is the acceptor's job, on
 `IncomingMeta::peer`: the identity is on every inbound transfer and request, so a handler can
 refuse per endpoint, per topic or per payload. The only allow list built into v0 is a `Trust`
 pin list on a binding, which is connection-wide and all-or-nothing; the authorization hooks
-of master doc §46 are not implemented.
+of master doc §46 are not implemented **by decision** — 0015 asked whether the handshake
+should carry an application credential and answered no, so there is nothing for a hook to
+carry that `(proved peer, dispatched path)` does not already say.
+
+Per endpoint path, an acceptor MAY decide whether the path exists at all (a non-registration
+answers `UNKNOWN_ENDPOINT`, which deliberately does not distinguish "no such endpoint" from
+"not for you"), whether to accept an individual transfer or exchange that dispatched to it
+(`REJECTED`), whether a given subscriber gets a given topic, and whether the peer may connect
+at all (`Trust`). It MUST NOT authorize on anything claimed rather than proved, read
+structure into an opaque path, expect a one-way refusal to be observed
+([decisions/0005](decisions/0005-refusal-race.md)), treat two anonymous connections as one
+peer, or take a decision on one connection and signal it on another
+([decisions/0011](decisions/0011-answered-where-it-arrived.md) §4.1).
 
 ---
 
