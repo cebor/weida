@@ -56,7 +56,10 @@
 //! the raw L0 surface (`Peer` and `Acceptor`) and a synchronous facade over
 //! `weida::blocking`, which is B-205 and follows the order every other
 //! binding in this tree used — the library's blocking facade first, then the
-//! binding's `sync` module.
+//! binding's `sync` module (B-205): `weida.sync` is `weida::blocking` with
+//! argument conversion around it, for a process with no event loop, and it
+//! shares every value class with the asyncio surface. What is not here is
+//! the raw L0 surface, `Peer` and `Acceptor`.
 //!
 //! # No protocol behaviour lives here
 //!
@@ -72,6 +75,7 @@ mod errors;
 mod pubsub;
 mod runtime;
 mod streams;
+mod sync;
 mod values;
 
 /// `weida`, as Python sees it.
@@ -94,6 +98,7 @@ fn weida(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<streams::PyOutgoingStream>()?;
     module.add_class::<streams::PyIncomingStream>()?;
     module.add_class::<streams::PyReply>()?;
+    sync::install(module)?;
     module.add("VERSION", ::weida::VERSION)?;
     module.add("ALPN", ::weida::ALPN)?;
     module.add("__all__", every_name())?;
@@ -120,6 +125,7 @@ fn every_name() -> Vec<&'static str> {
         "OutgoingStream",
         "IncomingStream",
         "Reply",
+        "sync",
         "VERSION",
         "ALPN",
         "WeidaError",

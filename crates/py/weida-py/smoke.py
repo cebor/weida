@@ -30,6 +30,11 @@ def surface() -> None:
     for name in weida.__all__:
         assert hasattr(weida, name), name
     assert issubclass(weida.Untrusted, weida.WeidaError)
+    # `weida.Runtime` is the runtime and `weida.RuntimeFailure` is the
+    # failure: a wheel that lost the rename would shadow one with the other.
+    assert not issubclass(weida.Runtime, BaseException)
+    assert issubclass(weida.RuntimeFailure, weida.WeidaError)
+    assert hasattr(weida.sync, "Runtime")
     print(f"{len(weida.__all__)} names, {weida.VERSION} the wire version")
 
 

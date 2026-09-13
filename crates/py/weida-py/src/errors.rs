@@ -2,7 +2,9 @@
 //!
 //! `weida.Untrusted`, `weida.UnknownEndpoint`, `weida.Indeterminate` and
 //! eighteen more, each its own class under `weida.WeidaError`, each instance
-//! carrying `errno` and `cause`. A caller writes the branch the failure model
+//! carrying `errno` and `cause`. One is renamed and the macro below says
+//! why: `Error::Runtime` becomes `weida.RuntimeFailure`, because
+//! `weida.Runtime` is the runtime. A caller writes the branch the failure model
 //! is made of — `except weida.Indeterminate` for "the outcome is genuinely
 //! unknown", `except weida.Rejected` for "the peer said no" — instead of
 //! matching on the text of a `RuntimeError`.
@@ -30,11 +32,29 @@ static ERRORS: ErrorClasses = ErrorClasses::new();
 /// The base class every failure of this module derives from.
 const BASE: &str = "WeidaError";
 
+/// The class name of one variant: its own, or the override beside it.
+macro_rules! class_of {
+    ($name:ident) => {
+        stringify!($name)
+    };
+    ($name:ident, $class:literal) => {
+        $class
+    };
+}
+
 /// Writes the name list and the exhaustive match from one source.
+///
+/// An entry is `(Variant)` or `(Variant, "ClassName")`. The override exists
+/// for exactly one variant and the reason is worth stating: `Error::Runtime`
+/// would want the class name `Runtime`, and `weida.Runtime` is **the
+/// runtime** — a module cannot have one name for two things, and the module
+/// with the collision silently kept whichever was added last. So the class is
+/// `RuntimeFailure`, its `errno` says the same, and the variant it comes from
+/// is here beside it.
 macro_rules! failures {
-    ($($name:ident),+ $(,)?) => {
+    ($( ( $name:ident $(, $class:literal)? ) ),+ $(,)?) => {
         /// Every failure name this module has a class for.
-        pub(crate) const NAMES: &[&str] = &[$(stringify!($name)),+];
+        pub(crate) const NAMES: &[&str] = &[$(class_of!($name $(, $class)?)),+];
 
         /// The name of one error, checked against the library's enum by the
         /// compiler.
@@ -43,34 +63,34 @@ macro_rules! failures {
         /// arm shape serves all three.
         fn name_of(error: &Error) -> &'static str {
             match error {
-                $(Error::$name { .. } => stringify!($name),)+
+                $(Error::$name { .. } => class_of!($name $(, $class)?),)+
             }
         }
     };
 }
 
 failures!(
-    Runtime,
-    InvalidAddress,
-    InvalidEndpointPath,
-    InvalidFingerprint,
-    AlreadyRegistered,
-    NotConnected,
-    ConnectionLost,
-    Negotiation,
-    Protocol,
-    Rejected,
-    UnknownEndpoint,
-    Unsupported,
-    NoParkedConnection,
-    NoReply,
-    Canceled,
-    Indeterminate,
-    LimitExceeded,
-    Tls,
-    Untrusted,
-    Io,
-    Transport,
+    (Runtime, "RuntimeFailure"),
+    (InvalidAddress),
+    (InvalidEndpointPath),
+    (InvalidFingerprint),
+    (AlreadyRegistered),
+    (NotConnected),
+    (ConnectionLost),
+    (Negotiation),
+    (Protocol),
+    (Rejected),
+    (UnknownEndpoint),
+    (Unsupported),
+    (NoParkedConnection),
+    (NoReply),
+    (Canceled),
+    (Indeterminate),
+    (LimitExceeded),
+    (Tls),
+    (Untrusted),
+    (Io),
+    (Transport),
 );
 
 /// Adds the base class and one class per failure name to the module.

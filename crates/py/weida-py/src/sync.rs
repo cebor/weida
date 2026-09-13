@@ -1,0 +1,528 @@
+//! `weida.sync`: weida for a Python program with no event loop.
+//!
+//! ```python
+//! from weida import Identity, Trust, sync
+//!
+//! runtime = sync.Runtime()
+//! binding = runtime.bind("127.0.0.1:0", Identity.generate())
+//! replier = binding.replier("/echo")
+//!
+//! client = sync.Runtime()
+//! requester = client.requester(Trust.by_address())
+//! requester.connect(binding.url("/echo"))
+//! # ... in another thread, or before the request:
+//! #   request = replier.accept(1 << 20); request.reply(request.payload)
+//! ```
+//!
+//! # It implements nothing, and the `block_on` is not here
+//!
+//! This module is `weida::blocking` — not a link, because a feature-gated
+//! item is a hard rustdoc error in the configuration that lacks it (B-184) —
+//! with argument conversion around it, and
+//! that is the whole of it. The facade is where the `block_on` lives, where
+//! the reactor is owned, and where the one refusal that matters is made: a
+//! call from inside a Tokio runtime would park the worker that has to drive
+//! what it is waiting for, so every entry point there checks for an ambient
+//! runtime and fails with `weida.Runtime` instead of deadlocking. A Python
+//! process has no ambient runtime, so the check is silent here — and it stays
+//! correct in a process that embeds one.
+//!
+//! Building the `block_on` again in this file would have been the second
+//! implementation [0013](../../../../docs/decisions/0013-competitor-libraries.md)
+//! §4.4 exists to prevent, and the order the other five bindings used —
+//! library facade first, binding `sync` module second — is what avoids it
+//! ([0014](../../../../docs/decisions/0014-parallel-libraries.md) §2).
+//!
+//! # The GIL is released while a call waits
+//!
+//! Every call below runs inside [`Python::detach`], so other Python threads
+//! run while one is parked in `accept` or `recv`. A blocking binding that
+//! held the GIL would make a second thread pointless, and the usual shape of
+//! a synchronous messaging program — one thread per endpoint — would be a
+//! program that serves one endpoint at a time.
+//!
+//! # What has no synchronous form here
+//!
+//! The streamed surface: `open`, `recv_stream` and `FanOut`. The blocking
+//! facade takes whole payloads by design, because a synchronous caller that
+//! wants to stream wants the asyncio surface or the Rust API — and a `sync`
+//! module that invented its own streaming would be inventing a second
+//! facade. The value classes are shared, not copied: `weida.Trust`,
+//! `weida.Identity` and `weida.IncomingMeta` are the same objects on both
+//! surfaces.
+
+use std::sync::Mutex;
+
+use pyo3::prelude::*;
+use pyo3::types::PyModule;
+use weida::blocking;
+use weida_py_core::{payload_of, py_bytes};
+
+use crate::errors::raise;
+use crate::values::{PyIdentity, PyIncomingMeta, PyTrust};
+
+/// What a call on a spent runtime gets.
+fn spent<T>(py: Python<'_>, what: &str) -> PyResult<T> {
+    raise(
+        py,
+        Err(weida::Error::Runtime(format!(
+            "this {what} was already shut down"
+        ))),
+    )
+}
+
+/// `weida.sync.Runtime`: a reactor of the library's own, driven by its caller.
+#[pyclass(frozen, name = "Runtime", module = "weida.sync")]
+pub struct SyncRuntime {
+    /// `None` after `shutdown` or `drain`, both of which consume the facade's
+    /// runtime.
+    runtime: Mutex<Option<blocking::Runtime>>,
+}
+
+#[pymethods]
+impl SyncRuntime {
+    /// A runtime with `worker_threads` reactor threads.
+    ///
+    /// # Errors
+    ///
+    /// `weida.Runtime` when `worker_threads` is `0`, when the OS refuses the
+    /// threads, or when this is called from inside a Tokio runtime — which
+    /// would deadlock on the first call.
+    #[new]
+    #[pyo3(signature = (worker_threads=1))]
+    fn new(py: Python<'_>, worker_threads: usize) -> PyResult<SyncRuntime> {
+        let config = weida::RuntimeConfig {
+            worker_threads,
+            ..weida::RuntimeConfig::default()
+        };
+        let runtime = raise(py, py.detach(|| blocking::Runtime::new(config)))?;
+        Ok(SyncRuntime {
+            runtime: Mutex::new(Some(runtime)),
+        })
+    }
+
+    /// Binds a QUIC socket; port `0` lets the kernel choose.
+    fn bind(&self, py: Python<'_>, addr: &str, identity: PyIdentity) -> PyResult<SyncBinding> {
+        let socket: std::net::SocketAddr = raise(
+            py,
+            addr.parse()
+                .map_err(|e| weida::Error::InvalidAddress(format!("{addr:?}: {e}"))),
+        )?;
+        let fingerprint = raise(py, identity.identity.fingerprint())?.to_string();
+        let guard = self.runtime.lock().expect("runtime lock poisoned");
+        let Some(runtime) = guard.as_ref() else {
+            return spent(py, "runtime");
+        };
+        let binding = raise(
+            py,
+            py.detach(|| runtime.bind_quic(socket, identity.identity.clone())),
+        )?;
+        let local = binding.local_addr().to_string();
+        Ok(SyncBinding {
+            binding,
+            local,
+            fingerprint,
+        })
+    }
+
+    /// A requester on this runtime.
+    fn requester(&self, py: Python<'_>, trust: PyTrust) -> PyResult<SyncRequester> {
+        let guard = self.runtime.lock().expect("runtime lock poisoned");
+        match guard.as_ref() {
+            Some(runtime) => Ok(SyncRequester {
+                endpoint: runtime.requester(trust.trust.clone()),
+            }),
+            None => spent(py, "runtime"),
+        }
+    }
+
+    /// A pusher on this runtime.
+    fn pusher(&self, py: Python<'_>, trust: PyTrust) -> PyResult<SyncPusher> {
+        let guard = self.runtime.lock().expect("runtime lock poisoned");
+        match guard.as_ref() {
+            Some(runtime) => Ok(SyncPusher {
+                endpoint: runtime.pusher(trust.trust.clone()),
+            }),
+            None => spent(py, "runtime"),
+        }
+    }
+
+    /// A subscriber on this runtime.
+    fn subscriber(&self, py: Python<'_>, trust: PyTrust) -> PyResult<SyncSubscriber> {
+        let guard = self.runtime.lock().expect("runtime lock poisoned");
+        match guard.as_ref() {
+            Some(runtime) => Ok(SyncSubscriber {
+                endpoint: runtime.subscriber(trust.trust.clone()),
+            }),
+            None => spent(py, "runtime"),
+        }
+    }
+
+    /// Stops admitting work and waits up to `deadline` seconds for finished
+    /// transfers to reach the peer's transport, returning
+    /// `(delivered, outstanding)`.
+    fn drain(&self, py: Python<'_>, deadline: f64) -> PyResult<(u64, u64)> {
+        let seconds = raise(
+            py,
+            std::time::Duration::try_from_secs_f64(deadline)
+                .map_err(|e| weida::Error::Runtime(format!("deadline: {e}"))),
+        )?;
+        let taken = self.runtime.lock().expect("runtime lock poisoned").take();
+        match taken {
+            Some(runtime) => {
+                let drained = raise(py, py.detach(|| runtime.drain(seconds)))?;
+                Ok((drained.delivered, drained.outstanding))
+            }
+            None => spent(py, "runtime"),
+        }
+    }
+
+    /// Closes every connection without waiting for anything in flight.
+    fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
+        let taken = self.runtime.lock().expect("runtime lock poisoned").take();
+        match taken {
+            Some(runtime) => raise(py, py.detach(|| runtime.shutdown())),
+            None => spent(py, "runtime"),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        "<weida.sync.Runtime>".to_owned()
+    }
+}
+
+/// `weida.sync.Binding`: a bound socket and the endpoints on it.
+#[pyclass(frozen, name = "Binding", module = "weida.sync")]
+pub struct SyncBinding {
+    binding: blocking::Binding,
+    local: String,
+    fingerprint: String,
+}
+
+#[pymethods]
+impl SyncBinding {
+    /// The address the socket is bound to, with the port the kernel chose.
+    fn local_addr(&self) -> &str {
+        &self.local
+    }
+
+    /// The fingerprint a client pins.
+    fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// The address a client dials for `path`.
+    fn url(&self, path: &str) -> String {
+        format!("weida://{}@{}{path}", self.fingerprint, self.local)
+    }
+
+    /// Registers a replier at `path`.
+    fn replier(&self, py: Python<'_>, path: &str) -> PyResult<SyncReplier> {
+        Ok(SyncReplier {
+            endpoint: raise(py, self.binding.replier(path))?,
+        })
+    }
+
+    /// Registers a puller at `path`.
+    fn puller(&self, py: Python<'_>, path: &str) -> PyResult<SyncPuller> {
+        Ok(SyncPuller {
+            endpoint: raise(py, self.binding.puller(path))?,
+        })
+    }
+
+    /// Registers a publisher at `path`.
+    fn publisher(&self, py: Python<'_>, path: &str) -> PyResult<SyncPublisher> {
+        Ok(SyncPublisher {
+            endpoint: raise(py, self.binding.publisher(path))?,
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<weida.sync.Binding {}>", self.local)
+    }
+}
+
+/// `weida.sync.Requester`.
+#[pyclass(frozen, name = "Requester", module = "weida.sync")]
+pub struct SyncRequester {
+    endpoint: blocking::Requester,
+}
+
+#[pymethods]
+impl SyncRequester {
+    /// Dials `url`; see the asyncio `Requester.connect` for the forms.
+    fn connect(&self, py: Python<'_>, url: &str) -> PyResult<()> {
+        raise(py, py.detach(|| self.endpoint.connect(url)))
+    }
+
+    /// Sends `payload` and returns the reply, at most `max_reply_bytes`.
+    fn request<'py>(
+        &self,
+        py: Python<'py>,
+        payload: &Bound<'py, PyAny>,
+        max_reply_bytes: usize,
+    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let body = payload_of(payload)?;
+        let reply = raise(
+            py,
+            py.detach(|| self.endpoint.request(&body, max_reply_bytes)),
+        )?;
+        Ok(py_bytes(py, &reply))
+    }
+
+    fn __repr__(&self) -> String {
+        "<weida.sync.Requester>".to_owned()
+    }
+}
+
+/// `weida.sync.Pusher`.
+#[pyclass(frozen, name = "Pusher", module = "weida.sync")]
+pub struct SyncPusher {
+    endpoint: blocking::Pusher,
+}
+
+#[pymethods]
+impl SyncPusher {
+    /// Dials `url`.
+    fn connect(&self, py: Python<'_>, url: &str) -> PyResult<()> {
+        raise(py, py.detach(|| self.endpoint.connect(url)))
+    }
+
+    /// Sends `payload` and waits for the peer's transport to acknowledge it.
+    fn send(&self, py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<()> {
+        let body = payload_of(payload)?;
+        raise(py, py.detach(|| self.endpoint.send(&body)))
+    }
+
+    fn __repr__(&self) -> String {
+        "<weida.sync.Pusher>".to_owned()
+    }
+}
+
+/// `weida.sync.Subscriber`.
+#[pyclass(frozen, name = "Subscriber", module = "weida.sync")]
+pub struct SyncSubscriber {
+    endpoint: blocking::Subscriber,
+}
+
+#[pymethods]
+impl SyncSubscriber {
+    /// Dials `url`.
+    fn connect(&self, py: Python<'_>, url: &str) -> PyResult<()> {
+        raise(py, py.detach(|| self.endpoint.connect(url)))
+    }
+
+    /// Subscribes to `filter`; the empty filter takes every topic.
+    fn subscribe(&self, py: Python<'_>, filter: &str) -> PyResult<()> {
+        raise(py, py.detach(|| self.endpoint.subscribe(filter)))
+    }
+
+    /// Withdraws one filter.
+    fn unsubscribe(&self, py: Python<'_>, filter: &str) -> PyResult<()> {
+        raise(py, py.detach(|| self.endpoint.unsubscribe(filter)))
+    }
+
+    /// Waits for the next published message, at most `max_bytes`, and
+    /// returns `(payload, meta)`.
+    fn recv<'py>(
+        &self,
+        py: Python<'py>,
+        max_bytes: usize,
+    ) -> PyResult<(Bound<'py, pyo3::types::PyBytes>, PyIncomingMeta)> {
+        let message = raise(py, py.detach(|| self.endpoint.recv(max_bytes)))?;
+        Ok((
+            py_bytes(py, &message.payload),
+            PyIncomingMeta::of(&message.meta),
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        "<weida.sync.Subscriber>".to_owned()
+    }
+}
+
+/// `weida.sync.Replier`.
+#[pyclass(frozen, name = "Replier", module = "weida.sync")]
+pub struct SyncReplier {
+    endpoint: blocking::Replier,
+}
+
+#[pymethods]
+impl SyncReplier {
+    /// The endpoint path this replier serves.
+    fn path(&self) -> String {
+        self.endpoint.path().to_owned()
+    }
+
+    /// Waits for the next request and reads its body, at most `max_bytes`.
+    fn accept(&self, py: Python<'_>, max_bytes: usize) -> PyResult<SyncRequest> {
+        let request = raise(py, py.detach(|| self.endpoint.accept(max_bytes)))?;
+        Ok(SyncRequest {
+            request: Mutex::new(Some(request)),
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<weida.sync.Replier {}>", self.endpoint.path())
+    }
+}
+
+/// `weida.sync.Request`: an accepted exchange and the reply it owes.
+#[pyclass(frozen, name = "Request", module = "weida.sync")]
+pub struct SyncRequest {
+    request: Mutex<Option<blocking::Request>>,
+}
+
+#[pymethods]
+impl SyncRequest {
+    /// The request payload.
+    #[getter]
+    fn payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let guard = self.request.lock().expect("request lock poisoned");
+        match guard.as_ref() {
+            Some(request) => Ok(py_bytes(py, &request.message().payload)),
+            None => spent(py, "request"),
+        }
+    }
+
+    /// What the DATA header said, including the proved peer.
+    #[getter]
+    fn meta(&self, py: Python<'_>) -> PyResult<PyIncomingMeta> {
+        let guard = self.request.lock().expect("request lock poisoned");
+        match guard.as_ref() {
+            Some(request) => Ok(PyIncomingMeta::of(&request.message().meta)),
+            None => spent(py, "request"),
+        }
+    }
+
+    /// Answers with `payload`.
+    fn reply(&self, py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<()> {
+        let body = payload_of(payload)?;
+        let taken = self.request.lock().expect("request lock poisoned").take();
+        match taken {
+            Some(request) => raise(py, py.detach(|| request.reply(&body))),
+            None => spent(py, "request"),
+        }
+    }
+
+    /// Declines the request, so the requester gets `weida.Rejected`.
+    fn refuse(&self, py: Python<'_>) -> PyResult<()> {
+        let taken = self.request.lock().expect("request lock poisoned").take();
+        match taken {
+            Some(request) => raise(py, py.detach(|| request.refuse(weida::ErrorCode::Rejected))),
+            None => spent(py, "request"),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        "<weida.sync.Request>".to_owned()
+    }
+}
+
+/// `weida.sync.Puller`.
+#[pyclass(frozen, name = "Puller", module = "weida.sync")]
+pub struct SyncPuller {
+    endpoint: blocking::Puller,
+}
+
+#[pymethods]
+impl SyncPuller {
+    /// The endpoint path this puller serves.
+    fn path(&self) -> String {
+        self.endpoint.path().to_owned()
+    }
+
+    /// Waits for the next transfer and reads it, at most `max_bytes`,
+    /// returning `(payload, meta)`.
+    fn recv<'py>(
+        &self,
+        py: Python<'py>,
+        max_bytes: usize,
+    ) -> PyResult<(Bound<'py, pyo3::types::PyBytes>, PyIncomingMeta)> {
+        let message = raise(py, py.detach(|| self.endpoint.recv(max_bytes)))?;
+        Ok((
+            py_bytes(py, &message.payload),
+            PyIncomingMeta::of(&message.meta),
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<weida.sync.Puller {}>", self.endpoint.path())
+    }
+}
+
+/// `weida.sync.Publisher`.
+#[pyclass(frozen, name = "Publisher", module = "weida.sync")]
+pub struct SyncPublisher {
+    endpoint: blocking::Publisher,
+}
+
+#[pymethods]
+impl SyncPublisher {
+    /// The endpoint path this publisher serves.
+    fn path(&self) -> String {
+        self.endpoint.path().to_owned()
+    }
+
+    /// Fans `payload` out to every matching subscriber and returns how many
+    /// it was enqueued for. Never waits, on either surface.
+    fn publish(&self, py: Python<'_>, topic: &str, payload: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let body = payload_of(payload)?;
+        raise(py, self.endpoint.publish(topic, body))
+    }
+
+    /// Subscribers currently connected.
+    fn subscriber_count(&self) -> usize {
+        self.endpoint.subscriber_count()
+    }
+
+    /// Copies dropped because a subscriber could not take them.
+    fn dropped(&self) -> u64 {
+        self.endpoint.dropped()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<weida.sync.Publisher {}>", self.endpoint.path())
+    }
+}
+
+/// Builds the `weida.sync` submodule.
+///
+/// A real submodule rather than a naming convention, so that
+/// `from weida import sync` works and `weida.sync.Runtime` is the class a
+/// traceback names.
+pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = parent.py();
+    let sync = PyModule::new(py, "sync")?;
+    sync.add_class::<SyncRuntime>()?;
+    sync.add_class::<SyncBinding>()?;
+    sync.add_class::<SyncRequester>()?;
+    sync.add_class::<SyncPusher>()?;
+    sync.add_class::<SyncSubscriber>()?;
+    sync.add_class::<SyncReplier>()?;
+    sync.add_class::<SyncRequest>()?;
+    sync.add_class::<SyncPuller>()?;
+    sync.add_class::<SyncPublisher>()?;
+    sync.add(
+        "__all__",
+        vec![
+            "Runtime",
+            "Binding",
+            "Requester",
+            "Pusher",
+            "Subscriber",
+            "Replier",
+            "Request",
+            "Puller",
+            "Publisher",
+        ],
+    )?;
+    parent.add_submodule(&sync)?;
+    // So that `import weida.sync` works and not only
+    // `from weida import sync`: a submodule added to its parent is not in
+    // `sys.modules` until something puts it there.
+    py.import("sys")?
+        .getattr("modules")?
+        .set_item("weida.sync", &sync)?;
+    Ok(())
+}
