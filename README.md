@@ -99,7 +99,9 @@ what it looks like; addresses, receipts and topics go to stderr. The address `se
 is the whole client configuration, exactly as in the section below. Every transport works
 the same way — `weida+unix://%2Ftmp%2Fs.sock/echo` for a socket, `weida+pipe://NAME/echo` for
 a Windows pipe — and the exit code names the error a script can act on: `3` refused, `4`
-unknown endpoint, `5` no reply, `6` untrusted, `7` connection lost.
+unknown endpoint, `5` no reply, `6` untrusted, `7` connection lost. `weida --help` lists every
+option, including `sub --framing line|raw|nul|length`, because a newline after each payload is
+readable and is not framing.
 
 ## Identity in one line
 

@@ -65,20 +65,76 @@ use weida::{
 /// that a megabyte is sixteen syscalls, small enough to stream.
 const CHUNK: usize = 64 * 1024;
 
-/// What a published message is followed by on stdout.
+/// How `sub` separates one payload from the next on stdout.
 ///
-/// A newline, because the alternative is a length prefix nobody asked for: a
-/// subscriber's output is a log to look at, and a caller who needs framing
-/// wants `--count 1` and one payload per invocation.
-const MESSAGE_SEPARATOR: u8 = b'\n';
+/// The default is a newline, because a subscriber's output is usually a log to
+/// look at — and a newline is *not framing*: a payload that contains one is
+/// indistinguishable from two payloads. So the choice is the caller's, stated
+/// rather than assumed (B-197).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// A newline after each payload. Unambiguous only for payloads that
+    /// contain none.
+    Line,
+    /// Nothing at all: the payload is the whole of stdout. For `--count 1`,
+    /// where the process boundary is the frame.
+    Raw,
+    /// A NUL after each payload — unambiguous for text, and what `xargs -0`
+    /// reads.
+    Nul,
+    /// An eight-byte big-endian length before each payload. Unambiguous for
+    /// anything, and the only form a script can parse without knowing the
+    /// payload.
+    Length,
+}
 
-fn usage() -> ! {
-    eprintln!(
-        "usage:
+impl Framing {
+    fn parse(name: &str) -> Framing {
+        match name {
+            "line" => Framing::Line,
+            "raw" => Framing::Raw,
+            "nul" => Framing::Nul,
+            "length" => Framing::Length,
+            other => fail(format!(
+                "--framing: {other:?} is not one of line, raw, nul, length"
+            )),
+        }
+    }
+
+    /// What precedes a payload of `len` bytes.
+    fn prefix(self, len: u64) -> Option<[u8; 8]> {
+        match self {
+            Framing::Length => Some(len.to_be_bytes()),
+            _ => None,
+        }
+    }
+
+    /// What follows it.
+    fn suffix(self) -> Option<u8> {
+        match self {
+            Framing::Line => Some(b'\n'),
+            Framing::Nul => Some(0),
+            Framing::Raw | Framing::Length => None,
+        }
+    }
+}
+
+/// The usage text, printed for `--help` and for a usage error alike.
+const USAGE: &str = "usage:
   weida send    [--ca PATH] URL [FILE]        one-way transfer; payload from FILE or stdin
   weida request [--ca PATH] URL [FILE]        exchange; the reply goes to stdout
-  weida sub     [--ca PATH] [--filter F] [--count N] URL
+  weida sub     [--ca PATH] [--filter F] [--count N] [--framing FORM] URL
   weida serve   (--echo | --sink | --pub) URL [--identity PATH] [--cert-out PATH]
+
+options:
+  --ca PATH        trust this certificate as an anchor instead of the address's key
+  --identity PATH  load or create the server identity here, so the address is stable
+  --cert-out PATH  write the server certificate, for a client that uses --ca
+  --filter F       subscribe to this topic filter; the default takes every topic
+  --count N        exit after N messages; without it, sub runs until stopped
+  --framing FORM   how sub separates payloads on stdout: line (default), raw, nul, length
+  --version        print the version
+  --help           print this
 
 URL is weida://[sha256:HEX@]HOST:PORT/PATH, weida+unix://SOCKET/PATH with the
 socket path percent-encoded (weida+unix://%2Ftmp%2Fs.sock/echo), or
@@ -87,9 +143,19 @@ served from a shell.
 
 Payload on stdin and stdout; addresses and diagnostics on stderr.
 Exit codes: 2 usage, 3 refused, 4 unknown endpoint, 5 no reply, 6 untrusted,
-7 connection lost, 1 anything else."
-    );
+7 connection lost, 1 anything else.";
+
+/// A usage *error*: the text on stderr and exit `2`.
+fn usage() -> ! {
+    eprintln!("{USAGE}");
     std::process::exit(2);
+}
+
+/// A help *request*: the text on stdout and exit `0`, because asking for help
+/// is not a mistake (B-195).
+fn help() -> ! {
+    println!("{USAGE}");
+    std::process::exit(0);
 }
 
 fn fail(message: impl std::fmt::Display) -> ! {
@@ -123,6 +189,7 @@ enum Command {
         url: String,
         filter: String,
         count: Option<u64>,
+        framing: Framing,
         ca: Option<PathBuf>,
     },
     Serve {
@@ -136,6 +203,15 @@ enum Command {
 fn parse_args() -> Command {
     let mut args = std::env::args().skip(1);
     let verb = args.next().unwrap_or_else(|| usage());
+    // Before anything else, because these two answer without a verb.
+    match verb.as_str() {
+        "--help" | "-h" | "help" => help(),
+        "--version" | "-V" => {
+            println!("weida {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        _ => {}
+    }
     let mut url = None;
     let mut file = None;
     let mut ca = None;
@@ -143,6 +219,7 @@ fn parse_args() -> Command {
     let mut cert_out = None;
     let mut filter = None;
     let mut count = None;
+    let mut framing = Framing::Line;
     let mut role = None;
 
     let next = |args: &mut dyn Iterator<Item = String>, what: &str| -> String {
@@ -163,10 +240,15 @@ fn parse_args() -> Command {
                         .unwrap_or_else(|e| fail(format!("--count: {e}"))),
                 );
             }
+            "--framing" => framing = Framing::parse(&next(&mut args, "--framing")),
             "--echo" => role = Some(Role::Echo),
             "--sink" => role = Some(Role::Sink),
             "--pub" => role = Some(Role::Publish),
-            "--help" | "-h" => usage(),
+            "--help" | "-h" => help(),
+            "--version" | "-V" => {
+                println!("weida {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             other if other.starts_with("--") => fail(format!("unexpected option: {other}")),
             other if url.is_none() => url = Some(other.to_owned()),
             other if file.is_none() => file = Some(PathBuf::from(other)),
@@ -184,6 +266,7 @@ fn parse_args() -> Command {
             // did not name one is asking for.
             filter: filter.unwrap_or_default(),
             count,
+            framing,
             ca,
         },
         "serve" => Command::Serve {
@@ -269,8 +352,9 @@ async fn main() -> ExitCode {
             url,
             filter,
             count,
+            framing,
             ca,
-        } => subscribe(&runtime, url, filter, *count, ca.as_ref()).await,
+        } => subscribe(&runtime, url, filter, *count, *framing, ca.as_ref()).await,
         Command::Serve {
             url,
             role,
@@ -365,6 +449,7 @@ async fn subscribe(
     url: &str,
     filter: &str,
     count: Option<u64>,
+    framing: Framing,
     ca: Option<&PathBuf>,
 ) -> Result<(), Error> {
     let subscriber = runtime.subscriber(trust(ca));
@@ -381,6 +466,12 @@ async fn subscribe(
     while count.is_none_or(|limit| seen < limit) {
         let mut transfer = subscriber.recv().await?;
         let topic = transfer.meta().topic.clone().unwrap_or_default();
+        // `length` framing has to know the size before the bytes, so it holds
+        // the payload; every other form streams. The hold is bounded by the
+        // publisher's own `max_message_size` for a whole publish, and by
+        // nothing for a streamed one — which is why it is not the default and
+        // why the help text says what each form costs.
+        let mut held = Vec::new();
         let mut bytes = 0u64;
         loop {
             let n = transfer.read(&mut chunk).await?;
@@ -388,9 +479,19 @@ async fn subscribe(
                 break;
             }
             bytes += n as u64;
-            stdout.write_all(&chunk[..n]).map_err(Error::Io)?;
+            if framing == Framing::Length {
+                held.extend_from_slice(&chunk[..n]);
+            } else {
+                stdout.write_all(&chunk[..n]).map_err(Error::Io)?;
+            }
         }
-        stdout.write_all(&[MESSAGE_SEPARATOR]).map_err(Error::Io)?;
+        if let Some(prefix) = framing.prefix(bytes) {
+            stdout.write_all(&prefix).map_err(Error::Io)?;
+            stdout.write_all(&held).map_err(Error::Io)?;
+        }
+        if let Some(suffix) = framing.suffix() {
+            stdout.write_all(&[suffix]).map_err(Error::Io)?;
+        }
         stdout.flush().map_err(Error::Io)?;
         // The gap is the whole reason a subscriber can trust what it got: a
         // fan-out drop is silent unless `PerProducer` is negotiated, and then
