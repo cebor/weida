@@ -10,12 +10,25 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Raft-backed replication. Off by default: a broker that leads no cluster needs
+# no consensus engine, and this is where the dependency weight of one lives
+# ([decisions/0021](../../docs/decisions/0021-consensus-openraft.md) §4.1).
+cluster = ["dep:openraft"]
+
 [dependencies]
 # The whole dependency list, deliberately: a broker is an ordinary weida
 # process and the layer below it is the public API, not its internals
 # (`docs/ARCHITECTURE.md` §4). Nothing in `weida` may depend on this crate,
 # and a brokerless deployment does not link it.
 weida.workspace = true
+# The one crate in this workspace that may name openraft, and it names it
+# nowhere in a public signature (0021 §4.1). **Optional**, behind the
+# non-default `cluster` feature, because a single-node broker must not link a
+# consensus engine: 39 crates enter the lockfile with it, among them a
+# command-line parser, a JSON-schema generator and five `windows-*` crates,
+# none of which openraft 0.9 lets a feature flag remove (B-222).
+openraft = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 

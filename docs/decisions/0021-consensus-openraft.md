@@ -81,6 +81,24 @@ the shape and is synchronous and frozen; `openraft` is async and owns the drivin
   maintainer; it is not *additional* trust, since it is the same person we would be trusting for
   openraft itself, but it is more crates to pin.
 
+**What the dependency actually weighs, measured after the decision was taken (B-222).** Adding
+`openraft = "0.9"` puts **39 crates** into the lockfile, and the reason is not consensus: openraft
+0.9 depends **non-optionally** on `clap` (with `derive` and `env`), on `byte-unit` — which pulls
+`rust_decimal`, `borsh`, `schemars` and `arrayvec` — and on `chrono`, which pulls
+`iana-time-zone` and five `windows-*` crates onto a Linux host. Its `[features]` list has no
+`default`, and none of those dependencies is optional, so no feature flag removes them.
+
+Two facts soften that, and both are measured rather than assumed:
+
+- **openraft's own code contains zero occurrences of `unsafe`** across its 208 source files. The
+  `unsafe` in the added subtree is entirely transitive — `arrayvec` 58, `byte-unit` 21, `chrono`
+  12, `ref-cast-impl` 10, `borsh` 7, `dyn-clone` 5, `derive_more` 5 — and arrives through exactly
+  the dependencies consensus does not need.
+- **0.10 removes them.** Its dependency list drops `clap` and `byte-unit` entirely and moves
+  `tokio` behind a separate `openraft-rt` crate. So the migration this note treats as a risk is
+  also the fix for the weight, which is an argument for doing it when 0.10 stabilizes rather than
+  for avoiding it.
+
 **What this repository already does with infrastructure.** It did not write QUIC (quinn), TLS
 (rustls), the CBOR codec (minicbor), the SHA-2/SPKI parsing (ring, rustls-webpki) or the NaCl box
 (`crypto_box`). [0013 §4.1]'s reimplement-it rule is about **competitor protocol libraries**,
@@ -124,30 +142,64 @@ The reason is mechanical rather than aesthetic: openraft promises incompatible c
 1.0, and a leaked type would turn every such bump into a breaking change of weida's API — and of
 every language binding built on it, where the type would have no representation at all.
 
-**4.2 `AsyncRuntime` is implemented over `Exec`, and that is a task rather than a hope.** Its
-nine types map onto Tokio's (`tokio::task::JoinHandle`, `tokio::time::Sleep`,
-`tokio::time::Instant`, `tokio::time::Timeout`, `rand::rngs::ThreadRng`,
-`tokio::sync::oneshot`), which this workspace already depends on. The one thing that must not be
-copied from openraft's default implementation is `spawn`: it calls `tokio::spawn` directly, and
-this workspace's rule is that nothing does so outside `weida-runtime`'s `Exec`
-[0013 §4.2]. So `spawn` enters the runtime handle `Exec` holds and everything else delegates —
-about sixty lines of a `WeidaRuntime` type, verified before anything else in this phase is
-written. **If it cannot be done cleanly, that is the argument for Option B** and this note is
-reopened rather than worked around.
+**And it is optional: the `cluster` feature, off by default.** A broker that leads no cluster must
+not link a consensus engine, and with the weight §2 measured — 39 crates, among them a
+command-line parser — that is not a stylistic preference. `weida-broker` without `cluster` is what
+B-201 and B-202 built; with it, the consensus module exists. The cost is the one this repository
+already knows: a non-default feature is invisible to the gate of [LOOP.md](../LOOP.md) §6 (B-107),
+so the two extra commands — `clippy` and `test` with `--features cluster` — are run by hand and
+recorded in each item's note until that gate names them.
 
-**4.3 The thirteen `RaftStorage` methods are a requirements list for the Phase 5 store.** This is
-the load-bearing consequence of choosing a library, and it inverts a sequencing assumption: the
-store is built first, but its *interface* is decided here, because openraft prescribes what a log
-must be able to do. In particular, a store that can only append and read will not fit:
+**4.2 The runtime binding is a construction-site rule, not a type — and that is a correction to
+what this note first said.** The prediction here was a sixty-line `WeidaRuntime` whose `spawn`
+enters the handle `Exec` holds. B-222 implemented it and found that it cannot exist in that
+shape: `AsyncRuntime`'s functions are **associated functions, not methods** — `fn spawn<T>(future:
+T)` takes no `self` — and the trait is chosen at the type level through `RaftTypeConfig`, so there
+is no instance to carry an `Exec` and no way to bind one engine to one runtime through the trait.
+
+What decides where openraft's tasks run is therefore the **ambient** runtime at the construction
+site. The rule is consequently: **a consensus group is built and driven from inside its broker's
+own `Exec`**, which makes the broker's runtime the ambient one, which is where every task openraft
+spawns lands. `AsyncRuntime = openraft::TokioRuntime` is then the honest choice, because a wrapper
+that only delegates to the same Tokio functions would document the invariant without enforcing
+anything.
+
+The invariant is **tested rather than asserted**: a plain `#[test]` — deliberately with no ambient
+runtime — builds a `weida::Runtime::owned`, starts the engine inside `exec().spawn(…)` and waits
+for a committed entry on a channel. Without inheritance the `spawn` inside openraft would panic
+and nothing would arrive. That is as close to proving "it runs on our runtime" as a static
+interface allows, and it is why this sub-section no longer claims a type does the work.
+
+**4.3 The storage traits are a requirements list for the Phase 5 store.** This is the
+load-bearing consequence of choosing a library, and it inverts a sequencing assumption: the store
+is built first, but its *interface* is decided here, because openraft prescribes what a log must
+be able to do. A store that can only append and read will not fit.
+
+Three findings from implementing it (B-222) refine what §2 read off the v1 trait:
+
+- **The v2 traits are the ones to implement**, and they are **sealed unless the `storage-v2`
+  feature is enabled** — without it the only implementable trait is the v1 `RaftStorage` behind an
+  `Adaptor`. v2 is what 0.10 makes the sole API, so the feature is on and the migration is
+  cheaper.
+- The v2 split is `RaftLogStorage` — `get_log_state`, `get_log_reader`, `save_vote`/`read_vote`,
+  `save_committed`/`read_committed`, `append`, `truncate`, `purge`, plus `RaftLogReader`'s
+  `try_get_log_entries` and `limited_get_log_entries` — and `RaftStateMachine`: `applied_state`,
+  `apply`, `get_snapshot_builder`, `begin_receiving_snapshot`, `install_snapshot`,
+  `get_current_snapshot`.
+- **`append` takes a flush callback**, `LogFlushed`, and the callback is what reports durability.
+  The persist-before-send rule of the Raft thesis is therefore in a signature rather than in
+  prose — and `LogFlushed::new` is `pub(crate)`, so a third-party store **cannot construct one in
+  a unit test**. A store's conformance to `append` is only exercisable through a live `Raft`,
+  which is a constraint on how B-223's store is tested, not a defect.
 
 | Requirement | Method | Why it is not obvious |
 | --- | --- | --- |
-| truncate **backwards** | `delete_conflict_logs_since(log_id)` | a follower whose log diverged must discard a suffix — an append-only file needs a rewrite path |
-| truncate **forwards** | `purge_logs_upto(log_id)` | compaction after a snapshot; the store must be able to forget a prefix without rewriting the rest |
+| truncate **backwards** | `truncate(log_id)` | a follower whose log diverged must discard a suffix — an append-only file needs a rewrite path |
+| truncate **forwards** | `purge(log_id)` | compaction after a snapshot; the store must be able to forget a prefix without rewriting the rest |
 | ranged reads | `try_get_log_entries(range)`, `limited_get_log_entries(start, end)` | replication reads arbitrary windows, and the *limited* form exists so a reader can respect a byte budget |
 | hard state | `save_vote`/`read_vote`, `save_committed`/`read_committed` | two small durable cells with their own ordering rules, not entries in the log |
 | snapshot in and out | `get_snapshot_builder`, `begin_receiving_snapshot`, `install_snapshot`, `get_current_snapshot` | a snapshot is a **stream**, not a value: it may be larger than memory, which is the same constraint weida's transfers already have |
-| applied position | `last_applied_state`, `apply_to_state_machine` | the state machine's position and the log's are separate, and a restart must agree with both |
+| applied position | `applied_state`, `apply` | the state machine's position and the log's are separate, and a restart must agree with both |
 
 **4.4 Raft traffic gets its own ALPN and its own connections: `weida-raft/0`.** Consensus
 messages are not client traffic and must not share a client connection: [0002 §6.2]'s whole

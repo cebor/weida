@@ -82,6 +82,18 @@ weida-nats = { path = "crates/nats/weida-nats", version = "0.1.0" }
 weida-nats-py = { path = "crates/nats/weida-nats-py", version = "0.1.0" }
 
 quinn = "0.11"
+# The consensus engine of the L2 broker, and a dependency rather than a
+# subsystem ([decisions/0021](docs/decisions/0021-consensus-openraft.md)): the
+# part of writing one that matters is the invariant harness this crate already
+# runs tick by tick against the paper and the TLA+ spec. Pinned to the stable
+# 0.9 line, because its own README promises incompatible changes before 1.0 —
+# which is also why no `openraft::` type may appear in a public signature of
+# `weida-broker`, the only crate allowed to name it.
+# `storage-v2` unseals `RaftLogStorage`/`RaftStateMachine` for third-party
+# crates — without it the only implementable storage trait is the v1
+# `RaftStorage` behind an `Adaptor`, and v2 is what 0.10 makes the sole API.
+# Writing against v2 now is the cheaper migration.
+openraft = { version = "0.9", features = ["storage-v2"] }
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
