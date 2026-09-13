@@ -113,14 +113,39 @@ async fn outbound(config: OutboundConfig) -> (String, Runtime) {
     (url, runtime)
 }
 
-/// A loopback address with a port the OS picks, as a `tcp://` endpoint string.
-async fn free_port() -> (SocketAddr, String) {
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("probe bind");
-    let addr = probe.local_addr().expect("probe addr");
-    drop(probe);
-    (addr, format!("tcp://{addr}"))
+/// How many OS-chosen ports one bind may lose to another test before the
+/// machine, rather than the race, is the explanation.
+const PROBES: usize = 8;
+
+/// Binds *their* socket to a loopback port the OS picked, retrying on
+/// `AddrInUse` with a fresh probe, and returns the address the bridge dials.
+///
+/// The port has to be probed by binding `127.0.0.1:0`, reading it and letting
+/// go, because zmq.rs's `bind` needs a concrete number and cannot report one
+/// back — and between letting go and their bind, another test binary of the
+/// suite can take it. That window cannot be closed while their bind needs a
+/// number, so it is retried instead; the bound keeps a machine with no free
+/// ports from looking like a flake.
+async fn bound_by_them(socket: &mut impl Socket) -> SocketAddr {
+    let mut taken = None;
+    for _ in 0..PROBES {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe bind");
+        let addr = probe.local_addr().expect("probe addr");
+        drop(probe);
+        let endpoint = format!("tcp://{addr}");
+        match within(socket.bind(&endpoint)).await {
+            Ok(_) => return addr,
+            Err(zeromq::ZmqError::Network(error))
+                if error.kind() == std::io::ErrorKind::AddrInUse =>
+            {
+                taken = Some(addr);
+            }
+            Err(error) => panic!("zmq.rs binds {endpoint}: {error}"),
+        }
+    }
+    panic!("{PROBES} probed ports in a row were taken, the last of them {taken:?}");
 }
 
 fn one_frame(message: &ZmqMessage) -> &[u8] {
@@ -372,9 +397,8 @@ async fn a_real_zmq_multipart_message_is_refused_rather_than_flattened() {
 /// is the only thing that proves it.
 #[tokio::test]
 async fn a_weida_requester_reaches_a_real_zmq_rep() {
-    let (addr, endpoint) = free_port().await;
     let mut rep = zeromq::RepSocket::new();
-    within(rep.bind(&endpoint)).await.expect("bind");
+    let addr = bound_by_them(&mut rep).await;
 
     let (url, bridge_runtime) = outbound(OutboundConfig::new(
         addr,
@@ -411,9 +435,8 @@ async fn a_weida_requester_reaches_a_real_zmq_rep() {
 /// Claim: a weida `Pusher` reaches a real ZeroMQ `PULL` through the bridge.
 #[tokio::test]
 async fn a_weida_pusher_reaches_a_real_zmq_pull() {
-    let (addr, endpoint) = free_port().await;
     let mut pull = zeromq::PullSocket::new();
-    within(pull.bind(&endpoint)).await.expect("bind");
+    let addr = bound_by_them(&mut pull).await;
 
     let (url, bridge_runtime) = outbound(OutboundConfig::new(
         addr,
@@ -447,9 +470,8 @@ async fn a_weida_pusher_reaches_a_real_zmq_pull() {
 /// bridge, with the bridge's own subscription reaching a foreign publisher.
 #[tokio::test]
 async fn a_weida_subscriber_receives_from_a_real_zmq_pub() {
-    let (addr, endpoint) = free_port().await;
     let mut publisher = zeromq::PubSocket::new();
-    within(publisher.bind(&endpoint)).await.expect("bind");
+    let addr = bound_by_them(&mut publisher).await;
 
     let mut config = OutboundConfig::new(
         addr,
@@ -506,9 +528,8 @@ async fn a_weida_subscriber_receives_from_a_real_zmq_pub() {
 /// an option on somebody else's socket.
 #[tokio::test]
 async fn a_request_a_real_zmq_router_drops_becomes_no_reply() {
-    let (addr, endpoint) = free_port().await;
     let mut router = zeromq::RouterSocket::new();
-    within(router.bind(&endpoint)).await.expect("bind");
+    let addr = bound_by_them(&mut router).await;
 
     let mut config = OutboundConfig::new(
         addr,
@@ -549,9 +570,8 @@ async fn a_request_a_real_zmq_router_drops_becomes_no_reply() {
 /// several heartbeat intervals and then uses it.
 #[tokio::test]
 async fn a_three_zero_peer_is_not_sent_pings() {
-    let (addr, endpoint) = free_port().await;
     let mut rep = zeromq::RepSocket::new();
-    within(rep.bind(&endpoint)).await.expect("bind");
+    let addr = bound_by_them(&mut rep).await;
 
     let mut config = OutboundConfig::new(
         addr,
@@ -600,9 +620,8 @@ async fn a_three_zero_peer_is_not_sent_pings() {
 /// afterwards.
 #[tokio::test]
 async fn a_payload_over_the_cap_reaches_no_real_zmq_peer() {
-    let (addr, endpoint) = free_port().await;
     let mut pull = zeromq::PullSocket::new();
-    within(pull.bind(&endpoint)).await.expect("bind");
+    let addr = bound_by_them(&mut pull).await;
 
     let mut config = OutboundConfig::new(
         addr,

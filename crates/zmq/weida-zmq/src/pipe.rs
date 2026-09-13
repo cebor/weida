@@ -171,6 +171,34 @@ struct QueueState {
     closed: bool,
 }
 
+/// The body a window event queues, so an assertion can name it.
+#[cfg(test)]
+const WINDOW_BODY: &str = "queued in the window";
+
+/// What a test makes happen in the instant between a wait's check and its
+/// await — the window `enable()` closes.
+///
+/// That instant is **inside a single poll**: no other task on this thread can
+/// run there, so the hazard is not reachable through the public surface, and
+/// only a second thread landing at exactly that point ever hits it. These
+/// hooks are how the tests below reach it deterministically instead of racing
+/// for it; they compile under `cfg(test)` only.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum Window {
+    /// A message is queued, notifying `ready`.
+    Arrives,
+    /// A message is taken, notifying `room`.
+    Frees,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Armed by [`Queue::arm_window`], fired once by the next wait on this
+    /// thread that reaches its window.
+    static WINDOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Queue {
     /// An empty queue under `config`.
     pub fn new(config: QueueConfig) -> Queue {
@@ -232,16 +260,20 @@ impl Queue {
     pub async fn wait_for_room(&self) {
         loop {
             let mut room = std::pin::pin!(self.room.notified());
-            // `notified()` registers the waiter when it is **polled**, so
-            // registering is `enable()` and not construction: without it a
-            // `notify_waiters()` between the check below and the await wakes
-            // nobody, and this wait never ends. The same at every wait in
-            // this file, and the reason a reply could sit in a queue while
-            // its session slept.
+            // Created *and* enabled above the check, so that room freed
+            // between the check and the await still ends this wait:
+            // `notified()` registers its waiter when it is **polled**, and
+            // `enable()` is that registration without awaiting. Creating it
+            // below the check is the shape that loses the wakeup, and the
+            // reason a reply could sit in a queue while its session slept.
+            // The same at every wait in this file; `tests` pins all four
+            // against that shape and records what it could not measure.
             room.as_mut().enable();
             if self.has_room() || self.is_closed() {
                 return;
             }
+            #[cfg(test)]
+            self.in_window(Window::Frees);
             room.await;
         }
     }
@@ -260,6 +292,8 @@ impl Queue {
                     return;
                 }
             }
+            #[cfg(test)]
+            self.in_window(Window::Arrives);
             ready.await;
         }
     }
@@ -308,6 +342,8 @@ impl Queue {
                     MuteAction::Block => {}
                 }
             }
+            #[cfg(test)]
+            self.in_window(Window::Frees);
             room.await;
         }
     }
@@ -358,6 +394,8 @@ impl Queue {
                     return Err(gone());
                 }
             }
+            #[cfg(test)]
+            self.in_window(Window::Arrives);
             ready.await;
         }
     }
@@ -404,6 +442,31 @@ impl Queue {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
         self.state.lock().expect("queue poisoned")
+    }
+
+    /// Arms the next window on this thread: the event fires once, between
+    /// the check and the await of the first wait that reaches it.
+    #[cfg(test)]
+    fn arm_window() {
+        WINDOW.with(|armed| armed.set(true));
+    }
+
+    /// Fires an armed window event on this queue — see [`Window`].
+    #[cfg(test)]
+    fn in_window(&self, event: Window) {
+        if !WINDOW.with(std::cell::Cell::take) {
+            return;
+        }
+        match event {
+            Window::Arrives => {
+                self.try_send(Multipart::single(WINDOW_BODY))
+                    .expect("the window's message needs room");
+            }
+            Window::Frees => {
+                self.try_recv()
+                    .expect("the window's receive needs a message");
+            }
+        }
     }
 }
 
@@ -461,6 +524,25 @@ impl Default for PipeConfig {
 /// why a message can be queued for a peer that never answers. Cloning shares
 /// the queues: the socket holds one clone and the connection engine the
 /// other, which is the only way a queue can be a rendezvous between them.
+///
+/// **A pipe is oriented from the socket's side, and that is why two sessions
+/// cannot be paired through this type.** [`Pipe::outgoing`] is the queue of
+/// messages headed *for* the peer and [`Pipe::incoming`] what arrived *from*
+/// it, and a session pumps against that orientation: it pops `outgoing` onto
+/// the wire and pushes what it reads into `incoming`. Two sessions driven
+/// against each other therefore need two pipes whose halves are **crossed** —
+/// one session's `outgoing` being the other's `incoming` — and
+/// [`Pipe::new`] is the only constructor there is: a `Pipe` cannot be
+/// assembled from two given queues, so the crossing is not expressible
+/// through the public API. Sharing one pipe between them, the obvious move,
+/// makes both sessions pop the same `outgoing` queue and push the same
+/// `incoming` one, so each message is raced by both readers and half of them
+/// arrive where nobody is looking. Nothing is broken by this: the engine
+/// pairs a session with a *socket*, one pipe per peer with the socket holding
+/// the other end, which is why every socket-level test over TCP delivers.
+/// `Pipe::crossed` is that pairing, for a test inside this crate that wants
+/// it; it exists under `cfg(test)` because nothing but a harness has any use
+/// for a pipe whose other end is not a socket.
 #[derive(Clone, Debug)]
 pub struct Pipe {
     outgoing: Arc<Queue>,
@@ -476,6 +558,35 @@ impl Pipe {
             incoming: Arc::new(Queue::new(config.incoming)),
             refusals: Arc::new(Refusals::default()),
         }
+    }
+
+    /// Two pipes with their halves crossed: what one side sends, the other
+    /// receives.
+    ///
+    /// The pairing the public API cannot express — see the type's own
+    /// documentation for why — and the whole of what a harness driving two
+    /// sessions against each other needs, since both halves are just
+    /// `Arc<Queue>` and the crossing is which `Arc` each end holds.
+    /// `config.outgoing` bounds the first pipe's outgoing direction and hence
+    /// the second's incoming one, and `config.incoming` the other way round.
+    /// The `ERROR` channels stay separate: a refusal is one connection's, and
+    /// there are two here.
+    #[cfg(test)]
+    pub(crate) fn crossed(config: PipeConfig) -> (Pipe, Pipe) {
+        let there = Arc::new(Queue::new(config.outgoing));
+        let back = Arc::new(Queue::new(config.incoming));
+        (
+            Pipe {
+                outgoing: Arc::clone(&there),
+                incoming: Arc::clone(&back),
+                refusals: Arc::new(Refusals::default()),
+            },
+            Pipe {
+                outgoing: back,
+                incoming: there,
+                refusals: Arc::new(Refusals::default()),
+            },
+        )
     }
 
     /// The queue of messages headed for this peer.
@@ -574,6 +685,7 @@ fn sanitize(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     fn queue(hwm: usize, mute: MuteAction) -> Arc<Queue> {
@@ -582,6 +694,23 @@ mod tests {
 
     fn message(body: &str) -> Multipart {
         Multipart::single(body)
+    }
+
+    /// Polls `future` by hand, with a waker that does nothing, exactly as
+    /// often as one wake is worth: once to let it register and check — the
+    /// armed window fires inside that poll — and once more for the wake it
+    /// is owed. `None` is the lost wakeup: the event happened and the waiter
+    /// is still asleep, which is what no amount of further polling would
+    /// change.
+    fn poll_through_the_window<F: Future>(future: F) -> Option<F::Output> {
+        let mut future = std::pin::pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..2 {
+            if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+                return Some(out);
+            }
+        }
+        None
     }
 
     /// Claim: the mute-state column of `zmq_socket(3)`'s table, row for row,
@@ -849,6 +978,40 @@ mod tests {
         assert!(same.incoming().is_closed());
     }
 
+    /// Claim: crossed pipes carry in both directions — what one side puts
+    /// into `outgoing` is what the other takes out of `incoming`, which is
+    /// the pairing a harness for two sessions needs and the one `Pipe::new`
+    /// cannot produce. Sharing a single pipe instead makes both ends pop the
+    /// same queue, so half the traffic arrives where nobody is looking.
+    #[tokio::test]
+    async fn crossed_pipes_carry_in_both_directions() {
+        let (here, there) = Pipe::crossed(PipeConfig::default());
+
+        here.outgoing()
+            .send(message("to the other side"))
+            .await
+            .expect("queued");
+        assert_eq!(
+            there.incoming().recv().await.expect("arrived"),
+            message("to the other side")
+        );
+
+        there
+            .outgoing()
+            .send(message("and back"))
+            .await
+            .expect("queued");
+        assert_eq!(
+            here.incoming().recv().await.expect("arrived"),
+            message("and back")
+        );
+
+        // Each end's `ERROR` channel is its own: a refusal belongs to one
+        // connection, and a crossed pair stands in for two.
+        here.refuse("no");
+        assert!(there.refusals.reasons.lock().expect("refusals").is_empty());
+    }
+
     /// Claim: a queue holds whole messages, so multipart survives the trip
     /// frame for frame and cannot be interleaved with another message.
     #[tokio::test]
@@ -866,5 +1029,85 @@ mod tests {
         assert_eq!(first, envelope);
         assert_eq!(first.len(), 2);
         assert_eq!(q.recv().await.expect("second"), Multipart::single("other"));
+    }
+
+    // The four waits, against the window B-087 closed — and what the window
+    // measured, which is not quite what that fix claimed.
+    //
+    // The hazard is inside a *single poll*: nothing else on this thread runs
+    // between a wait's check and its await, so it is not reachable through
+    // the public surface at all, and the `Window` hook exists to occupy that
+    // instant deterministically instead of racing a second thread for it.
+    //
+    // What fails without the fix is the shape that creates the `Notified`
+    // **below** the check — `self.ready.notified().await` after an empty
+    // read, the obvious simplification of all four of these loops: all four
+    // tests then report the message or the room that never woke anybody.
+    // What does **not** fail is dropping `enable()` alone while the
+    // `notified()` stays above the check, and that is worth writing down
+    // rather than assuming: `Notified` snapshots the count of
+    // `notify_waiters()` calls when it is *constructed* and its first poll
+    // completes if the count moved (tokio 1.53.1, `sync/notify.rs:569` and
+    // `:1121`), so construction — not `enable()` — is what covers the window
+    // for a `notify_waiters()`. `enable()` is still what makes that
+    // registration explicit rather than a detail of tokio's, and it is what
+    // a `notify_one()` would require, so it stays and these tests hold the
+    // creation point above the check.
+
+    /// Claim: a message queued in the instant between a receiver's check and
+    /// its await still wakes that receiver — the message must not sit in the
+    /// queue while its reader sleeps.
+    #[test]
+    fn a_message_arriving_in_the_window_wakes_a_receiver() {
+        let q = queue(4, MuteAction::Block);
+        Queue::arm_window();
+        let received = poll_through_the_window(q.recv())
+            .expect("a message queued in the window must wake the receiver")
+            .expect("the receive");
+        assert_eq!(received, message(WINDOW_BODY));
+        assert!(q.is_empty(), "the woken receiver took the message");
+    }
+
+    /// Claim: the same window, for the wait a fair-queueing receiver races
+    /// one of per peer.
+    #[test]
+    fn a_message_arriving_in_the_window_ends_a_wait_for_a_message() {
+        let q = queue(4, MuteAction::Block);
+        Queue::arm_window();
+        poll_through_the_window(q.wait_for_message())
+            .expect("a message queued in the window must end the wait");
+        assert_eq!(q.len(), 1, "the wait ended on a message that is there");
+    }
+
+    /// Claim: room freed in the instant between a blocked sender's check and
+    /// its await still wakes that sender — the backpressure half of the same
+    /// hazard, and the reason a reply could sit in a queue while its session
+    /// slept.
+    #[test]
+    fn room_freed_in_the_window_wakes_a_blocked_sender() {
+        let q = queue(1, MuteAction::Block);
+        q.try_send(message("filling the bound")).expect("filling");
+        Queue::arm_window();
+        let sent = poll_through_the_window(q.send(message("blocked")))
+            .expect("room freed in the window must wake the sender")
+            .expect("the send");
+        assert_eq!(sent, Sent::Queued);
+        assert_eq!(
+            q.len(),
+            1,
+            "the window took one out and the send put one in"
+        );
+    }
+
+    /// Claim: the same window, for the wait a sender choosing between peers
+    /// races one of per peer.
+    #[test]
+    fn room_freed_in_the_window_ends_a_wait_for_room() {
+        let q = queue(1, MuteAction::Block);
+        q.try_send(message("filling the bound")).expect("filling");
+        Queue::arm_window();
+        poll_through_the_window(q.wait_for_room())
+            .expect("room freed in the window must end the wait");
+        assert!(q.has_room(), "the wait ended on room that is there");
     }
 }

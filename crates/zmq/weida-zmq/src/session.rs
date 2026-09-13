@@ -67,6 +67,13 @@ const PING_CONTEXT: &[u8] = b"weida-zmq";
 /// Constructed with the socket type it announces, because that is the one
 /// thing about the handshake that differs per pattern: `Socket-Type` in our
 /// `READY`, and the compatibility check against the peer's.
+///
+/// Run against a *socket's* pipe and never against another session of this
+/// crate: a pipe is oriented from the socket's side, so pairing two sessions
+/// needs two pipes with crossed halves and [`crate::pipe::Pipe`] has no
+/// constructor that builds one. The diagnosis is on that type and on the
+/// `drive` this delegates to; a harness that wants the pairing has
+/// `Pipe::crossed` under `cfg(test)`.
 #[derive(Clone, Debug)]
 pub struct ZmtpSession {
     socket_type: SocketType,
@@ -133,6 +140,23 @@ pub struct Negotiated {
     pub user_id: Option<ZapUserId>,
 }
 
+/// Runs one connection: handshake, then pump until it ends.
+///
+/// **The pipe is the socket's end, not the peer's**, and that is what defeats
+/// a harness of two sessions driven against each other over a TCP pair. This
+/// pumps *against* the pipe's orientation — it pops [`crate::pipe::Pipe`]'s
+/// `outgoing` onto the wire and pushes what it reads into `incoming` — so two
+/// sessions can only be paired through two pipes whose halves are crossed,
+/// one's `outgoing` being the other's `incoming`. `Pipe::new` is the only
+/// public constructor and builds both queues itself, so that crossing cannot
+/// be expressed through the public API; handing both sessions the same pipe,
+/// the obvious substitute, makes them pop the same `outgoing` queue and push
+/// the same `incoming` one, and a message is then raced by both readers and
+/// never arrives where the test looks. Nothing here is broken by it — the
+/// engine pairs a session with a *socket*, one pipe per peer with the socket
+/// holding the other end, which is why every socket-level test over TCP
+/// delivers, `tests/plain_zap.rs` included. A harness that wants the pairing
+/// anyway takes `Pipe::crossed`, which exists under `cfg(test)`.
 async fn drive(
     ours: SocketType,
     mine: Option<Arc<Subscriptions>>,
