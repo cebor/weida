@@ -340,7 +340,7 @@ exactly [0007 §4.1].
 | --- | --- | --- |
 | Compatible peer | `Subscriber` | `Publisher` |
 | Direction | binds | connects |
-| Send/receive pattern | `publish(topic, bytes)`: synchronous, returns the number of subscribers reached | `subscribe`/`unsubscribe`, then `recv` |
+| Send/receive pattern | `publish(topic, bytes)`: synchronous, returns the number of subscribers reached; `open(topic)` for a payload written chunk by chunk (§4.1) | `subscribe`/`unsubscribe`, then `recv` |
 | Incoming routing | — | one bounded queue (`endpoint_queue`) over every peer |
 | Outgoing routing | fan-out to every subscriber whose filter matches, one copy each | — |
 | Action with no peer | `publish` returns `0`; nothing is queued for a subscriber that does not exist yet | `recv` waits; `peer_count` is the only sign that the publisher is gone |
@@ -348,7 +348,7 @@ exactly [0007 §4.1].
 | Ordering | `None`; one subscriber's copies are enqueued in publication order, but that is not a guarantee | |
 | Delivery signal | none, and none is possible: `publish` never awaits a subscriber | none |
 | Backpressure | `Drop`: a copy that does not fit in `subscriber_buffer_bytes` for that subscriber is dropped and counted in `dropped()`, and per topic and cause in `dropped_on(topic)` / `drops()` — budget, full queue, or no parked connection on a socket transport — so a starving signal can be named rather than inferred; the publisher never blocks | a subscriber that stops reading fills its budget at the publisher and then loses messages |
-| Payload | whole `Bytes`, at most `subscriber_buffer_bytes`; larger is `LimitExceeded` before fan-out | |
+| Payload | whole `Bytes`, at most `subscriber_buffer_bytes`; larger is `LimitExceeded` before fan-out — **or unbounded through `open`**, where the budget bounds one chunk (§4.1) | |
 
 Failure modes:
 
@@ -359,6 +359,7 @@ Failure modes:
 | Publisher's connection lost | — | `recv` keeps waiting; filters are remembered and re-sent on the next `connect` |
 | Too many filters on one connection | closes it with `LIMIT_EXCEEDED` | `connect`/`subscribe` fails |
 | Message beyond the budget | `LimitExceeded`, nothing sent | — |
+| Streamed transfer a subscriber cannot keep up with | that subscriber's stream is reset with `CANCELED` and the drop counted; the others keep receiving | a partial payload, ended by a reset rather than a FIN, so it is never mistaken for a whole one |
 
 This is the one place weida answers overload by discarding, and it is confined to fan-out
 ([GUARANTEES.md](GUARANTEES.md) §6). Today a subscriber cannot detect a drop; **subscriber-side
@@ -371,11 +372,37 @@ drops on purpose. The reassemble level holds messages instead, bounded by
 the cap, at the buffer cost measured in [IMPLEMENTATION.md](IMPLEMENTATION.md) §4 (B-010).
 Both are **on the wire and implemented**: DATA keys 6 and 7 carry the sequence and the
 producer ([PROTOCOL.md](PROTOCOL.md) §6.2), and a fan-out drop reaches a detecting
-subscriber as a `Gap`. Streaming fan-out — a publisher that hands out a stream per
-subscriber instead of a `Bytes` — is a recorded deferral.
+subscriber as a `Gap`.
 *`slow_subscriber_drops_not_blocks`, `subscribe_filters_topics_by_segment`,
 `a_dropped_fan_out_copy_shows_up_as_a_gap`,
 `a_full_hold_reports_the_pub_sub_drop_it_was_waiting_for`.*
+
+### 4.1 Streaming fan-out: a payload the publisher never holds
+
+`Publisher::open(topic)` returns a `FanOut`: one stream per matched subscriber, written
+chunk by chunk. It exists because `publish` takes a whole `Bytes` and refuses anything above
+`subscriber_buffer_bytes` — so a 33 MB video frame could not be published at all, and
+raising the limit would have bought a per-subscriber copy of it inside the publisher, which
+is exactly the materialization [INVARIANTS.md](INVARIANTS.md) forbids (B-064,
+[requirements/zeughaus-video.md](requirements/zeughaus-video.md) request 1). With `open` the
+budget bounds a **chunk**, one `Bytes` allocation is shared by every copy, and the payload
+has no ceiling.
+
+| | What it does |
+| --- | --- |
+| `write_within(chunk, limit)` | waits up to `limit` for a subscriber with no room, then drops **that** subscriber's copy. The bound is mandatory and finite for the reason `drain(Duration)`'s is ([decisions/0009](decisions/0009-drain.md) §4.4): an unbounded wait is how a publisher hangs on a peer, and never waiting would make a payload larger than the budget undeliverable to anybody — the publisher would outrun its own budget and abort every copy |
+| `write_now(chunk)` | never waits: a subscriber without room right now loses the transfer. Fan-out's `Drop` in its purest form, and the right call where a later chunk supersedes an earlier one |
+| `finish()` | FIN on every remaining copy; returns how many subscribers got all of it as far as this side can tell. A fan-out copy carries no receipt, so the acknowledgement is the drain's business and nobody else's |
+| dropping the handle | resets every copy, so no subscriber mistakes a partial payload for a whole one |
+
+Two things are deliberately unlike `publish`. The subscriber set is **fixed at `open`**: a
+subscriber that arrives mid-payload would receive a fragment with no way to know it, so it
+gets the next message. And the drop is per subscriber and per *transfer* rather than per
+message — a subscriber that misses one chunk loses the whole payload, because half a frame is
+not a frame. Both are counted exactly like any other fan-out drop, in `dropped_on(topic)`.
+*`a_streamed_publish_carries_a_payload_no_publish_could_take`,
+`a_streamed_publish_drops_the_subscriber_that_stalls_and_keeps_the_other`,
+`a_streamed_publish_that_never_waits_drops_at_the_budget`.*
 
 ---
 
@@ -417,6 +444,6 @@ publishers and binding pushers are recorded deferrals.
 | work distributed over workers, nothing lost under load | Push/Pull | backpressure is `Block`; the only losses are explicit refusals and `Indeterminate` after a loss (§3) |
 | the newest of a feed, many readers, laggards may lose | Pub/Sub | drops are per subscriber and counted (§4) |
 | ordered messages to one peer | a raw stream | QUIC orders bytes within a stream and nowhere else (§1.7, §5) |
-| a signal larger than `subscriber_buffer_bytes` to many readers | a raw stream per reader, until streaming fan-out exists | Pub/Sub materializes a copy per subscriber (§4) |
+| a signal larger than `subscriber_buffer_bytes` to many readers | `Publisher::open`, which streams one per subscriber (§4.1) | `publish` takes a whole `Bytes` and refuses it; `open` bounds a chunk instead (B-064) |
 | proof the peer's application acted | Req/Rep, or an L2 broker (Phase 6) | a transport receipt never says that (§1.2); `Accepted`/`Stored`/`Processed` are reserved for a hop that owns the message |
 | to know whether the receiver accepted it | Req/Rep | a one-way refusal can lose the race with the receipt and then reaches no observer (§1.6, [decisions/0005](decisions/0005-refusal-race.md) §4.3) |

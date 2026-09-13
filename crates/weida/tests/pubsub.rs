@@ -426,6 +426,213 @@ async fn a_payload_larger_than_the_budget_is_refused() {
     assert!(matches!(err, Error::LimitExceeded), "{err:?}");
 }
 
+/// B-064: the payload `publish` refuses is an ordinary streamed publish, and
+/// two subscribers both get all of it.
+#[tokio::test]
+async fn a_streamed_publish_carries_a_payload_no_publish_could_take() {
+    const BUDGET: usize = 64 * 1024;
+    const CHUNK: usize = 16 * 1024;
+    const CHUNKS: usize = 64;
+
+    let server = Server::start_with(Limits {
+        subscriber_buffer_bytes: BUDGET,
+        ..Limits::default()
+    })
+    .await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+
+    // The whole payload is sixteen times the budget: `publish` cannot take
+    // it at all, which is the premise of the item.
+    let whole = vec![0xa5u8; CHUNK * CHUNKS];
+    assert!(
+        matches!(
+            publisher.publish("px.eur", whole.clone()).unwrap_err(),
+            Error::LimitExceeded
+        ),
+        "the whole-payload publish must still refuse what cannot be enqueued"
+    );
+
+    let first_rt = server.client_runtime();
+    let second_rt = server.client_runtime();
+    let first = first_rt.subscriber(server.trust());
+    let second = second_rt.subscriber(server.trust());
+    within(first.connect(&server.url("/md")))
+        .await
+        .expect("connect first");
+    within(second.connect(&server.url("/md")))
+        .await
+        .expect("connect second");
+    within(first.subscribe("px.#")).await.expect("subscribe");
+    within(second.subscribe("px.#")).await.expect("subscribe");
+    await_filters(&publisher, 2).await;
+
+    // Both subscribers read concurrently, so the 64 KiB budget cycles while
+    // the megabyte goes out.
+    let readers = tokio::spawn(async move {
+        let one = recv_one(&first).await;
+        let two = recv_one(&second).await;
+        (one, two)
+    });
+
+    let mut fan = publisher.open("px.eur");
+    assert_eq!(fan.subscribers(), 2);
+    assert_eq!(fan.topic(), "px.eur");
+    let chunk = vec![0xa5u8; CHUNK];
+    for _ in 0..CHUNKS {
+        // The budget is a sixteenth of the payload, so this waits for room
+        // repeatedly. Both subscribers are reading, so both keep the
+        // transfer.
+        let still = within(fan.write_within(chunk.clone(), DEADLINE))
+            .await
+            .expect("write");
+        assert_eq!(still, 2, "a reading subscriber must not lose the transfer");
+    }
+    assert_eq!(fan.finish(), 2);
+
+    let ((topic_one, body_one), (topic_two, body_two)) =
+        within(readers).await.expect("both subscribers");
+    assert_eq!(topic_one, "px.eur");
+    assert_eq!(topic_two, "px.eur");
+    assert_eq!(body_one.len(), CHUNK * CHUNKS);
+    assert_eq!(body_two, body_one);
+    assert_eq!(body_one, whole);
+    assert_eq!(publisher.dropped(), 0, "nobody was behind");
+}
+
+/// B-064: the drop is per subscriber, not per publish. One subscriber that
+/// never reads loses the streamed transfer; the other gets every byte, and
+/// the publisher never waits for the one that stalled.
+#[tokio::test]
+async fn a_streamed_publish_drops_the_subscriber_that_stalls_and_keeps_the_other() {
+    const BUDGET: usize = 64 * 1024;
+    const CHUNK: usize = 16 * 1024;
+    const CHUNKS: usize = 64;
+
+    let server = Server::start_with(Limits {
+        subscriber_buffer_bytes: BUDGET,
+        ..Limits::default()
+    })
+    .await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+
+    // Small windows, so a subscriber that never reads stops taking bytes
+    // instead of absorbing the payload in its transport.
+    let slow_rt = server.client_runtime_with(Limits {
+        connection_receive_window: 128 * 1024,
+        stream_receive_window: 64 * 1024,
+        ..Limits::default()
+    });
+    let fast_rt = server.client_runtime();
+    let slow = slow_rt.subscriber(server.trust());
+    let fast = fast_rt.subscriber(server.trust());
+    within(slow.connect(&server.url("/md")))
+        .await
+        .expect("connect slow");
+    within(fast.connect(&server.url("/md")))
+        .await
+        .expect("connect fast");
+    within(slow.subscribe("")).await.expect("subscribe slow");
+    within(fast.subscribe("")).await.expect("subscribe fast");
+    await_filters(&publisher, 2).await;
+
+    let reader = tokio::spawn(async move { recv_one(&fast).await });
+
+    // The whole loop is inside the deadline: a publisher that waited for the
+    // stalled subscriber would time out here instead of dropping it.
+    // A short per-chunk bound: the reading subscriber frees room inside it
+    // every time, the one that never reads never does. Short enough that 64
+    // chunks fit the test's own deadline even if every one of them waits.
+    let squeeze = Duration::from_millis(100);
+    let (remaining, delivered) = within(async {
+        let mut fan = publisher.open("px.eur");
+        assert_eq!(fan.subscribers(), 2);
+        let chunk = vec![0x5au8; CHUNK];
+        let mut remaining = 2;
+        for _ in 0..CHUNKS {
+            remaining = fan
+                .write_within(chunk.clone(), squeeze)
+                .await
+                .expect("write");
+        }
+        let delivered = fan.finish();
+        (remaining, delivered)
+    })
+    .await;
+
+    assert_eq!(
+        remaining, 1,
+        "the subscriber that never read must lose this transfer and the other must keep it"
+    );
+    assert_eq!(delivered, 1);
+
+    let (topic, body) = within(reader).await.expect("the reading subscriber");
+    assert_eq!(topic, "px.eur");
+    assert_eq!(body.len(), CHUNK * CHUNKS);
+    assert!(
+        publisher.dropped() >= 1,
+        "the abandoned copy is counted like any other fan-out drop"
+    );
+    let drops = publisher
+        .dropped_on("px.eur")
+        .expect("the topic that lost a copy");
+    assert_eq!(drops.total(), 1, "one copy, counted once: {drops:?}");
+}
+
+/// B-064: `write_now` is fan-out's `Drop` without a wait — the right call
+/// where a later chunk supersedes an earlier one. A subscriber that is not
+/// keeping up loses the transfer at the budget rather than slowing the
+/// publisher by even a bounded wait.
+#[tokio::test]
+async fn a_streamed_publish_that_never_waits_drops_at_the_budget() {
+    const BUDGET: usize = 64 * 1024;
+    const CHUNK: usize = 16 * 1024;
+
+    let server = Server::start_with(Limits {
+        subscriber_buffer_bytes: BUDGET,
+        ..Limits::default()
+    })
+    .await;
+    let publisher = server.listener.publisher("/md").expect("publisher");
+
+    let client = server.client_runtime_with(Limits {
+        connection_receive_window: 128 * 1024,
+        stream_receive_window: 64 * 1024,
+        ..Limits::default()
+    });
+    let sub = client.subscriber(server.trust());
+    within(sub.connect(&server.url("/md")))
+        .await
+        .expect("connect");
+    within(sub.subscribe("")).await.expect("subscribe");
+    await_filters(&publisher, 1).await;
+
+    // Nobody reads, so the budget can only shrink. Every call returns at
+    // once: the whole loop is inside the deadline, and a `write_within` here
+    // would spend its bound on every chunk.
+    let mut fan = publisher.open("px.eur");
+    assert_eq!(fan.subscribers(), 1);
+    let chunk = vec![0x11u8; CHUNK];
+    let mut written = 0usize;
+    within(async {
+        while fan.write_now(chunk.clone()).expect("write") == 1 {
+            written += 1;
+        }
+    })
+    .await;
+
+    // The subscriber's transport absorbs some of it, so the exact count is
+    // the machine's; what is pinned is that the drop happened without a
+    // wait and was counted once, for this topic.
+    assert!(written >= 1, "the first chunks fit the budget");
+    assert_eq!(fan.subscribers(), 0);
+    assert_eq!(fan.finish(), 0);
+    let drops = publisher
+        .dropped_on("px.eur")
+        .expect("the topic that lost the copy");
+    assert_eq!(drops.total(), 1, "{drops:?}");
+    assert_eq!(drops.subscriber_budget, 1);
+}
+
 #[tokio::test]
 async fn publishing_to_nobody_is_not_an_error() {
     let server = Server::start().await;

@@ -1079,8 +1079,14 @@ versions.
   is broker work and has no v0 representation. Pair patterns are likewise unspecified.
 - **Connecting publishers and binding pushers.** In v0 Rep, Pull and Pub bind while Req,
   Push and Sub connect. The reverse directions have no v0 representation.
-- **Streaming fan-out.** A publisher sends whole messages (§9.5). Tee-ing one long stream
-  to many subscribers needs its own drop and ordering design and is not specified.
+- **Nothing for streaming fan-out**, because it needed nothing. A publisher can write one
+  stream per subscriber chunk by chunk (`Publisher::open`, B-064,
+  [PATTERNS.md](PATTERNS.md) §4.1), and that is the same DATA frame on the same
+  unidirectional stream as §9.5's whole message with the `content_len` key absent — a
+  subscriber reads to FIN, as it does for every streamed transfer. What the drop looks like
+  is `RESET_STREAM(CANCELED)` on that subscriber's stream and nothing on anybody else's,
+  which is §7's existing vocabulary. The design the deferral expected — a wire construct for
+  tee-ing — did not exist to be added.
 - **Ordering and deduplication beyond what is negotiated.** The sequence and producer keys
   of §6.2 are coded, pinned (§8) and now acted on: a peer that negotiated `PerProducer`
   numbers its one-way transfers and, in `detect`, reports gaps, or, in `reassemble`, holds

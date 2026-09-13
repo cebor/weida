@@ -200,6 +200,11 @@ resume at the current frame, never replay a backlog.
    equivalent). Without it, push-based frames are impossible at any size above
    `subscriber_buffer_bytes`, and raising that limit trades the problem for a
    per-subscriber 33 MB copy. Already a recorded Phase 3 deferral.
+   **Delivered (B-064):** `Publisher::open(topic)` returns a `FanOut` written
+   with `write_within(chunk, limit)` or `write_now(chunk)`; the budget bounds a
+   chunk rather than the payload, one `Bytes` is shared by every copy, and a
+   subscriber that cannot keep up loses that transfer alone
+   ([PATTERNS.md](../PATTERNS.md) §4.1).
 2. **A conflating queue** -- the planned `Coalescing(key)`. Not needed for a
    private stream per viewer (the runtime holds only the newest frame, so the
    conflation is free), but the moment fan-out exists it does: one publisher and

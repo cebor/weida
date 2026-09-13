@@ -641,7 +641,9 @@ the pool is not a special case: nothing above the transport knows it is there. 1
 - Connecting publishers and binding pushers; v0 fixes Pub/Pull as binders and Sub/Push as
   connectors.
 - Streaming fan-out — tee-ing one long stream to many subscribers needs its own drop and
-  ordering design.
+  ordering design. **Delivered later as B-064** (`Publisher::open`, §4.1 of
+  [PATTERNS.md](PATTERNS.md)): the drop design turned out to be the per-subscriber drop this
+  increment already had, applied per transfer instead of per message.
 - Per-producer ordering. Ordering is `None` for both new patterns; a sequence field would
   be a protocol addition, not an implementation detail.
 - Coalescing backpressure (master doc §27); only `Block`, `Reject` and fan-out `Drop` exist.

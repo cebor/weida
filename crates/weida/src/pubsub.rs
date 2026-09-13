@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
+use tokio::sync::mpsc::OwnedPermit;
 use tokio::sync::{Semaphore, mpsc};
 use weida_core::{Error, Limits, TraceContext};
 use weida_protocol::header::OrderingMode;
@@ -25,6 +26,8 @@ use weida_protocol::{DataHeader, filter};
 use crate::conn::ConnHandle;
 use crate::ordering::Sequencer;
 use crate::transfer::write_data_preamble;
+use crate::transport::SendHalf;
+use weida_protocol::codes;
 
 /// Messages one subscriber's writer task may hold. The real bound is the byte
 /// budget; this only keeps the channel itself from growing without limit when
@@ -91,12 +94,36 @@ struct PubMsg {
     sequence: Option<u64>,
 }
 
+/// What one subscriber's writer is told to do.
+///
+/// A whole message is one item, which is what [`SubRegistry::publish`] sends.
+/// A **streamed** publish ([`SubRegistry::open`], B-064) is `Begin`, then a
+/// `Chunk` per piece, then `Finish` — so a payload the publisher never
+/// materializes still becomes one stream per subscriber, and the per-chunk
+/// byte budget is what bounds this side rather than the payload's size.
+enum PubItem {
+    /// A message whose payload is already in memory: open, write, finish.
+    Whole(PubMsg),
+    /// Opens a stream for a streamed transfer and writes its DATA header,
+    /// which carries no `content_len` because nobody knows it yet.
+    Begin { id: u64, head: PubMsg },
+    /// The next piece of the streamed transfer `id`.
+    Chunk { id: u64, payload: Bytes },
+    /// The end of `id`: FIN, and the receipt parked for the drain.
+    Finish { id: u64 },
+    /// `id` will not be completed — a chunk did not fit this subscriber's
+    /// budget, or the publisher dropped the handle. The stream is reset, so
+    /// the subscriber discards a partial payload instead of waiting for a FIN
+    /// that will never arrive.
+    Abort { id: u64 },
+}
+
 /// One subscribing connection's state for one publisher path.
 struct SubEntry {
     /// `quinn::Connection::stable_id`, the identity a SUBSCRIBE arrives with.
     conn_id: usize,
     filters: HashSet<String>,
-    tx: mpsc::Sender<PubMsg>,
+    tx: mpsc::Sender<PubItem>,
     /// Payload bytes this subscriber may hold queued. Permits are taken by
     /// `publish` and returned by the writer once the bytes are on the wire.
     budget: Arc<Semaphore>,
@@ -253,6 +280,10 @@ pub(crate) struct SubRegistry {
     /// copy visible as a gap: the survivors keep the numbers the lost ones
     /// would have had.
     sequencer: Sequencer,
+    /// Names one streamed publish, so a writer can tell the chunks of two
+    /// concurrent ones apart. Local and never on the wire: what identifies a
+    /// transfer to a subscriber is the stream it arrives on.
+    next_stream: AtomicU64,
 }
 
 impl SubRegistry {
@@ -262,6 +293,7 @@ impl SubRegistry {
             per_conn: RwLock::new(HashMap::new()),
             limits,
             sequencer: Sequencer::new(ordering),
+            next_stream: AtomicU64::new(0),
         }
     }
 
@@ -397,7 +429,7 @@ impl SubRegistry {
                 trace,
                 sequence,
             };
-            match entry.tx.try_send(msg) {
+            match entry.tx.try_send(PubItem::Whole(msg)) {
                 Ok(()) => {
                     // The writer returns the permits once the bytes are gone.
                     permit.forget();
@@ -411,6 +443,61 @@ impl SubRegistry {
             }
         }
         sent
+    }
+
+    /// Opens a streamed publish: one stream per matched subscriber, written
+    /// chunk by chunk and never materialized whole.
+    ///
+    /// The subscriber set is fixed here, at `open`, because a stream is a
+    /// stream: a subscriber that arrives mid-payload would receive a fragment
+    /// and could not be told where it started. It gets the next message.
+    pub(crate) fn open(&self, path: &str, topic: &str, trace: TraceContext) -> FanOut {
+        let paths = self.paths.read().expect("subscription lock poisoned");
+        let topic: Arc<str> = Arc::from(topic);
+        let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
+        let Some(state) = paths.get(path) else {
+            return FanOut::empty(id, topic);
+        };
+        // One number for the message, as `publish` does: a subscriber whose
+        // copy is aborted below leaves a hole rather than renumbering.
+        let sequence = self.sequencer.next(&topic);
+        let mut targets = Vec::new();
+        for entry in &state.subs {
+            if !entry.filters.iter().any(|f| matches_filter(&topic, f)) {
+                continue;
+            }
+            // The permit for the ending — `Finish` or `Abort` — is taken
+            // before the first chunk, so ending a transfer can never fail for
+            // want of queue room. Without it a subscriber whose queue filled
+            // mid-payload would hold an open stream waiting for a FIN nobody
+            // could enqueue.
+            let Ok(ending) = entry.tx.clone().try_reserve_owned() else {
+                state.drops.record(&topic, DropCause::SubscriberQueue);
+                continue;
+            };
+            let head = PubMsg {
+                topic: Arc::clone(&topic),
+                payload: Bytes::new(),
+                trace,
+                sequence,
+            };
+            if entry.tx.try_send(PubItem::Begin { id, head }).is_err() {
+                state.drops.record(&topic, DropCause::SubscriberQueue);
+                continue;
+            }
+            targets.push(Target {
+                tx: entry.tx.clone(),
+                budget: Arc::clone(&entry.budget),
+                ending: Some(ending),
+            });
+        }
+        FanOut {
+            id,
+            topic,
+            targets,
+            drops: Some(Arc::clone(&state.drops)),
+            finished: false,
+        }
     }
 
     /// Connections currently subscribed to `path`.
@@ -460,6 +547,226 @@ impl SubRegistry {
     }
 }
 
+/// One subscriber a streamed publish is writing to.
+struct Target {
+    tx: mpsc::Sender<PubItem>,
+    budget: Arc<Semaphore>,
+    /// The reserved slot for this copy's `Finish` or `Abort`. Always `Some`
+    /// until the transfer ends.
+    ending: Option<OwnedPermit<PubItem>>,
+}
+
+/// A publish in progress: a payload written once and fanned out to one stream
+/// per subscriber, without ever being held whole.
+///
+/// This is what [`Publisher::publish`](crate::Publisher::publish) cannot do:
+/// that call takes a `Bytes` and refuses anything above
+/// `Limits::subscriber_buffer_bytes`, because a message that large could not
+/// be enqueued for anybody. Here the **chunk** is what the budget bounds, so
+/// the payload is unbounded and a 33 MB frame is an ordinary publish
+/// (B-064, `docs/requirements/zeughaus-video.md` request 1).
+///
+/// **The drop behaviour of [GUARANTEES](../../../docs/GUARANTEES.md) §6 is
+/// per subscriber, not per publish.** A subscriber whose budget or queue
+/// cannot take a chunk loses *this* transfer — its stream is reset, so it
+/// never mistakes a partial payload for a whole one — and it is counted in
+/// [`Publisher::drops`](crate::Publisher::drops) like any other fan-out drop.
+/// Every other subscriber keeps receiving, and the publisher never waits for
+/// the slowest one.
+///
+/// Dropping this handle without [`FanOut::finish`] aborts every copy, for the
+/// same reason [`OutgoingTransfer`](crate::OutgoingTransfer) resets on drop.
+pub struct FanOut {
+    id: u64,
+    topic: Arc<str>,
+    targets: Vec<Target>,
+    /// `None` only for a fan-out with no subscribers at all, which has
+    /// nothing to count against.
+    drops: Option<Arc<DropTable>>,
+    finished: bool,
+}
+
+impl FanOut {
+    fn empty(id: u64, topic: Arc<str>) -> FanOut {
+        FanOut {
+            id,
+            topic,
+            targets: Vec::new(),
+            drops: None,
+            finished: false,
+        }
+    }
+
+    /// The topic this transfer is published on.
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    /// Subscribers still receiving this transfer.
+    ///
+    /// It only falls: a subscriber that loses a chunk is gone from this
+    /// transfer, and one that subscribes while it is in flight receives the
+    /// next message rather than half of this one.
+    pub fn subscribers(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// Writes the next chunk to every subscriber still receiving, waiting up
+    /// to `limit` for one that has no room, and returns how many subscribers
+    /// are left.
+    ///
+    /// **The bound is mandatory and finite, and it is the caller's**, for the
+    /// reason [`Runtime::drain`](crate::Runtime::drain) takes one
+    /// (`docs/decisions/0009-drain.md` §4.4): waiting on a subscriber with no
+    /// deadline is how a publisher hangs on a peer's behaviour, and refusing
+    /// to wait at all would make a payload larger than
+    /// `Limits::subscriber_buffer_bytes` impossible to send to anyone —
+    /// the publisher would outrun its own budget and abort every copy. A
+    /// subscriber that frees room inside `limit` keeps the transfer; one that
+    /// does not loses it, and only it.
+    ///
+    /// One `Bytes` allocation is shared by every copy, so a chunk costs one
+    /// buffer regardless of subscriber count, and the payload is never held
+    /// whole anywhere.
+    ///
+    /// Fails with [`Error::LimitExceeded`] for a chunk larger than
+    /// `Limits::subscriber_buffer_bytes`: such a chunk could never be
+    /// enqueued for anybody, and the point of this API is that the *payload*
+    /// need not fit while a chunk does.
+    pub async fn write_within(
+        &mut self,
+        chunk: impl Into<Bytes>,
+        limit: std::time::Duration,
+    ) -> Result<usize, Error> {
+        let chunk = chunk.into();
+        let want = u32::try_from(chunk.len()).map_err(|_| Error::LimitExceeded)?;
+        let mut kept = Vec::with_capacity(self.targets.len());
+        for mut target in std::mem::take(&mut self.targets) {
+            let budget = Arc::clone(&target.budget);
+            let acquired = tokio::select! {
+                permit = tokio::time::timeout(limit, budget.acquire_many_owned(want)) => {
+                    match permit {
+                        Ok(Ok(permit)) => Some(permit),
+                        // Timed out, or the semaphore is closed.
+                        _ => None,
+                    }
+                }
+                // The writer task is gone — the connection closed — so no
+                // permit will ever come back. Without this arm the wait would
+                // run to `limit` for a subscriber that cannot exist.
+                () = target.tx.closed() => None,
+            };
+            let Some(permit) = acquired else {
+                self.abort_one(&mut target, DropCause::SubscriberBudget);
+                continue;
+            };
+            match self.enqueue(&target, &chunk) {
+                Ok(()) => {
+                    // The writer returns the permits once the bytes are gone.
+                    permit.forget();
+                    kept.push(target);
+                }
+                Err(()) => {
+                    // Dropping the permit returns the budget immediately.
+                    drop(permit);
+                    self.abort_one(&mut target, DropCause::SubscriberQueue);
+                }
+            }
+        }
+        self.targets = kept;
+        Ok(self.targets.len())
+    }
+
+    /// Writes the next chunk without ever waiting: a subscriber with no room
+    /// right now loses the transfer.
+    ///
+    /// Fan-out's `Drop` from [GUARANTEES](../../../docs/GUARANTEES.md) §6 in
+    /// its purest form, and the right call where a later chunk supersedes an
+    /// earlier one — a video frame, a market snapshot — because a subscriber
+    /// that cannot keep up should be waiting for the *next* transfer rather
+    /// than holding this one up. A publisher streaming a payload that must
+    /// arrive whole wants [`FanOut::write_within`].
+    pub fn write_now(&mut self, chunk: impl Into<Bytes>) -> Result<usize, Error> {
+        let chunk = chunk.into();
+        let want = u32::try_from(chunk.len()).map_err(|_| Error::LimitExceeded)?;
+        let mut kept = Vec::with_capacity(self.targets.len());
+        for mut target in std::mem::take(&mut self.targets) {
+            let Ok(permit) = target.budget.try_acquire_many(want) else {
+                self.abort_one(&mut target, DropCause::SubscriberBudget);
+                continue;
+            };
+            match self.enqueue(&target, &chunk) {
+                Ok(()) => {
+                    permit.forget();
+                    kept.push(target);
+                }
+                Err(()) => {
+                    drop(permit);
+                    self.abort_one(&mut target, DropCause::SubscriberQueue);
+                }
+            }
+        }
+        self.targets = kept;
+        Ok(self.targets.len())
+    }
+
+    /// Hands one chunk to one subscriber's writer. `Err` means the writer's
+    /// queue is full or gone; the caller aborts that copy.
+    fn enqueue(&self, target: &Target, chunk: &Bytes) -> Result<(), ()> {
+        let item = PubItem::Chunk {
+            id: self.id,
+            payload: chunk.clone(),
+        };
+        target.tx.try_send(item).map_err(|_| ())
+    }
+
+    /// Ends the transfer, and returns how many subscribers received all of
+    /// it as far as this side can tell.
+    ///
+    /// "As far as this side can tell" is the honest claim: the count is the
+    /// subscribers whose every chunk was enqueued and whose FIN is queued
+    /// behind them. A fan-out copy carries no receipt — nobody holds a
+    /// `Delivery` for it — so the transport acknowledgement is awaited by the
+    /// drain and by nothing else (`docs/decisions/0009-drain.md` §4.2).
+    pub fn finish(mut self) -> usize {
+        self.finished = true;
+        let id = self.id;
+        let delivered = self.targets.len();
+        for target in &mut self.targets {
+            if let Some(ending) = target.ending.take() {
+                ending.send(PubItem::Finish { id });
+            }
+        }
+        delivered
+    }
+
+    /// Aborts one subscriber's copy, counting the cause.
+    fn abort_one(&self, target: &mut Target, cause: DropCause) {
+        if let Some(drops) = &self.drops {
+            drops.record(&self.topic, cause);
+        }
+        if let Some(ending) = target.ending.take() {
+            ending.send(PubItem::Abort { id: self.id });
+        }
+        tracing::debug!(topic = %self.topic, ?cause, "streamed fan-out copy aborted");
+    }
+}
+
+impl Drop for FanOut {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Abandoned mid-payload: reset every copy rather than leave a
+        // subscriber waiting for a FIN.
+        for target in &mut self.targets {
+            if let Some(ending) = target.ending.take() {
+                ending.send(PubItem::Abort { id: self.id });
+            }
+        }
+    }
+}
+
 fn decrement(counts: &mut HashMap<usize, usize>, conn_id: usize, by: usize) {
     if let Some(count) = counts.get_mut(&conn_id) {
         *count = count.saturating_sub(by);
@@ -476,41 +783,113 @@ fn decrement(counts: &mut HashMap<usize, usize>, conn_id: usize, by: usize) {
 async fn writer(
     ctx: ConnHandle,
     path: Arc<str>,
-    mut rx: mpsc::Receiver<PubMsg>,
+    mut rx: mpsc::Receiver<PubItem>,
     budget: Arc<Semaphore>,
     drops: Arc<DropTable>,
 ) {
+    // The streams of the streamed publishes currently in flight for this
+    // subscriber. Bounded by what this process opens, never by the peer: a
+    // remote party cannot make a publisher open a transfer.
+    let mut streaming: HashMap<u64, SendHalf> = HashMap::new();
     loop {
-        let msg = tokio::select! {
-            msg = rx.recv() => match msg {
-                Some(msg) => msg,
+        let item = tokio::select! {
+            item = rx.recv() => match item {
+                Some(item) => item,
                 None => break,
             },
             // Without this a subscriber on a dead connection would sit here
             // forever holding an `Arc<ConnCtx>`.
             _ = ctx.conn.closed() => break,
         };
-        let len = msg.payload.len();
-        let outcome = write_one(&ctx, &path, &msg).await;
-        budget.add_permits(len);
-        match outcome {
-            Ok(()) => {}
-            // The subscriber parked no connection for this copy. That is a
-            // drop of the copy, not a failure of the subscription: the pool
-            // refills and the next message may well go out
-            // ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
-            // §4.4). Counted exactly like an exhausted byte budget.
-            Err(Error::NoParkedConnection) => {
-                drops.record(&msg.topic, DropCause::NoParkedConnection);
-                tracing::debug!(path = %path, "no parked connection; copy dropped");
+        match item {
+            PubItem::Whole(msg) => {
+                let len = msg.payload.len();
+                let outcome = write_one(&ctx, &path, &msg).await;
+                budget.add_permits(len);
+                match outcome {
+                    Ok(()) => {}
+                    // The subscriber parked no connection for this copy. That
+                    // is a drop of the copy, not a failure of the
+                    // subscription: the pool refills and the next message may
+                    // well go out
+                    // ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
+                    // §4.4). Counted exactly like an exhausted byte budget.
+                    Err(Error::NoParkedConnection) => {
+                        drops.record(&msg.topic, DropCause::NoParkedConnection);
+                        tracing::debug!(path = %path, "no parked connection; copy dropped");
+                    }
+                    Err(e) => {
+                        tracing::debug!(path = %path, error = %e, "fan-out write failed; subscriber writer ending");
+                        break;
+                    }
+                }
             }
-            Err(e) => {
-                tracing::debug!(path = %path, error = %e, "fan-out write failed; subscriber writer ending");
-                break;
+            PubItem::Begin { id, head } => match begin_one(&ctx, &path, &head).await {
+                Ok(stream) => {
+                    streaming.insert(id, stream);
+                }
+                Err(Error::NoParkedConnection) => {
+                    drops.record(&head.topic, DropCause::NoParkedConnection);
+                    tracing::debug!(path = %path, "no parked connection; streamed copy dropped");
+                }
+                Err(e) => {
+                    tracing::debug!(path = %path, error = %e, "fan-out open failed; subscriber writer ending");
+                    break;
+                }
+            },
+            PubItem::Chunk { id, payload } => {
+                let len = payload.len();
+                // A chunk for a transfer whose stream is gone — the open
+                // failed, or a write did — is dropped here: the budget is
+                // still returned, because the publisher charged it.
+                if let Some(stream) = streaming.get_mut(&id)
+                    && let Err(e) = stream.write_all(&payload).await
+                {
+                    tracing::debug!(path = %path, error = %e, "streamed fan-out write failed");
+                    if let Some(mut stream) = streaming.remove(&id) {
+                        stream.reset(codes::CANCELED);
+                    }
+                }
+                budget.add_permits(len);
+            }
+            PubItem::Finish { id } => {
+                if let Some(mut stream) = streaming.remove(&id)
+                    && stream.finish().is_ok()
+                    && ctx.parked.park(stream.stopped())
+                {
+                    ctx.shared.drain.evict();
+                }
+            }
+            PubItem::Abort { id } => {
+                if let Some(mut stream) = streaming.remove(&id) {
+                    stream.reset(codes::CANCELED);
+                }
             }
         }
     }
+    // Whatever is still open was abandoned by the connection ending, not by
+    // the publisher: reset it so the subscriber does not wait for a FIN.
+    for (_, mut stream) in streaming {
+        stream.reset(codes::CANCELED);
+    }
     tracing::debug!(path = %path, "subscriber writer ended");
+}
+
+/// Opens one subscriber's stream for a streamed publish and writes its DATA
+/// header.
+///
+/// No `content_len`: the key is optional at the decoder
+/// (`docs/PROTOCOL.md` §6.2) and a streaming publisher does not know the
+/// length. A subscriber therefore reads until FIN, which is what every
+/// streamed transfer in weida does.
+async fn begin_one(ctx: &ConnHandle, path: &str, head: &PubMsg) -> Result<SendHalf, Error> {
+    let mut header = DataHeader::addressed(path);
+    header.topic = Some(head.topic.to_string());
+    header.traceparent = Some(head.trace.to_traceparent());
+    header.sequence = head.sequence;
+    let mut stream = ctx.open_uni().await?;
+    write_data_preamble(&mut stream, &header).await?;
+    Ok(stream)
 }
 
 async fn write_one(ctx: &ConnHandle, path: &str, msg: &PubMsg) -> Result<(), Error> {

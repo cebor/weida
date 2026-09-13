@@ -23,7 +23,7 @@ use weida_protocol::{FrameKind, SubscriptionHeader};
 use crate::config::ClientTls;
 use crate::conn::{ConnHandle, Ctl, write_control};
 use crate::listener::Route;
-use crate::pubsub::SubRegistry;
+use crate::pubsub::{FanOut, SubRegistry};
 use crate::runtime::RuntimeInner;
 use crate::stream::Peer;
 use crate::transfer::{
@@ -353,6 +353,36 @@ impl Publisher {
             .state
             .registry
             .publish(&self.state.path, topic, payload, trace, want))
+    }
+
+    /// Opens a streamed publish: one stream per matched subscriber, written
+    /// chunk by chunk.
+    ///
+    /// This is the fan-out for a payload that is not in memory and need not
+    /// be — a video frame read from a capture device, a file, a response body
+    /// being forwarded (B-064,
+    /// [requirements/zeughaus-video.md](../../../docs/requirements/zeughaus-video.md)
+    /// request 1). [`Publisher::publish`] refuses a payload above
+    /// `Limits::subscriber_buffer_bytes` because such a message could not be
+    /// enqueued for anybody; here that limit applies to a **chunk**, so the
+    /// payload has no ceiling at all.
+    ///
+    /// The subscriber set is fixed at this call: a subscriber that arrives
+    /// while the payload is in flight would receive a fragment with no way to
+    /// know it, so it gets the next message instead. Zero subscribers is not
+    /// an error, exactly as for [`Publisher::publish`].
+    ///
+    /// Every guarantee of [`Publisher::publish`] holds per subscriber rather
+    /// than per publish: see [`FanOut`].
+    pub fn open(&self, topic: &str) -> FanOut {
+        self.state
+            .registry
+            .open(&self.state.path, topic, new_trace_context())
+    }
+
+    /// Like [`Publisher::open`], propagating an existing trace context.
+    pub fn open_with_trace(&self, topic: &str, trace: TraceContext) -> FanOut {
+        self.state.registry.open(&self.state.path, topic, trace)
     }
 
     /// Connections currently subscribed to this publisher.
