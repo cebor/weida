@@ -114,15 +114,23 @@ flushed)` is a cursor over the same bytes as `Stored`, with the replica count at
 the one [0020 §4.5]'s streamed payload replication needs: "0..N replicated to a quorum" is what
 lets a 33 MB frame be replicated without any hop holding it whole.
 
-**4.3 Cursors ride the reply half of the exchange, as frame kind `6`.** The reply half **is** the
-correlation, so a cursor needs no identifier and Option D's `transfer_id` is not reintroduced.
-[PROTOCOL §4.1]'s rule changes from "either DATA or ERROR, exactly one frame, followed by FIN"
-to: **zero or more CURSOR frames, then exactly one DATA or ERROR, then FIN.** Kind `6` — the
-number [0016 §4.10] recorded as the first free one — is spent on this.
+**4.3 Cursors travel on their own unidirectional stream, as frame kind `6`.** The rule is one
+sentence — **a cursor never shares a stream with payload** — and
+[0024](0024-three-families-one-back-channel.md) §4.4 records why the first draft's answer (the
+exchange's reply half) fails: a DATA frame is "header followed by opaque payload bytes until FIN",
+so a responder that streams a reply while still reporting on the request would have to interleave
+control into payload, and a cursor about the *reply* direction has no carrier at all once the
+initiating half is finished.
 
-Its fields are the mirror of kind `5`: a level and an **absolute byte offset**, monotone per
-level at the receiver, idempotent under loss and reordering. One encoding, two directions: credit
-is a cursor the receiver *grants*, a completion is a cursor the receiver *reports*.
+So kind `6` — the number [0016 §4.10] recorded as the first free one — is a **uni** stream, as
+kind `5` is: a head frame naming the payload stream it reports about, then `(level, offset)`
+records until FIN. The level is §4.3a's `uint`; the offset is **absolute**, monotone per level at
+the receiver, idempotent under loss and reordering. One encoding, two directions: credit is a
+cursor the receiver *grants*, a completion is a cursor the receiver *reports*.
+
+[PROTOCOL §4.1] is therefore **unchanged** — a reply half still carries "either DATA or ERROR,
+exactly one frame, followed by FIN" — and this note is one stream kind, not a new rule about
+exchanges.
 
 **4.3a The level space is open, and weida interprets only its own half.** A fixed ladder cannot
 express what a consumer actually does — "written, then synced, then validated, then indexed" is
@@ -157,11 +165,11 @@ nothing waits on a cursor to make progress.
 
 Two consequences, both deliberate:
 
-- **A one-way transfer gets no cursors**, because it has no reply half — the trade [0018 §4.6]
-  names: "a producer that will not wait sends a one-way transfer and gets the transport receipt
-  and nothing more". [0024](0024-three-families-one-back-channel.md) §4.4 turns that into the
-  mechanism: **ordering cursors makes the transfer an exchange**, one stream a direction wider,
-  because a cursor that may be lost is not worth reporting.
+- **A one-way transfer can be reported on**, because the cursor stream is separate: a Push
+  producer keeps its unidirectional payload stream and still receives a reliable verdict. This is
+  what the separate stream buys over the first draft's reply half, and it means no pattern changes
+  shape to gain cursors. A producer that orders nothing still gets the transport receipt and
+  nothing more [0018 §4.6].
 - **A cursor is never a refusal.** A hop that cannot continue sends the ERROR that terminates the
   reply half; cursors only ever move forward, which is what makes "keep the maximum" a complete
   rule.
@@ -224,9 +232,10 @@ rather than per prefix), then `Stored` stays a verdict and only settlement is a 
 
 ## 5. Consequences and follow-ups
 
-- **[PROTOCOL.md](../PROTOCOL.md) §4, §4.1, §6** gain kind `6` and the relaxed reply-half rule;
-  §6.5's `acknowledgement` dimension gains the sentence that the level decides *whether* cursors
-  are reported; §9.2 keeps the transport receipt exactly as it is.
+- **[PROTOCOL.md](../PROTOCOL.md) §4, §6** gain kind `6` as a uni stream with a head frame and
+  records until FIN; **§4.1 is unchanged**; §6.5's `acknowledgement` dimension gains the sentence
+  that the level decides *whether* cursors are reported; §9.2 keeps the transport receipt exactly
+  as it is.
 - **[GUARANTEES.md](../GUARANTEES.md) §1** gains the split of §4.2: which levels are cursors,
   which are verdicts, and that `Processed` is a settlement rather than an end-to-end claim.
 - **[PATTERNS.md](../PATTERNS.md) §1.2** gains one sentence: the window reasoning is an
@@ -237,10 +246,10 @@ rather than per prefix), then `Stored` stays a verdict and only settlement is a 
   their definitions and gain an offset where the state is about bytes.
 - **Backlog.** Three items, links relative to `docs/BACKLOG.md`.
 
-### B-233 — Frame kind `6`: the completion cursor
+### B-233 — Frame kind `6`: the cursor stream
 kind: code | size: 90 | status: ready | needs: []
-acceptance: `FrameKind::Cursor` = 6 with a header carrying a level (the `acknowledgement` value of [PROTOCOL.md](PROTOCOL.md) §6.5) and an **absolute byte offset**, encoded and decoded in `weida-protocol` with golden vectors in §8's shape and a fuzz target beside the other headers; §4.1's reply-half rule relaxed to "zero or more CURSOR frames, then exactly one DATA or ERROR, then FIN", with a hostile test proving that a CURSOR on a **one-way** stream and a CURSOR **after** the terminal frame are both protocol violations. The receiving side keeps the **maximum** offset per level, so a duplicated or reordered cursor changes nothing — mutation-checked, as B-202's credit rule was.
-note: the frame is the cheap half of [0023](decisions/0023-completion-is-a-cursor.md); what makes it useful is a store that can report an offset, which is why the reporting side is a separate item.
+acceptance: `FrameKind::Cursor` = 6 on a **unidirectional** stream, as CREDIT is: a head frame naming the payload stream it reports about — QUIC's own `StreamId`, which `quinn` exposes as `SendStream::id()`/`RecvStream::id()` and which is a varint both ends already know — followed by `(level, offset)` records until FIN, where the level is the `uint` of [0023](decisions/0023-completion-is-a-cursor.md) §4.3a and the offset is absolute. Encoded and decoded in `weida-protocol` with golden vectors in §8's shape and a fuzz target beside the other headers. The receiving side keeps the **maximum** offset per level, so a duplicated or reordered record changes nothing — mutation-checked, as B-202's credit rule was. Hostile tests: a cursor record whose offset goes backwards is ignored rather than fatal, a cursor stream naming a stream id that does not exist on the connection is a protocol violation, and **[PROTOCOL.md](PROTOCOL.md) §4.1 is untouched** — a test asserts that a reply half still carries exactly one DATA or ERROR.
+note: a cursor never shares a stream with payload, which is what makes the frame independent of the pattern: the same stream kind reports on a one-way transfer and on either direction of an exchange.
 
 ### B-234 — Reporting a cursor, and the number that says how often
 kind: code | size: 60 | status: blocked | needs: [B-233, the Phase 5 store]

@@ -125,51 +125,74 @@ and MQTT all have is **this system's degenerate case**, not a different mechanis
 application asks for `fin_only` and gets what it had; nothing in the design has to argue that
 whole-message verdicts are obsolete.
 
-**4.4 The back channel is a reliable stream, and a transfer that orders cursors is an exchange.**
-The owner's requirement decides this: "auf die ack muss man sich trotzdem verlassen koennen,
-wenigstens auf das fin" — and a verdict that may be lost is not a verdict. So the terminal cursor
-rides a **stream**, and the cheapest stream is the one the transfer already has.
+**4.4 A cursor never shares a stream with payload.** Two requirements from the owner, in order.
+First, reliability: "auf die ack muss man sich trotzdem verlassen koennen, wenigstens auf das fin"
+— so the carrier is a stream, not a datagram. Second, separation: "fuer ack brauche ich einen
+**getrennten stream**" — and this is not a preference, it is forced by the frame shape. A DATA
+frame is "header followed by opaque payload bytes until FIN" [PROTOCOL §4], so:
 
-- **An exchange's reply half carries every cursor and the terminal verdict**, reliably and in
-  order. It is already the correlation [0023 §4.3], so nothing on the wire names the transfer,
-  and the shape already exists in the implementation: the broker's confirm *is* an exchange reply
-  carrying the achieved level as DATA key `8` (B-201).
-- **A transfer that orders cursors is therefore sent as an exchange**, not as a one-way transfer.
-  That is one bidirectional stream instead of one unidirectional stream — the same single stream,
-  a direction wider — and it changes **no pattern's semantics**, because Push/Pull's defining
-  property is that the *application* does not answer, while a cursor is a report rather than a
-  reply. Asking for a reliable answer is asking for a stream that can carry one.
-- **A producer that orders nothing keeps its one-way transfer** and gets the transport receipt and
-  nothing more, exactly as [0018 §4.6] says.
+- a responder that **streams** a reply while still reporting on the request would have to
+  interleave control frames into payload bytes, which the shape forbids and which would cost the
+  zero-copy property that makes payload opaque in the first place;
+- a cursor about the **reply** direction flows from requester to responder, where the initiating
+  half is already finished — no carrier exists at all.
 
-**Datagrams are rejected, and the reason is worth keeping.** An earlier draft of this note put
-progress cursors on QUIC datagrams, and the analysis stands as far as it went: an absolute cursor
-can afford loss, and quinn discards the *oldest* unsent datagram, which is the one a newer cursor
-makes redundant. But weigh what that bought. A datagram is not on a stream, so it needed the
-connection-local stream id anyway — **the addressing cost was identical**. What it saved was
-per-cursor overhead; what it cost was the one property the mechanism must have. When the only
-advantage is cost and the requirement is reliability, the reliable carrier wins outright.
+Either blocker alone settles it. **Cursors get their own unidirectional stream: frame kind `6`, a
+head frame naming the payload stream it reports about, then `(level, offset)` records until FIN**
+([0023 §4.3]). The identifier is QUIC's own `StreamId`, which `quinn` exposes as
+`SendStream::id()` and `RecvStream::id()`, encoded as the varint both ends already share — not an
+application-visible identifier, and not the per-transfer correlation machinery
+[ARCHITECTURE §1] deleted: there is no pending table, no cancellation frame and no
+reply-arrival notification, because closing the payload stream ends the reporting and the FIN of
+the cursor stream says there is no more.
 
-**The fallback, if per-transfer reply halves ever cost too much.** At very high fan-out — millions
-of small messages, each ordering cursors — a reply half per transfer is a reader per in-flight
-transfer. The alternative is then a **single long-lived back-channel stream per connection**
-carrying cursor frames tagged with the connection-local stream id they report about, which
-amortizes stream setup and keeps reliability. It is deliberately *not* the default, because it
-reintroduces addressing that [ARCHITECTURE §1] removed on purpose: "the correlation machinery
-existed only because replies rode separate streams… machinery whose entire job was to undo a
-choice made one layer down". A separate back-channel stream makes that choice again, so it needs a
-measurement to justify it (§4.8), not a preference.
+**4.4a The answer to "uni, uni und bidi — oder grundsaetzlich bidi?": the payload topology does
+not change at all.** It is the pattern's business, and the cursor stream is orthogonal to it.
 
-Two rules survive from the datagram draft unchanged, because they are about the cursor and not
-about its carrier:
+| What is sent | Payload streams | Cursor streams |
+| --- | --- | --- |
+| one-way transfer, nothing ordered | 1 uni | none — the transport receipt and nothing more [0018 §4.6] |
+| one-way transfer, cursors ordered | 1 uni | 1 uni, opened by the receiver |
+| exchange, nothing ordered | 1 bidi: request on the initiating half, reply or ERROR on the reply half | none |
+| exchange, cursors ordered on the request | the same 1 bidi | 1 uni, opened by the responder |
+| exchange, cursors ordered both ways | the same 1 bidi | 2 uni, one per reporter |
+
+Two things this table says out loud. **A Push producer keeps its unidirectional transfer and still
+gets a reliable verdict**, which the earlier draft of this note got wrong by making an ordered
+cursor turn the transfer into an exchange: no pattern changes shape to gain cursors. And **the
+reply half stays the application's**: an exchange's reply is the application's answer, so the
+broker's confirm — DATA key `8` on a reply half (B-201) — is untouched, and `fin_only` on an
+exchange needs no cursor stream at all.
+
+The **second** option the owner raised — always bidi for payload, with the reply on its own uni —
+is rejected for the reason [ARCHITECTURE §1] records as one of the project's two founding
+removals: "the correlation machinery existed only because replies rode separate streams… machinery
+whose entire job was to undo a choice made one layer down". A reply on its own stream must be
+matched back; a reply on the bidi's other half is matched by the stream. That stays.
+
+One subtlety, recorded because it is the kind of thing that is discovered twice: a **bidi** stream
+has one id for both directions, so a cursor stream naming it appears ambiguous. It is not. The
+reporter can only report on bytes it **received**, so the pair (who opened the cursor stream, which
+stream id) is unique — the responder's cursor stream about bidi *X* reports the request direction,
+the requester's reports the reply direction. No direction field is needed.
+
+**Datagrams are rejected, and the reason is worth keeping.** An earlier draft put progress cursors
+on QUIC datagrams, and the analysis stands as far as it went: an absolute cursor can afford loss,
+and quinn discards the *oldest* unsent datagram, which is the one a newer cursor makes redundant.
+But weigh what it bought. A datagram is not on a stream, so it needed a stream id in its payload
+anyway — **the addressing cost was identical to the cursor stream's**. What it saved was per-cursor
+overhead; what it cost was the one property the mechanism must have. When the only advantage is
+cost and the requirement is reliability, the reliable carrier wins outright.
+
+Two rules survive from that draft unchanged, because they are about the cursor and not its carrier:
 
 1. **Nothing waits on a cursor.** No guarantee is expressed through one, and a peer that receives
-   none behaves correctly — it merely learns less. This is what keeps the back channel out of the
-   critical path however it travels.
-2. **Coalescing is free**, because the cursors are absolute: a reporter may drop every
-   intermediate cursor and the receiver still ends at the same offset per level [0023 §4.3b].
-   Reliability and batching are therefore not in tension — the stream delivers what is sent, and
-   the reporter decides how much that is.
+   none behaves correctly — it merely learns less. A stalled or unread cursor stream must therefore
+   block no transfer, which is a test in B-240.
+2. **Coalescing is free**, because the cursors are absolute: a reporter may drop every intermediate
+   record and the receiver still ends at the same offset per level [0023 §4.3b]. Reliability and
+   batching are not in tension — the stream delivers what is sent, and the reporter decides how
+   much that is.
 
 **4.5 Materialization is a per-hop choice, and this is the headline.** The video case states the
 property exactly: the uploader is satisfied by the **first hop's** transport receipt, and that hop
@@ -198,12 +221,13 @@ B-237, B-238). `Delivery` keeps its exact meaning, transport state stays hidden
 [0023 §4.1], and adapter honesty is untouched — a foreign protocol that has one whole-message
 ack maps to `fin_only` and says so.
 
-**4.8 Status is `provisional`, and what would change it.** The carrier is the part with a
-measurement attached. §4.4's fallback becomes the default if a reply half per transfer proves too
-expensive at high fan-out; the numbers to measure are memory and scheduling cost per in-flight
-exchange against the same workload sent as one-way transfers, at a fan-out where the reader count
-is the dominant term. Until that measurement exists, the default is the stream the transfer
-already has.
+**4.8 Status is `provisional`, and what would change it.** The cost of a cursor stream **per
+payload stream** is the measurement attached to §4.4. At very high fan-out — millions of small
+messages, each ordering cursors — a stream per transfer doubles stream accounting, and the
+alternative is one long-lived cursor stream per connection carrying records for many payload
+streams, which the head frame's stream id already makes expressible. That is a pure optimization
+of the same design, not a different one, and it needs a number: streams created per second and
+memory per in-flight report, against the same workload with cursors off.
 
 ## 5. Consequences and follow-ups
 
@@ -212,11 +236,13 @@ already has.
   describe crate boundaries.
 - **[PATTERNS.md](../PATTERNS.md)** gains the sentence that the families overlap and why, next to
   §1.11's "a message is a stream that reached FIN".
-- **[PROTOCOL.md](../PROTOCOL.md)** states that cursors travel only on an exchange's reply half,
-  that a transfer ordering cursors is therefore an exchange, and that nothing waits on a cursor.
-  No datagram extension is used, so §4's stream-shape table stays as it is.
-- **[0023](0023-completion-is-a-cursor.md) §4.3** keeps its rule — a one-way transfer gets no
-  cursors — and gains the consequence: ordering cursors makes the transfer an exchange.
+- **[PROTOCOL.md](../PROTOCOL.md) §4** gains kind `6` as a unidirectional stream whose shape is
+  "head frame, then records until FIN" — the first such shape, since every other kind is
+  header-only or header-plus-payload — and the statement that nothing waits on a cursor. §4.1 is
+  unchanged, and no datagram extension is used.
+- **[0023](0023-completion-is-a-cursor.md) §4.3** is rewritten onto the separate stream, and its
+  "a one-way transfer gets no cursors" becomes "a one-way transfer can be reported on", which is
+  what the separation buys.
 - **Backlog.** Three items, links relative to `docs/BACKLOG.md`.
 
 ### B-239 — The three ack modes, including `fin_only`
@@ -224,10 +250,10 @@ kind: code | size: 60 | status: blocked | needs: [B-233]
 acceptance: a sender states per message which levels it wants and in which mode — `per_chunk`, `coalesced { bytes, interval }`, `fin_only` ([0024](decisions/0024-three-families-one-back-channel.md) §4.3) — and the reporting side honours it, with `coalesced` proved lossless: a reporter that coalesces 100 advances into 3 frames leaves the receiver with the same final offset per level as one that reports all 100, because cursors are absolute. `fin_only` produces **exactly one** cursor frame per level and is the mode an adapter with a whole-message ack maps to; a test asserts that `fin_only` plus a `Stored` level is byte-for-byte the classic confirm, so the migration story is real rather than asserted.
 note: the mode is configuration, not protocol: the frame of B-233 is unchanged by all three.
 
-### B-240 — Ordering cursors makes a transfer an exchange
+### B-240 — The cursor stream, orthogonal to every pattern
 kind: code | size: 60 | status: blocked | needs: [B-239]
-acceptance: a send that orders cursors opens a **bidirectional** stream and reads its reply half, where a one-way send opens a unidirectional one — decided by the request, not by the pattern ([0024](decisions/0024-three-families-one-back-channel.md) §4.4). Proved on Push/Pull, the pattern where it is surprising: the same `push` call with cursors ordered yields the same delivery semantics, the same round-robin selection and the same refusal behaviour, plus a reliable terminal cursor; with none ordered it is byte-for-byte today's one-way transfer. A test asserts the stream **kind** in both cases, because that is the whole mechanism, and one asserts that a stalled or unread back channel blocks no transfer — nothing waits on a cursor.
-note: no datagram extension and no new addressing: the reply half is already the correlation, and the broker's existing confirm (DATA key `8` on a reply half, B-201) is the shape this generalizes.
+acceptance: the reporting side opens a uni cursor stream per payload stream it reports on, and the payload topology is **unchanged** in every case ([0024](decisions/0024-three-families-one-back-channel.md) §4.4a). Proved where it is surprising: a Push transfer with cursors ordered is still **one unidirectional** payload stream with unchanged round-robin selection, refusal behaviour and delivery semantics, plus a reliable verdict on a separate stream; with none ordered it is byte-for-byte today's transfer. An exchange reporting both directions has **two** cursor streams and one bidi, and a test asserts that the pair (opener, stream id) disambiguates them without a direction field. Two load-bearing negatives: a stalled or never-read cursor stream blocks no transfer, and a peer that ignores cursor streams entirely completes every transfer and every guarantee.
+note: the reply half stays the application's, so the broker's confirm (DATA key `8`, B-201) is untouched and `fin_only` on an exchange needs no cursor stream at all.
 
 ### B-241 — ARCHITECTURE §1: three vocabularies instead of an onion
 kind: spec | size: 30 | status: done | needs: []
@@ -236,9 +262,9 @@ note: done. The onion was never wrong about dependencies and always wrong as a u
 
 ## 6. What this note does not decide
 
-- **Whether the per-connection back-channel stream of §4.4 is ever built.** It is the named
-  fallback with a measurement attached (§4.8), not a plan, and it is the only place a
-  connection-local stream id would appear on the wire.
+- **Whether many payload streams ever share one cursor stream.** §4.8's optimization: the head
+  frame's stream id makes it expressible, and the measurement decides whether it is worth a second
+  code path.
 - **Whether a broker ever *requires* cursors.** It prescribes which levels it reports; whether it
   refuses a producer that asks for none is a broker policy question, and queue admission
   [0018 §4.6] does not need one.

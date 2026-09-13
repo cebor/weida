@@ -32,7 +32,10 @@ hop that outlives the sender.
 Across all three runs **one** extra mechanism, and it is the only significant addition to the
 ZeroMQ base: a sender may state, with a message, which completion levels it wants reported —
 `written`, `synced`, `processed`, or its own stages — as **cursors** over the bytes
-([decisions/0023](decisions/0023-completion-is-a-cursor.md)). It changes no pattern's semantics.
+([decisions/0023](decisions/0023-completion-is-a-cursor.md)). They travel on their own
+unidirectional stream, never mixed into payload, so **no pattern's stream topology changes to gain
+them**: a Push transfer stays one unidirectional stream and an exchange keeps its reply half for
+the application's answer.
 Without it an application that wants progress builds a back-propagation stream and a correlation
 scheme by hand; with QUIC it is nearly free, and the broker helps itself to the same mechanism
 rather than to a private one.
@@ -51,7 +54,7 @@ rather than to a private one.
                            SURVEY, BUS             redelivery
       └───────────────────────┴───────────────────────┘
                               │
-             two stream kinds + the cursor back channel
+     two stream kinds + the cursor stream (uni, never mixed with payload)
                               │
               ┌───────────────┴────────────────────────┐
               │                                        │
