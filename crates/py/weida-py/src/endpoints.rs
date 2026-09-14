@@ -21,6 +21,7 @@ use pyo3::prelude::*;
 use weida::{Puller, Pusher, Replier, Requester, Runtime, TransferMeta};
 use weida_py_core::{Bridge, payload_of, py_bytes};
 
+use crate::cursors::{PyCursors, PyReporter, reporting_meta};
 use crate::errors::errno_of;
 use crate::streams::{PyIncomingStream, PyOutgoingStream, PyReply};
 use crate::values::PyIncomingMeta;
@@ -171,31 +172,43 @@ impl PyPusher {
     /// ([GUARANTEES.md](../../../../docs/GUARANTEES.md) §1). A caller that does
     /// not want to wait for it at all wants Req/Rep, where the reply is the
     /// proof, or `asyncio.create_task`.
+    /// `report` orders a cursor report on the levels it names — see
+    /// `weida.Cursors` — and the call then returns the handle to read it on;
+    /// `None` when nothing was ordered, which is every ordinary send.
+    /// `mode` is `weida.PROGRESS` or `weida.FINAL_ONLY`.
     ///
     /// # Errors
     ///
     /// `weida.ConnectionLost` before the FIN, `weida.Indeterminate` after it,
     /// `weida.Rejected` when the peer refused the payload,
-    /// `weida.UnknownEndpoint`, `weida.LimitExceeded`.
+    /// `weida.UnknownEndpoint`, `weida.LimitExceeded`, `weida.Protocol` for a
+    /// value in `report` that is not a level.
+    #[pyo3(signature = (payload, report=None, mode=0))]
     fn send<'py>(
         &self,
         py: Python<'py>,
         payload: &Bound<'py, PyAny>,
+        report: Option<Vec<u64>>,
+        mode: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let body = payload_of(payload)?;
+        let meta = reporting_meta(py, Some(body.len() as u64), report, mode)?;
         let endpoint = Arc::clone(&self.endpoint);
+        let bridge = self.bridge.clone();
+        let runtime = Arc::clone(&self._runtime);
         self.bridge.awaitable(py, async move {
-            let mut transfer = endpoint
-                .open(TransferMeta::default().with_content_len(body.len() as u64))
-                .await
-                .map_err(errno_of)?;
+            let mut transfer = endpoint.open(meta).await.map_err(errno_of)?;
+            // Taken before the payload: `finish` consumes the transfer and
+            // the report outlives it by design.
+            let cursors = transfer.cursors();
             transfer.write_all(&body).await.map_err(errno_of)?;
             transfer
                 .finish()
                 .map_err(errno_of)?
                 .delivered()
                 .await
-                .map_err(errno_of)
+                .map_err(errno_of)?;
+            Ok(cursors.map(|cursors| PyCursors::new(cursors, bridge, runtime)))
         })
     }
 
@@ -203,15 +216,19 @@ impl PyPusher {
     ///
     /// The stream's `finish` is what waits for the receipt; `send` is the
     /// whole-payload form of the same thing.
-    fn open<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (report=None, mode=0))]
+    fn open<'py>(
+        &self,
+        py: Python<'py>,
+        report: Option<Vec<u64>>,
+        mode: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let meta = reporting_meta(py, None, report, mode)?;
         let endpoint = Arc::clone(&self.endpoint);
         let bridge = self.bridge.clone();
         let runtime = Arc::clone(&self._runtime);
         self.bridge.awaitable(py, async move {
-            let transfer = endpoint
-                .open(TransferMeta::default())
-                .await
-                .map_err(errno_of)?;
+            let transfer = endpoint.open(meta).await.map_err(errno_of)?;
             Ok(PyOutgoingStream::new(transfer, bridge, runtime))
         })
     }
@@ -411,6 +428,39 @@ impl PyPuller {
             let meta = PyIncomingMeta::of(transfer.meta());
             let payload = transfer.collect(max_bytes).await.map_err(errno_of)?;
             Ok((payload, meta))
+        })
+    }
+
+    /// `recv`, plus the reporter the sender ordered:
+    /// `(payload, meta, reporter)`.
+    ///
+    /// The third element is `None` unless the sender ordered a report, which
+    /// is the ordinary case. **This is the call a staged receiver wants**:
+    /// `recv` forgets the transfer once the payload is in hand, and a
+    /// receiver that wants to say "accepted", "stored", "processed" as it
+    /// gets there needs the handle that outlives the payload
+    /// ([0023](../../../../docs/decisions/0023-completion-is-a-cursor.md)).
+    ///
+    /// # Errors
+    ///
+    /// As `recv`.
+    fn recv_reporting<'py>(
+        &self,
+        py: Python<'py>,
+        max_bytes: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let endpoint = Arc::clone(&self.endpoint);
+        let bridge = self.bridge.clone();
+        let runtime = Arc::clone(&self._runtime);
+        self.bridge.awaitable(py, async move {
+            let transfer = endpoint.recv().await.map_err(errno_of)?;
+            let meta = PyIncomingMeta::of(transfer.meta());
+            // Taken before the payload: `collect` consumes the transfer.
+            let reporter = transfer
+                .reporter()
+                .map(|reporter| PyReporter::new(reporter, bridge, runtime));
+            let payload = transfer.collect(max_bytes).await.map_err(errno_of)?;
+            Ok((payload, meta, reporter))
         })
     }
 

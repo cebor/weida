@@ -165,6 +165,18 @@ pub struct PyIncomingMeta {
     /// How many messages this arrival is known to have missed, under
     /// `PerProducer` detect: the honest report of a fan-out drop.
     pub missed: Option<u64>,
+    /// The levels the sender ordered a report on, as wire values, ascending.
+    ///
+    /// Empty when nothing was ordered, which is the ordinary case. A receiver
+    /// that wants to answer them takes the `Reporter` from
+    /// `recv_reporting`.
+    pub report: Vec<u64>,
+    /// How often the sender asked to be told: `weida.PROGRESS` or
+    /// `weida.FINAL_ONLY`.
+    pub report_mode: u64,
+    /// The id the sender allocated for the report, present exactly when
+    /// `report` is non-empty.
+    pub report_id: Option<u64>,
     /// The W3C `traceparent` of this transfer, for a caller that propagates a
     /// trace.
     pub traceparent: Option<String>,
@@ -173,12 +185,10 @@ pub struct PyIncomingMeta {
 impl PyIncomingMeta {
     /// The metadata of one arrival, flattened into the Python shape.
     ///
-    /// Eight of the Rust struct's twelve fields. `tracestate` is dropped
-    /// because a Python caller gets the `traceparent` and not the vendor
-    /// state, and the three report fields — `report`, `report_mode`,
-    /// `report_id` — are dropped because the whole cursor surface is absent
-    /// from this binding and filed as **B-243**: exposing the metadata of a
-    /// report a caller cannot act on would be worse than omitting it.
+    /// Eleven of the Rust struct's twelve fields. `tracestate` is the one
+    /// that stays behind, because a Python caller gets the `traceparent` and
+    /// not the vendor state. The three report fields are here since B-243
+    /// added the cursor surface: a caller can act on them.
     pub fn of(meta: &IncomingMeta) -> PyIncomingMeta {
         PyIncomingMeta {
             endpoint: meta.endpoint.clone(),
@@ -188,6 +198,9 @@ impl PyIncomingMeta {
             peer: meta.peer.as_ref().map(ToString::to_string),
             sequence: meta.sequence,
             missed: meta.gap.as_ref().map(|gap| gap.missed()),
+            report: meta.report.iter().map(|level| level.to_wire()).collect(),
+            report_mode: meta.report_mode.to_wire(),
+            report_id: meta.report_id,
             traceparent: meta.trace.map(|trace| trace.to_traceparent()),
         }
     }

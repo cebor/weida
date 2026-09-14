@@ -67,16 +67,22 @@
 //! asynchronous iterator: the only channel out of a bridged future here is
 //! the errno family, so `async for` would need a second error channel
 //! invented for `StopAsyncIteration` alone. The Rust `SurveyRun` is where
-//! answers arrive one at a time.
+//! answers arrive one at a time. `weida.Cursors` reads the same way, and for
+//! the same reason: `while (set := await cursors.changed()) is not None:`.
+//!
+//! **The cursor surface** is here too (B-243): `pusher.send(payload,
+//! report=[weida.PROCESSED])` orders a report and hands back the
+//! `weida.Cursors` to read it on, `puller.recv_reporting(max_bytes)` hands a
+//! receiver the `weida.Reporter` to answer with, and `IncomingMeta` carries
+//! the three report fields the wire does. A level is an **integer** —
+//! `weida.ACCEPTED`, `weida.PROCESSED`, or an application's own number at or
+//! above `weida.APPLICATION_FLOOR` — because the level space is open and a
+//! class would close it.
 //!
 //! What is absent, with the reason: the raw L0 surface — `Peer` and
 //! `Acceptor`, weida's own stream-level API — because every pattern above is
 //! built on it and a Python caller that wants a bare stream wants the Rust
-//! API; the **cursor** surface — `TransferMeta`'s report order,
-//! `Cursors` and `Reporter` — filed as **B-243** because it costs both
-//! surfaces here, which is
-//! also why `IncomingMeta`'s three report fields are not among the attributes
-//! below; and type stubs, which `docs/libraries/weida-py.md` §10 names as the
+//! API; and type stubs, which `docs/libraries/weida-py.md` §10 names as the
 //! follow-up they are.
 //!
 //! # No protocol behaviour lives here
@@ -88,6 +94,7 @@
 
 use pyo3::prelude::*;
 
+mod cursors;
 mod endpoints;
 mod errors;
 mod patterns;
@@ -122,6 +129,20 @@ fn weida(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<streams::PyOutgoingStream>()?;
     module.add_class::<streams::PyIncomingStream>()?;
     module.add_class::<streams::PyReply>()?;
+    module.add_class::<cursors::PyCursors>()?;
+    module.add_class::<cursors::PyReporter>()?;
+    // The cursor vocabulary: the named rungs of weida's ladder, the floor an
+    // application's own stages start at, and the two report modes. Integers
+    // rather than an enum class, because the level space is **open** — an
+    // application names its own numbers above the floor — and a class would
+    // close what the protocol leaves open (B-243).
+    for (name, value) in cursors::NAMED_LEVELS {
+        module.add(name, value)?;
+    }
+    module.add("APPLICATION_FLOOR", ::weida::CursorLevel::APPLICATION_FLOOR)?;
+    for (name, value) in cursors::MODES {
+        module.add(name, value)?;
+    }
     sync::install(module)?;
     module.add("VERSION", ::weida::VERSION)?;
     module.add("ALPN", ::weida::ALPN)?;
@@ -154,11 +175,17 @@ fn every_name() -> Vec<&'static str> {
         "OutgoingStream",
         "IncomingStream",
         "Reply",
+        "Cursors",
+        "Reporter",
+        "APPLICATION_FLOOR",
+        "PROGRESS",
+        "FINAL_ONLY",
         "sync",
         "VERSION",
         "ALPN",
         "WeidaError",
     ];
+    names.extend(cursors::NAMED_LEVELS.iter().map(|(name, _)| *name));
     names.extend_from_slice(errors::NAMES);
     names
 }

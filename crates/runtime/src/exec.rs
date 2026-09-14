@@ -110,6 +110,14 @@ impl Exec {
     /// it held is released. This is the only place an await is bounded on
     /// wall-clock time, for the same reason [`Exec::sleep`] lives here: the
     /// timer belongs to the runtime, not to the caller.
+    pub async fn within<F: Future>(&self, limit: Duration, future: F) -> Option<F::Output> {
+        let deadline = self.sleep(limit);
+        tokio::select! {
+            output = future => Some(output),
+            () = deadline => None,
+        }
+    }
+
     /// Resolves `host:port` through the **system** resolver.
     ///
     /// The convenience the competitor libraries use: a foreign-protocol client
@@ -131,14 +139,6 @@ impl Exec {
         crate::resolve::SystemResolver
             .resolve(self, host, Some(port), max_addresses)
             .await
-    }
-
-    pub async fn within<F: Future>(&self, limit: Duration, future: F) -> Option<F::Output> {
-        let deadline = self.sleep(limit);
-        tokio::select! {
-            output = future => Some(output),
-            () = deadline => None,
-        }
     }
 }
 

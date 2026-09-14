@@ -14,7 +14,10 @@
 use std::time::Duration;
 
 use weida::blocking::Runtime;
-use weida::{Error, Identity, RuntimeConfig, Trust};
+use weida::{
+    Acknowledgement, CursorLevel, Error, Identity, ReportMode, Reported, RuntimeConfig,
+    TransferMeta, Trust,
+};
 
 /// A payload ceiling for every receive: the facade has no default, on purpose.
 const CAP: usize = 1024 * 1024;
@@ -292,4 +295,122 @@ fn the_facade_refuses_to_block_a_reactor_thread() {
         "{refused:?} must be refused rather than deadlock"
     );
     outside.shutdown().expect("shutdown");
+}
+
+/// The cursor surface, synchronously: a fire-and-forget producer that gets a
+/// **verdict** without an exchange, and a staged receiver that gives it
+/// (B-243).
+#[test]
+fn a_push_gets_a_verdict_from_a_cursor_with_no_exchange() {
+    const ACCEPTED: CursorLevel = CursorLevel::Known(Acknowledgement::Accepted);
+    const PROCESSED: CursorLevel = CursorLevel::Known(Acknowledgement::Processed);
+
+    let (server, binding, url) = served("/work");
+    let puller = binding.puller("/work").expect("puller");
+
+    let receiving = std::thread::spawn(move || {
+        let (message, reporter) = puller.recv_reporting(CAP).expect("recv");
+        assert_eq!(message.payload, b"a unit of work");
+        // The order is in the metadata the DATA header carried, which is what
+        // makes a report the sender's request rather than this side's idea.
+        assert_eq!(message.meta.report, vec![ACCEPTED, PROCESSED]);
+        assert_eq!(message.meta.report_mode, ReportMode::Progress);
+        assert!(message.meta.report_id.is_some());
+
+        let mut reporter = reporter.expect("the sender ordered a report");
+        assert_eq!(reporter.levels(), [ACCEPTED, PROCESSED]);
+        reporter
+            .report(ACCEPTED, message.payload.len() as u64)
+            .expect("accepted");
+        // A level nobody ordered is ignored rather than refused: the order
+        // says what the sender wants to hear.
+        reporter
+            .report(CursorLevel::Known(Acknowledgement::Stored), 1)
+            .expect("ignored");
+        reporter
+            .report(PROCESSED, message.payload.len() as u64)
+            .expect("processed");
+        reporter.finish().expect("finish the report");
+    });
+
+    let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+    let pusher = client.pusher(Trust::by_address());
+    pusher.connect(&url).expect("connect");
+    let body = b"a unit of work";
+    let mut cursors = pusher
+        .send_reporting(
+            TransferMeta::default()
+                .with_content_len(body.len() as u64)
+                .with_report([PROCESSED, ACCEPTED]),
+            body,
+        )
+        .expect("send")
+        .expect("the metadata ordered a report");
+
+    // The verdict arrives **after** the transport receipt `send_reporting`
+    // already waited for, which is the whole point of a cursor: `Processed` is
+    // not something a FIN can carry. The wait is bounded, because a
+    // synchronous one has to be: a receiver that died would otherwise park
+    // this thread on a connection nobody closes.
+    let mut processed = None;
+    while processed.is_none() {
+        match cursors.changed(Duration::from_secs(15)).expect("a cursor") {
+            Reported::Changed => {
+                processed = cursors.snapshot().offset(PROCESSED);
+            }
+            Reported::Waiting => panic!("no cursor within the deadline"),
+            Reported::Ended => panic!("the report ended without a verdict"),
+        }
+    }
+    assert_eq!(processed, Some(body.len() as u64));
+    assert_eq!(
+        cursors.snapshot().offset(ACCEPTED),
+        Some(body.len() as u64),
+        "a cursor is absolute, so the earlier level is still readable"
+    );
+    // The level nobody ordered never arrived.
+    assert_eq!(
+        cursors
+            .snapshot()
+            .offset(CursorLevel::Known(Acknowledgement::Stored)),
+        None
+    );
+
+    receiving.join().expect("the receiving thread");
+    client.shutdown().expect("client shutdown");
+    server.shutdown().expect("server shutdown");
+}
+
+/// A send that orders nothing has nothing to read, and a receiver of it has
+/// nothing to report with (B-243).
+#[test]
+fn a_transfer_that_orders_no_report_hands_out_no_handles() {
+    let (server, binding, url) = served("/plain");
+    let puller = binding.puller("/plain").expect("puller");
+
+    let receiving = std::thread::spawn(move || {
+        let (message, reporter) = puller.recv_reporting(CAP).expect("recv");
+        assert_eq!(message.payload, b"no report");
+        assert!(message.meta.report.is_empty());
+        assert!(message.meta.report_id.is_none());
+        assert!(
+            reporter.is_none(),
+            "a reporter with nothing ordered would be a handle that writes to nobody"
+        );
+    });
+
+    let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+    let pusher = client.pusher(Trust::by_address());
+    pusher.connect(&url).expect("connect");
+    assert!(
+        pusher
+            .send_reporting(TransferMeta::default(), b"no report")
+            .expect("send")
+            .is_none(),
+        "nothing was ordered, so there is nothing to read"
+    );
+
+    receiving.join().expect("the receiving thread");
+    client.shutdown().expect("client shutdown");
+    server.shutdown().expect("server shutdown");
 }

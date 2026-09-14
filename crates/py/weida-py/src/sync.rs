@@ -51,6 +51,7 @@
 //! `weida.Identity` and `weida.IncomingMeta` are the same objects on both
 //! surfaces.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use pyo3::prelude::*;
@@ -58,6 +59,7 @@ use pyo3::types::PyModule;
 use weida::blocking;
 use weida_py_core::{payload_of, py_bytes};
 
+use crate::cursors::{level_of, reporting_meta, set_of};
 use crate::errors::raise;
 use crate::values::{PyIdentity, PyIncomingMeta, PySurvey, PyTrust};
 
@@ -332,9 +334,24 @@ impl SyncPusher {
     }
 
     /// Sends `payload` and waits for the peer's transport to acknowledge it.
-    fn send(&self, py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<()> {
+    ///
+    /// `report` and `mode` order a cursor report, as on the asyncio surface,
+    /// and the call then returns the `weida.Cursors` to read it on — `None`
+    /// when nothing was ordered.
+    #[pyo3(signature = (payload, report=None, mode=0))]
+    fn send(
+        &self,
+        py: Python<'_>,
+        payload: &Bound<'_, PyAny>,
+        report: Option<Vec<u64>>,
+        mode: u64,
+    ) -> PyResult<Option<SyncCursors>> {
         let body = payload_of(payload)?;
-        raise(py, py.detach(|| self.endpoint.send(&body)))
+        let meta = reporting_meta(py, Some(body.len() as u64), report, mode)?;
+        let cursors = raise(py, py.detach(|| self.endpoint.send_reporting(meta, &body)))?;
+        Ok(cursors.map(|cursors| SyncCursors {
+            cursors: Mutex::new(cursors),
+        }))
     }
 
     fn __repr__(&self) -> String {
@@ -489,6 +506,31 @@ impl SyncPuller {
         ))
     }
 
+    /// `recv`, plus the reporter the sender ordered:
+    /// `(payload, meta, reporter)`.
+    ///
+    /// The third element is `None` unless the sender ordered a report. This
+    /// is the call a staged receiver wants, for the reason the asyncio
+    /// `Puller.recv_reporting` gives.
+    fn recv_reporting<'py>(
+        &self,
+        py: Python<'py>,
+        max_bytes: usize,
+    ) -> PyResult<(
+        Bound<'py, pyo3::types::PyBytes>,
+        PyIncomingMeta,
+        Option<SyncReporter>,
+    )> {
+        let (message, reporter) = raise(py, py.detach(|| self.endpoint.recv_reporting(max_bytes)))?;
+        Ok((
+            py_bytes(py, &message.payload),
+            PyIncomingMeta::of(&message.meta),
+            reporter.map(|reporter| SyncReporter {
+                reporter: Mutex::new(Some(reporter)),
+            }),
+        ))
+    }
+
     fn __repr__(&self) -> String {
         format!("<weida.sync.Puller {}>", self.endpoint.path())
     }
@@ -553,9 +595,22 @@ impl SyncPaired {
     }
 
     /// Sends `payload` and waits for the peer's transport to acknowledge it.
-    fn send(&self, py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<()> {
+    ///
+    /// `report` and `mode` order a cursor report, as on `Pusher.send`.
+    #[pyo3(signature = (payload, report=None, mode=0))]
+    fn send(
+        &self,
+        py: Python<'_>,
+        payload: &Bound<'_, PyAny>,
+        report: Option<Vec<u64>>,
+        mode: u64,
+    ) -> PyResult<Option<SyncCursors>> {
         let body = payload_of(payload)?;
-        raise(py, py.detach(|| self.endpoint.send(&body)))
+        let meta = reporting_meta(py, Some(body.len() as u64), report, mode)?;
+        let cursors = raise(py, py.detach(|| self.endpoint.send_reporting(meta, &body)))?;
+        Ok(cursors.map(|cursors| SyncCursors {
+            cursors: Mutex::new(cursors),
+        }))
     }
 
     /// Waits for the next transfer from the peer, at most `max_bytes`, and
@@ -569,6 +624,27 @@ impl SyncPaired {
         Ok((
             py_bytes(py, &message.payload),
             PyIncomingMeta::of(&message.meta),
+        ))
+    }
+
+    /// `recv`, plus the reporter the peer ordered:
+    /// `(payload, meta, reporter)`.
+    fn recv_reporting<'py>(
+        &self,
+        py: Python<'py>,
+        max_bytes: usize,
+    ) -> PyResult<(
+        Bound<'py, pyo3::types::PyBytes>,
+        PyIncomingMeta,
+        Option<SyncReporter>,
+    )> {
+        let (message, reporter) = raise(py, py.detach(|| self.endpoint.recv_reporting(max_bytes)))?;
+        Ok((
+            py_bytes(py, &message.payload),
+            PyIncomingMeta::of(&message.meta),
+            reporter.map(|reporter| SyncReporter {
+                reporter: Mutex::new(Some(reporter)),
+            }),
         ))
     }
 
@@ -714,6 +790,136 @@ impl SyncBusMember {
     }
 }
 
+/// `weida.sync.Cursors`: the sender's end of one transfer's report.
+///
+/// The same three calls the asyncio `weida.Cursors` has, blocking. The loop a
+/// caller writes is `while (set := cursors.changed()) is not None:` — and
+/// `changed` is where the thread parks with the GIL released, which is what
+/// makes waiting for a verdict on one thread while another works the ordinary
+/// shape rather than a trick.
+#[pyclass(frozen, name = "Cursors", module = "weida.sync")]
+pub struct SyncCursors {
+    /// `&mut` on the facade's side; a `std` mutex is right here because no
+    /// guard crosses an await on this surface.
+    cursors: Mutex<blocking::Cursors>,
+}
+
+#[pymethods]
+impl SyncCursors {
+    /// The latest set as `{level: offset}`, without waiting.
+    fn snapshot(&self) -> BTreeMap<u64, u64> {
+        set_of(
+            self.cursors
+                .lock()
+                .expect("cursors lock poisoned")
+                .snapshot(),
+        )
+    }
+
+    /// The latest offset for `level`, or `None` if it was never reported.
+    fn offset(&self, py: Python<'_>, level: u64) -> PyResult<Option<u64>> {
+        let level = level_of(py, level)?;
+        Ok(self
+            .cursors
+            .lock()
+            .expect("cursors lock poisoned")
+            .offset(level))
+    }
+
+    /// Waits up to `deadline` seconds for the next change and returns the new
+    /// set, or `None` once no further cursors are coming.
+    ///
+    /// The deadline is **mandatory**, unlike the asyncio `Cursors.changed`:
+    /// there `asyncio.wait_for` bounds the wait and composes, while a parked
+    /// thread is interrupted by nothing. A deadline that passes with nothing
+    /// new raises `TimeoutError` — the builtin, as `socket.settimeout` does —
+    /// because it is **not** the end of the report and returning `None` for
+    /// it would make a caller stop reading a verdict that is still coming.
+    fn changed(&self, py: Python<'_>, deadline: f64) -> PyResult<Option<BTreeMap<u64, u64>>> {
+        let deadline = raise(
+            py,
+            std::time::Duration::try_from_secs_f64(deadline)
+                .map_err(|e| weida::Error::Runtime(format!("deadline: {e}"))),
+        )?;
+        let reported = raise(
+            py,
+            py.detach(|| {
+                self.cursors
+                    .lock()
+                    .expect("cursors lock poisoned")
+                    .changed(deadline)
+            }),
+        )?;
+        match reported {
+            weida::Reported::Changed => Ok(Some(self.snapshot())),
+            weida::Reported::Ended => Ok(None),
+            weida::Reported::Waiting => Err(pyo3::exceptions::PyTimeoutError::new_err(
+                "no cursor arrived within the deadline; the report may still continue",
+            )),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        "<weida.sync.Cursors>".to_owned()
+    }
+}
+
+/// `weida.sync.Reporter`: the receiver's end, blocking.
+#[pyclass(frozen, name = "Reporter", module = "weida.sync")]
+pub struct SyncReporter {
+    /// `None` after `finish`, which consumes the reporter: a report ends
+    /// once.
+    reporter: Mutex<Option<blocking::Reporter>>,
+}
+
+#[pymethods]
+impl SyncReporter {
+    /// The levels the sender ordered, ascending.
+    #[getter]
+    fn levels(&self, py: Python<'_>) -> PyResult<Vec<u64>> {
+        let guard = self.reporter.lock().expect("reporter lock poisoned");
+        match guard.as_ref() {
+            Some(reporter) => Ok(reporter.levels().iter().map(|l| l.to_wire()).collect()),
+            None => spent(py, "report"),
+        }
+    }
+
+    /// The mode the sender asked for.
+    #[getter]
+    fn mode(&self, py: Python<'_>) -> PyResult<u64> {
+        let guard = self.reporter.lock().expect("reporter lock poisoned");
+        match guard.as_ref() {
+            Some(reporter) => Ok(reporter.mode().to_wire()),
+            None => spent(py, "report"),
+        }
+    }
+
+    /// Reports that `level` has reached `offset`.
+    ///
+    /// A level the sender did not order is ignored rather than refused.
+    fn report(&self, py: Python<'_>, level: u64, offset: u64) -> PyResult<()> {
+        let level = level_of(py, level)?;
+        let mut guard = self.reporter.lock().expect("reporter lock poisoned");
+        match guard.as_mut() {
+            Some(reporter) => raise(py, py.detach(|| reporter.report(level, offset))),
+            None => spent(py, "report"),
+        }
+    }
+
+    /// Flushes the latest offset per level and ends the cursor stream.
+    fn finish(&self, py: Python<'_>) -> PyResult<()> {
+        let taken = self.reporter.lock().expect("reporter lock poisoned").take();
+        match taken {
+            Some(reporter) => raise(py, py.detach(|| reporter.finish())),
+            None => spent(py, "report"),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        "<weida.sync.Reporter>".to_owned()
+    }
+}
+
 /// Builds the `weida.sync` submodule.
 ///
 /// A real submodule rather than a naming convention, so that
@@ -735,6 +941,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     sync.add_class::<SyncSurveyor>()?;
     sync.add_class::<SyncRespondent>()?;
     sync.add_class::<SyncBusMember>()?;
+    sync.add_class::<SyncCursors>()?;
+    sync.add_class::<SyncReporter>()?;
     sync.add(
         "__all__",
         vec![
@@ -751,6 +959,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
             "Surveyor",
             "Respondent",
             "BusMember",
+            "Cursors",
+            "Reporter",
         ],
     )?;
     parent.add_submodule(&sync)?;

@@ -8,8 +8,9 @@
 //! (`weida_zmq::blocking`, `weida_mqtt::blocking`, `weida_nng::blocking`).
 //! This is the same shape for weida's own patterns (B-194, B-244) — for
 //! **every role of every pattern**: Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY
-//! and BUS. The cursor surface is the one thing still asynchronous-only, and
-//! it is filed (B-243) rather than half-wrapped here.
+//! and BUS — and, since B-243, for the cursor surface of
+//! [0023](../../../docs/decisions/0023-completion-is-a-cursor.md) as well:
+//! [`Cursors`] is a report read by its caller, [`Reporter`] one written by it.
 //!
 //! One design question came with SURVEY rather than a translation, and it is
 //! answered in [`Survey`]: a deadline-bounded fan-out of exchanges yields
@@ -74,7 +75,8 @@ use std::time::Duration;
 use weida_core::{Error, Limits};
 
 use crate::{
-    ClientTls, Drained, Identity, IncomingMeta, RuntimeConfig, ServerTls, TransferMeta, Trust,
+    ClientTls, CursorLevel, CursorSet, Drained, Identity, IncomingMeta, ReportMode, Reported,
+    RuntimeConfig, ServerTls, TransferMeta, Trust,
 };
 
 /// A runtime that owns its reactor, for a synchronous caller.
@@ -308,6 +310,102 @@ pub struct Message {
     pub meta: IncomingMeta,
 }
 
+/// The reader's end of one transfer's report, waited on by its caller.
+///
+/// Independent of the transfer that ordered it, deliberately: the terminal
+/// cursor arrives **after** the payload's FIN, so a handle tied to the send
+/// would be gone exactly when the interesting record lands
+/// ([0023](../../../docs/decisions/0023-completion-is-a-cursor.md) §4.3b).
+/// A cursor is never load-bearing, so nothing here fails for a transport
+/// reason: "no more cursors" is the one fact a reader acts on.
+pub struct Cursors {
+    inner: crate::Cursors,
+}
+
+impl Cursors {
+    /// The latest set, without waiting.
+    pub fn snapshot(&self) -> CursorSet {
+        self.inner.snapshot()
+    }
+
+    /// The latest offset for `level`, without waiting.
+    pub fn offset(&self, level: CursorLevel) -> Option<u64> {
+        self.inner.offset(level)
+    }
+
+    /// Waits up to `deadline` for the next change.
+    ///
+    /// The deadline is **mandatory**, for the reason
+    /// [`Runtime::drain`]'s is: a parked thread is interrupted by nothing, a
+    /// peer that never reports opens no stream, and a connection both sides
+    /// keep alive never closes — so an unbounded wait here is a hang with a
+    /// rationale. The three outcomes are [`Reported`]'s, and
+    /// [`Reported::Waiting`] is not the end of anything: a caller that wants
+    /// to keep waiting calls again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Runtime`] from inside a reactor, and nothing else: there is
+    /// no transport failure a cursor may report.
+    pub fn changed(&mut self, deadline: Duration) -> Result<Reported, Error> {
+        outside_a_reactor()?;
+        Ok(drive(self.inner.changed_within(deadline)))
+    }
+
+    /// The asynchronous handle underneath.
+    pub fn cursors(&mut self) -> &mut crate::Cursors {
+        &mut self.inner
+    }
+}
+
+/// The writer's end: what a receiver uses to report on a transfer it got.
+///
+/// Every write is best effort, so nothing here fails for a transport reason
+/// either — a peer that reset the cursor stream must not fail the application
+/// that is doing the reporting. The granularity is this side's own number and
+/// is never negotiated: more often is always allowed, less often never.
+pub struct Reporter {
+    inner: crate::Reporter,
+}
+
+impl Reporter {
+    /// The levels the sender ordered, ascending.
+    pub fn levels(&self) -> &[CursorLevel] {
+        self.inner.levels()
+    }
+
+    /// The mode the sender asked for.
+    pub fn mode(&self) -> ReportMode {
+        self.inner.mode()
+    }
+
+    /// Reports that `level` has reached `offset`.
+    ///
+    /// A level the sender did not order is ignored rather than refused.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Runtime`] from inside a reactor.
+    pub fn report(&mut self, level: CursorLevel, offset: u64) -> Result<(), Error> {
+        outside_a_reactor()?;
+        drive(self.inner.report(level, offset))
+    }
+
+    /// Flushes the latest offset per level and ends the cursor stream.
+    ///
+    /// The flush is what makes coalescing lossless: whatever the granularity
+    /// suppressed, the last number each level reached is on the wire before
+    /// the end.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reporter::report`].
+    pub fn finish(self) -> Result<(), Error> {
+        outside_a_reactor()?;
+        drive(self.inner.finish())
+    }
+}
+
 /// Drives one of this crate's futures on the **calling** thread.
 ///
 /// Not on the reactor: its threads are driving the connections, and a caller
@@ -440,6 +538,39 @@ impl Pusher {
             let mut transfer = self.endpoint.open(meta).await?;
             transfer.write_all(body).await?;
             transfer.finish()?.delivered().await
+        })
+    }
+
+    /// [`Pusher::send_with`], keeping the report `meta` ordered.
+    ///
+    /// `send_with` discards it, exactly as the asynchronous `send_with` does:
+    /// this is the same send with the reader's end of the report handed back.
+    /// `None` when `meta` ordered no levels — a caller that asked for nothing
+    /// gets nothing to read rather than an empty handle.
+    ///
+    /// **This is the call a fire-and-forget producer wants a verdict from.**
+    /// A Push has no reply to carry one, and the receipt this returns after is
+    /// the transport's; `Accepted` and everything above it arrive on the
+    /// cursor stream, after the FIN
+    /// ([0023](../../../docs/decisions/0023-completion-is-a-cursor.md) §4.1).
+    ///
+    /// # Errors
+    ///
+    /// As [`Pusher::send`].
+    pub fn send_reporting(
+        &self,
+        meta: TransferMeta,
+        body: &[u8],
+    ) -> Result<Option<Cursors>, Error> {
+        outside_a_reactor()?;
+        drive(async {
+            let mut transfer = self.endpoint.open(meta).await?;
+            // Taken before the payload, because `finish` consumes the
+            // transfer and the report outlives it by design.
+            let cursors = transfer.cursors();
+            transfer.write_all(body).await?;
+            transfer.finish()?.delivered().await?;
+            Ok(cursors.map(|inner| Cursors { inner }))
         })
     }
 }
@@ -626,6 +757,32 @@ impl Puller {
         })
     }
 
+    /// [`Puller::recv`], with the reporter the sender ordered.
+    ///
+    /// `None` when the sender ordered nothing, which is the ordinary case:
+    /// a reporter is only there when a producer asked to be told.
+    ///
+    /// **This is the call a staged receiver wants.** `recv` collects the
+    /// payload and forgets the transfer, so a receiver that wants to say
+    /// "accepted", "stored", "processed" as it gets there needs the handle
+    /// that outlives the payload
+    /// ([0023](../../../docs/decisions/0023-completion-is-a-cursor.md) §4.1).
+    ///
+    /// # Errors
+    ///
+    /// As [`Puller::recv`].
+    pub fn recv_reporting(&self, max_bytes: usize) -> Result<(Message, Option<Reporter>), Error> {
+        outside_a_reactor()?;
+        drive(async {
+            let transfer = self.endpoint.recv().await?;
+            let meta = transfer.meta().clone();
+            // Taken before the payload: `collect` consumes the transfer.
+            let reporter = transfer.reporter().map(|inner| Reporter { inner });
+            let payload = transfer.collect(max_bytes).await?;
+            Ok((Message { payload, meta }, reporter))
+        })
+    }
+
     /// The asynchronous puller underneath.
     pub fn endpoint(&self) -> &crate::Puller {
         &self.endpoint
@@ -729,6 +886,29 @@ impl Paired {
         })
     }
 
+    /// [`Paired::send_with`], keeping the report `meta` ordered.
+    ///
+    /// As [`Pusher::send_reporting`]: a pair carries one-way transfers in
+    /// each direction, so a verdict from the far end is a cursor here too.
+    ///
+    /// # Errors
+    ///
+    /// As [`Paired::send`].
+    pub fn send_reporting(
+        &self,
+        meta: TransferMeta,
+        body: &[u8],
+    ) -> Result<Option<Cursors>, Error> {
+        outside_a_reactor()?;
+        drive(async {
+            let mut transfer = self.endpoint.open(meta).await?;
+            let cursors = transfer.cursors();
+            transfer.write_all(body).await?;
+            transfer.finish()?.delivered().await?;
+            Ok(cursors.map(|inner| Cursors { inner }))
+        })
+    }
+
     /// Waits for the next transfer from the peer, at most `max_bytes`.
     ///
     /// # Errors
@@ -741,6 +921,22 @@ impl Paired {
             let meta = transfer.meta().clone();
             let payload = transfer.collect(max_bytes).await?;
             Ok(Message { payload, meta })
+        })
+    }
+
+    /// [`Paired::recv`], with the reporter the peer ordered.
+    ///
+    /// # Errors
+    ///
+    /// As [`Paired::recv`].
+    pub fn recv_reporting(&self, max_bytes: usize) -> Result<(Message, Option<Reporter>), Error> {
+        outside_a_reactor()?;
+        drive(async {
+            let transfer = self.endpoint.recv().await?;
+            let meta = transfer.meta().clone();
+            let reporter = transfer.reporter().map(|inner| Reporter { inner });
+            let payload = transfer.collect(max_bytes).await?;
+            Ok((Message { payload, meta }, reporter))
         })
     }
 }

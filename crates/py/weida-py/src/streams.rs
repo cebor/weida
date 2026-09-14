@@ -36,6 +36,7 @@ use tokio::io::AsyncReadExt as _;
 use weida::{IncomingTransfer, OutgoingTransfer, ReplyStream, Runtime};
 use weida_py_core::{Bridge, Errno, payload_of};
 
+use crate::cursors::{PyCursors, PyReporter};
 use crate::errors::errno_of;
 use crate::values::PyIncomingMeta;
 
@@ -116,6 +117,26 @@ impl PyOutgoingStream {
                 .delivered()
                 .await
                 .map_err(errno_of)
+        })
+    }
+
+    /// The report this transfer ordered, once.
+    ///
+    /// `None` when nothing was ordered, and `None` on every call after the
+    /// first: there is one report, so there is one reader. The handle is
+    /// independent of the stream and stays usable after `finish`, which is
+    /// the point — a verdict such as `Accepted` arrives *after* the FIN
+    /// ([0023](../../../../docs/decisions/0023-completion-is-a-cursor.md)).
+    fn cursors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let transfer = Arc::clone(&self.transfer);
+        let bridge = self.bridge.clone();
+        let runtime = Arc::clone(&self._runtime);
+        self.bridge.awaitable(py, async move {
+            let mut guard = transfer.lock().await;
+            let transfer = guard.as_mut().ok_or_else(|| spent("stream"))?;
+            Ok(transfer
+                .cursors()
+                .map(|cursors| PyCursors::new(cursors, bridge, runtime)))
         })
     }
 
@@ -211,6 +232,25 @@ impl PyIncomingStream {
                 .take()
                 .ok_or_else(|| spent("stream"))?;
             taken.collect(max_bytes).await.map_err(errno_of)
+        })
+    }
+
+    /// The reporter this transfer's sender ordered, if it ordered one.
+    ///
+    /// `None` when nothing was ordered. Handed out as often as asked — unlike
+    /// the sender's `cursors`, a reporter is a writer and the library's own
+    /// accessor takes `&self` — but a caller wants one, because `finish`
+    /// ends the report.
+    fn reporter<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let transfer = Arc::clone(&self.transfer);
+        let bridge = self.bridge.clone();
+        let runtime = Arc::clone(&self._runtime);
+        self.bridge.awaitable(py, async move {
+            let guard = transfer.lock().await;
+            let transfer = guard.as_ref().ok_or_else(|| spent("stream"))?;
+            Ok(transfer
+                .reporter()
+                .map(|reporter| PyReporter::new(reporter, bridge, runtime)))
         })
     }
 

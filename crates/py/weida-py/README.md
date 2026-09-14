@@ -67,6 +67,31 @@ number — `silent()` is who said nothing before the deadline — and a responde
 died is `failed`, so "nobody answered" is an answer rather than an exception. The same three
 patterns are on `weida.sync` with the same shapes.
 
+## A verdict for a transfer that has no reply
+
+```python
+# The producer orders a report and reads it. `Processed` is not something a
+# FIN can carry, so it arrives on a stream of its own, after the payload.
+cursors = await pusher.send(work, report=[weida.ACCEPTED, weida.PROCESSED])
+while (latest := await cursors.changed()) is not None:
+    if weida.PROCESSED in latest:
+        break
+
+# The receiver answers as it gets there.
+payload, meta, reporter = await puller.recv_reporting(1 << 20)
+await reporter.report(weida.ACCEPTED, len(payload))
+...
+await reporter.report(weida.PROCESSED, len(payload))
+await reporter.finish()
+```
+
+A level is an integer: the named rungs are `weida.TRANSPORT_RECEIPT`, `ACCEPTED`, `STORED`,
+`REPLICATED` and `PROCESSED`, and an application names its own stages at or above
+`weida.APPLICATION_FLOOR` — carried and ordered, never interpreted. Offsets are absolute, so a
+report coalesced on the way loses nothing, and nothing ever waits on a cursor: a peer that
+never reports fails no transfer. On `weida.sync` the same two handles are there, and
+`changed(seconds)` takes a deadline, because a parked thread is interrupted by nothing.
+
 ## A peer is its public key
 
 `binding.url(path)` prints `weida://sha256:…@host:port/path`, and that address is the whole

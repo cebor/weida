@@ -84,7 +84,7 @@ pub use weida_protocol::{ALPN, VERSION, codes, filter};
 pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
 
 pub use config::{ClientTls, Discovery, Identity, Pem, RuntimeConfig, ServerTls, Trust};
-pub use cursor::{CursorSet, Cursors, Reporter};
+pub use cursor::{CursorSet, Cursors, Reported, Reporter};
 pub use drain::Drained;
 pub use endpoint::{
     Bus, BusMember, Endpoint, Pair, Paired, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher,

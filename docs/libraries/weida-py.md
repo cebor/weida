@@ -44,12 +44,12 @@ not estimated:
 
 | Number | Value | Counted from |
 | --- | --- | --- |
-| `#[pyclass]`es | **34** | 21 `add_class` calls in `lib.rs:103-124` plus 13 in `sync.rs:722-737` |
-| `weida.__all__` | **46** names | 25 literals in `lib.rs:133-159` (which include `sync`, `VERSION`, `ALPN` and `WeidaError`) plus the 21 of `errors::NAMES`, appended at `lib.rs:160` |
-| `weida.sync.__all__` | **13** names | the list at `sync.rs:738-755`, one per class registered above it |
+| `#[pyclass]`es | **38** | 23 `add_class` calls in `lib.rs:117-141` plus 15 in `sync.rs:919-936` |
+| `weida.__all__` | **56** names | 30 literals in `lib.rs:150-184` (which include `sync`, `VERSION`, `ALPN`, `WeidaError` and the five cursor names), the five named levels appended at `lib.rs:185`, plus the 21 of `errors::NAMES` |
+| `weida.sync.__all__` | **15** names | the list at `sync.rs:937-957`, one per class registered above it |
 | Exception classes | **22** | the 21 entries of the `failures!` invocation at `errors.rs:72-94`, **plus the base** `WeidaError` (`errors.rs:33`), which is not in that list |
-| Test functions | **25** | 8 in `tests/test_asyncio.py`, 9 in `tests/test_patterns.py`, 8 in `tests/test_sync.py` |
-| `IncomingMeta` attributes | **8** of the Rust struct's 12 fields | `values.rs:147-171` against `crates/weida/src/transfer.rs`; `tracestate` and the three report fields are the four that are absent (§9) |
+| Test functions | **32** | 8 in `tests/test_asyncio.py`, 9 in `tests/test_patterns.py`, 8 in `tests/test_sync.py`, 7 in `tests/test_cursors.py` |
+| `IncomingMeta` attributes | **11** of the Rust struct's 12 fields | `values.rs:147-183` against `crates/weida/src/transfer.rs`; `tracestate` is the only one absent (§5) |
 
 ## 2. How it is built, tested and packaged
 
@@ -71,8 +71,8 @@ is a thin wrapper over it, so a "pairing" here would be this library against its
 what every test in `crates/py/weida-py/tests/` and `smoke.py` already is. The claim a real
 interop section would carry is therefore unavailable, and no number in this document is an
 interop number. The counts above were counted out of the tree with the sources named in §1
-**and re-measured by a run** when B-244 added PAIR, SURVEY and BUS to both surfaces: 25 tests
-passed and `smoke.py` resolved all 46 names through a freshly built wheel.
+**and re-measured by a run** when B-244 and B-243 completed the surface: 32 tests passed and
+`smoke.py` resolved all 56 names through a freshly built wheel.
 
 ## 3. The runtime, the binding and the reactor
 
@@ -97,7 +97,7 @@ passed and `smoke.py` resolved all 46 names through a freshly built wheel.
 
 ## 4. The asyncio surface, class by class
 
-Twenty-one classes in `weida` (§1). Every call that waits is a coroutine and the waiting happens
+Twenty-three classes in `weida` (§1). Every call that waits is a coroutine and the waiting happens
 on the reactor with the GIL released; the Rust future starts at the **first `await`**, not at
 the call, so a coroutine that is never awaited does nothing at all
 (`crates/py/weida-py-core/src/bridge.rs:131-153`).
@@ -185,6 +185,28 @@ by **B-244**. `crates/py/weida-py/src/patterns.rs`, and a `weida.Survey` in `val
 | `ReplyStream::recv()` | `await reply.recv()` → `(IncomingStream, IncomingMeta)` | present — `streams.rs:256-266`. A lost connection on this half is `weida.Indeterminate` and never `ConnectionLost`, because after the request's FIN the outcome is genuinely unknown ([FAILURE_MODEL.md](../FAILURE_MODEL.md)) |
 | the request and reply halves are independent streams | two objects, `OutgoingStream` and `Reply` | present, and deliberately two: a caller may read the reply while still writing the request, which is what keeps flow control live in both directions (`streams.rs:11-17`) |
 
+### 4.6 The cursor surface
+
+How a **one-way** transfer gets a verdict: a Push has no reply to carry one, so `Accepted`,
+`Stored` and `Processed` arrive on a stream of their own, after the payload's FIN
+([0023](../decisions/0023-completion-is-a-cursor.md)). Added on both surfaces by **B-243**;
+`crates/py/weida-py/src/cursors.rs` is the asyncio half.
+
+| `crates/weida` | This binding | Verdict |
+| --- | --- | --- |
+| `TransferMeta::with_report(levels)`, `with_report_mode(mode)` | `report=` and `mode=` on `pusher.send`, `pusher.open` and `paired.send` | present as keyword arguments — `cursors.rs:107-131`, `endpoints.rs:185-233`, `patterns.rs:96-116`. There is no `weida.TransferMeta`, so the order rides the call that makes the transfer; the levels reach the DATA header, which is what makes a report the **sender's** request rather than a convention |
+| `CursorLevel::Known(Acknowledgement)` and `CursorLevel::Application(u64)` | an **integer**: `weida.TRANSPORT_RECEIPT`, `ACCEPTED`, `STORED`, `REPLICATED`, `PROCESSED`, or any value at or above `weida.APPLICATION_FLOOR` | present as module constants rather than a class — `lib.rs:128-141`, `cursors.rs:47-58`. The level space is **open** (0023 §4.4), and a class would close what the protocol leaves open. `test_cursors.py::test_an_application_level_is_carried_and_never_interpreted` orders `APPLICATION_FLOOR + 3` and reads back an offset the library cannot check against the payload |
+| an undefined value **below** the floor is a protocol violation | `weida.Protocol`, naming the floor | refused at the boundary — `cursors.rs:60-76`, asserted by `test_cursors.py::test_a_value_the_protocol_reserves_is_refused` for the level `7` and for the mode `9`, with `APPLICATION_FLOOR` itself accepted in the same case so the line is a line |
+| `ReportMode::Progress`, `FinalOnly` | `weida.PROGRESS`, `weida.FINAL_ONLY` | present as the same two integers on both surfaces (`cursors.rs:60`, `sync.rs`), and `Progress` is the default because it is the library's |
+| `OutgoingTransfer::cursors()` → `Option<Cursors>`, once | `await pusher.send(...)` → `weida.Cursors` or `None`; `await stream.cursors()` on the streamed form | present — `endpoints.rs:198-211`, `streams.rs:122-140`. `None` means nothing was ordered, which is every ordinary send; the second `cursors()` on one stream is `None`, asserted by `test_cursors.py::test_a_streamed_transfer_orders_a_report_too` |
+| `Cursors::snapshot()`, `offset(level)`, `changed()` | `cursors.snapshot()` → `{level: offset}`, `cursors.offset(level)`, `await cursors.changed()` | present — `cursors.rs:141-205`. A set is a **dict** rather than a class: a `CursorSet` is exactly the latest absolute offset per level, and a class would add a vocabulary without adding a fact |
+| `Cursors::changed()` → `None` at the end | the same `None`, and **no `async for`** | present, with the reason `weida.Survey` gives: the only channel out of a bridged future is the exception family, so `StopAsyncIteration` would need a second one. The loop is `while (set := await cursors.changed()) is not None:` |
+| `Cursors::changed_within(deadline)` → `Reported` | `sync.Cursors.changed(seconds)` → dict, `None`, or **`TimeoutError`** | present on the synchronous surface **only**, and that asymmetry is the point (`sync.rs:829-860`): `asyncio.wait_for` bounds the asyncio call and composes, while a parked thread is interrupted by nothing — a peer that never reports opens no stream and a connection both sides keep alive never closes. The deadline is mandatory there for the reason [0009](../decisions/0009-drain.md) §4.4 gives for `drain`, and a deadline that passes raises rather than returning `None`, because it is **not** the end of the report |
+| `IncomingTransfer::reporter()` → `Option<Reporter>` | `await puller.recv_reporting(max_bytes)` → `(payload, meta, reporter)`, `await paired.recv_reporting(...)`, `await stream.reporter()` | present — `endpoints.rs:433-464`, `patterns.rs:135-157`, `streams.rs:237-254`. `recv` stays a two-tuple and forgets the transfer: a receiver that reports is a receiver with stages, and it says so at the call it makes |
+| `Reporter::levels()`, `mode()`, `report(level, offset)`, `finish()` | all four — `reporter.levels`, `reporter.mode`, `await reporter.report(...)`, `await reporter.finish()` | present — `cursors.rs:207-293`. A level the sender did not order is **ignored rather than refused**, which `test_cursors.py` asserts by reporting `STORED` on a report that ordered only `ACCEPTED` and `PROCESSED` and then finding it absent from the sender's snapshot |
+| `Reporter::with_granularity(bytes, interval)` | — | absent: the granularity is the reporter's own number and never negotiated (0023 §4.5), and this binding takes the library's default. A Python reporter that wants coarser records reports less often |
+| a cursor on a **fan-out** or an **exchange** | — | absent, and not an omission: a published copy is one transfer per subscriber with no single handle to read, and an exchange's **reply is** its verdict. The senders that can order are the one-way ones — `Pusher` and `Paired` — which is what `crates/weida` itself allows (`BusMember::send_with` opens one transfer per member and keeps none) |
+
 ## 5. The value classes
 
 | `crates/weida` | This binding | Verdict |
@@ -194,9 +216,9 @@ by **B-244**. `crates/py/weida-py/src/patterns.rs`, and a `weida.Survey` in `val
 | `Identity::generate()`, `generate_for(names)`, `from_pem_file(path)`, `fingerprint()` | all four | present — `values.rs:84-136`. `fingerprint()` is a method and not a field because a `from_pem_file` identity is read lazily, so a corrupt file fails there with the path in hand |
 | `Identity::from_pem(chain, key)`, `from_pem_files(chain, key)`, `certificate_pem()`, `to_pem()` | — | absent: PEM **in memory** cannot enter (a key from a secret store has no Python route in, `config.rs:221-232`) and a generated identity cannot be persisted from Python (`config.rs:270`). §10 |
 | `Pem`, `ClientTls`, `ServerTls` as types | — | absent: `Trust` and `Identity` are converted into them by the calls that take them (`runtime.rs:92`, `112-136`), so the two combining types never appear in Python |
-| `IncomingMeta`'s 12 fields | 8 attributes: `endpoint`, `content_len`, `content_type`, `topic`, `peer`, `sequence`, `missed`, `traceparent` | present — `values.rs:147-171`, and the shape is flattened: `gap` becomes `missed` as a number and `trace` becomes the W3C `traceparent` string |
+| `IncomingMeta`'s 12 fields | 11 attributes: `endpoint`, `content_len`, `content_type`, `topic`, `peer`, `sequence`, `missed`, `report`, `report_mode`, `report_id`, `traceparent` | present — `values.rs:147-209`, and the shape is flattened: `gap` becomes `missed` as a number, `trace` becomes the W3C `traceparent` string, and `report` becomes a list of wire values (§4.6) |
 | `IncomingMeta::tracestate` | — | absent: forwarded unmodified by the library and not surfaced here. A caller that propagates a full trace context gets the `traceparent` and loses the vendor state |
-| `IncomingMeta::{report, report_mode, report_id}` | — | absent: the three cursor fields the library gained after this binding was written. The whole cursor surface is filed as **B-243**, and surfacing the metadata of a report a caller cannot act on would be worse than omitting it |
+| `IncomingMeta::{report, report_mode, report_id}` | `meta.report`, `meta.report_mode`, `meta.report_id` | present since **B-243** — `values.rs:168-179`, `200-207`. They were absent while the cursor surface was, because the metadata of a report a caller could not act on would have been worse than nothing; now a receiver acts on them (§4.6) |
 | `PeerIdentity` as a type | `meta.peer` as `str` or `None` | present as text — `values.rs:157-161`: `sha256:…` over QUIC, `uid=…` over a local socket, `None` for an anonymous or in-process peer. Never from a header, so it can be authorized on rather than claimed ([0015](../decisions/0015-peer-authorization.md)); `test_asyncio.py:47` asserts the `None` for a client that presented no identity |
 | a survey's outcome: `SurveyRun`'s answers, `respondents()` and `late()` | `weida.Survey` — `replies`, `asked`, `failed`, `late`, `silent()` | present as a shared value class, on both surfaces (§4.4) — `values.rs:206-250` |
 | `TransferMeta::with_content_len` | set by the binding on `request`, `send`, `reply` | present implicitly — `endpoints.rs:112`, `188`, `323` |
@@ -207,7 +229,7 @@ by **B-244**. `crates/py/weida-py/src/patterns.rs`, and a `weida.Survey` in `val
 ## 6. The `sync` surface, and exactly how it differs
 
 `weida.sync` is a **real submodule** placed in `sys.modules`, so `import weida.sync` works and
-a traceback names `weida.sync.Runtime` (`sync.rs:717-756`, asserted by
+a traceback names `weida.sync.Runtime` (`sync.rs:916-956`, asserted by
 `test_sync.py::test_the_submodule_is_importable_and_shares_its_values`). It implements no
 protocol behaviour: it is `weida::blocking` — where the `block_on`, the owned reactor and the
 refusal of a call from inside a Tokio runtime live (`crates/weida/src/blocking.rs:32-47`) —
@@ -217,10 +239,11 @@ is what makes one thread per endpoint the shape it is supposed to be
 (`test_sync.py::test_a_request_is_answered_with_no_event_loop` runs the serving half on a
 `threading.Thread`).
 
-Thirteen classes: `Runtime`, `Binding`, `Requester`, `Pusher`, `Subscriber`, `Replier`,
-`Request`, `Puller`, `Publisher`, `Paired`, `Surveyor`, `Respondent`, `BusMember`
-(`sync.rs:722-737`) — every pattern of §4, because B-244 added the three new ones to both
-surfaces at once. The value classes are **shared, not copied** —
+Fifteen classes: `Runtime`, `Binding`, `Requester`, `Pusher`, `Subscriber`, `Replier`,
+`Request`, `Puller`, `Publisher`, `Paired`, `Surveyor`, `Respondent`, `BusMember`, `Cursors`,
+`Reporter` (`sync.rs:919-936`) — every pattern of §4 and the cursor surface of §4.6, because
+B-244 and B-243 added each to both surfaces at once. The value classes are
+**shared, not copied** —
 `weida.Trust`, `weida.Identity` and `weida.IncomingMeta` are the same objects on both surfaces
 (`sync.rs:50-52`, `sync.rs:62`) — and so is the whole exception family
 (`test_sync.py::test_the_failure_classes_are_the_same_on_both_surfaces`).
@@ -242,6 +265,8 @@ What differs, row by row:
 | — | `blocking::Requester::endpoint()` and the other `endpoint()` accessors, which hand out the async type | absent from Python: the escape hatch the facade offers a Rust caller (`crates/weida/src/blocking.rs:459-462`) has no Python spelling, because the asyncio surface *is* the escape hatch here |
 | `await surveyor.survey(...)` → `weida.Survey` | `surveyor.survey(...)` → the **same** `weida.Survey` | present, and the same value class rather than a synchronous twin of it (`sync.rs:594-628`): the collected shape is the right one on a surface with no event loop for the reason §4.4 gives, and it happens to be the right one on both |
 | `paired.peer_count()`, `member.dropped()`, `respondent.accept()` | all three | present — `sync.rs:532-715`; the synchronous `Respondent.accept` hands back `weida.sync.Request`, the class `Replier.accept` hands back, exactly as on the asyncio surface |
+| `await cursors.changed()`, unbounded | `cursors.changed(seconds)`, **mandatory** deadline, `TimeoutError` when it passes | present as the one deliberate signature difference in this module (§4.6) — `sync.rs:829-860`. `asyncio.wait_for` bounds the asyncio call and composes; a parked thread has nothing, so the facade takes the deadline that the asyncio surface gets from its loop (`crates/weida/src/blocking.rs:336-353`, `crates/weida/src/cursor.rs:280-296`) |
+| `await stream.reporter()`, `await stream.cursors()` | — | absent as stream calls, because `sync` has no streams (§9.3). The handles arrive from `pusher.send(report=…)` and `puller.recv_reporting(...)` instead, which is the whole-payload shape of the same thing |
 
 ## 7. The exception family
 
@@ -356,7 +381,7 @@ The `Typing :: Typed` classifier was the third of the same kind and is handled i
 | --- | --- | --- |
 | the raw L0 surface, `Peer` and `Acceptor` (§9.2) | taking a stream without a pattern interpreting it; `Incoming::Transfer` vs `Incoming::Exchange` as the application's choice | a slice binding `Runtime.peer(trust)` and `Binding.acceptor(path)` with an `Incoming` the two arms of which are distinguishable in Python |
 | a **streamed** form for PAIR (§4.4) | writing or reading a pair's payload in pieces; `Paired::open(meta)` is the Rust call | the same shape Push/Pull has here — one `paired.open()` returning an `OutgoingStream` — if a caller ever needs it. PAIR, SURVEY and BUS themselves landed on both surfaces in **B-244** |
-| the **cursor** surface: `TransferMeta`'s report order, `Cursors`, `Reporter`, and `IncomingMeta`'s three report fields (§9) | ordering a completion level per transfer and reading absolute byte offsets back; a Push producer's reliable `Accepted` without an exchange | **B-243** — a cursor's reader outlives the handle it came from, which is a lifetime question in Python rather than a translation |
+| `Reporter::with_granularity(bytes, interval)` (§4.6) | choosing how often a reporter's records reach the wire; the library's default stands | one method on `weida.Reporter` taking bytes and seconds, if a Python reporter ever needs coarser records. The cursor surface itself landed on both surfaces in **B-243**, and nothing is lost by the default: a cursor is absolute, so coarser records end at the same numbers |
 | a Python **server** on a local transport | `bind_inproc`, `bind_unix`, `bind_pipe` (`listener.rs:197`, `232`, `263`); the client side already dials all three (`endpoints.rs:59-62`) | three coroutines on `Runtime` beside `bind`, each returning the binding kind the library has, plus the `LocalPrincipal`/`WindowsPrincipal` reading that makes `uid=…` useful |
 | eight of `RuntimeConfig`'s nine fields, and all of `Limits` (§3) | every resource ceiling weida bounds — queue depths, connection counts, the subscriber budget, the guarantee set — is the library's default and cannot be moved from Python | a `weida.Limits` and keyword arguments on `Runtime`, in the shape [`mqtt-py.md`](mqtt-py.md) §5 uses for the two limits that surface there |
 | streaming in `weida.sync` (§9.3) | a synchronous caller cannot write or read a payload in pieces | `weida::blocking` gaining a streamed form first; building it in the binding is what 0013 §4.4 forbids |
@@ -375,7 +400,8 @@ The `Typing :: Typed` classifier was the third of the same kind and is handled i
 ## 11. Sources
 
 - This binding: `crates/py/weida-py/src/` (`lib.rs`, `runtime.rs`, `endpoints.rs`,
-  `pubsub.rs`, `patterns.rs`, `streams.rs`, `sync.rs`, `values.rs`, `errors.rs`),
+  `pubsub.rs`, `patterns.rs`, `cursors.rs`, `streams.rs`, `sync.rs`, `values.rs`,
+  `errors.rs`),
   `crates/py/weida-py/Cargo.toml`, `pyproject.toml`, `develop.sh`, `package.sh`, `smoke.py`,
   `README.md`.
 - The shared foundation: `crates/py/weida-py-core/src/` — `bridge.rs` (the coroutine and its
@@ -383,10 +409,10 @@ The `Typing :: Typed` classifier was the third of the same kind and is handled i
   builds on.
 - The API this document is the parity table of: `crates/weida/src/` — `lib.rs:67-99`,
   `config.rs`, `runtime.rs`, `listener.rs`, `endpoint.rs`, `transfer.rs`, `stream.rs`,
-  `blocking.rs`.
+  `cursor.rs`, `blocking.rs`.
 - Tests: `crates/py/weida-py/tests/` — `test_asyncio.py` (8), `test_patterns.py` (9),
-  `test_sync.py` (8). **Run** for B-244: 25 passed, and `smoke.py` reporting 46 names
-  through a freshly built wheel.
+  `test_sync.py` (8), `test_cursors.py` (7). **Run** for B-243: 32 passed, and `smoke.py`
+  resolving all 56 names through a freshly built wheel.
 - Normative documents the rows cite: [PROTOCOL.md](../PROTOCOL.md) §6.4 and §9.4,
   [PATTERNS.md](../PATTERNS.md) §4.1, [GUARANTEES.md](../GUARANTEES.md) §1,
   [INVARIANTS.md](../INVARIANTS.md), [FAILURE_MODEL.md](../FAILURE_MODEL.md).
@@ -396,5 +422,5 @@ The `Typing :: Typed` classifier was the third of the same kind and is handled i
   [0009](../decisions/0009-drain.md) §4.4 (the mandatory finite deadline),
   [0010](../decisions/0010-local-transport.md) §4.8 (the local address forms),
   [0015](../decisions/0015-peer-authorization.md) (the proved peer).
-- Backlog: B-200, B-204 and B-205 in [BACKLOG.md](../BACKLOG.md), whose merge notes are the
-  last recorded execution of the suite this document counts.
+- Backlog: B-200, B-204, B-205, B-244 and B-243 in [BACKLOG.md](../BACKLOG.md), whose merge
+  notes are the recorded executions of the suite this document counts.

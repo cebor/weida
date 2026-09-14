@@ -25,6 +25,7 @@ use pyo3::prelude::*;
 use weida::{BusMember, Paired, Respondent, Runtime, Surveyor, TransferMeta};
 use weida_py_core::{Bridge, payload_of};
 
+use crate::cursors::{PyCursors, PyReporter, reporting_meta};
 use crate::endpoints::{PyRequest, endpoint};
 use crate::errors::{errno_of, to_py};
 use crate::values::{PyIncomingMeta, PySurvey};
@@ -83,25 +84,35 @@ impl PyPaired {
     /// nothing is buffered, and a bound pair with no peer has nobody to
     /// address rather than a backlog.
     ///
+    /// `report` and `mode` order a cursor report exactly as `Pusher.send`
+    /// does — a pair carries one-way transfers in each direction, so a
+    /// verdict from the far end is a cursor here too — and the call then
+    /// returns the `weida.Cursors` to read it on.
+    ///
     /// # Errors
     ///
     /// `weida.LimitExceeded` when the peer's pair already belongs to somebody
-    /// else, `weida.NotConnected`, `weida.ConnectionLost`.
+    /// else, `weida.NotConnected`, `weida.ConnectionLost`, `weida.Protocol`
+    /// for a value in `report` that is not a level.
+    #[pyo3(signature = (payload, report=None, mode=0))]
     fn send<'py>(
         &self,
         py: Python<'py>,
         payload: &Bound<'py, PyAny>,
+        report: Option<Vec<u64>>,
+        mode: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let body = payload_of(payload)?;
+        let meta = reporting_meta(py, Some(body.len() as u64), report, mode)?;
         let endpoint = Arc::clone(&self.endpoint);
+        let bridge = self.bridge.clone();
+        let runtime = Arc::clone(&self._runtime);
         self.bridge.awaitable(py, async move {
-            endpoint
-                .send_with(
-                    TransferMeta::default().with_content_len(body.len() as u64),
-                    &body,
-                )
-                .await
-                .map_err(errno_of)
+            let mut transfer = endpoint.open(meta).await.map_err(errno_of)?;
+            let cursors = transfer.cursors();
+            transfer.write_all(&body).await.map_err(errno_of)?;
+            transfer.finish().map_err(errno_of)?;
+            Ok(cursors.map(|cursors| PyCursors::new(cursors, bridge, runtime)))
         })
     }
 
@@ -119,6 +130,29 @@ impl PyPaired {
             let meta = PyIncomingMeta::of(transfer.meta());
             let payload = transfer.collect(max_bytes).await.map_err(errno_of)?;
             Ok((payload, meta))
+        })
+    }
+
+    /// `recv`, plus the reporter the peer ordered:
+    /// `(payload, meta, reporter)`.
+    ///
+    /// As `Puller.recv_reporting`.
+    fn recv_reporting<'py>(
+        &self,
+        py: Python<'py>,
+        max_bytes: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let endpoint = Arc::clone(&self.endpoint);
+        let bridge = self.bridge.clone();
+        let runtime = Arc::clone(&self._runtime);
+        self.bridge.awaitable(py, async move {
+            let transfer = endpoint.recv().await.map_err(errno_of)?;
+            let meta = PyIncomingMeta::of(transfer.meta());
+            let reporter = transfer
+                .reporter()
+                .map(|reporter| PyReporter::new(reporter, bridge, runtime));
+            let payload = transfer.collect(max_bytes).await.map_err(errno_of)?;
+            Ok((payload, meta, reporter))
         })
     }
 
