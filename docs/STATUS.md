@@ -6,8 +6,8 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `145537b`, 2026-09-14 ~02:40 UTC. Tree clean, gate green on Linux:
-**1767 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+**Snapshot:** main `28a254c`, 2026-09-14 ~03:10 UTC. Tree clean, gate green on Linux:
+**1770 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
 plus `weida --features blocking` at **214**, 1 ignored.
 The Windows 11 VM last ran at `f8e8051`: **1712 across 128 binaries**, the same 37 ignored. Add
@@ -140,7 +140,7 @@ a multipart refused at hop one, the smaller `max_message_bytes` deciding — are
 
 Every point is a merge into main behind the four-step gate of [LOOP.md](LOOP.md) §6. **The
 chart stops at the two-day stop it was drawn for** (`5ca1329`, 1678 tests); the sessions since
-took it to **1767** without changing its shape, so it is left as the picture of the parallel run
+took it to **1770** without changing its shape, so it is left as the picture of the parallel run
 rather than redrawn per merge. Two things it does not show: three review findings were caught **before** their merge by reading
 the branch (a reassembler counter that drifted on repeated sequence numbers, a runtime-wide
 mutex on the fire-and-forget path that cost 3 % in the header bench, a parked receipt that
@@ -194,14 +194,13 @@ Three things, and only three:
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1767 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  green at **1770 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session.
-- **11 items are `ready`, 15 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
+- **11 items are `ready`, 14 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
   B-068, a licence and a publication target; the rest waiting on an item this session is
-  building or on a toolchain this machine does not have), **one is `in_progress`** (B-240, whose
-  stream half has landed) and **one is `parked`** (A5's control tier by 0011 §4.3). Of **238**
-  filed items, **210 are `done`**, and the eleven `ready` are four
+  building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
+  tier by 0011 §4.3). Of **238** filed items, **212 are `done`**, and the eleven `ready` are four
   kinds: **the three patterns `ARCHITECTURE.md` §6b maps and nobody built** (B-236 PAIR, B-237
   SURVEY, B-238 BUS), **five slices of the cluster and store phase** (B-219, B-220, B-224,
   B-226, B-231), **the cursor API in the two Python halves** (B-243), and **two sentences in a
