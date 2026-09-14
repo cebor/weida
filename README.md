@@ -18,14 +18,13 @@ on a unidirectional stream of its own that never shares a stream with payload. S
 producer gets a reliable `Accepted` without an exchange, a reader learns how far the far end
 got rather than only whether it finished, and no pattern changes shape to gain any of it.
 
-**Status:** alpha. Wire protocol version `0` (experimental, breaking changes permitted
-within `0.x`). Phases 0-2 implemented: docs, core model, native QUIC transport with Req/Rep.
-Phase 3 in progress: Push/Pull, Pub/Sub, the raw L0 stream API, peer identity by public-key
-fingerprint, opt-in per-producer ordering and bounded deduplication, one connection per
-dialled endpoint path, a bounded `drain`, and an in-process transport beside QUIC have
-landed. Beside weida the repository ships a **ZeroMQ library**: `weida-zmq` is a native Rust
-**Status:** alpha. Wire protocol version `0` (experimental, breaking changes permitted
-within `0.x`). Phases 0-3 are implemented — the docs, the core model, the native QUIC
+**Status:** alpha, and **not released**: nothing is published to a registry, there is no tag
+and there are no binaries. The website at
+[weida.doodleshnookie.net](https://weida.doodleshnookie.net) says the same in one place, and
+is rendered from the documents below rather than written beside them
+([decisions/0025](docs/decisions/0025-the-website.md)).
+Wire protocol version `0` is experimental and breaking changes are permitted within `0.x`.
+Phases 0-3 are implemented — the docs, the core model, the native QUIC
 transport, the in-process, `AF_UNIX` and named-pipe transports, all six patterns, the raw L0
 stream API, peer identity by public-key fingerprint, opt-in per-producer ordering and bounded
 deduplication, a bounded `drain`, the cursor back channel, a synchronous facade
@@ -44,6 +43,11 @@ the devices, the zguide's canonical recipes as examples that assert the guide's 
 and interop against libzmq 4.3.5 and the pure-Rust `zeromq` crate in both roles
 ([docs/libraries/zmq.md](docs/libraries/zmq.md)). `weida-zmq-bridge` and `weida-nng-bridge`
 are the forwarders beside them, joining foreign peers and weida endpoints in both directions.
+
+## Documents
+
+| Document | What it covers |
+| --- | --- |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layer model, terminology, addressing, crate map, runtime internals, public API v0 |
 | [docs/PATTERNS.md](docs/PATTERNS.md) | the pattern reference: per-pattern tables in the shape of `zmq_socket(3)`, and what QUIC streams do underneath, measured |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | normative wire protocol v0: framing, frame headers, golden vectors, limits |
@@ -62,7 +66,7 @@ some of them for the deployments that want both networks joined, and a Python bi
 each finished library. The `kind` column says which is which, and no row calls a library an
 adapter, a bridge a library or a binding either
 ([decisions/0013](docs/decisions/0013-competitor-libraries.md) §5.5). The table lists **every
-one of the twenty-four `[workspace] members`** and is read off `cargo metadata`, not kept by
+one of the twenty-eight `[workspace] members`** and is read off `cargo metadata`, not kept by
 hand.
 
 | Path | Package | kind | Responsibility |
@@ -72,7 +76,10 @@ hand.
 | `crates/runtime` | `weida-runtime` | weida | the reactor and the OS plumbing, with no protocol in it: tasks, timers, DNS with a capped resolver, the three reactor-ownership constructors, a bounded close budget, an in-process name registry, `AF_UNIX` bind hygiene with peer credentials and, on Windows, named-pipe hygiene with the client's SID |
 | `crates/winpipe` | `weida-winpipe` | weida | the Win32 calls a named pipe needs and nothing else — an owner-only DACL, the client's token SID, the pipe's owner SID, both process ids — behind a safe surface; the one crate that may use `unsafe`, and empty off Windows |
 | `crates/weida` | `weida` | weida | runtime, the QUIC, in-process, `AF_UNIX` and named-pipe transports, the raw stream core, all six patterns — Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY, BUS — and the cursor back channel |
+| `crates/broker` | `weida-broker` | weida | L2, and a layer rather than a fork: queues at endpoint paths, the publisher confirm and the absolute per-subscription credit; depends on `weida` and nothing depends on it ([0018](docs/decisions/0018-minimal-broker.md) §4.1) |
+| `crates/raft/weida-raft` | `weida-raft` | weida | openraft plus the I/O it deliberately does not have — weida's transport under it — so a Raft service needs only a state machine ([0021](docs/decisions/0021-consensus-openraft.md)) |
 | `crates/py/weida-py-core` | `weida-py-core` | foundation | the shared PyO3 foundation under every binding, with nothing protocol-specific in it: errno exception families, the asyncio bridge that drives a Rust future on the caller's loop, and the bytes boundary ([0014](docs/decisions/0014-parallel-libraries.md) §2) |
+| `crates/py/weida-py` | `weida-py` | binding | the Python surface of weida itself: every pattern including the streamed fan-out, asyncio and synchronous ([docs/libraries/weida-py.md](docs/libraries/weida-py.md)) |
 | `crates/zmq/weida-zmtp` | `weida-zmtp` | codec | ZMTP 3.1 — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |
 | `crates/zmq/weida-zmq` | `weida-zmq` | library | the ZeroMQ implementation: every socket type of `zmq_socket(3)` bar `ZMQ_STREAM`, `tcp`/`ipc`/`inproc`, NULL/PLAIN/CURVE with ZAP, the option table, the monitor and the devices, interop-tested against libzmq 4.3.5 in both roles ([docs/libraries/zmq.md](docs/libraries/zmq.md)) |
 | `crates/zmq/weida-zmq-bridge` | `weida-zmq-bridge` | bridge | joins ZeroMQ peers and weida endpoints in both directions, terminating both protocols; the ZeroMQ half is `weida-zmq`'s sockets and what is here is the mapping |
@@ -91,6 +98,7 @@ hand.
 | `crates/nats/weida-nats` | `weida-nats` | library | the Core NATS client: subjects and wildcards, queue groups, request-reply over an inbox, five credential forms and TLS; interop is written and **not run**, because no `nats-server` was available ([docs/libraries/nats.md](docs/libraries/nats.md)) |
 | `crates/nats/weida-nats-py` | `weida-nats-py` | binding | the Python NATS surface: publish with headers, subscriptions as iterators, queue groups, `request` with a mandatory timeout, asyncio and synchronous |
 | `crates/interop/cross-tests` | `weida-cross-tests` | weida | no library code: one message in through one foreign protocol and out through the other, which belongs to neither family |
+| `crates/site` | `weida-site` | site | the website at [weida.doodleshnookie.net](https://weida.doodleshnookie.net), rendered from the documents in `docs/` rather than written beside them; the one member that is `publish = false` ([0025](docs/decisions/0025-the-website.md)) |
 
 ## Quick start, without writing a program
 
@@ -187,6 +195,23 @@ cargo test -p weida-zmq-bridge                  # both bridge directions, plus a
 cargo bench                                      # codec and loopback QUIC throughput
 cargo bench -p weida-zmq-bridge --bench interop # the bridge's cost against no bridge
 ```
+
+## The website
+
+[weida.doodleshnookie.net](https://weida.doodleshnookie.net) is this document set, rendered.
+It lives in the tree as `crates/site` and adds **no prose of its own** — a landing page with
+its own summary of the guarantees would be a second copy of every claim
+([decisions/0025](docs/decisions/0025-the-website.md)):
+
+```
+cargo run -p weida-site                          # writes target/site, prints the landing page
+xdg-open target/site/index.html                  # no server: the output is files
+cargo test -p weida-site                         # every document published or excluded on purpose,
+                                                 # and every link between documents resolves
+```
+
+Nothing here deploys it. The site is **not served from anywhere yet**, and the release it
+would announce does not exist: no crate on a registry, no tag, no binaries.
 
 ## License
 

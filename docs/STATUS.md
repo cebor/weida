@@ -6,37 +6,45 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `87cf7bb`, 2026-09-14 ~09:40 UTC. Tree clean, gate green on Linux:
-**1827 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+**Snapshot:** main, 2026-09-14 ~12:20 UTC. Tree clean, gate green on Linux:
+**1845 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
-plus `weida --features blocking` at **237**, 1 ignored. The twenty-four new tests are the
-review round's regression tests: what each one kills is in the [NIGHTLOG](NIGHTLOG.md) entry
-for it, and eight of them were confirmed to fail on the code they replaced.
-The Windows 11 VM ran at `2a38c47`, nine tests back: **1772 across 136 binaries**, the same 37
-ignored, after two storage faults (`LNK1201`, then `STATUS_IN_PAGE_ERROR`) cleared by a
+plus `weida --features blocking` at **237**, 1 ignored. Forty-one of those tests arrived in
+the last two rounds: twenty-four regression tests from the review, and seventeen that hold
+the website to the document set it renders. The intermittent failure this snapshot used to
+carry a caveat about is **found and fixed**: it was a port race in the cross-protocol tests,
+not a timing assertion (B-252).
+The Windows 11 VM ran at `93568c9`: **1805 across 136 binaries**, the same 37
+ignored, after one storage fault (`STATUS_IN_PAGE_ERROR`) cleared by a
 `cargo clean` — §6 point 3, not a code problem. Add
 the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
 items, and **every one of the four wheels built and smoke-tested with no Rust toolchain on
-`PATH`**. Twenty-four decision notes (0001–0024): fourteen `accepted` and ten `provisional` —
-0015 (peer authorization), 0016 (conflation) and 0017 (the subscription verdict) because each
-answers an open question with a wire-affecting "no"; 0018 (the minimal broker) and 0019 (the
-JVM binding) because they are the first step of a phase the user chooses; and 0020–0024 (the
-cluster, consensus, the store, one control group, the cursor and the three families) because
-they are the phase now being built.
+`PATH`**. Twenty-five decision notes (0001–0025): fourteen `accepted` and eleven
+`provisional` — 0015 (peer authorization), 0016 (conflation) and 0017 (the subscription
+verdict) because each answers an open question with a wire-affecting "no"; 0018 (the minimal
+broker) and 0019 (the JVM binding) because they are the first step of a phase the user
+chooses; 0020–0024 (the cluster, consensus, the store, one control group, the cursor and the
+three families) because they are the phase now being built; and 0025 (the website) because
+what a site may claim is settled by a release that does not exist yet.
 One binary, `weida` (B-060), beside the library, `weida::blocking` (B-194) beside the async API,
 and **`weida-py`** (B-200, B-204, B-205), the sixth Python binding in the tree, the first of
 weida itself, the only one that reaches every pattern of its library including the streamed
-fan-out, and — like the other five — with an asyncio surface and a `sync` one. **Twenty-four `[workspace]
-members`**, one directory per protocol family, read off `cargo metadata` rather than a
-hand-kept list: `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`, `weida`,
-`crates/py/weida-py-core`, then
+fan-out, and — like the other five — with an asyncio surface and a `sync` one. **Twenty-eight
+`[workspace] members`**, one directory per protocol family, read off `cargo metadata` rather
+than a hand-kept list: `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`,
+`weida`, `weida-broker`, `crates/raft/weida-raft`, `crates/py/{weida-py-core, weida-py}`,
+then
 `crates/zmq/{weida-zmtp, weida-zmq, weida-zmq-bridge, weida-zmq-py}`,
 `crates/nng/{weida-sp, weida-nng, weida-nng-bridge, weida-nng-py}`,
 `crates/mqtt/{weida-mqtt-codec, weida-mqtt, weida-mqtt-py}`,
 `crates/amqp/{weida-amqp-codec, weida-amqp, weida-amqp-py}`,
-`crates/nats/{weida-nats-codec, weida-nats, weida-nats-py}` and `crates/interop/cross-tests`.
+`crates/nats/{weida-nats-codec, weida-nats, weida-nats-py}`, `crates/interop/cross-tests`
+and `crates/site` — the last of which is the website at
+[weida.doodleshnookie.net](https://weida.doodleshnookie.net), rendered from the documents in
+this directory rather than written beside them
+([0025](decisions/0025-the-website.md)), and the one member that is `publish = false`.
 
 ![Product line](status/product-line.svg)
 
@@ -185,14 +193,15 @@ other end.
 
 Four things:
 
-1. **A licence, and where this is published** (B-068, now `blocked`). `cargo package
-   --workspace --no-verify` succeeds for all 24 crates and every one of them warns `manifest
-   has no license, license-file, documentation, homepage or repository`. The `[workspace.package]`
-   block is one commit; the licence is the copyright holder's choice and the `repository`
-   field is a publication decision, since the remote is a self-hosted Forgejo. MSRV is already
-   answered (`1.88`). One thing that needed no decision was fixed in the same pass: `chacha20
-   0.10.1` was **yanked** in the registry and in our lockfile, reached through `rand` from both
-   `quinn-proto` and `async-nats`; the lockfile now holds `0.10.2`.
+1. **Whether anything is published, and from where** — the one question the website makes
+   concrete. The licence half of this is **settled and done**: `MIT OR Apache-2.0` with both
+   files in the tree, `repository` and `homepage` in `[workspace.package]`, and `cargo package
+   --workspace --no-verify` clean for every publishable crate (B-068). What is left is not
+   mechanical: there is **no release** — no crate on any registry, no tag, no binary — and
+   `crates/site` renders a site that nothing serves. Two answers are yours: which host serves
+   `weida.doodleshnookie.net`, and whether the site goes up before there is something to
+   install. Until then the site says so on every page and B-254 holds the work
+   ([0025](decisions/0025-the-website.md) §4.6).
 2. **Two sentences in [LOOP.md](LOOP.md) §6** (B-184 and B-107). The loop does not edit its own
    standing instructions, so the checks are run by hand and recorded in each item's note. They
    are not theoretical: running B-184's own command this session found a third `cfg`-gated
@@ -220,27 +229,25 @@ Four things:
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1827 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  green at **1845 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
-  gate yet and were run by hand this session. One caveat worth stating rather than hiding:
-  **one full-workspace run in about twenty reports a single failure whose name nobody has
-  seen** — once on Linux, once on Windows, both times through a pipeline that counted the
-  results and discarded the failure block, and not reproduced in twenty-six further Linux runs
-  (eight of them at `--test-threads=32`, three under sixteen busy-loop processes) or four
-  further Windows ones. Filed as B-252 with the capture recipe, because a name is what closes
-  it and a green run is not.
-- **17 items are `ready`, 14 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
-  B-068, a licence and a publication target; the rest waiting on an item this session is
+  gate yet and were run by hand this session. The one caveat this section used to carry — a
+  failure in roughly one full-workspace run in twenty that nobody had seen — is **closed**:
+  the website's own gate run kept its log, the failure named itself
+  (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
+  a cross-test helper rather than the timing assertion it looked like (B-252).
+- **17 items are `ready`, 15 are `blocked`** (B-061, CI: the Forgejo host cannot run this
+  gate; B-254, serving the site; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **248** filed items, **216 are `done`**, and the `ready` ones are four
+  tier by 0011 §4.3). Of **250** filed items, **217 are `done`**, and the `ready` ones are five
   kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231),
   **the surfaces this session's work has not reached yet** (B-243, the cursor API in the two
   Python halves; B-244, the three new patterns in `weida::blocking` and both Python halves),
-  **eight findings the review round filed rather than fixed** (B-245 the `AF_UNIX` reset loss,
+  **seven findings the review round filed rather than fixed** (B-245 the `AF_UNIX` reset loss,
   B-246 the unconditional `traceparent`, B-247 fan-out unpriced, B-248 the `unsafe` guard,
   B-249 the parked-receipt sweep, B-250 the per-message header allocations, B-251 one refusal
-  table, B-252 the unnamed intermittent failure), and **two sentences in a file this loop does
-  not write** (§6, B-107 and B-184).
+  table), **the website** (B-253, built; B-254, serving it, blocked on the owner), and **two
+  sentences in a file this loop does not write** (§6, B-107 and B-184).
   Nothing else is open: every requirement-driven item, every library item and both binding
   slices of weida's own Python surface are closed.
 - **The requirement-driven backlog is closed.** All five requests of
