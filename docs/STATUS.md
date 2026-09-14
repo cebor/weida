@@ -6,9 +6,10 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `b5fa4a3`, 2026-09-14 ~02:00 UTC. Tree clean, gate green on Linux:
-**1754 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
-37 ignored — the interop suites that need a library or a broker the machine does not have.
+**Snapshot:** main `145537b`, 2026-09-14 ~02:40 UTC. Tree clean, gate green on Linux:
+**1767 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+37 ignored — the interop suites that need a library or a broker the machine does not have —
+plus `weida --features blocking` at **214**, 1 ignored.
 The Windows 11 VM last ran at `f8e8051`: **1712 across 128 binaries**, the same 37 ignored. Add
 the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
@@ -111,6 +112,18 @@ of B-051 found the session's first two unbounded remote-influenced allocations i
 rather than in the core, and B-097 found two more in the new library — so the invariant sweep
 covers the foreign-protocol crates too, and every bound they added is named where it is taken.
 
+**Completions are cursors, on a stream of their own.** `weida::Cursors`, `weida::CursorSet` and
+`weida::Reporter` (B-233, B-240) are the acknowledgement surface of
+[0023](decisions/0023-completion-is-a-cursor.md) and
+[0024](decisions/0024-three-families-one-back-channel.md): a sender orders levels per transfer
+with `TransferMeta::with_report` and reads absolute byte offsets back on frame kind `6`, a
+unidirectional stream that never shares a stream with payload. Two properties are structural
+rather than promised. **No pattern's topology changes**: a Push transfer that orders cursors is
+still one unidirectional stream, proved against a raw `quinn` peer because the library's own API
+cannot assert it. And **nothing waits on a cursor**: a sender that never reads its cursors blocks
+no transfer, a receiver that never reports fails none, and the level space is open — `0..=15` is
+weida's ladder, `16` and above is the application's, carried and ordered but never interpreted.
+
 ## 3. The first message across two protocols
 
 ![Cross-adapter chain](status/cross-adapter-chain.svg)
@@ -127,7 +140,7 @@ a multipart refused at hop one, the smaller `max_message_bytes` deciding — are
 
 Every point is a merge into main behind the four-step gate of [LOOP.md](LOOP.md) §6. **The
 chart stops at the two-day stop it was drawn for** (`5ca1329`, 1678 tests); the sessions since
-took it to **1754** without changing its shape, so it is left as the picture of the parallel run
+took it to **1767** without changing its shape, so it is left as the picture of the parallel run
 rather than redrawn per merge. Two things it does not show: three review findings were caught **before** their merge by reading
 the branch (a reassembler counter that drifted on repeated sequence numbers, a runtime-wide
 mutex on the fire-and-forget path that cost 3 % in the header bench, a parked receipt that
@@ -181,17 +194,20 @@ Three things, and only three:
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1754 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  green at **1767 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session.
-- **10 items are `ready`, 16 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
+- **11 items are `ready`, 15 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
   B-068, a licence and a publication target; the rest waiting on an item this session is
-  building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **237** filed items, **210 are `done`**, and the ten `ready` are three
+  building or on a toolchain this machine does not have), **one is `in_progress`** (B-240, whose
+  stream half has landed) and **one is `parked`** (A5's control tier by 0011 §4.3). Of **238**
+  filed items, **210 are `done`**, and the eleven `ready` are four
   kinds: **the three patterns `ARCHITECTURE.md` §6b maps and nobody built** (B-236 PAIR, B-237
   SURVEY, B-238 BUS), **five slices of the cluster and store phase** (B-219, B-220, B-224,
-  B-226, B-231), and **two sentences in a file this loop does not write** (§6, B-107 and
-  B-184).
+  B-226, B-231), **the cursor API in the two Python halves** (B-243), and **two sentences in a
+  file this loop does not write** (§6, B-107 and B-184). Nothing else is open: every
+  requirement-driven item, every library item and both binding slices of weida's own Python
+  surface are closed.
 - **The requirement-driven backlog is closed.** All five requests of
   [requirements/zeughaus-video.md](requirements/zeughaus-video.md) are answered where they were
   filed: streaming fan-out **built** (B-064, `Publisher::open`), conflation **answered without a
