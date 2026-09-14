@@ -115,12 +115,12 @@ that choice is the adapter's, not the protocol's (L8).
 | PULL v0 (`0x51`) | `Puller` [ARCHITECTURE §6b] | yes | PULL fair-queues arrivals with no defined order between simultaneously ready peers [nanomsg-nng §4, §7]; weida's `Puller` is one bounded queue behind an opaque path [ARCHITECTURE §6a P4] and its ordering is `None` [GUARANTEES §6] |
 | PUB v0 (`0x20`) | `Publisher` [ARCHITECTURE §6b] | no — the filter is on the wrong side | PUB offers **every** message to **every** connected subscriber without testing subscriptions [nanomsg-nng §4 "PUB/SUB filtering locus"]; weida filters at the publisher [ARCHITECTURE §6c.2]. §6 and L1 |
 | SUB v0 (`0x21`) | `Subscriber` [ARCHITECTURE §6b] | yes on delivery, no on the filter | SUB matches the initial body bytes locally; an empty subscription admits everything [nanomsg-nng §3, §4]. The adapter owns the local match when bridging inbound (§6) |
-| SURVEYOR v0 (`0x62`) | fan-out of exchanges with a deadline — *mapped, unimplemented* [ARCHITECTURE §6b] | no counterpart exists yet | A survey is one send to every respondent plus at most one reply each within `SURVEYTIME`, started at send [nanomsg-nng §4]. weida has no deadline-scoped fan-out of exchanges. Until §6b's row is built, the adapter refuses this pairing (§9.4); the honest interim shape is a weida `Publisher` for the survey plus a `Puller` for the answers, which is **not** the same object and MUST NOT be presented as one |
+| SURVEYOR v0 (`0x62`) | `Surveyor` [ARCHITECTURE §6b] | yes on the shape, no on the deadline | A survey is one send to every respondent plus at most one reply each within `SURVEYTIME`, started at send [nanomsg-nng §4]. weida's `Surveyor::survey(body, deadline)` is exactly that shape — one exchange per respondent, replies until the deadline, late replies dropped and **counted** [PATTERNS §6.2] — so the pairing is no longer refused. What still differs is where the deadline lives: `SURVEYTIME` is a socket option on the surveyor and weida's is a **per-survey argument**, so a bridge carries the option's value into each call rather than configuring it once |
 | RESPONDENT v0 (`0x63`) | `Replier` per survey | partly | A respondent may simply not answer, and the surveyor cannot tell silence from slowness [nanomsg-nng §4 "Survey time boundary"]. weida's `IncomingRequest` must be answered or refused; "no answer" is a deadline at the requester, not a protocol state |
-| PAIR v0 (`0x10`) | one connection, one exchange or one one-way transfer each way — *mapped, unimplemented* [ARCHITECTURE §6b] | n/a | PAIR v0 has no protocol header and is the legacy interoperable form [nanomsg-nng §4]. Its exclusivity — a peer rejects a second connection while paired [nanomsg-nng §4 matrix] — has no weida equivalent (L6) |
+| PAIR v0 (`0x10`) | `Paired` [ARCHITECTURE §6b] | yes | PAIR v0 has no protocol header and is the legacy interoperable form [nanomsg-nng §4]. Its exclusivity — a peer rejects a second connection while paired [nanomsg-nng §4 matrix] — now **has** a weida equivalent: a bound `Paired` refuses a second peer's stream with `LIMIT_EXCEEDED` and keeps the first [PATTERNS §6.1]. One asymmetry to carry: a bound `Paired` cannot address a peer before that peer has spoken, so a bridge that must speak first dials |
 | PAIR v1 (`0x11`) | as PAIR v0 | n/a | Adds a 32-bit hop-count header bounded by `MAXTTL` (1-255, commonly 8) [nanomsg-nng §3, §4, §11]. weida has no forwarding layer in v0, so the count is consumed and never propagated |
 | PAIR v1 polyamorous | not mapped | no | The destination is a *pipe handle*, not an address; an unavailable directed pipe discards silently and cannot route through devices [nanomsg-nng §4]. weida addresses by opaque endpoint path [INVARIANTS]; there is no handle to carry. Deprecated upstream [nanomsg-nng §4] |
-| BUS v0 (`0x70`) | n peers, each a `Peer` plus an `Acceptor` on the same path — *mapped, unimplemented* [ARCHITECTURE §6b] | no | BUS is one hop to *directly connected* peers only, and needs a fully connected mesh to be a bus [nanomsg-nng §4]. weida has no mesh membership concept. Refused until §6b's row is built (§9.5) |
+| BUS v0 (`0x70`) | `BusMember` [ARCHITECTURE §6b] | yes on the hop, no on membership | BUS is one hop to *directly connected* peers only, and needs a fully connected mesh to be a bus [nanomsg-nng §4]. weida's `BusMember` makes the same trade — a message reaches every **other** member, there is no relay, and *n* members is *n* × (*n* − 1) deliveries [PATTERNS §6.3] — so the pairing is no longer refused. What weida still has no concept of is mesh *membership*: joining is a dial and leaving a disconnect, and nothing tells a member who else is on the bus |
 | Raw variants of all of the above | — | n/a | Raw preserves the wire headers and moves state machines, retries, matching and loop control to the application [nanomsg-nng §4, §11]. The adapter speaks cooked (§1); a raw *peer* is fine, a raw adapter is not |
 
 ## 3. Stream mapping
@@ -453,10 +453,17 @@ configuration entry [0006 §4.7]. The adapter rejects, naming the reason:
    needs an identity [GUARANTEES §6]; the SP request ID is 31 bits, per-context and randomly
    seeded [rfc-reqrep §5], so the adapter's synthesized identity — and its window — must be
    spelled out in the configuration or the configuration is refused.
-4. **SURVEYOR/RESPONDENT onto weida patterns**, until [ARCHITECTURE §6b]'s row is built: the
-   deadline-scoped fan-out of exchanges does not exist, and approximating it with a publisher
-   plus a puller loses the per-respondent reply correlation (L5).
-5. **BUS onto weida**, for the same reason plus the mesh (L7).
+4. ~~**SURVEYOR/RESPONDENT onto weida patterns**, until [ARCHITECTURE §6b]'s row is built.~~
+   **Withdrawn: §6b's row is built** (B-237). `Surveyor::survey(body, deadline)` is the
+   deadline-scoped fan-out of exchanges this item said did not exist, so the pairing maps
+   directly and needs no publisher-plus-puller approximation. What the bridge must still
+   carry across is the *locus* of the deadline: `SURVEYTIME` is a socket option, weida's is a
+   per-survey argument (§2).
+5. ~~**BUS onto weida**, for the same reason plus the mesh.~~ **Half withdrawn: §6b's row is
+   built** (B-238). `BusMember` makes SP's own trade — one hop, no relay, *n* × (*n* − 1)
+   deliveries — so the pattern maps. What is **not** withdrawn is the mesh: neither side has a
+   membership concept, so a configuration that expects a bridge to know who is on the bus is
+   still refused (L7).
 6. **`RECVMAXSZ = 0` or no `max_message_bytes`.** Unbounded inbound size is refused
    [INVARIANTS], [nanomsg-nng §5].
 7. **Any configuration that makes the adapter the durable hop** — storing before forwarding —

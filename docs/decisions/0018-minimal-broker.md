@@ -252,8 +252,15 @@ for a queue at its bound, `{UNKNOWN_ENDPOINT}` for a path with no queue — so a
 invention either [PROTOCOL §9.4]. A producer that will not wait sends a one-way transfer to the
 same path and gets the transport receipt and nothing more, the honest spelling of `acks=0`
 [kafka §6]. **The whole first slice's frame budget is therefore one number: kind `5`.** Kind `6`
-stays the first free kind, as [0016 §4.10] recorded, and the consumer acknowledgement of §4.3
-travels on the reply half of the delivery exchange.
+was the first free kind when this note was written, as [0016 §4.10] recorded; it has since been
+**spent on the cursor stream** [0023], [0024 §4.4], and `7` is the first free kind now. That
+spending also answers §4.3's open half: the consumer acknowledgement does **not** travel on the
+reply half of a delivery exchange — a delivery stays a one-way transfer and settlement is a
+cursor on a CURSOR stream, which is why §6's "a kind `6` carrying batched acks in RabbitMQ's
+`multiple` shape" alternative is not merely unchosen but unavailable, and needs no `multiple`
+flag: a cursor is cumulative because it is an absolute offset. A producer's confirm is
+untouched by all of it — still DATA key `8` on the reply half of *its* exchange — and a producer
+that wants a verdict without an exchange now orders `Accepted` as a cursor instead.
 
 **4.7 The drain: a queue drain is a different operation, and here is what it means.** Plainly,
 in 0009's own words: "**L2 owes a different drain, and may not present it as this one**"

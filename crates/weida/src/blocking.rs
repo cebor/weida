@@ -6,7 +6,10 @@
 //! test harness, a CLI or a thread pool that has none — and this repository's
 //! four protocol libraries all learned that, one facade each
 //! (`weida_zmq::blocking`, `weida_mqtt::blocking`, `weida_nng::blocking`).
-//! This is the same shape for weida's own patterns (B-194).
+//! This is the same shape for weida's own patterns (B-194) — for the **six
+//! roles** of Req/Rep, Push/Pull and Pub/Sub. PAIR, SURVEY and BUS are
+//! asynchronous-only for now, and so is the cursor surface; both are filed
+//! (B-244, B-243) rather than half-wrapped here.
 //!
 //! # It is a wrapper, and nothing else
 //!

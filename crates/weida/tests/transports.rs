@@ -1,12 +1,22 @@
-//! The same pattern tests over both transports.
+//! The same pattern tests over every transport.
 //!
-//! Each body below is written once and run twice: over native QUIC and over
+//! Each body below is written once and run over all of them: native QUIC,
 //! the in-process transport of
-//! [decision 0010](../../docs/decisions/0010-local-transport.md). That is
+//! [decision 0010](../../docs/decisions/0010-local-transport.md), `AF_UNIX`
+//! and, on Windows, a named pipe. That is
 //! what the transport boundary introduced in B-037 is for — above it, the
 //! frames, the HELLO exchange, the negotiation and the patterns are the same
 //! (`docs/PROTOCOL.md` §2.1) — and running the *same* body is the only way to
 //! check that claim rather than restate it.
+//!
+//! All six patterns are here, and PAIR is the one whose presence changes
+//! something: its **bound** side opens a stream toward a peer that dialled
+//! it, which on a socket transport is only possible over the reverse pool
+//! [0012 §4.4]. Req/Rep never exercises that — a reply rides the request's
+//! own bidirectional stream — so before PAIR nothing here proved the pool
+//! carries an ordinary send. BUS, by contrast, needs no pool at all: every
+//! member writes on a connection it dialled itself, and `bus_over_unix` is
+//! what turns that from an argument into a fact.
 
 mod common;
 
@@ -147,6 +157,198 @@ async fn pub_sub_fan_out(h: &Harness) {
     );
     first_client.shutdown().await;
     second_client.shutdown().await;
+}
+
+/// PAIR: one-way transfers in both directions on one connection.
+///
+/// The direction that matters here is the **bound** side's: it writes on the
+/// connection its peer dialled, which on a socket transport is only possible
+/// over the reverse pool the dialling side parked
+/// (`docs/decisions/0012-local-connection-grouping.md` §4.4). Req/Rep never
+/// exercises that — a reply rides the request's own bidirectional stream — so
+/// PAIR is the first pattern whose *bound* side opens a stream, and this body
+/// is what proves the pool carries it.
+async fn pair_both_directions(h: &Harness) {
+    let bound = h.listener.pair("/link").expect("bound pair");
+
+    let client = h.client();
+    let dialling = client.pair(h.trust());
+    within(dialling.connect(&h.url("/link")))
+        .await
+        .expect("connect");
+
+    within(dialling.send(b"from the dialler"))
+        .await
+        .expect("send");
+    let inbound = within(bound.recv()).await.expect("recv");
+    assert_eq!(
+        within(inbound.collect(1024)).await.expect("collect"),
+        b"from the dialler".to_vec()
+    );
+
+    within(bound.send(b"from the bound side"))
+        .await
+        .expect("the bound side reaches its peer on every transport");
+    let answer = within(dialling.recv()).await.expect("recv");
+    assert_eq!(
+        within(answer.collect(1024)).await.expect("collect"),
+        b"from the bound side".to_vec()
+    );
+    client.shutdown().await;
+}
+
+/// SURVEY: one exchange per respondent, answered inside the deadline.
+async fn survey_one_respondent(h: &Harness) {
+    let respondent = h.listener.respondent("/poll").expect("respondent");
+    let answering = tokio::spawn(async move {
+        let mut request = respondent.accept().await.expect("accept");
+        let body = request.body().read_capped(1024).await.expect("body");
+        assert_eq!(body, b"who is there");
+        let mut reply = request.reply(TransferMeta::default()).await.expect("reply");
+        reply.write_all(b"here").await.expect("write");
+        reply.finish().expect("finish");
+    });
+
+    let client = h.client();
+    let surveyor = client.surveyor(h.trust());
+    within(surveyor.connect(&h.url("/poll")))
+        .await
+        .expect("connect");
+    let mut run = within(surveyor.survey(b"who is there", Duration::from_secs(5)))
+        .await
+        .expect("survey");
+    assert_eq!(run.respondents(), 1);
+    assert_eq!(
+        within(run.next(1024))
+            .await
+            .expect("an answer")
+            .expect("a reply"),
+        b"here".to_vec()
+    );
+    assert!(within(run.next(1024)).await.is_none());
+    assert_eq!(run.late(), 0);
+    within(answering).await.expect("respondent");
+    client.shutdown().await;
+}
+
+/// BUS: two members, each bound on its own binding and dialling the other.
+///
+/// Two harnesses rather than one, because a bus member *is* a binding: this
+/// is the only pattern that needs two of them on the same transport. Every
+/// send goes out over a connection the sender dialled, so unlike PAIR a bus
+/// needs no reverse pool — which is exactly the kind of claim that is worth a
+/// test rather than an argument.
+async fn bus_two_members(a: &Harness, b: &Harness) {
+    let first = a.listener.bus("/bus", b.trust()).expect("first member");
+    let second = b.listener.bus("/bus", a.trust()).expect("second member");
+    within(first.connect(&b.url("/bus"))).await.expect("join b");
+    within(second.connect(&a.url("/bus")))
+        .await
+        .expect("join a");
+
+    assert_eq!(
+        within(first.send(b"from the first")).await.expect("send"),
+        1
+    );
+    let seen = within(second.recv()).await.expect("recv");
+    assert_eq!(
+        within(seen.collect(1024)).await.expect("collect"),
+        b"from the first".to_vec()
+    );
+
+    assert_eq!(
+        within(second.send(b"from the second")).await.expect("send"),
+        1
+    );
+    let seen = within(first.recv()).await.expect("recv");
+    assert_eq!(
+        within(seen.collect(1024)).await.expect("collect"),
+        b"from the second".to_vec()
+    );
+    assert_eq!(first.dropped(), 0);
+    assert_eq!(second.dropped(), 0);
+}
+
+#[tokio::test]
+async fn pair_over_quic() {
+    pair_both_directions(&Harness::start(Transport::Quic).await).await;
+}
+
+#[tokio::test]
+async fn pair_over_inproc() {
+    pair_both_directions(&Harness::start(Transport::Inproc).await).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pair_over_unix() {
+    pair_both_directions(&Harness::start(Transport::Unix).await).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pair_over_pipe() {
+    pair_both_directions(&Harness::start(Transport::Pipe).await).await;
+}
+
+#[tokio::test]
+async fn survey_over_quic() {
+    survey_one_respondent(&Harness::start(Transport::Quic).await).await;
+}
+
+#[tokio::test]
+async fn survey_over_inproc() {
+    survey_one_respondent(&Harness::start(Transport::Inproc).await).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn survey_over_unix() {
+    survey_one_respondent(&Harness::start(Transport::Unix).await).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn survey_over_pipe() {
+    survey_one_respondent(&Harness::start(Transport::Pipe).await).await;
+}
+
+#[tokio::test]
+async fn bus_over_quic() {
+    let a = Harness::start(Transport::Quic).await;
+    let b = Harness::start(Transport::Quic).await;
+    bus_two_members(&a, &b).await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn bus_over_inproc() {
+    let a = Harness::start(Transport::Inproc).await;
+    let b = Harness::start(Transport::Inproc).await;
+    bus_two_members(&a, &b).await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bus_over_unix() {
+    let a = Harness::start(Transport::Unix).await;
+    let b = Harness::start(Transport::Unix).await;
+    bus_two_members(&a, &b).await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn bus_over_pipe() {
+    let a = Harness::start(Transport::Pipe).await;
+    let b = Harness::start(Transport::Pipe).await;
+    bus_two_members(&a, &b).await;
+    a.shutdown().await;
+    b.shutdown().await;
 }
 
 #[tokio::test]

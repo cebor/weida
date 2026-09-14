@@ -1,7 +1,11 @@
 //! weida: a QUIC-native messaging framework.
 //!
 //! This crate hosts the runtime, the native QUIC transport, the raw stream core
-//! and the brokerless messaging patterns: Req/Rep, Push/Pull and Pub/Sub.
+//! and the brokerless messaging patterns: Req/Rep, Push/Pull, Pub/Sub, PAIR,
+//! SURVEY and BUS — the whole nanomsg set, none of which adds wire
+//! vocabulary. A completion is a **cursor**: a level plus an absolute byte
+//! offset, reported on a unidirectional stream of its own
+//! ([`Cursors`], [`Reporter`]).
 //! `docs/ARCHITECTURE.md` describes the layer model,
 //! `docs/PROTOCOL.md` is the normative wire specification, and
 //! `docs/FAILURE_MODEL.md` defines what each outcome means.

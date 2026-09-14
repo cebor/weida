@@ -172,6 +172,13 @@ pub struct PyIncomingMeta {
 
 impl PyIncomingMeta {
     /// The metadata of one arrival, flattened into the Python shape.
+    ///
+    /// Eight of the Rust struct's twelve fields. `tracestate` is dropped
+    /// because a Python caller gets the `traceparent` and not the vendor
+    /// state, and the three report fields — `report`, `report_mode`,
+    /// `report_id` — are dropped because the whole cursor surface is absent
+    /// from this binding and filed as **B-243**: exposing the metadata of a
+    /// report a caller cannot act on would be worse than omitting it.
     pub fn of(meta: &IncomingMeta) -> PyIncomingMeta {
         PyIncomingMeta {
             endpoint: meta.endpoint.clone(),

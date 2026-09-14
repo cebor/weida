@@ -47,7 +47,8 @@
 //!
 //! # What is here, and what is not
 //!
-//! All three patterns, on both surfaces. Asyncio: `Requester`/`Replier`,
+//! **Three of weida's six patterns**, on both surfaces. Asyncio:
+//! `Requester`/`Replier`,
 //! `Pusher`/`Puller` and `Publisher`/`Subscriber` (B-200, B-204), each with
 //! the whole-payload calls a caller reaches for first **and** the streamed
 //! forms for a payload that does not fit memory — `pusher.open()`,
@@ -62,7 +63,12 @@
 //! What is absent, with the reason: the raw L0 surface — `Peer` and
 //! `Acceptor`, weida's own stream-level API — because every pattern above is
 //! built on it and a Python caller that wants a bare stream wants the Rust
-//! API; and type stubs, which `docs/libraries/weida-py.md` §10 names as the
+//! API; **PAIR, SURVEY and BUS**, the three patterns the library gained after
+//! this binding was written, filed as B-244 because each costs both surfaces
+//! here; the **cursor** surface — `TransferMeta`'s report order,
+//! `Cursors` and `Reporter` — filed as B-243 for the same reason, which is
+//! also why `IncomingMeta`'s three report fields are not among the attributes
+//! below; and type stubs, which `docs/libraries/weida-py.md` §10 names as the
 //! follow-up they are.
 //!
 //! # No protocol behaviour lives here

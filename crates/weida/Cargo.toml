@@ -1,6 +1,6 @@
 [package]
 name = "weida"
-description = "QUIC-native messaging framework: runtime, native QUIC transport, Req/Rep, Push/Pull and Pub/Sub"
+description = "QUIC-native messaging framework: runtime, native QUIC transport, Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY and BUS"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true

@@ -512,8 +512,9 @@ unit-testable without a network.
 ### `weida-protocol`
 
 The wire codec, also with no I/O: RFC 9000 varints, the stream preamble with its
-cap-before-allocation check, the four frame headers behind the five frame kinds — SUBSCRIBE
-and UNSUBSCRIBE share one — with hand-written CBOR encoders and decoders, the negotiation
+cap-before-allocation check, the five frame headers behind the six frame kinds — SUBSCRIBE
+and UNSUBSCRIBE share one — with hand-written CBOR encoders and decoders, the cursor record's
+varint pair, the negotiation
 function, and the QUIC application error code constants. Being I/O-free makes it directly
 fuzzable: a fuzz target feeds it arbitrary bytes with no socket in the way.
 

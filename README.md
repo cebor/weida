@@ -8,9 +8,15 @@ It is built in layers. **L0** is a stream core: ZeroMQ's idea rebuilt on QUIC, w
 primitives are unidirectional and bidirectional streams with exactly the guarantees QUIC
 gives — ordered bytes within a stream, none across streams, flow control, a transport
 delivery receipt, and cancellation by reset. **L1** is the ZeroMQ/nanomsg pattern family as
-thin wrappers over L0: Req/Rep, Push/Pull, Pub/Sub. **L2** will be a RabbitMQ-analog broker
-with queues, publisher confirms and consumer acknowledgements; it does not exist yet, and
-its guarantee vocabulary is deliberately kept out of the socket layer until it does.
+thin wrappers over L0: Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY and BUS — the whole nanomsg
+set, and none of them adds wire vocabulary. **L2** is a RabbitMQ-analog broker,
+`weida-broker`: queues at endpoint paths, publisher confirms, and an absolute per-subscription
+credit. Consumer acknowledgement and redelivery are the slice still to come.
+
+A completion is a **cursor**, not a verdict: a level plus an **absolute byte offset**, reported
+on a unidirectional stream of its own that never shares a stream with payload. So a Push
+producer gets a reliable `Accepted` without an exchange, a reader learns how far the far end
+got rather than only whether it finished, and no pattern changes shape to gain any of it.
 
 **Status:** alpha. Wire protocol version `0` (experimental, breaking changes permitted
 within `0.x`). Phases 0-2 implemented: docs, core model, native QUIC transport with Req/Rep.
@@ -18,21 +24,26 @@ Phase 3 in progress: Push/Pull, Pub/Sub, the raw L0 stream API, peer identity by
 fingerprint, opt-in per-producer ordering and bounded deduplication, one connection per
 dialled endpoint path, a bounded `drain`, and an in-process transport beside QUIC have
 landed. Beside weida the repository ships a **ZeroMQ library**: `weida-zmq` is a native Rust
-ZeroMQ on the ZMTP 3.1 codec `weida-zmtp`, complete against
+**Status:** alpha. Wire protocol version `0` (experimental, breaking changes permitted
+within `0.x`). Phases 0-3 are implemented — the docs, the core model, the native QUIC
+transport, the in-process, `AF_UNIX` and named-pipe transports, all six patterns, the raw L0
+stream API, peer identity by public-key fingerprint, opt-in per-producer ordering and bounded
+deduplication, a bounded `drain`, the cursor back channel, a synchronous facade
+(`weida::blocking`), a `weida` binary and a Python binding (`weida-py`) — and the first two
+broker slices with them. Beside weida the repository ships **five protocol libraries**, none
+of which has weida in its picture: ZeroMQ (`weida-zmtp` + `weida-zmq` + `weida-zmq-py`), the
+nanomsg SP protocols (`weida-sp` + `weida-nng` + `weida-nng-py`), MQTT 5 (`weida-mqtt-codec` +
+`weida-mqtt` + `weida-mqtt-py`), AMQP 1.0 (`weida-amqp-codec` + `weida-amqp` +
+`weida-amqp-py`) and Core NATS (`weida-nats-codec` + `weida-nats` + `weida-nats-py`), each
+with a parity document under [docs/libraries/](docs/libraries/) and each measured against a
+real peer where one exists. `weida-zmq` is complete against
 [decisions/0013](docs/decisions/0013-competitor-libraries.md) §4.7's definition of
 first-class — every socket type of `zmq_socket(3)` bar `ZMQ_STREAM`, `tcp`/`ipc`/`inproc`,
 NULL/PLAIN/CURVE with ZAP, the option table honoured or refused row by row, the monitor and
 the devices, the zguide's canonical recipes as examples that assert the guide's own claims,
 and interop against libzmq 4.3.5 and the pure-Rust `zeromq` crate in both roles
-([docs/libraries/zmq.md](docs/libraries/zmq.md)). `weida-zmq-bridge` is the forwarder beside
-it, joining ZeroMQ peers and weida endpoints in both directions. The NNG family has its codec
-and its bridge; its library is next.
-
-## Documentation
-
-| Document | Contents |
-| --- | --- |
-| [docs/STATUS.md](docs/STATUS.md) | one-page status: roadmap, layers, the cross-adapter chain, tests over time, the measurements that decided something |
+([docs/libraries/zmq.md](docs/libraries/zmq.md)). `weida-zmq-bridge` and `weida-nng-bridge`
+are the forwarders beside them, joining foreign peers and weida endpoints in both directions.
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layer model, terminology, addressing, crate map, runtime internals, public API v0 |
 | [docs/PATTERNS.md](docs/PATTERNS.md) | the pattern reference: per-pattern tables in the shape of `zmq_socket(3)`, and what QUIC streams do underneath, measured |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | normative wire protocol v0: framing, frame headers, golden vectors, limits |
@@ -60,7 +71,7 @@ hand.
 | `crates/protocol` | `weida-protocol` | weida | wire codec, no I/O: varints, framing, CBOR headers, negotiation, error codes |
 | `crates/runtime` | `weida-runtime` | weida | the reactor and the OS plumbing, with no protocol in it: tasks, timers, DNS with a capped resolver, the three reactor-ownership constructors, a bounded close budget, an in-process name registry, `AF_UNIX` bind hygiene with peer credentials and, on Windows, named-pipe hygiene with the client's SID |
 | `crates/winpipe` | `weida-winpipe` | weida | the Win32 calls a named pipe needs and nothing else — an owner-only DACL, the client's token SID, the pipe's owner SID, both process ids — behind a safe surface; the one crate that may use `unsafe`, and empty off Windows |
-| `crates/weida` | `weida` | weida | runtime, the QUIC, in-process, `AF_UNIX` and named-pipe transports, the raw stream core, and the Req/Rep, Push/Pull and Pub/Sub patterns |
+| `crates/weida` | `weida` | weida | runtime, the QUIC, in-process, `AF_UNIX` and named-pipe transports, the raw stream core, all six patterns — Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY, BUS — and the cursor back channel |
 | `crates/py/weida-py-core` | `weida-py-core` | foundation | the shared PyO3 foundation under every binding, with nothing protocol-specific in it: errno exception families, the asyncio bridge that drives a Rust future on the caller's loop, and the bytes boundary ([0014](docs/decisions/0014-parallel-libraries.md) §2) |
 | `crates/zmq/weida-zmtp` | `weida-zmtp` | codec | ZMTP 3.1 — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |
 | `crates/zmq/weida-zmq` | `weida-zmq` | library | the ZeroMQ implementation: every socket type of `zmq_socket(3)` bar `ZMQ_STREAM`, `tcp`/`ipc`/`inproc`, NULL/PLAIN/CURVE with ZAP, the option table, the monitor and the devices, interop-tested against libzmq 4.3.5 in both roles ([docs/libraries/zmq.md](docs/libraries/zmq.md)) |

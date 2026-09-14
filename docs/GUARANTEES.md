@@ -174,14 +174,21 @@ the state that means the application consumed the bytes — is one the sender ca
 progress, MAX_STREAM_DATA credit being only a proxy a receiver may advertise on any basis it
 likes (RFC 9000 §4.1).
 
-`Accepted`, `Stored`, `Replicated` and `Processed` are reserved for the L2 broker layer and
-are deliberately absent from the v0 wire ([PROTOCOL.md](PROTOCOL.md) §11). Earlier drafts
-carried application ACK frames in the core and they were removed: without a broker in the
+`Accepted`, `Stored`, `Replicated` and `Processed` belong to a hop that owns the message, and
+the brokerless core produces none of them on its own. What they now **have** is a carrier:
+they ride a CURSOR stream as absolute byte offsets, ordered per transfer in DATA keys `9`-`11`
+([PROTOCOL.md](PROTOCOL.md) §6.7, [decisions/0023](decisions/0023-completion-is-a-cursor.md)).
+The distinction that earlier drafts got wrong is worth keeping sharp. Those drafts carried
+application ACK **frames in the core** and they were removed: without a broker in the
 topology, an application ACK means "arrived in RAM at the other end", which is precisely
 what QUIC already guarantees by retransmitting until the peer acknowledges. It bought
 RabbitMQ's vocabulary without RabbitMQ's responsibility transfer — the one thing that makes
-the vocabulary worth having (§1). The words return when a hop exists that can own the
-message.
+the vocabulary worth having (§1). The cursor stream does not reopen that: a cursor is
+**reported by a hop that took responsibility**, never synthesized by the transport, nothing
+waits on one, and a level a peer cannot reach is simply absent rather than invented. So the
+words are back on the wire while the rule that made them meaningless in the core still holds
+— which is why `weida-broker` reports `Accepted` and nothing in this repository reports
+`Stored`.
 
 The receipt is a correctness signal, not a latency-sensitive one. On an idle loopback
 connection `delivered()` resolves in ~26 ms, because the peer delays its acknowledgement up
@@ -484,7 +491,7 @@ name a level that is decided and specified but not yet implemented.
 
 | Dimension | v0 support | Notes |
 | --- | --- | --- |
-| Acknowledgement | transport receipt only | `Delivery::delivered()` resolves `Ok(())` when the peer's **transport** holds every byte and the FIN — explicitly not "the application read it" (§3). There is no application acknowledgement anywhere in the v0 core: `Accepted`, `Stored`, `Replicated` and `Processed` are reserved for the L2 broker layer and have no wire representation, not even a reserved code point ([PROTOCOL.md](PROTOCOL.md) §11). |
+| Acknowledgement | transport receipt at L0; **`Accepted` reported as a cursor** by `weida-broker` | `Delivery::delivered()` resolves `Ok(())` when the peer's **transport** holds every byte and the FIN — explicitly not "the application read it" (§3). That is still the *only* signal the brokerless core produces on its own. What changed is that the higher levels now have a **carrier**: a sender orders levels per transfer in DATA keys `9`-`11` and a receiver reports them as **absolute byte offsets** on a CURSOR stream, frame kind `6`, which never shares a stream with payload ([PROTOCOL.md](PROTOCOL.md) §6.7, [decisions/0023](decisions/0023-completion-is-a-cursor.md)). Ordering a level is a **request, not a guarantee**: a hop that cannot reach it simply does not report it, and the transfer does not fail for that — a level a peer MUST reach is this dimension, negotiated in HELLO. `weida-broker` reports `Accepted` at the admitted body length; `Stored`, `Replicated` and `Processed` remain unreported by anything in this repository, because no hop here owns a store. |
 | Delivery | `BestEffort` only | v0 performs no retries. A failed or indeterminate transfer is reported to the application, which decides. `AtMostOnce` and `AtLeastOnce` require retry and dedup machinery that does not exist yet. |
 | Ordering | `None` by default; `PerProducer` **implemented in both modes**, opt-in | QUIC guarantees byte order **within** one stream. A one-way transfer is one stream, and each half of an exchange is one stream, so a single payload is ordered end to end. Across streams there is no ordering guarantee of any kind, which is what `PerProducer` addresses: a runtime configured with it (`RuntimeConfig::guarantees`) numbers its one-way transfers per (producer, path or topic) in DATA key `6`. In **detect** mode the receiver reports what is missing through `IncomingMeta::gap` and delivers every message as it arrives; in **reassemble** mode it holds an arrival whose predecessors are missing and releases the run in sequence order, bounded by `Limits::max_reorder_hold` and releasing out of order with a reported gap at the bound (§3). The level is declared in HELLO and negotiated, so both ends agree or the handshake fails ([PROTOCOL.md](PROTOCOL.md) §2.3). *Spec ahead of code:* `PerKey` is L2-only by decision [0001 §7.4]; `Total` is not specified. Exchanges are not numbered: a reply carries no endpoint, and the stream is the correlation. |
 | Deduplication | `None` by default; `Bounded(window)` **implemented**, opt-in | Under `core` there are no idempotency ids and no dedup window, and nothing on the wire names a transfer, so a receiver could not deduplicate even if it wanted to. A runtime configured `Bounded` with a window (`RuntimeConfig::guarantees`) remembers the identity of what it received — `(producer, scope, sequence)`, the producer being the connection's proved fingerprint unless DATA key `7` names another ([decisions/0008](decisions/0008-session-identity.md) §4.4) — and suppresses a repeat inside the window, counting it in `Runtime::suppressed_duplicates`. A suppressed transfer is read to EOF and discarded, so the sender sees an ordinary receipt: the window saves the application, not the bandwidth. Bounded means bounded twice over — in time by the window and in count by `Limits::max_dedup_entries` — so an identity reused after its window, or evicted at the cap, is **not** suppressed [0001 §7.6]. `Durable` needs a store and belongs to the L2 broker. |

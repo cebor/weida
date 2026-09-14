@@ -97,13 +97,13 @@
   <text x="28" y="478" class="side">ITSELF</text>
   <text x="28" y="494" class="sub">crates/weida,</text>
   <text x="28" y="506" class="sub">crates/protocol</text>
-  <rect x="140" y="458" width="152" height="40" rx="4" class="built"/><text x="148" y="475" class="lbl">Patterns</text><text x="148" y="489" class="sub">Req/Rep, Push/Pull, Pub/Sub</text>
+  <rect x="140" y="458" width="152" height="40" rx="4" class="built"/><text x="148" y="475" class="lbl">Patterns</text><text x="148" y="489" class="sub">six: the whole nanomsg set</text>
   <rect x="302" y="458" width="152" height="40" rx="4" class="built"/><text x="310" y="475" class="lbl">Ordering</text><text x="310" y="489" class="sub">detect + reassemble</text>
   <rect x="464" y="458" width="152" height="40" rx="4" class="built"/><text x="472" y="475" class="lbl">Dedup</text><text x="472" y="489" class="sub">Bounded(window)</text>
   <rect x="626" y="458" width="152" height="40" rx="4" class="built"/><text x="634" y="475" class="lbl">Drain / shutdown</text><text x="634" y="489" class="sub">bounded, counted</text>
   <rect x="788" y="458" width="152" height="40" rx="4" class="built"/><text x="796" y="475" class="lbl">Pool</text><text x="796" y="489" class="sub">one conn per dialled path</text>
-  <rect x="140" y="506" width="380" height="36" rx="4" class="built"/><text x="148" y="522" class="lbl">weida-protocol</text><text x="148" y="536" class="sub">DATA keys 0–7, HELLO guarantee sets, filter grammar, fuzzed</text>
-  <rect x="530" y="506" width="410" height="36" rx="4" class="partial"/><text x="538" y="522" class="lbl">Guarantee sets</text><text x="538" y="536" class="sub">core + supersets negotiated; Stored/Replicated reserved for the L2 broker</text>
+  <rect x="140" y="506" width="380" height="36" rx="4" class="built"/><text x="148" y="522" class="lbl">weida-protocol</text><text x="148" y="536" class="sub">DATA keys 0–11, 6 frame kinds, HELLO sets, filters, fuzzed</text>
+  <rect x="530" y="506" width="410" height="36" rx="4" class="partial"/><text x="538" y="522" class="lbl">Guarantee sets</text><text x="538" y="536" class="sub">core + supersets negotiated; Accepted reported as a cursor (kind 6)</text>
   <rect x="140" y="552" width="800" height="30" rx="4" class="built"/><text x="148" y="571" class="lbl">Transport boundary — transport.rs: Link / SendHalf / RecvHalf as enums (no vtable on the payload path)</text>
   <rect x="140" y="596" width="192" height="46" rx="4" class="built"/><text x="148" y="612" class="lbl">QUIC (quinn)</text><text x="148" y="625" class="sub">TLS identity = fingerprint</text><text x="148" y="637" class="sub">one connection per path</text>
   <rect x="342" y="596" width="192" height="46" rx="4" class="built"/><text x="350" y="612" class="lbl">inproc</text><text x="350" y="625" class="sub">duplex channel pair per stream</text><text x="350" y="637" class="sub">peer = None</text>

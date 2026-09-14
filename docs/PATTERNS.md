@@ -6,9 +6,9 @@ nowhere to send, followed by what happens at every failure. Where ZeroMQ's table
 what its threads and queues do, these describe what the **transport** does, because a weida
 pattern is a thin wrapper over transport streams and inherits its behaviour from them.
 
-Three transports carry those streams today ([decisions/0010](decisions/0010-local-transport.md),
-[0012](decisions/0012-local-connection-grouping.md)): QUIC, an in-process channel pair, and
-`AF_UNIX`, where the OS connection **is** the stream. Every statement below is written for
+Four transports carry those streams today ([decisions/0010](decisions/0010-local-transport.md),
+[0012](decisions/0012-local-connection-grouping.md)): QUIC, an in-process channel pair,
+`AF_UNIX` and, on Windows, a named pipe, where the OS connection **is** the stream. Every statement below is written for
 QUIC unless it says otherwise, because QUIC is the transport whose flow control the patterns
 were designed against; §1.10 says which of them mean something different locally, and the
 failure tables name the transport where the two diverge.
@@ -16,8 +16,11 @@ failure tables name the transport where the two diverge.
 Every statement below that could be false is defended by a test named in the text. The
 measured numbers are from `crates/weida/tests/streams.rs` on loopback with `quinn 0.11`; the
 statements hold on any link, the numbers do not. `crates/weida/tests/transports.rs` runs one
-Req/Rep, Push/Pull and Pub/Sub body over all three transports, which is what makes the
-pattern semantics a fact about weida rather than about QUIC.
+body per pattern — Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY and BUS — over every one of
+those transports, which is what makes the pattern semantics a fact about weida rather than
+about QUIC. PAIR earns its place there twice over: its **bound** side is the only one that
+opens a stream toward a peer that dialled it, so it is the pattern that proves the reverse
+pool of [0012](decisions/0012-local-connection-grouping.md) §4.4 carries an ordinary send.
 
 Related: [ARCHITECTURE.md](ARCHITECTURE.md) (layer model, primitives P1-P4),
 [GUARANTEES.md](GUARANTEES.md) (the vocabulary), [FAILURE_MODEL.md](FAILURE_MODEL.md)

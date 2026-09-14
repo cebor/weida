@@ -48,7 +48,7 @@ not estimated:
 | `weida.sync.__all__` | **9** names | the list at `sync.rs:508-518`, one per class registered above it |
 | Exception classes | **22** | the 21 entries of the `failures!` invocation at `errors.rs:72-94`, **plus the base** `WeidaError` (`errors.rs:33`), which is not in that list |
 | Test functions | **19** | 8 in `tests/test_asyncio.py`, 6 in `tests/test_patterns.py`, 5 in `tests/test_sync.py` |
-| `IncomingMeta` attributes | **8** of the Rust struct's 9 fields | `values.rs:147-171` against `crates/weida/src/transfer.rs:64-100` |
+| `IncomingMeta` attributes | **8** of the Rust struct's 12 fields | `values.rs:147-171` against `crates/weida/src/transfer.rs`; `tracestate` and the three report fields are the four that are absent (§9) |
 
 ## 2. How it is built, tested and packaged
 
@@ -171,8 +171,9 @@ the call, so a coroutine that is never awaited does nothing at all
 | `Identity::generate()`, `generate_for(names)`, `from_pem_file(path)`, `fingerprint()` | all four | present — `values.rs:84-136`. `fingerprint()` is a method and not a field because a `from_pem_file` identity is read lazily, so a corrupt file fails there with the path in hand |
 | `Identity::from_pem(chain, key)`, `from_pem_files(chain, key)`, `certificate_pem()`, `to_pem()` | — | absent: PEM **in memory** cannot enter (a key from a secret store has no Python route in, `config.rs:221-232`) and a generated identity cannot be persisted from Python (`config.rs:270`). §10 |
 | `Pem`, `ClientTls`, `ServerTls` as types | — | absent: `Trust` and `Identity` are converted into them by the calls that take them (`runtime.rs:92`, `112-136`), so the two combining types never appear in Python |
-| `IncomingMeta`'s 9 fields | 8 attributes: `endpoint`, `content_len`, `content_type`, `topic`, `peer`, `sequence`, `missed`, `traceparent` | present — `values.rs:147-171`, and the shape is flattened: `gap` becomes `missed` as a number (`values.rs:183`) and `trace` becomes the W3C `traceparent` string (`values.rs:184`) |
-| `IncomingMeta::tracestate` (`transfer.rs:78`) | — | absent: the ninth field, forwarded unmodified by the library and not surfaced here. A caller that propagates a full trace context gets the `traceparent` and loses the vendor state |
+| `IncomingMeta`'s 12 fields | 8 attributes: `endpoint`, `content_len`, `content_type`, `topic`, `peer`, `sequence`, `missed`, `traceparent` | present — `values.rs:147-171`, and the shape is flattened: `gap` becomes `missed` as a number and `trace` becomes the W3C `traceparent` string |
+| `IncomingMeta::tracestate` | — | absent: forwarded unmodified by the library and not surfaced here. A caller that propagates a full trace context gets the `traceparent` and loses the vendor state |
+| `IncomingMeta::{report, report_mode, report_id}` | — | absent: the three cursor fields the library gained after this binding was written. The whole cursor surface is filed as **B-243**, and surfacing the metadata of a report a caller cannot act on would be worse than omitting it |
 | `PeerIdentity` as a type | `meta.peer` as `str` or `None` | present as text — `values.rs:157-161`: `sha256:…` over QUIC, `uid=…` over a local socket, `None` for an anonymous or in-process peer. Never from a header, so it can be authorized on rather than claimed ([0015](../decisions/0015-peer-authorization.md)); `test_asyncio.py:47` asserts the `None` for a client that presented no identity |
 | `TransferMeta::with_content_len` | set by the binding on `request`, `send`, `reply` | present implicitly — `endpoints.rs:112`, `188`, `323` |
 | `TransferMeta::with_content_type`, `with_trace` (`transfer.rs:44`, `56`) | — | absent: an outbound transfer cannot declare a content type or carry a trace from Python, although both are readable on arrival (§5 above) |
@@ -326,6 +327,8 @@ The `Typing :: Typed` classifier was the third of the same kind and is handled i
 | Absent | What a caller does not get | Where it would be added |
 | --- | --- | --- |
 | the raw L0 surface, `Peer` and `Acceptor` (§9.2) | taking a stream without a pattern interpreting it; `Incoming::Transfer` vs `Incoming::Exchange` as the application's choice | a slice binding `Runtime.peer(trust)` and `Binding.acceptor(path)` with an `Incoming` the two arms of which are distinguishable in Python |
+| **PAIR, SURVEY and BUS** | three of weida's six patterns: a one-peer link, a deadline-scoped fan-out of exchanges, and an n-member bus | **B-244** — each costs both surfaces here, and a survey's deadline is the first weida concept whose Python shape is a design question rather than a translation |
+| the **cursor** surface: `TransferMeta`'s report order, `Cursors`, `Reporter`, and `IncomingMeta`'s three report fields (§9) | ordering a completion level per transfer and reading absolute byte offsets back; a Push producer's reliable `Accepted` without an exchange | **B-243** — a cursor's reader outlives the handle it came from, which is a lifetime question in Python rather than a translation |
 | a Python **server** on a local transport | `bind_inproc`, `bind_unix`, `bind_pipe` (`listener.rs:197`, `232`, `263`); the client side already dials all three (`endpoints.rs:59-62`) | three coroutines on `Runtime` beside `bind`, each returning the binding kind the library has, plus the `LocalPrincipal`/`WindowsPrincipal` reading that makes `uid=…` useful |
 | eight of `RuntimeConfig`'s nine fields, and all of `Limits` (§3) | every resource ceiling weida bounds — queue depths, connection counts, the subscriber budget, the guarantee set — is the library's default and cannot be moved from Python | a `weida.Limits` and keyword arguments on `Runtime`, in the shape [`mqtt-py.md`](mqtt-py.md) §5 uses for the two limits that surface there |
 | streaming in `weida.sync` (§9.3) | a synchronous caller cannot write or read a payload in pieces | `weida::blocking` gaining a streamed form first; building it in the binding is what 0013 §4.4 forbids |

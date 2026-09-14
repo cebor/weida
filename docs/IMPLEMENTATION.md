@@ -673,6 +673,10 @@ the pool is not a special case: nothing above the transport knows it is there. 1
   conflation is the producer's single slot over `Publisher::open` + `write_now`.
 - PAIR, BUS and SURVEYOR/RESPONDENT: mapped onto L0 in
   [ARCHITECTURE.md](ARCHITECTURE.md), deliberately not implemented until a use case asks.
+  **Delivered later as B-236, B-237 and B-238**, when the owner asked for the full family:
+  `weida::Paired`, `weida::Surveyor`/`Respondent` and `weida::BusMember`, and the mapping held
+  — not one byte of wire vocabulary was added for any of the three ([PATTERNS.md](PATTERNS.md)
+  §6).
 - Router/Dealer as first-class types, and the broker work they would actually require
   (master doc §47, §85, Phase 6).
 
