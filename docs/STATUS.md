@@ -6,7 +6,7 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `cff962b`, 2026-09-14 ~17:00 UTC. Tree clean, gate green on Linux:
+**Snapshot:** main `cecae03`, 2026-09-14 ~18:00 UTC. Tree clean, gate green on Linux:
 **1862 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
 plus `weida --features blocking` at **237**, 1 ignored. Fifty-eight of those tests arrived in
@@ -49,7 +49,7 @@ and about 27 messages per second at that width. The width interval in the guide 
 settles how a fan-out fails: a stalled subscriber is refused by the **byte budget** when that
 budget is below the connection's 0.6-1.5 MiB absorption band and by the **queue** when it is
 above it — which is why `dropped_on(topic)` separates the two causes.
-The Windows 11 VM ran at this round's bookkeeping commit (`477e589`): **1840 across 142
+The Windows 11 VM ran at this commit (`cecae03`): **1840 across 142
 binaries**, the same 37 ignored, in one clean pass — fmt, clippy in both configurations and
 rustdoc included, with both guide suites among the binaries; chapter 4's cross-protocol chain
 runs there too, `nng`'s C library and all. Add
