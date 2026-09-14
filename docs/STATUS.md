@@ -6,10 +6,10 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `d35d4f6`, 2026-09-14 ~04:20 UTC. Tree clean, gate green on Linux:
-**1787 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+**Snapshot:** main `2a38c47`, 2026-09-14 ~04:55 UTC. Tree clean, gate green on Linux:
+**1794 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
-plus `weida --features blocking` at **217**, 1 ignored.
+plus `weida --features blocking` at **237**, 1 ignored.
 The Windows 11 VM last ran at `f8e8051`: **1712 across 128 binaries**, the same 37 ignored. Add
 the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
@@ -155,7 +155,7 @@ a multipart refused at hop one, the smaller `max_message_bytes` deciding — are
 
 Every point is a merge into main behind the four-step gate of [LOOP.md](LOOP.md) §6. **The
 chart stops at the two-day stop it was drawn for** (`5ca1329`, 1678 tests); the sessions since
-took it to **1787** without changing its shape, so it is left as the picture of the parallel run
+took it to **1794** without changing its shape, so it is left as the picture of the parallel run
 rather than redrawn per merge. Two things it does not show: three review findings were caught **before** their merge by reading
 the branch (a reassembler counter that drifted on repeated sequence numbers, a runtime-wide
 mutex on the fire-and-forget path that cost 3 % in the header bench, a parked receipt that
@@ -209,16 +209,17 @@ Three things, and only three:
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1787 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  green at **1794 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session.
-- **8 items are `ready`, 14 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
+- **9 items are `ready`, 14 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
   B-068, a licence and a publication target; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **238** filed items, **215 are `done`**, and the eight `ready` are three
+  tier by 0011 §4.3). Of **240** filed items, **216 are `done`**, and the nine `ready` are three
   kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231),
-  **the cursor API in the two Python halves** (B-243), and **two sentences in a
-  file this loop does not write** (§6, B-107 and B-184). Nothing else is open: every
+  **the surfaces this session's work has not reached yet** (B-243, the cursor API in the two
+  Python halves; B-244, the three new patterns in `weida::blocking` and both Python halves),
+  and **two sentences in a file this loop does not write** (§6, B-107 and B-184). Nothing else is open: every
   requirement-driven item, every library item and both binding slices of weida's own Python
   surface are closed.
 - **The requirement-driven backlog is closed.** All five requests of
@@ -227,7 +228,7 @@ Three things, and only three:
   key** (B-065, [0016](decisions/0016-conflation.md)), peer authorization **answered "neither"**
   (B-066, [0015](decisions/0015-peer-authorization.md)), per-topic drop counters **built**
   (B-067), and the dependency form blocked on the licence above (B-068).
-- **What this session closed**: B-177 (split a `weida-zmq` socket into halves — the library diff
+- **What the previous session closed**: B-177 (split a `weida-zmq` socket into halves — the library diff
   *removes* 691 lines while adding 493, because the pattern bodies the whole sockets had are now
   shared), B-096 (a byte ceiling per peer queue, where a message count never was one), B-064
   (streaming fan-out), B-060 (the `weida` binary, Phase 11's first slice) with B-195..B-197 on
@@ -236,7 +237,20 @@ Three things, and only three:
   replenish the backlog (B-191..B-200) and a review pass was logged at `db5c144`: 0 new
   findings, and the allocation sweep's best answer is that the pipe transport's chunk header
   declares a `u32` length and allocates **nothing** from it.
-- **What moves the roadmap next** is yours to choose: **Phase D**, the L2 broker, which is also
-  where MQTT's and AMQP's server halves live and where the credit of 0003 gets a consumer on
-  both ends; or **Phase C's Java row**, now that the Python row is four bindings wide and
-  `weida-py-core` has proved the shape a per-language foundation takes.
+- **What this session closed**: the acknowledgement model and the pattern family. **B-233**
+  (frame kind `6`, the cursor stream, with four golden vectors and a fuzz target), **B-239** and
+  **B-240** (the cursor API in `weida`, two report modes and a granularity that is the
+  reporter's own), the broker reporting `Accepted` as a cursor so a Push producer gets a
+  reliable verdict on one unidirectional stream (0024 §4.4a), **B-236**, **B-237** and **B-238**
+  (PAIR, SURVEY and BUS, which complete `ARCHITECTURE.md` §6b's table and the nanomsg set), and
+  **B-242** (the failure matrix `PATTERNS.md` §1.11 claimed and nothing tested). Four decision
+  notes were **corrected by building them**: 0024 §4.4 (the head frame names a `report_id`, not
+  QUIC's `StreamId`, which exists on one of four transports), 0024 §4.3 (two wire modes, not
+  three — a `{bytes, interval}` pair in a header *is* a negotiated granularity, which 0023 §4.5
+  forbids), B-236's own acceptance (PAIR is one-way transfers both ways) and B-239's
+  (`final-only` is not byte-for-byte the classic confirm and cannot be).
+- **What moves the roadmap next** is yours to choose: **Phase D**, the L2 broker, where B-203's
+  two parked design questions are now answered — consumer settlement is a cursor, so a delivery
+  stays one-way — or **Phase C's Java row**. The two surfaces this session deliberately did not
+  reach are filed: B-243 (cursors in `weida-py`) and B-244 (PAIR, SURVEY and BUS in
+  `weida::blocking` and both Python halves).
