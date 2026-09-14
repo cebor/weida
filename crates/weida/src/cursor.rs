@@ -285,7 +285,9 @@ impl Cursors {
     /// caller can wrap [`Cursors::changed`] in its own timeout and rarely
     /// needs this; a **synchronous** one cannot — a parked thread is
     /// interrupted by nothing — which is why the timer lives here, where the
-    /// runtime is ([`crate::blocking::Cursors::changed`] is this call).
+    /// runtime is: `weida::blocking::Cursors::changed` is this call, written
+    /// as text rather than as a link because a link to a feature-gated item
+    /// is a hard rustdoc error in the configuration that lacks it (B-184).
     pub async fn changed_within(&mut self, deadline: Duration) -> Reported {
         let exec = self.guard.conn.exec.clone();
         match exec.within(deadline, self.changed()).await {
