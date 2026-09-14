@@ -500,6 +500,17 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
     };
     let header = read_header(&mut recv, &preamble).await?;
 
+    // Nothing but HELLO may be interpreted before negotiation completes,
+    // which is the rule `handle_stream` states for QUIC — and it matters
+    // *more* here: every frame arrives on an OS connection of its own, so a
+    // frame overtaking the control connection's HELLO is likelier on these
+    // transports than on QUIC. Without the gate a peer whose HELLO will be
+    // refused could still spend `max_subscriptions` and register
+    // subscriptions that outlive its refusal.
+    if preamble.kind != FrameKind::Hello {
+        ctx.negotiated().await?;
+    }
+
     match preamble.kind {
         // HELLO belongs to the control connection and nowhere else: a peer
         // that sends one here has not understood the grouping [0012 §4.1].
@@ -516,7 +527,6 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
             handle_cursor(ctx, recv, &header).await
         }
         FrameKind::Data => {
-            ctx.negotiated().await?;
             let decoded = match DataHeader::decode(&header) {
                 Ok(h) => h,
                 Err(e) => return violation(ctx, &e.to_string()),
@@ -1050,7 +1060,12 @@ async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
 /// ([FAILURE_MODEL.md](../../../docs/FAILURE_MODEL.md) §4) — which a
 /// successfully deduplicated message is not.
 async fn drain(mut stream: RecvHalf) -> Result<(), Error> {
-    let mut scratch = [0u8; 8 * 1024];
+    // Heap, not stack: this future is awaited inline by `handle_data`, which
+    // `handle_stream` awaits inline, which `accept_uni_loop` spawns — and a
+    // generator is as large as its largest state, not the states it takes.
+    // An array here made every inbound unidirectional stream's boxed future
+    // 8 KiB larger whether it deduplicated anything or not.
+    let mut scratch = vec![0u8; 8 * 1024];
     while stream.read(&mut scratch).await?.is_some() {}
     Ok(())
 }

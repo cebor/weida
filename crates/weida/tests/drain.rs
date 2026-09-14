@@ -403,3 +403,48 @@ async fn a_draining_runtime_refuses_a_late_stream_on_an_open_connection() {
     client.shutdown().await;
     server.peer.join().expect("peer thread");
 }
+
+#[tokio::test]
+async fn a_drain_closes_a_local_connection_the_way_shutdown_does() {
+    // `Runtime::drain`'s third step is documented as "the same close as
+    // `Runtime::shutdown`". On QUIC that is masked, because closing the
+    // endpoints closes their connections too; on the three local transports
+    // the connection registry is the **only** handle a close has
+    // (0010 §4.2), and a drain that emptied that registry before closing it
+    // left every local connection open, its peer never told and its tasks
+    // holding the connection for the life of the process.
+    let harness = common::Harness::start(common::Transport::Inproc).await;
+    let puller = harness.listener.puller("/jobs").expect("puller");
+    let client = harness.client();
+    let pusher = client.pusher(harness.trust());
+    within(pusher.connect(&harness.url("/jobs")))
+        .await
+        .expect("connect");
+    within(pusher.send(b"before the drain"))
+        .await
+        .expect("send");
+    assert_eq!(
+        within(within(puller.recv()).await.expect("recv").collect(64))
+            .await
+            .expect("collect"),
+        b"before the drain"
+    );
+
+    let drained = within(client.clone().drain(Duration::from_secs(2))).await;
+    assert_eq!(
+        drained.outstanding, 0,
+        "nothing was left in flight: {drained:?}"
+    );
+
+    // The connection is gone, so there is no peer to send to. Without the
+    // close this send succeeds and the drain closed nothing at all.
+    let after = within(pusher.send(b"after the drain"))
+        .await
+        .expect_err("a drained runtime has no live connections left");
+    assert!(
+        after.is_definite_failure(),
+        "a closed connection is a definite failure, got {after:?}"
+    );
+
+    harness.shutdown().await;
+}

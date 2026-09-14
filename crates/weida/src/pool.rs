@@ -120,22 +120,41 @@ impl ClientPool {
         let port = dial_port(written_port, config.discovery, host)?;
         let peer: PeerKey = (host.to_owned(), port, Arc::clone(tls), expected);
         let key: ConnKey = (peer.clone(), path.clone());
-        let mut state = self.state.lock().await;
-
-        if let Some(existing) = state.connections.get(&key) {
-            if existing.conn.close_reason().is_none() {
-                return Ok(ConnHandle::clone(existing));
+        // What the pool has to say is read under the lock and the lock is
+        // then **released for the dial**. Holding it across name resolution,
+        // the handshake attempts and the HELLO exchange — seconds of a
+        // peer's choosing — serialized every dial in the process against
+        // every other, and made `Runtime::close`, which takes this same
+        // lock to retire the client endpoint, wait on a peer: 0009 §4.4
+        // forbids exactly that.
+        //
+        // The cost of releasing it is that two dials for one key can both
+        // build a connection. That race is settled below, where the loser
+        // closes its own and returns the winner's, and it costs one extra
+        // handshake rather than a lock that spans the network.
+        let (endpoint, known) = {
+            let mut state = self.state.lock().await;
+            if let Some(existing) = state.connections.get(&key) {
+                if existing.conn.close_reason().is_none() {
+                    return Ok(ConnHandle::clone(existing));
+                }
+                state.connections.remove(&key);
             }
-            state.connections.remove(&key);
-        }
-
-        let endpoint = match &state.endpoint {
-            Some(endpoint) => endpoint.clone(),
-            None => {
-                let endpoint = bind_client_endpoint(exec)?;
-                state.endpoint = Some(endpoint.clone());
-                endpoint
-            }
+            // A connection whose key is never dialled again would otherwise
+            // be retained forever, and with it its namespace, its dedup
+            // window, its reorder hold and its driver task.
+            state
+                .connections
+                .retain(|_, handle| handle.conn.close_reason().is_none());
+            let endpoint = match &state.endpoint {
+                Some(endpoint) => endpoint.clone(),
+                None => {
+                    let endpoint = bind_client_endpoint(exec)?;
+                    state.endpoint = Some(endpoint.clone());
+                    endpoint
+                }
+            };
+            (endpoint, state.peer_identity(&peer))
         };
 
         let (client_config, refused) = tls::client_config(tls, expected, &config.limits)?;
@@ -235,7 +254,7 @@ impl ClientPool {
         // it lives: once the last one is gone, a replacement server with a new
         // key is a new peer and nothing should still be objecting to it.
         let presented = crate::tls::peer_fingerprint(&conn);
-        if let Some(known) = state.peer_identity(&peer)
+        if let Some(known) = known
             && known != presented
         {
             conn.close(
@@ -273,6 +292,22 @@ impl ClientPool {
         // version mismatch must fail `connect`, not the first request.
         handle.negotiated().await?;
 
+        // The race the released lock allows, settled: whoever inserted first
+        // owns the key, and this connection is closed rather than left open
+        // for nobody. Both sides then hand their caller the same connection,
+        // which is what a pool is for.
+        let mut state = self.state.lock().await;
+        let winner = state
+            .connections
+            .get(&key)
+            .filter(|held| held.conn.close_reason().is_none())
+            .map(ConnHandle::clone);
+        if let Some(winner) = winner {
+            handle
+                .conn
+                .close(codes::SHUTDOWN, "a concurrent dial won this pool key");
+            return Ok(winner);
+        }
         state.connections.insert(key, ConnHandle::clone(&handle));
         Ok(handle)
     }

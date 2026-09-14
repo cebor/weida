@@ -132,11 +132,18 @@ impl DrainState {
 
     /// Takes everything this drain has to wait for, from every live
     /// connection.
+    ///
+    /// The registry is **swept, not emptied**: `Runtime::drain` calls this
+    /// and then `close_all`, and on a local transport that registry is the
+    /// only handle a close has (`docs/decisions/0010-local-transport.md`
+    /// §4.2). Draining the vector here left `close_all` nothing to close, so
+    /// a drained in-process or socket peer never saw the shutdown at all.
     pub(crate) fn take(&self) -> (Vec<Receipt>, u64) {
         let live: Vec<Arc<ConnCtx>> = {
             let mut connections = self.connections.lock().expect("drain state poisoned");
+            connections.retain(|conn| conn.strong_count() > 0);
             connections
-                .drain(..)
+                .iter()
                 .filter_map(|conn| conn.upgrade())
                 .collect()
         };
@@ -194,7 +201,12 @@ impl ConnDrain {
     /// Returns `true` when an unsettled receipt had to be dropped to make
     /// room, which the caller counts as a loss the next drain reports.
     pub(crate) fn park(&self, receipt: Receipt) -> bool {
-        let mut parked = self.parked.lock().expect("drain state poisoned");
+        // Never `expect` here. `park` runs inside `Drop for Delivery`, on the
+        // fire-and-forget path of every pattern, and a panic in a destructor
+        // during an unwind aborts the process. A deque of receipts has no
+        // invariant a panic could have broken, so a poisoned lock is taken
+        // rather than propagated.
+        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
         let mut lost = false;
         if parked.len() >= self.max_parked {
             // Only now is it worth looking: everything settled goes, and the
@@ -218,7 +230,7 @@ impl ConnDrain {
     /// too coarse to notice. Nothing is thrown away that has not settled, so a
     /// drain still sees every receipt whose outcome is still open.
     pub(crate) fn reap(&self) -> usize {
-        let mut parked = self.parked.lock().expect("drain state poisoned");
+        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
         let before = parked.len();
         parked.retain_mut(|receipt| settled(receipt).is_none());
         before - parked.len()
@@ -226,7 +238,7 @@ impl ConnDrain {
 
     /// Takes this connection's receipts, for a drain.
     pub(crate) fn take(&self) -> Vec<Receipt> {
-        let mut parked = self.parked.lock().expect("drain state poisoned");
+        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *parked).into()
     }
 }

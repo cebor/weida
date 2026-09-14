@@ -69,15 +69,23 @@ impl ReportTable {
     pub(crate) fn claim(&self, id: u64) -> Option<Arc<watch::Sender<CursorSet>>> {
         self.live
             .lock()
-            .expect("report table poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(&id)
             .map(Arc::clone)
     }
 
     /// Drops the report's entry, which is what turns a reader's
     /// [`Cursors::changed`] into `None`.
+    ///
+    /// A poisoned lock is taken rather than propagated: this runs inside
+    /// `Drop for ReportGuard`, and a panic in a destructor during an unwind
+    /// aborts the process. A map of senders has no invariant a panic could
+    /// have broken.
     pub(crate) fn release(&self, id: u64) {
-        self.live.lock().expect("report table poisoned").remove(&id);
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
     }
 }
 
@@ -92,7 +100,7 @@ pub(crate) fn order_report(conn: &ConnHandle) -> (u64, Cursors) {
     conn.reports
         .live
         .lock()
-        .expect("report table poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .insert(id, Arc::new(tx));
     (
         id,
