@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use tokio::sync::Notify;
 use weida_sp::{Backtrace, EndpointType, backtrace};
 
 use crate::context::Context;
@@ -85,6 +86,16 @@ struct SurveyorShared {
     survey_time: Duration,
     contexts: Mutex<HashMap<CtxId, SurveyorCtxState>>,
     next_ctx: AtomicU64,
+    /// Woken when an answer lands in some context's slot.
+    ///
+    /// An answer is filed by whichever context happens to be inside a
+    /// receive, and [`route`] walks every context to find the one whose
+    /// survey it answers — so the slot's owner is usually not the drainer.
+    /// Without this signal that owner stays parked on its pipes until
+    /// unrelated traffic arrives or its deadline passes, and `recv` reports
+    /// `NNG_ETIMEDOUT` for an answer already in memory. [`crate::reqrep`]
+    /// carries the same signal for the same reason.
+    delivered: Notify,
     late: AtomicU64,
 }
 
@@ -127,6 +138,7 @@ impl SurveyorSocket {
             survey_time,
             contexts: Mutex::new(HashMap::new()),
             next_ctx: AtomicU64::new(1),
+            delivered: Notify::new(),
             late: AtomicU64::new(0),
         });
         let implicit = SurveyorCtx::open(&shared);
@@ -311,14 +323,26 @@ impl SurveyorCtx {
                     return Ok(survey.answers.remove(0));
                 }
             }
-            // Whichever context is inside a receive drains the pipes and
-            // files each response under the survey ID it carries, exactly
-            // as a REQ context does with replies.
+            // Whichever context is inside a receive drains the pipes for
+            // all of them and files each response under the survey ID it
+            // carries, exactly as a REQ context does with replies. So this
+            // wait has two wake-ups to race: a message on a pipe, and a
+            // sibling filing an answer into *this* context's slot.
+            //
+            // `notified()` registers the waiter when it is **polled**, so
+            // registering is `enable()` and not construction: a filing
+            // between the drain below and the select would otherwise wake
+            // nobody and this wait would run to the deadline.
+            let mut delivered = std::pin::pin!(self.shared().delivered.notified());
+            delivered.as_mut().enable();
             if let Some((pipe, message)) = self.shared().core.try_take_any() {
                 route(self.shared(), pipe, message);
                 continue;
             }
-            self.shared().core.wait_for_message().await;
+            tokio::select! {
+                () = delivered => {}
+                () = self.shared().core.wait_for_message() => {}
+            }
         }
     }
 }
@@ -359,6 +383,11 @@ fn route(shared: &Arc<SurveyorShared>, pipe: PipeId, message: Message) {
             return;
         }
         survey.answers.push(framed(&stack, payload));
+        drop(contexts);
+        // The context this answer belongs to is usually not the one that
+        // drained the pipe it arrived on, and nothing else will wake it:
+        // overlapping surveys are what contexts are for (§4).
+        shared.delivered.notify_waiters();
         return;
     }
     // No context is collecting this survey any more: its answer is late by
@@ -435,3 +464,67 @@ impl RespondentSocket {
 }
 
 socket_endpoints!(RespondentSocket);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::context::ContextConfig;
+
+    fn options() -> SocketOptions {
+        SocketOptions {
+            survey_time: Duration::from_secs(2),
+            ..SocketOptions::default()
+        }
+    }
+
+    /// An answer as it comes off a pipe: the tag stack is in the body,
+    /// where [`route`] looks for it, and not yet split into a header.
+    fn arrived(id: u32, payload: &[u8]) -> Message {
+        let mut body = Backtrace::direct(id).encode();
+        body.extend_from_slice(payload);
+        Message::from_body(body)
+    }
+
+    fn survey_id(ctx: &SurveyorCtx) -> u32 {
+        ctx.shared()
+            .lock()
+            .get(&ctx.id())
+            .and_then(|state| state.survey.as_ref().map(|survey| survey.id))
+            .expect("an armed survey")
+    }
+
+    /// Claim: an answer filed by a **sibling** context wakes the context it
+    /// belongs to. Whichever context is inside a receive drains the pipes
+    /// for all of them, so the context that owns an answer is usually not
+    /// the one that took it off the pipe; if the filing does not wake the
+    /// owner, its receive waits out the deadline and reports
+    /// `NNG_ETIMEDOUT` for an answer that is already in memory — and the
+    /// answer is not counted late either, so it is neither delivered nor
+    /// discarded. Calling [`route`] directly is exactly what a sibling's
+    /// drain does, with no pipe traffic that could wake the parked receive
+    /// by accident.
+    #[tokio::test]
+    async fn an_answer_filed_by_a_sibling_wakes_the_context_it_belongs_to() {
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        let surveyor = SurveyorSocket::with_options(&ctx, options()).expect("surveyor");
+        let parked = surveyor.context();
+        let sibling = surveyor.context();
+        parked.send(b"who is there".to_vec()).await.expect("one");
+        sibling.send(b"and who else".to_vec()).await.expect("two");
+
+        let id = survey_id(&parked);
+        let collecting = parked.recv();
+        let mut collecting = std::pin::pin!(collecting);
+        assert!(
+            futures::poll!(collecting.as_mut()).is_pending(),
+            "nobody has answered yet"
+        );
+
+        route(&surveyor.shared, PipeId::new(1), arrived(id, b"here"));
+
+        let answer = collecting.await.expect("the answer the sibling filed");
+        assert_eq!(answer.body(), b"here");
+        assert_eq!(surveyor.discarded_late(), 0, "it was delivered, not late");
+    }
+}

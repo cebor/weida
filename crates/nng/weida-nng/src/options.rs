@@ -21,7 +21,10 @@ use weida_sp::EndpointType;
 
 use crate::error::Result;
 use crate::message::DEFAULT_RECV_MAX_SIZE;
-use crate::pipe::{DEFAULT_RECV_DEPTH, DEFAULT_SEND_DEPTH, FullAction, PipeConfig, QueueConfig};
+use crate::pipe::{
+    DEFAULT_QUEUE_BYTES, DEFAULT_RECV_DEPTH, DEFAULT_SEND_DEPTH, FullAction, PipeConfig,
+    QueueConfig,
+};
 use crate::protocol::protocol;
 
 /// Default `NNG_OPT_RECONNMINT`: the first retry delay after a pipe closes.
@@ -218,11 +221,13 @@ impl SocketOptions {
     pub fn validate(&self) -> Result<()> {
         QueueConfig {
             depth: self.send_depth.unwrap_or(DEFAULT_SEND_DEPTH),
+            max_bytes: DEFAULT_QUEUE_BYTES,
             full: FullAction::Block,
         }
         .validate("NNG_OPT_SENDBUF")?;
         QueueConfig {
             depth: self.recv_depth.unwrap_or(DEFAULT_RECV_DEPTH),
+            max_bytes: DEFAULT_QUEUE_BYTES,
             full: FullAction::Block,
         }
         .validate("NNG_OPT_RECVBUF")?;

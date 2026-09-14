@@ -40,7 +40,10 @@
 //! - [`Queue`] and [`PipeId`] — `NNG_OPT_SENDBUF`/`NNG_OPT_RECVBUF` as
 //!   depths in messages, where depth zero is NNG's rendezvous rather than
 //!   libzmq's "unlimited", with [`FullAction`] carrying each protocol's
-//!   behaviour at the bound so that no socket type re-decides it.
+//!   behaviour at the bound so that no socket type re-decides it — plus the
+//!   octet ceiling NNG has no option for ([`DEFAULT_QUEUE_BYTES`]), because
+//!   a depth in messages times `NNG_OPT_RECVMAXSZ` is a product nobody
+//!   bounded.
 //!
 //! # Rules this crate keeps
 //!
@@ -157,8 +160,8 @@ pub use options::{
 };
 pub use pair::{POLYAMOROUS_ABSENT, Pair0Socket, Pair1Socket};
 pub use pipe::{
-    DEFAULT_RECV_DEPTH, DEFAULT_SEND_DEPTH, FullAction, MAX_QUEUE_DEPTH, PipeId, Queue,
-    QueueConfig, Sent,
+    DEFAULT_QUEUE_BYTES, DEFAULT_RECV_DEPTH, DEFAULT_SEND_DEPTH, FullAction, MAX_QUEUE_DEPTH,
+    PipeId, Queue, QueueConfig, Sent,
 };
 pub use pipe::{Discarded, Pipe, PipeConfig};
 pub use pipeline::{PullSocket, PushSocket};

@@ -327,7 +327,14 @@ impl ReqCtx {
             // Nobody pumps on our behalf unless we pump ourselves: whichever
             // context is inside a receive drains the pipes and files each
             // reply under the request ID it carries.
-            let delivered = self.shared().delivered.notified();
+            //
+            // `notified()` registers the waiter when it is **polled**, so
+            // registering is `enable()` and not construction: a sibling
+            // filing our reply between the drain below and the park would
+            // otherwise wake nobody, and this wait would run to the resend
+            // or the receive timeout with the reply already in our slot.
+            let mut delivered = std::pin::pin!(self.shared().delivered.notified());
+            delivered.as_mut().enable();
             if let Some((_, message)) = self.shared().core.try_take_any() {
                 route(self.shared(), message);
                 continue;
@@ -535,3 +542,70 @@ impl RepSocket {
 }
 
 socket_endpoints!(RepSocket);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::context::ContextConfig;
+
+    /// A reply as it comes off a pipe: the tag stack is in the body, where
+    /// [`route`] looks for it, and not yet split into a header.
+    fn arrived(id: u32, payload: &[u8]) -> Message {
+        let mut body = Backtrace::direct(id).encode();
+        body.extend_from_slice(payload);
+        Message::from_body(body)
+    }
+
+    /// Arms an outstanding request the way [`ReqCtx::send`] does once its
+    /// round robin has picked a pipe.
+    ///
+    /// A REQ send needs a peer to pick, and a real peer would answer over a
+    /// pipe — whose arrival wakes every parked context by itself and so
+    /// hides the wake this test is about.
+    fn arm(ctx: &ReqCtx, id: u32) {
+        let mut contexts = ctx.shared().lock();
+        let state = contexts.entry(ctx.id()).or_default();
+        state.outstanding = Some(Outstanding {
+            id,
+            payload: Vec::new(),
+            pipe: None,
+            deadline: Instant::now() + Duration::from_secs(60),
+        });
+    }
+
+    /// Claim: a reply filed by a **sibling** context wakes the context it
+    /// belongs to. Whichever context is inside a receive drains the pipes
+    /// for all of them and [`route`] files each reply under the request ID
+    /// it carries, so the context that owns a reply is usually not the one
+    /// that took it off the pipe; without the wake its receive runs to
+    /// `NNG_OPT_RECVTIMEO` with the reply already in its slot. Calling
+    /// [`route`] directly is exactly what a sibling's drain does, with no
+    /// pipe traffic that could wake the parked receive by accident.
+    #[tokio::test]
+    async fn a_reply_filed_by_a_sibling_wakes_the_context_it_belongs_to() {
+        let ctx = Context::new(ContextConfig::default()).expect("context");
+        let options = SocketOptions {
+            recv_timeout: Some(Duration::from_secs(2)),
+            resend_time: Duration::from_secs(60),
+            ..SocketOptions::default()
+        };
+        let socket = ReqSocket::with_options(&ctx, options).expect("req socket");
+        let parked = socket.context();
+        let sibling = socket.context();
+        arm(&parked, 7);
+        arm(&sibling, 9);
+
+        let waiting = parked.recv();
+        let mut waiting = std::pin::pin!(waiting);
+        assert!(
+            futures::poll!(waiting.as_mut()).is_pending(),
+            "nobody has replied yet"
+        );
+
+        route(&socket.shared, arrived(7, b"mine"));
+
+        let reply = waiting.await.expect("the reply the sibling filed");
+        assert_eq!(reply.body(), b"mine");
+    }
+}

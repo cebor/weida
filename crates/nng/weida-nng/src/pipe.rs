@@ -4,9 +4,39 @@
 //! "NNG socket `SENDBUF` and `RECVBUF` are depths in **messages**, each
 //! configurable from 0 through 8192, not byte credit"
 //! (`docs/research/nanomsg-nng.md` §5). So a queue here holds whole
-//! [`Message`]s and counts them, and the byte bound is a different
-//! mechanism entirely: `NNG_OPT_RECVMAXSZ` bounds one message
-//! ([`crate::message`]) and has nothing to do with how many fit.
+//! [`Message`]s and counts them, exactly as NNG does — and counts their
+//! octets too, for the reason below.
+//!
+//! # A queue is bounded twice: in messages, as NNG is, and in bytes
+//!
+//! A depth counts messages and `NNG_OPT_RECVMAXSZ` bounds one message
+//! ([`crate::message`]), so what a peer can make a queue hold is the
+//! **product** of the two: [`DEFAULT_RECV_DEPTH`] messages of
+//! [`DEFAULT_RECV_MAX_SIZE`](crate::DEFAULT_RECV_MAX_SIZE) is 128 MiB per
+//! pipe, and a socket admits [`DEFAULT_MAX_PIPES`](crate::DEFAULT_MAX_PIPES)
+//! pipes — 128 GiB nobody bounded, which is not what "no remote input can
+//! cause unbounded memory allocation" (`docs/INVARIANTS.md`) says. So every
+//! queue carries [`QueueConfig::max_bytes`] as well: [`DEFAULT_QUEUE_BYTES`],
+//! 8 MiB per direction per pipe, which is the number the sibling ZMTP
+//! library bounds the same quantity with.
+//!
+//! The byte ceiling is enforced here rather than divided into a smaller
+//! depth, because `NNG_OPT_RECVMAXSZ` is a **ceiling and not a size**:
+//! dividing by it would cut every queue to eight messages, including the
+//! ones whose messages are forty octets, and `NNG_OPT_RECVBUF` would stop
+//! meaning what NNG says it means. Counting the octets where they are
+//! refuses only the pipe that occupies the memory.
+//!
+//! **A queue always accepts one message**, however large, so the ceiling
+//! applies only to a queue that is not already empty: without that rule a
+//! message above the ceiling could never be queued at all and a blocking
+//! protocol would wait for room that cannot appear — a deadlock in place of
+//! a bound. What one direction of one pipe can hold is therefore
+//! `max_bytes` plus one `NNG_OPT_RECVMAXSZ`, 9 MiB at the defaults, and a
+//! socket at its pipe ceiling holds at most 9 GiB of incoming queues rather
+//! than the 128 GiB the depth alone allowed. Which of the two bounds is
+//! full changes nothing about what happens next: both are a full queue, and
+//! the answer to a full queue is [`FullAction`]'s.
 //!
 //! **Zero is not "unlimited" here; it is zero.** libzmq's high-water mark of
 //! `0` means no limit, and NNG's buffer depth of `0` means no buffer: "A
@@ -73,6 +103,22 @@ pub const DEFAULT_RECV_DEPTH: usize = 128;
 /// the dropping protocols get a depth, and it is named here rather than
 /// hidden in each of them.
 pub const DEFAULT_BROADCAST_SEND_DEPTH: usize = 128;
+
+/// Default byte ceiling on one direction of one pipe's queue, in octets.
+///
+/// **NNG has no such option**, and that is the reason this exists: its
+/// buffer depths count messages (§5), so at the defaults one pipe could hold
+/// [`DEFAULT_RECV_DEPTH`] × `NNG_OPT_RECVMAXSZ` = 128 MiB per direction and
+/// a socket 128 GiB of it, and "no remote input can cause unbounded memory
+/// allocation" (`docs/INVARIANTS.md`) would be a claim about a product
+/// nobody bounded.
+///
+/// 8 MiB is the number the sibling ZMTP library gives the same quantity and
+/// the number weida's own runtime gives a subscriber, so a socket, a bridge
+/// and a weida endpoint expose a peer to the same order of memory rather
+/// than to three numbers chosen separately. `0` means no ceiling, which is
+/// NNG's own behaviour and is available to a caller who wants exactly it.
+pub const DEFAULT_QUEUE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// What a protocol does when the queue it is putting a message into is full.
 ///
@@ -172,7 +218,13 @@ pub struct QueueConfig {
     /// messages, `0..=`[`MAX_QUEUE_DEPTH`]. Zero is a rendezvous, not
     /// "unlimited".
     pub depth: usize,
-    /// What to do at the bound.
+    /// The same direction's ceiling in octets, which NNG has no option for.
+    /// `0` means no ceiling. A queue that is empty accepts one message of
+    /// any size regardless of this number, so what one direction of one pipe
+    /// holds is bounded by `max_bytes` plus one `NNG_OPT_RECVMAXSZ` and
+    /// never by this alone (module documentation).
+    pub max_bytes: u64,
+    /// What to do at either bound.
     pub full: FullAction,
 }
 
@@ -219,6 +271,11 @@ pub struct Queue {
 
 struct QueueState {
     messages: VecDeque<Message>,
+    /// The octets the queued messages occupy — what
+    /// [`QueueConfig::max_bytes`] bounds. Maintained rather than summed on
+    /// every send: a full queue is asked about once per message and the
+    /// counter costs less than the walk.
+    bytes: u64,
     /// Takers currently parked in [`Queue::recv`]. Only a depth-zero queue
     /// consults it, and for that queue it *is* the room: a rendezvous
     /// accepts a message exactly when somebody is already waiting for one.
@@ -234,6 +291,7 @@ impl Queue {
             config,
             state: Mutex::new(QueueState {
                 messages: VecDeque::new(),
+                bytes: 0,
                 waiting: 0,
                 dropped: 0,
                 closed: false,
@@ -243,7 +301,7 @@ impl Queue {
         }
     }
 
-    /// This queue's depth and its action at the bound.
+    /// This queue's two bounds and its action at them.
     pub const fn config(&self) -> QueueConfig {
         self.config
     }
@@ -256,6 +314,12 @@ impl Queue {
     /// Whether the queue holds nothing.
     pub fn is_empty(&self) -> bool {
         self.lock().messages.is_empty()
+    }
+
+    /// Octets the queued messages occupy — what
+    /// [`QueueConfig::max_bytes`] bounds.
+    pub fn queued_bytes(&self) -> u64 {
+        self.lock().bytes
     }
 
     /// Messages this queue discarded at its bound.
@@ -277,7 +341,10 @@ impl Queue {
     /// exactly what "capable of accepting" means with no buffer.
     pub fn has_room(&self) -> bool {
         let state = self.lock();
-        !state.closed && self.accepts(&state)
+        // One octet, not one message: without the message in hand that is
+        // the strongest thing that can be said about the byte ceiling, and
+        // the send itself re-checks against the real size.
+        !state.closed && self.full(&state, 1).is_none()
     }
 
     /// Waits until [`Queue::has_room`] would be true, or the pipe is
@@ -317,6 +384,7 @@ impl Queue {
     /// Fails with `NNG_ECLOSED` once the pipe is destroyed: the peer is gone
     /// and its queue went with it.
     pub async fn send(&self, message: Message) -> Result<Sent> {
+        let size = message.wire_len() as u64;
         loop {
             // Register before looking, so that room freed between the two
             // wakes this wait instead of being missed by it.
@@ -327,8 +395,8 @@ impl Queue {
                 if state.closed {
                     return Err(gone());
                 }
-                if self.accepts(&state) {
-                    state.messages.push_back(message);
+                if self.full(&state, size).is_none() {
+                    self.push(&mut state, message, size);
                     drop(state);
                     self.ready.notify_waiters();
                     return Ok(Sent::Queued);
@@ -339,17 +407,32 @@ impl Queue {
                         return Ok(Sent::Dropped);
                     }
                     FullAction::DropOldest => {
-                        // A depth-zero queue has no oldest to drop, and
-                        // dropping the new one is the only way to make the
-                        // policy mean anything there.
-                        if state.messages.pop_front().is_some() {
-                            state.dropped += 1;
-                            state.messages.push_back(message);
+                        // Discard the oldest to make room for the newest,
+                        // which is what `SUB_PREFNEW` asks for — and as
+                        // many as it takes, because one forty-octet message
+                        // is not room for a megabyte and pushing anyway
+                        // would let the octet ceiling creep upwards one
+                        // message at a time.
+                        let mut discarded = 0;
+                        while self.full(&state, size).is_some() {
+                            if Queue::pop(&mut state).is_none() {
+                                break;
+                            }
+                            discarded += 1;
+                        }
+                        state.dropped += discarded;
+                        if discarded > 0 {
+                            // Something was discarded, so the newest takes
+                            // its place.
+                            self.push(&mut state, message, size);
                             drop(state);
                             self.ready.notify_waiters();
                             self.room.notify_waiters();
                             return Ok(Sent::Queued);
                         }
+                        // Nothing to discard — a depth-zero queue with no
+                        // taker — so the newest is what goes, which is the
+                        // only way the policy means anything there.
                         state.dropped += 1;
                         return Ok(Sent::Dropped);
                     }
@@ -375,10 +458,11 @@ impl Queue {
     /// choice.
     pub fn try_send(&self, message: Message) -> Result<()> {
         let closed = self.is_closed();
+        let size = message.wire_len() as u64;
         match self.offer(message) {
             Ok(()) => Ok(()),
             Err(_) if closed => Err(gone()),
-            Err(_) => Err(Error::EAGAIN(self.full_cause())),
+            Err(_) => Err(Error::EAGAIN(self.full_cause(size))),
         }
     }
 
@@ -393,10 +477,11 @@ impl Queue {
     /// and keeps its message.
     pub fn offer(&self, message: Message) -> std::result::Result<(), Message> {
         let mut state = self.lock();
-        if state.closed || !self.accepts(&state) {
+        let size = message.wire_len() as u64;
+        if state.closed || self.full(&state, size).is_some() {
             return Err(message);
         }
-        state.messages.push_back(message);
+        self.push(&mut state, message, size);
         drop(state);
         self.ready.notify_waiters();
         Ok(())
@@ -412,7 +497,7 @@ impl Queue {
             ready.as_mut().enable();
             {
                 let mut state = self.lock();
-                if let Some(message) = state.messages.pop_front() {
+                if let Some(message) = Queue::pop(&mut state) {
                     drop(state);
                     self.room.notify_waiters();
                     return Ok(message);
@@ -432,7 +517,7 @@ impl Queue {
     /// Takes the next message if one is queued.
     pub fn try_recv(&self) -> Result<Message> {
         let mut state = self.lock();
-        match state.messages.pop_front() {
+        match Queue::pop(&mut state) {
             Some(message) => {
                 drop(state);
                 self.room.notify_waiters();
@@ -457,6 +542,7 @@ impl Queue {
             state.closed = true;
             let discarded = state.messages.len();
             state.messages.clear();
+            state.bytes = 0;
             discarded
         };
         self.room.notify_waiters();
@@ -464,31 +550,78 @@ impl Queue {
         discarded
     }
 
-    fn accepts(&self, state: &QueueState) -> bool {
+    /// Which bound `size` further octets would cross, if any.
+    ///
+    /// The byte ceiling is skipped for an empty queue, so a message larger
+    /// than the ceiling is queued rather than waited for forever (module
+    /// documentation).
+    fn full(&self, state: &QueueState, size: u64) -> Option<Full> {
         if self.config.depth == 0 {
             // A rendezvous: room exists only while somebody is waiting for a
             // message, and only for as many messages as there are waiters.
-            state.waiting > state.messages.len()
-        } else {
-            state.messages.len() < self.config.depth
+            if state.waiting <= state.messages.len() {
+                return Some(Full::Depth);
+            }
+        } else if state.messages.len() >= self.config.depth {
+            return Some(Full::Depth);
         }
+        if self.config.max_bytes != 0
+            && !state.messages.is_empty()
+            && state.bytes.saturating_add(size) > self.config.max_bytes
+        {
+            return Some(Full::Bytes);
+        }
+        None
     }
 
-    fn full_cause(&self) -> crate::error::Cause {
-        if self.config.depth == 0 {
-            "no peer is ready to take a message and this queue has no buffer (depth 0)".into()
-        } else {
-            format!(
+    /// What a refusal of a message of `size` says, naming the bound it met.
+    ///
+    /// Takes the state lock itself, so a caller must not already hold it: a
+    /// `std::sync::Mutex` is not reentrant. [`Queue::try_send`] calls this
+    /// only after [`Queue::offer`] has handed the message back.
+    fn full_cause(&self, size: u64) -> crate::error::Cause {
+        let state = self.lock();
+        match self.full(&state, size) {
+            Some(Full::Bytes) => format!(
+                "this pipe's queue holds {} octets of its {} octet ceiling",
+                state.bytes, self.config.max_bytes
+            )
+            .into(),
+            _ if self.config.depth == 0 => {
+                "no peer is ready to take a message and this queue has no buffer (depth 0)".into()
+            }
+            _ => format!(
                 "this pipe's queue holds its depth of {} messages",
                 self.config.depth
             )
-            .into()
+            .into(),
         }
+    }
+
+    fn push(&self, state: &mut QueueState, message: Message, size: u64) {
+        state.bytes = state.bytes.saturating_add(size);
+        state.messages.push_back(message);
+    }
+
+    fn pop(state: &mut QueueState) -> Option<Message> {
+        let message = state.messages.pop_front()?;
+        state.bytes = state.bytes.saturating_sub(message.wire_len() as u64);
+        Some(message)
     }
 
     fn lock(&self) -> MutexGuard<'_, QueueState> {
         self.state.lock().expect("queue poisoned")
     }
+}
+
+/// Which of a queue's two bounds a message met.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Full {
+    /// [`QueueConfig::depth`]: the message count, or a rendezvous with
+    /// nobody waiting.
+    Depth,
+    /// [`QueueConfig::max_bytes`]: the octet ceiling.
+    Bytes,
 }
 
 /// How both directions of one pipe are bounded.
@@ -509,10 +642,12 @@ impl PipeConfig {
         PipeConfig {
             outgoing: QueueConfig {
                 depth: PipeConfig::default_send_depth(protocol),
+                max_bytes: DEFAULT_QUEUE_BYTES,
                 full: sending,
             },
             incoming: QueueConfig {
                 depth: DEFAULT_RECV_DEPTH,
+                max_bytes: DEFAULT_QUEUE_BYTES,
                 full: FullAction::receiving(protocol),
             },
         }
@@ -616,8 +751,10 @@ impl std::fmt::Debug for Queue {
         let state = self.lock();
         f.debug_struct("Queue")
             .field("depth", &self.config.depth)
+            .field("max_bytes", &self.config.max_bytes)
             .field("full", &self.config.full)
             .field("queued", &state.messages.len())
+            .field("queued_bytes", &state.bytes)
             .field("dropped", &state.dropped)
             .field("closed", &state.closed)
             .finish()
@@ -633,7 +770,21 @@ mod tests {
     use super::*;
 
     fn config(depth: usize, full: FullAction) -> QueueConfig {
-        QueueConfig { depth, full }
+        QueueConfig {
+            depth,
+            max_bytes: DEFAULT_QUEUE_BYTES,
+            full,
+        }
+    }
+
+    /// A queue bounded only by its octet ceiling: the depth is out of the
+    /// way, so what refuses is the ceiling.
+    fn byte_queue(max_bytes: u64, full: FullAction) -> Queue {
+        Queue::new(QueueConfig {
+            depth: MAX_QUEUE_DEPTH,
+            max_bytes,
+            full,
+        })
     }
 
     fn msg(n: u8) -> Message {
@@ -685,6 +836,77 @@ mod tests {
                 "one waiter is room for one message"
             );
             assert_eq!(taking.await.expect("delivered").body(), [7]);
+        });
+    }
+
+    /// Claim: the octet ceiling binds before the depth, which is the bound
+    /// a message count cannot express. [`MAX_QUEUE_DEPTH`] is the deepest
+    /// queue NNG admits, and 8192 messages of `NNG_OPT_RECVMAXSZ` is 8 GiB
+    /// for one direction of one pipe — so at that depth what stops a peer
+    /// sending many small messages is [`DEFAULT_QUEUE_BYTES`] and not the
+    /// count, and the refusal names the octets because the count is nowhere
+    /// near its bound.
+    #[test]
+    fn the_octet_ceiling_binds_before_the_depth() {
+        let queue = byte_queue(DEFAULT_QUEUE_BYTES, FullAction::Block);
+        futures::executor::block_on(async {
+            let chunk = Message::from_body(vec![0u8; 4096]);
+            let fits = (DEFAULT_QUEUE_BYTES / 4096) as usize;
+            for n in 0..fits {
+                assert_eq!(
+                    queue.send(chunk.clone()).await.expect("under the ceiling"),
+                    Sent::Queued,
+                    "message {n}"
+                );
+            }
+            assert_eq!(queue.queued_bytes(), DEFAULT_QUEUE_BYTES);
+            assert_eq!(queue.len(), fits, "8 MiB of 4 KiB messages");
+            assert!(fits < MAX_QUEUE_DEPTH, "with the depth nowhere near full");
+
+            let err = queue.try_send(chunk.clone()).unwrap_err();
+            assert!(matches!(err, Error::EAGAIN(_)), "{err:?}");
+            assert!(
+                err.cause().contains(&DEFAULT_QUEUE_BYTES.to_string()),
+                "{}",
+                err.cause()
+            );
+            assert!(err.cause().contains("octet"), "{}", err.cause());
+
+            // Octets, not slots, are what a taker frees here.
+            assert_eq!(queue.recv().await.expect("one out").len(), 4096);
+            assert_eq!(queue.queued_bytes(), DEFAULT_QUEUE_BYTES - 4096);
+            assert_eq!(queue.send(chunk).await.expect("room again"), Sent::Queued);
+        });
+    }
+
+    /// Claim: an empty queue accepts one message however large, so the
+    /// octet ceiling never becomes a deadlock — a blocking protocol holding
+    /// a message above the ceiling would otherwise wait for room that
+    /// cannot appear. The exemption is for an empty queue and not for every
+    /// large message.
+    #[test]
+    fn an_empty_queue_accepts_a_message_above_its_ceiling() {
+        let queue = byte_queue(64, FullAction::Block);
+        futures::executor::block_on(async {
+            let huge = Message::from_body(vec![7u8; 4096]);
+            assert_eq!(
+                queue.send(huge).await.expect("the one message"),
+                Sent::Queued
+            );
+            assert_eq!(queue.queued_bytes(), 4096);
+
+            let second = queue.send(Message::from_body(vec![1u8; 4096]));
+            let mut second = std::pin::pin!(second);
+            assert!(
+                futures::poll!(second.as_mut()).is_pending(),
+                "the queue is no longer empty, so the ceiling applies"
+            );
+            assert_eq!(queue.recv().await.expect("the first out").len(), 4096);
+            assert_eq!(
+                second.await.expect("queued once the queue emptied"),
+                Sent::Queued
+            );
+            assert_eq!(queue.dropped(), 0, "a blocking queue discards nothing");
         });
     }
 

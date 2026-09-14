@@ -220,6 +220,40 @@ async fn contexts_overlap_surveys_with_their_own_deadlines() {
     assert_eq!(answer_second.body(), b"two");
 }
 
+/// Claim: an answer reaches the context that asked for it even when a
+/// **sibling** context is the one that takes it off the pipe. Both receives
+/// are parked before either answer exists — which is what overlapping
+/// surveys are for (§4) — so whichever of them the arrival wakes drains the
+/// pipe and files the other's answer into its slot. A filing that does not
+/// wake the slot's owner leaves that context waiting out its own deadline
+/// with the answer already in memory, so this is asserted on two answers
+/// collected concurrently rather than one after the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_that_drains_the_pipe_delivers_the_other_contexts_answer() {
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    let (surveyor, respondents) = survey_of(&ctx, 1, Duration::from_secs(2)).await;
+
+    let first = surveyor.context();
+    let second = surveyor.context();
+    first.send(b"one".to_vec()).await.expect("send one");
+    second.send(b"two".to_vec()).await.expect("send two");
+
+    let a = respondents[0].context();
+    let b = respondents[0].context();
+    let survey_a = a.recv().await.expect("a");
+    let survey_b = b.recv().await.expect("b");
+
+    let answering = async {
+        b.send(survey_b.body().to_vec()).await.expect("answer b");
+        a.send(survey_a.body().to_vec()).await.expect("answer a");
+    };
+    // `join!` polls in order, so both collections are parked before the
+    // answers exist and one of them files the other's.
+    let collected = tokio::join!(first.recv(), second.recv(), answering);
+    assert_eq!(collected.0.expect("first").body(), b"one");
+    assert_eq!(collected.1.expect("second").body(), b"two");
+}
+
 /// Claim: a receive with no active survey is `NNG_ESTATE`, and a
 /// respondent that received nothing cannot answer (§4, §8).
 #[tokio::test]

@@ -148,6 +148,7 @@ impl SubSocket {
             subscriptions: std::sync::Mutex::new(Subscriptions::default()),
             admitted: Queue::new(QueueConfig {
                 depth,
+                max_bytes: crate::DEFAULT_QUEUE_BYTES,
                 full: if prefer_new {
                     FullAction::DropOldest
                 } else {
