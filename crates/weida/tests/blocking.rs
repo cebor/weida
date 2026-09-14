@@ -125,6 +125,144 @@ fn a_published_message_reaches_a_blocking_subscriber() {
     server.shutdown().expect("server shutdown");
 }
 
+/// PAIR over the facade, and the one rule a caller gets wrong: the **first**
+/// peer is kept and a second is refused (B-244).
+#[test]
+fn a_pair_carries_both_directions_and_refuses_a_second_peer() {
+    let (server, binding, url) = served("/link");
+    let bound = binding.pair("/link").expect("bound pair");
+
+    // The bound half runs on its own thread: a pair is symmetric, so both
+    // ends block on `recv` and answer. It is **handed back** rather than
+    // dropped: dropping a bound pair unregisters its route, so a first peer
+    // that "still works" has to have something to talk to.
+    let answering = std::thread::spawn(move || {
+        let first = bound.recv(CAP).expect("recv");
+        assert_eq!(first.payload, b"ping");
+        bound.send(b"pong").expect("send back");
+        bound
+    });
+
+    let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+    let paired = client.pair(Trust::by_address());
+    paired.connect(&url).expect("connect");
+    paired.send(b"ping").expect("send");
+    assert_eq!(paired.recv(CAP).expect("recv").payload, b"pong");
+    let bound = answering.join().expect("the bound thread");
+
+    // A second peer: the connection is accepted — the refusal is per stream —
+    // and the transfer is refused. Past the peer's 1 MiB stream window, so the
+    // refusal cannot lose the race to the receipt
+    // (`docs/decisions/0005-refusal-race.md`).
+    let newcomer = Runtime::new(RuntimeConfig::default()).expect("second client runtime");
+    let second = newcomer.pair(Trust::by_address());
+    second
+        .connect(&url)
+        .expect("the refusal is per stream, not per connection");
+    let refused = second
+        .send(&vec![0x7au8; 2 * 1024 * 1024])
+        .expect_err("a second peer is refused");
+    assert!(
+        matches!(refused, Error::LimitExceeded),
+        "a capacity decision said out loud, got {refused:?}"
+    );
+
+    // And the first peer still **delivers**, which is the whole rule: ZeroMQ's
+    // PAIR would have dropped it for the newcomer.
+    paired.send(b"still mine").expect("the first peer is kept");
+    assert_eq!(bound.recv(CAP).expect("recv").payload, b"still mine");
+
+    newcomer.shutdown().expect("second client shutdown");
+    client.shutdown().expect("client shutdown");
+    server.shutdown().expect("server shutdown");
+}
+
+/// SURVEY over the facade, and the one rule a caller gets wrong: the
+/// **deadline** is the caller's and silence is a number (B-244).
+#[test]
+fn a_survey_collects_what_answers_and_counts_what_does_not() {
+    let (server, binding, url) = served("/poll");
+    let quiet_url = url.replace("/poll", "/quiet");
+    let answering = binding.respondent("/poll").expect("respondent");
+    let silent = binding.respondent("/quiet").expect("a second respondent");
+
+    let answers = std::thread::spawn(move || {
+        let question = answering.accept(CAP).expect("accept");
+        assert_eq!(question.message().payload, b"who is there");
+        question.reply(b"me").expect("reply");
+    });
+    // Accepts the question and never answers it: not unreachable, not
+    // refusing, just silent — which is what a deadline exists for.
+    let holding = std::thread::spawn(move || {
+        let question = silent.accept(CAP).expect("accept");
+        std::thread::sleep(Duration::from_secs(3));
+        drop(question);
+    });
+
+    let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+    let surveyor = client.surveyor(Trust::by_address());
+    surveyor.connect(&url).expect("connect the answering one");
+    surveyor
+        .connect(&quiet_url)
+        .expect("connect the silent one");
+
+    let survey = surveyor
+        .survey(b"who is there", Duration::from_millis(500), CAP)
+        .expect("the survey ran");
+    assert_eq!(survey.asked, 2, "both respondents were asked: {survey:?}");
+    assert_eq!(
+        survey.replies,
+        vec![b"me".to_vec()],
+        "one answered: {survey:?}"
+    );
+    assert_eq!(
+        survey.silent(),
+        1,
+        "and the other's silence is a number, not an error: {survey:?}"
+    );
+
+    answers.join().expect("the answering thread");
+    client.shutdown().expect("client shutdown");
+    server.shutdown().expect("server shutdown");
+    holding.join().expect("the silent thread");
+}
+
+/// BUS over the facade, and the one rule a caller gets wrong: **never your
+/// own message** (B-244).
+#[test]
+fn a_bus_message_reaches_every_other_member_and_never_the_sender() {
+    let (first_rt, first_binding, first_url) = served("/bus1");
+    let (second_rt, second_binding, second_url) = served("/bus2");
+    let one = first_binding
+        .bus("/bus1", Trust::by_address())
+        .expect("first member");
+    let two = second_binding
+        .bus("/bus2", Trust::by_address())
+        .expect("second member");
+    one.connect(&second_url).expect("one dials two");
+    two.connect(&first_url).expect("two dials one");
+
+    let listening = std::thread::spawn(move || {
+        let heard = two.recv(CAP).expect("recv");
+        assert_eq!(heard.payload, b"hello all");
+        two.send(b"and back").expect("send back");
+        two
+    });
+
+    assert_eq!(one.send(b"hello all").expect("send"), 1, "one other member");
+    assert_eq!(one.recv(CAP).expect("recv").payload, b"and back");
+
+    // The sender never hears itself: with the exchange above complete, a
+    // further send leaves nothing for this member to receive.
+    let two = listening.join().expect("the second member's thread");
+    one.send(b"mine alone").expect("send");
+    assert_eq!(two.recv(CAP).expect("recv").payload, b"mine alone");
+    drop(two);
+
+    first_rt.shutdown().expect("first shutdown");
+    second_rt.shutdown().expect("second shutdown");
+}
+
 /// The mistake that would otherwise be a hang: blocking a reactor worker.
 #[test]
 fn the_facade_refuses_to_block_a_reactor_thread() {

@@ -212,3 +212,119 @@ def test_a_finished_transfer_is_finished():
         await pusher.connect(url.replace("/md", "/md"))
 
     run(exchange())
+
+
+def test_a_pair_carries_both_directions_and_keeps_its_first_peer():
+    """PAIR from Python, and its one rule: the first peer is the one kept."""
+
+    async def exchange():
+        _server, binding, url = await served("/link")
+        bound = binding.pair("/link")
+
+        client = weida.Runtime()
+        paired = client.pair(weida.Trust.by_address())
+        await paired.connect(url)
+        assert paired.peer_count() == 1
+
+        await paired.send(b"ping")
+        heard, meta = await bound.recv(CAP)
+        assert heard == b"ping"
+        assert meta.endpoint == "/link"
+        await bound.send(b"pong")
+        answer, _ = await paired.recv(CAP)
+        assert answer == b"pong"
+
+        # A second dialler: the connection is accepted, because the refusal
+        # is per transfer, and the transfer is refused. Written past the 1 MiB
+        # stream window so the refusal cannot lose the race to the receipt
+        # (docs/decisions/0005-refusal-race.md).
+        newcomer = weida.Runtime()
+        second = newcomer.pair(weida.Trust.by_address())
+        await second.connect(url)
+        with pytest.raises(weida.LimitExceeded):
+            await second.send(b"z" * (2 << 20))
+
+        # And the first peer still delivers, which is the whole rule.
+        await paired.send(b"still mine")
+        kept, _ = await bound.recv(CAP)
+        assert kept == b"still mine"
+
+        # A pair has one peer, so dialling twice on one endpoint is refused
+        # too — before any transfer.
+        with pytest.raises(weida.LimitExceeded):
+            await paired.connect(url)
+
+    run(exchange())
+
+
+def test_a_survey_collects_what_answers_and_counts_the_silence():
+    """SURVEY from Python, and its one rule: the deadline is the caller's."""
+
+    async def exchange():
+        _server, binding, url = await served("/poll")
+        answering = binding.respondent("/poll")
+        quiet = binding.respondent("/quiet")
+
+        async def answer():
+            question = await answering.accept(CAP)
+            assert question.payload == b"who is there"
+            await question.reply(b"me")
+
+        async def say_nothing():
+            # Accepts the question and never answers: not unreachable, not
+            # refusing, just silent — which is what a deadline is for. The
+            # request is held, because dropping it would report NO_REPLY and
+            # that would be a failure rather than silence.
+            question = await quiet.accept(CAP)
+            await asyncio.sleep(DEADLINE)
+            return question
+
+        answered = asyncio.create_task(answer())
+        holding = asyncio.create_task(say_nothing())
+
+        client = weida.Runtime()
+        surveyor = client.surveyor(weida.Trust.by_address())
+        await surveyor.connect(url)
+        await surveyor.connect(url.replace("/poll", "/quiet"))
+        assert surveyor.peer_count() == 2
+
+        survey = await surveyor.survey(b"who is there", 0.5, CAP)
+        assert survey.asked == 2, repr(survey)
+        assert survey.replies == [b"me"], repr(survey)
+        assert survey.silent() == 1, repr(survey)
+        assert survey.failed == 0, repr(survey)
+
+        await answered
+        holding.cancel()
+
+    run(exchange())
+
+
+def test_a_bus_message_reaches_every_other_member_and_never_the_sender():
+    """BUS from Python, and its one rule: never your own message."""
+
+    async def exchange():
+        _first_rt, first_binding, first_url = await served("/bus1")
+        _second_rt, second_binding, second_url = await served("/bus2")
+        one = first_binding.bus("/bus1", weida.Trust.by_address())
+        two = second_binding.bus("/bus2", weida.Trust.by_address())
+        await one.connect(second_url)
+        await two.connect(first_url)
+        assert one.peer_count() == 1
+
+        assert await one.send(b"hello all") == 1
+        heard, meta = await two.recv(CAP)
+        assert heard == b"hello all"
+        assert meta.endpoint == "/bus2"
+
+        # Nothing came back to the sender: `one` has no message of its own to
+        # read, so a receive with everything already delivered would hang —
+        # which is why this is a timeout and not an assertion on a queue.
+        assert await two.send(b"and back") == 1
+        mine, _ = await one.recv(CAP)
+        assert mine == b"and back"
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(one.recv(CAP), 0.3)
+        assert one.dropped() == 0
+
+    run(exchange())

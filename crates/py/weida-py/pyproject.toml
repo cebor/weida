@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "weida"
-description = "weida for Python: Req/Rep, Push/Pull and Pub/Sub over QUIC, asyncio and synchronous, on the Rust implementation"
+description = "weida for Python: all six patterns over QUIC — Req/Rep, Push/Pull, Pub/Sub, Pair, Survey and Bus — asyncio and synchronous, on the Rust implementation"
 requires-python = ">=3.9"
 # Taken from the crate, which takes it from the workspace: one version for the
 # library and its binding, typed once.

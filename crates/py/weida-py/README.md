@@ -1,8 +1,9 @@
 # weida for Python
 
-QUIC-native messaging from asyncio, on the Rust implementation: Req/Rep, Push/Pull and Pub/Sub,
-each with the whole-payload calls a caller reaches for first and the streamed forms for a
-payload that does not fit memory.
+QUIC-native messaging from asyncio, on the Rust implementation: all six patterns — Req/Rep,
+Push/Pull, Pub/Sub, Pair, Survey and Bus — each with the whole-payload calls a caller reaches
+for first, and the streamed forms for a payload that does not fit memory where the pattern has
+one.
 
 ```python
 import asyncio
@@ -41,6 +42,30 @@ await fan.finish()
 drops *that* subscriber's copy; `write_now(chunk)` never waits, which is what a signal whose
 next chunk supersedes this one wants. Neither is a default, because the choice is the
 publisher's.
+
+## A pair, a survey and a bus
+
+```python
+# PAIR: one peer, both directions. The first peer is the one kept — a second
+# dialler's transfer is refused and the first keeps working.
+link = binding.pair("/link")
+await link.send(b"anything")
+payload, meta = await link.recv(1 << 20)
+
+# SURVEY: one question to every respondent, bounded by *your* deadline.
+survey = await surveyor.survey(b"who is there", 0.5, 1 << 20)
+print(survey.replies, survey.asked, survey.silent(), survey.failed)
+
+# BUS: every message to every other member, never to the sender.
+member = binding.bus("/mesh", weida.Trust.by_address())
+await member.connect(other_url)
+reached = await member.send(b"hello all")
+```
+
+A survey is a value and not an iterator: it is asked, waited out, and read. Silence is a
+number — `silent()` is who said nothing before the deadline — and a respondent that refused or
+died is `failed`, so "nobody answered" is an answer rather than an exception. The same three
+patterns are on `weida.sync` with the same shapes.
 
 ## A peer is its public key
 
@@ -87,9 +112,11 @@ as a definite failure is wrong.
 ## No timeouts of its own
 
 Nothing here takes a timeout argument, because `asyncio.wait_for` already is one and cancelling
-a weida coroutine resets the streams it owns — so the peer learns rather than waits. The one
-exception is `Runtime.drain(seconds)`, whose deadline is mandatory: an unbounded drain is a
-hang with a rationale.
+a weida coroutine resets the streams it owns — so the peer learns rather than waits. The
+exceptions are the three deadlines that are part of what the call *means*:
+`Runtime.drain(seconds)`, `Surveyor.survey(payload, seconds, ceiling)` and
+`FanOut.write_within(chunk, seconds)`. Each is mandatory: an unbounded drain, an unbounded
+survey and an unbounded wait for a subscriber are all hangs with a rationale.
 
 ## Building it
 

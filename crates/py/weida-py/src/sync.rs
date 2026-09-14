@@ -59,7 +59,7 @@ use weida::blocking;
 use weida_py_core::{payload_of, py_bytes};
 
 use crate::errors::raise;
-use crate::values::{PyIdentity, PyIncomingMeta, PyTrust};
+use crate::values::{PyIdentity, PyIncomingMeta, PySurvey, PyTrust};
 
 /// What a call on a spent runtime gets.
 fn spent<T>(py: Python<'_>, what: &str) -> PyResult<T> {
@@ -158,6 +158,28 @@ impl SyncRuntime {
         }
     }
 
+    /// A dialling pair on this runtime.
+    fn pair(&self, py: Python<'_>, trust: PyTrust) -> PyResult<SyncPaired> {
+        let guard = self.runtime.lock().expect("runtime lock poisoned");
+        match guard.as_ref() {
+            Some(runtime) => Ok(SyncPaired {
+                endpoint: runtime.pair(trust.trust.clone()),
+            }),
+            None => spent(py, "runtime"),
+        }
+    }
+
+    /// A surveyor on this runtime.
+    fn surveyor(&self, py: Python<'_>, trust: PyTrust) -> PyResult<SyncSurveyor> {
+        let guard = self.runtime.lock().expect("runtime lock poisoned");
+        match guard.as_ref() {
+            Some(runtime) => Ok(SyncSurveyor {
+                endpoint: runtime.surveyor(trust.trust.clone()),
+            }),
+            None => spent(py, "runtime"),
+        }
+    }
+
     /// Stops admitting work and waits up to `deadline` seconds for finished
     /// transfers to reach the peer's transport, returning
     /// `(delivered, outstanding)`.
@@ -234,6 +256,27 @@ impl SyncBinding {
     fn publisher(&self, py: Python<'_>, path: &str) -> PyResult<SyncPublisher> {
         Ok(SyncPublisher {
             endpoint: raise(py, self.binding.publisher(path))?,
+        })
+    }
+
+    /// Registers a bound pair at `path`.
+    fn pair(&self, py: Python<'_>, path: &str) -> PyResult<SyncPaired> {
+        Ok(SyncPaired {
+            endpoint: raise(py, self.binding.pair(path))?,
+        })
+    }
+
+    /// Registers a respondent at `path`.
+    fn respondent(&self, py: Python<'_>, path: &str) -> PyResult<SyncRespondent> {
+        Ok(SyncRespondent {
+            endpoint: raise(py, self.binding.respondent(path))?,
+        })
+    }
+
+    /// Registers a bus member at `path`, dialling others on `trust`'s terms.
+    fn bus(&self, py: Python<'_>, path: &str, trust: PyTrust) -> PyResult<SyncBusMember> {
+        Ok(SyncBusMember {
+            endpoint: raise(py, self.binding.bus(path, trust.trust.clone()))?,
         })
     }
 
@@ -486,6 +529,191 @@ impl SyncPublisher {
     }
 }
 
+/// `weida.sync.Paired`: one peer, both directions.
+#[pyclass(frozen, name = "Paired", module = "weida.sync")]
+pub struct SyncPaired {
+    endpoint: blocking::Paired,
+}
+
+#[pymethods]
+impl SyncPaired {
+    /// The endpoint path this pair uses.
+    fn path(&self) -> String {
+        self.endpoint.path().to_owned()
+    }
+
+    /// Dials `url`, once; a second call is `weida.LimitExceeded`.
+    fn connect(&self, py: Python<'_>, url: &str) -> PyResult<()> {
+        raise(py, py.detach(|| self.endpoint.connect(url)))
+    }
+
+    /// Peers connected: `0` or `1`.
+    fn peer_count(&self) -> usize {
+        self.endpoint.peer_count()
+    }
+
+    /// Sends `payload` and waits for the peer's transport to acknowledge it.
+    fn send(&self, py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<()> {
+        let body = payload_of(payload)?;
+        raise(py, py.detach(|| self.endpoint.send(&body)))
+    }
+
+    /// Waits for the next transfer from the peer, at most `max_bytes`, and
+    /// returns `(payload, meta)`.
+    fn recv<'py>(
+        &self,
+        py: Python<'py>,
+        max_bytes: usize,
+    ) -> PyResult<(Bound<'py, pyo3::types::PyBytes>, PyIncomingMeta)> {
+        let message = raise(py, py.detach(|| self.endpoint.recv(max_bytes)))?;
+        Ok((
+            py_bytes(py, &message.payload),
+            PyIncomingMeta::of(&message.meta),
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<weida.sync.Paired {}>", self.endpoint.path())
+    }
+}
+
+/// `weida.sync.Surveyor`.
+#[pyclass(frozen, name = "Surveyor", module = "weida.sync")]
+pub struct SyncSurveyor {
+    endpoint: blocking::Surveyor,
+}
+
+#[pymethods]
+impl SyncSurveyor {
+    /// Dials `url` and adds one respondent to the set.
+    fn connect(&self, py: Python<'_>, url: &str) -> PyResult<()> {
+        raise(py, py.detach(|| self.endpoint.connect(url)))
+    }
+
+    /// Respondents currently connected.
+    fn peer_count(&self) -> usize {
+        self.endpoint.peer_count()
+    }
+
+    /// Asks every respondent and returns a `weida.Survey` of what arrived
+    /// within `deadline` seconds, each answer at most `max_reply_bytes`.
+    ///
+    /// The same value class the asyncio surface returns, for the reason
+    /// `weida.Survey` documents.
+    fn survey(
+        &self,
+        py: Python<'_>,
+        payload: &Bound<'_, PyAny>,
+        deadline: f64,
+        max_reply_bytes: usize,
+    ) -> PyResult<PySurvey> {
+        let body = payload_of(payload)?;
+        let deadline = raise(
+            py,
+            std::time::Duration::try_from_secs_f64(deadline)
+                .map_err(|e| weida::Error::Runtime(format!("deadline: {e}"))),
+        )?;
+        let survey = raise(
+            py,
+            py.detach(|| self.endpoint.survey(&body, deadline, max_reply_bytes)),
+        )?;
+        Ok(PySurvey {
+            replies: survey.replies,
+            asked: survey.asked,
+            failed: survey.failed,
+            late: survey.late,
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        "<weida.sync.Surveyor>".to_owned()
+    }
+}
+
+/// `weida.sync.Respondent`.
+#[pyclass(frozen, name = "Respondent", module = "weida.sync")]
+pub struct SyncRespondent {
+    endpoint: blocking::Respondent,
+}
+
+#[pymethods]
+impl SyncRespondent {
+    /// The endpoint path this respondent serves.
+    fn path(&self) -> String {
+        self.endpoint.path().to_owned()
+    }
+
+    /// Waits for the next question and reads it, at most `max_bytes`.
+    ///
+    /// Hands back the same `weida.sync.Request` a replier does: a question is
+    /// an exchange.
+    fn accept(&self, py: Python<'_>, max_bytes: usize) -> PyResult<SyncRequest> {
+        let request = raise(py, py.detach(|| self.endpoint.accept(max_bytes)))?;
+        Ok(SyncRequest {
+            request: Mutex::new(Some(request)),
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<weida.sync.Respondent {}>", self.endpoint.path())
+    }
+}
+
+/// `weida.sync.BusMember`.
+#[pyclass(frozen, name = "BusMember", module = "weida.sync")]
+pub struct SyncBusMember {
+    endpoint: blocking::BusMember,
+}
+
+#[pymethods]
+impl SyncBusMember {
+    /// The path this member accepts on.
+    fn path(&self) -> String {
+        self.endpoint.path().to_owned()
+    }
+
+    /// Joins the member at `url`.
+    fn connect(&self, py: Python<'_>, url: &str) -> PyResult<()> {
+        raise(py, py.detach(|| self.endpoint.connect(url)))
+    }
+
+    /// Members this one has joined.
+    fn peer_count(&self) -> usize {
+        self.endpoint.peer_count()
+    }
+
+    /// Sends `payload` to every **other** member, returning how many it
+    /// reached. Never waits for a receipt: a fan-out has no single peer to
+    /// get one from.
+    fn send(&self, py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let body = payload_of(payload)?;
+        raise(py, py.detach(|| self.endpoint.send(&body)))
+    }
+
+    /// Waits for the next message from another member, at most `max_bytes`,
+    /// and returns `(payload, meta)`.
+    fn recv<'py>(
+        &self,
+        py: Python<'py>,
+        max_bytes: usize,
+    ) -> PyResult<(Bound<'py, pyo3::types::PyBytes>, PyIncomingMeta)> {
+        let message = raise(py, py.detach(|| self.endpoint.recv(max_bytes)))?;
+        Ok((
+            py_bytes(py, &message.payload),
+            PyIncomingMeta::of(&message.meta),
+        ))
+    }
+
+    /// Copies that never reached a member.
+    fn dropped(&self) -> u64 {
+        self.endpoint.dropped()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<weida.sync.BusMember {}>", self.endpoint.path())
+    }
+}
+
 /// Builds the `weida.sync` submodule.
 ///
 /// A real submodule rather than a naming convention, so that
@@ -503,6 +731,10 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     sync.add_class::<SyncRequest>()?;
     sync.add_class::<SyncPuller>()?;
     sync.add_class::<SyncPublisher>()?;
+    sync.add_class::<SyncPaired>()?;
+    sync.add_class::<SyncSurveyor>()?;
+    sync.add_class::<SyncRespondent>()?;
+    sync.add_class::<SyncBusMember>()?;
     sync.add(
         "__all__",
         vec![
@@ -515,6 +747,10 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
             "Request",
             "Puller",
             "Publisher",
+            "Paired",
+            "Surveyor",
+            "Respondent",
+            "BusMember",
         ],
     )?;
     parent.add_submodule(&sync)?;

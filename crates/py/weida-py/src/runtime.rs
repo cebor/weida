@@ -32,6 +32,7 @@ use weida_py_core::Bridge;
 
 use crate::endpoints::{PyPuller, PyPusher, PyReplier, PyRequester};
 use crate::errors::{errno_of, raise, to_py};
+use crate::patterns::{PyBusMember, PyPaired, PyRespondent, PySurveyor};
 use crate::pubsub::{PyPublisher, PySubscriber};
 use crate::values::{PyIdentity, PyTrust};
 
@@ -135,6 +136,27 @@ impl PyRuntime {
         )
     }
 
+    /// A dialling pair on this runtime.
+    ///
+    /// One type for both roles, as in the Rust API: what distinguishes a
+    /// dialling pair from a bound one is which of them calls `connect`.
+    fn pair(&self, trust: PyTrust) -> PyPaired {
+        PyPaired::new(
+            self.runtime.pair(trust.trust.clone()),
+            self.bridge.clone(),
+            Arc::clone(&self.runtime),
+        )
+    }
+
+    /// A surveyor on this runtime.
+    fn surveyor(&self, trust: PyTrust) -> PySurveyor {
+        PySurveyor::new(
+            self.runtime.surveyor(trust.trust.clone()),
+            self.bridge.clone(),
+            Arc::clone(&self.runtime),
+        )
+    }
+
     /// Stops admitting work and waits up to `deadline` seconds for finished
     /// transfers to reach the peer's transport, returning
     /// `(delivered, outstanding)`.
@@ -233,6 +255,56 @@ impl PyBinding {
         let publisher = raise(py, self.listener.publisher(path))?;
         Ok(PyPublisher::new(
             publisher,
+            self.bridge.clone(),
+            Arc::clone(&self._runtime),
+        ))
+    }
+
+    /// Registers a bound pair at `path`.
+    ///
+    /// It has nothing to dial: the peer comes to it, and the first peer is
+    /// the one it keeps.
+    ///
+    /// # Errors
+    ///
+    /// As [`PyBinding::replier`].
+    fn pair(&self, py: Python<'_>, path: &str) -> PyResult<PyPaired> {
+        let paired = raise(py, self.listener.pair(path))?;
+        Ok(PyPaired::new(
+            paired,
+            self.bridge.clone(),
+            Arc::clone(&self._runtime),
+        ))
+    }
+
+    /// Registers a respondent at `path`.
+    ///
+    /// # Errors
+    ///
+    /// As [`PyBinding::replier`].
+    fn respondent(&self, py: Python<'_>, path: &str) -> PyResult<PyRespondent> {
+        let respondent = raise(py, self.listener.respondent(path))?;
+        Ok(PyRespondent::new(
+            respondent,
+            self.bridge.clone(),
+            Arc::clone(&self._runtime),
+        ))
+    }
+
+    /// Registers a bus member at `path`, dialling other members on `trust`'s
+    /// terms.
+    ///
+    /// A member is bound **and** dialling: it accepts here and joins others
+    /// with `connect`, which is why this one takes a trust and the other
+    /// registrations do not.
+    ///
+    /// # Errors
+    ///
+    /// As [`PyBinding::replier`].
+    fn bus(&self, py: Python<'_>, path: &str, trust: PyTrust) -> PyResult<PyBusMember> {
+        let member = raise(py, self.listener.bus(path, trust.trust.clone()))?;
+        Ok(PyBusMember::new(
+            member,
             self.bridge.clone(),
             Arc::clone(&self._runtime),
         ))

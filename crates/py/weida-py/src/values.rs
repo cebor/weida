@@ -202,3 +202,56 @@ impl PyIncomingMeta {
         )
     }
 }
+
+/// `weida.Survey`: what one survey collected before its deadline.
+///
+/// Shared by both surfaces, like [`PyIncomingMeta`], and a **value** on both
+/// rather than an iterator on one: an end-of-iteration is not a failure, and
+/// this binding's only channel out of a bridged future is the errno family, so
+/// an `async for` over answers would need a second error channel invented for
+/// `StopAsyncIteration` alone. The Rust `SurveyRun` is where answers arrive
+/// one at a time; here a survey is asked, waited out, and read
+/// ([PATTERNS.md](../../../../docs/PATTERNS.md) §5).
+#[pyclass(
+    frozen,
+    get_all,
+    skip_from_py_object,
+    name = "Survey",
+    module = "weida"
+)]
+#[derive(Clone)]
+pub struct PySurvey {
+    /// The answers, in arrival order.
+    pub replies: Vec<Vec<u8>>,
+    /// Respondents the question reached.
+    pub asked: usize,
+    /// Respondents that answered with a failure — a refusal, a reset, a reply
+    /// past the ceiling. A number, because a survey's result is its answers.
+    pub failed: usize,
+    /// Answers that arrived after the deadline: dropped, and counted.
+    pub late: u64,
+}
+
+#[pymethods]
+impl PySurvey {
+    /// Respondents that said nothing at all before the deadline.
+    ///
+    /// "Nobody answered" is an answer, so this is a number and never an
+    /// exception.
+    fn silent(&self) -> usize {
+        self.asked
+            .saturating_sub(self.replies.len())
+            .saturating_sub(self.failed)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<weida.Survey asked={} answered={} failed={} silent={} late={}>",
+            self.asked,
+            self.replies.len(),
+            self.failed,
+            self.silent(),
+            self.late
+        )
+    }
+}

@@ -30,7 +30,8 @@ here is an interop claim about a foreign peer, because there is no foreign peer 
 about (§2, last paragraph).
 
 **What each side was read from.** The Python column is `crates/py/weida-py/src/` — `lib.rs`,
-`runtime.rs`, `endpoints.rs`, `pubsub.rs`, `streams.rs`, `sync.rs`, `values.rs`, `errors.rs` —
+`runtime.rs`, `endpoints.rs`, `pubsub.rs`, `patterns.rs`, `streams.rs`, `sync.rs`, `values.rs`,
+`errors.rs` —
 and the tests under `crates/py/weida-py/tests/`. The Rust column is `crates/weida/src/`:
 `lib.rs`'s re-exports (`lib.rs:67-99`), `config.rs`, `runtime.rs`, `listener.rs`,
 `endpoint.rs`, `transfer.rs`, `stream.rs` and `blocking.rs`. CPython 3.9 and up through PyO3
@@ -43,18 +44,18 @@ not estimated:
 
 | Number | Value | Counted from |
 | --- | --- | --- |
-| `#[pyclass]`es | **25** | 16 `add_class` calls in `lib.rs:89-104` plus 9 in `sync.rs:497-505` |
-| `weida.__all__` | **41** names | 20 literals in `lib.rs:115-136` (which include `sync`, `VERSION`, `ALPN` and `WeidaError`) plus the 21 of `errors::NAMES`, appended at `lib.rs:137` |
-| `weida.sync.__all__` | **9** names | the list at `sync.rs:508-518`, one per class registered above it |
+| `#[pyclass]`es | **34** | 21 `add_class` calls in `lib.rs:103-124` plus 13 in `sync.rs:722-737` |
+| `weida.__all__` | **46** names | 25 literals in `lib.rs:133-159` (which include `sync`, `VERSION`, `ALPN` and `WeidaError`) plus the 21 of `errors::NAMES`, appended at `lib.rs:160` |
+| `weida.sync.__all__` | **13** names | the list at `sync.rs:738-755`, one per class registered above it |
 | Exception classes | **22** | the 21 entries of the `failures!` invocation at `errors.rs:72-94`, **plus the base** `WeidaError` (`errors.rs:33`), which is not in that list |
-| Test functions | **19** | 8 in `tests/test_asyncio.py`, 6 in `tests/test_patterns.py`, 5 in `tests/test_sync.py` |
+| Test functions | **25** | 8 in `tests/test_asyncio.py`, 9 in `tests/test_patterns.py`, 8 in `tests/test_sync.py` |
 | `IncomingMeta` attributes | **8** of the Rust struct's 12 fields | `values.rs:147-171` against `crates/weida/src/transfer.rs`; `tracestate` and the three report fields are the four that are absent (§9) |
 
 ## 2. How it is built, tested and packaged
 
 | Rust-side fact | This binding | Verdict |
 | --- | --- | --- |
-| the crate is `weida_py`, the module is `weida` | one `#[pymodule] fn weida` (`lib.rs:82-106`); the crate cannot share the name because rustdoc writes one directory per lib name | present, and the reason is in `Cargo.toml:9-15` |
+| the crate is `weida_py`, the module is `weida` | one `#[pymodule] fn weida` (`lib.rs:101-130`); the crate cannot share the name because rustdoc writes one directory per lib name | present, and the reason is in `Cargo.toml:9-15` |
 | `cargo test` links libpython, a wheel must not | `extension-module` is off by default in the crate and turned on by maturin (`Cargo.toml:41-46`, `pyproject.toml:27-32`) | present |
 | — | `develop.sh` | present: a `uv` virtualenv at the repository root, `maturin` and `pytest` into **that** virtualenv and nothing into a system interpreter, `maturin develop`, then pytest with the caller's arguments (`develop.sh:23-37`) |
 | — | `package.sh` | present: `maturin build --release`, a wheel whose name is **checked to contain `abi3`** or the script exits 1 (`package.sh:40-43`), a fresh temporary virtualenv holding only that wheel, and `smoke.py` run with `PATH=/usr/bin:/bin` (`package.sh:45-52`) — so "the wheel needs no Rust toolchain" is established rather than expected |
@@ -69,9 +70,9 @@ run against. weida's protocol has exactly one implementation, `crates/weida`, an
 is a thin wrapper over it, so a "pairing" here would be this library against itself — which is
 what every test in `crates/py/weida-py/tests/` and `smoke.py` already is. The claim a real
 interop section would carry is therefore unavailable, and no number in this document is an
-interop number. **Nor were the counts above re-measured by a run**: they were counted out of
-the tree with the sources named in §1, and the last recorded execution is B-200/B-204/B-205's
-merge notes in [BACKLOG.md](../BACKLOG.md).
+interop number. The counts above were counted out of the tree with the sources named in §1
+**and re-measured by a run** when B-244 added PAIR, SURVEY and BUS to both surfaces: 25 tests
+passed and `smoke.py` resolved all 46 names through a freshly built wheel.
 
 ## 3. The runtime, the binding and the reactor
 
@@ -83,20 +84,20 @@ merge notes in [BACKLOG.md](../BACKLOG.md).
 | `Runtime::exec()` (`runtime.rs:431`) | not a method; the bridge is built on it | present as the *reason that accessor exists*: `Bridge::new(runtime.exec().clone(), ...)` at `runtime.rs:61` puts this crate's futures on the runtime's own executor, so one process holds **one** Tokio runtime rather than two (`runtime.rs:13-18`) |
 | `Runtime::listener()` then `Listener::bind_quic(addr, identity)` | `await runtime.bind("host:port", identity)` → `Binding` | present as one call — `runtime.rs:78-109`. `bind` is a coroutine because it creates a socket and a QUIC endpoint, and a `__new__` that did that would block the event loop (`runtime.rs:20-25`) |
 | `Listener::bind_inproc`, `bind_unix`, `bind_pipe` (`listener.rs:197`, `232`, `263`) | — | absent: only QUIC can be bound from Python. The dialling side's address grammar does accept `weida+unix://`, `weida+pipe://` and `weida+inproc://` (`endpoints.rs:59-62`), so a Python client can reach a local binding a Rust process made, and a Python **server** on a local transport is what is missing. §10 |
-| `Listener::replier/puller/publisher(path)` | `binding.replier(path)`, `.puller(path)`, `.publisher(path)` | present, synchronous, raising `weida.AlreadyRegistered` or `weida.InvalidEndpointPath` — `runtime.rs:204-239` |
+| `Listener::replier/puller/publisher(path)` | `binding.replier(path)`, `.puller(path)`, `.publisher(path)` | present, synchronous, raising `weida.AlreadyRegistered` or `weida.InvalidEndpointPath` — `runtime.rs:225-261`. `pair`, `respondent` and `bus` join them at `runtime.rs:263-311` (§4.4) |
 | `Listener::acceptor(path)` (`listener.rs:350`) | — | absent: the raw L0 surface. §9.2 |
-| `Binding::local_addr()` | `binding.local_addr()` → `str` | present — `runtime.rs:183-185`, and port `0` resolved is what every test dials |
-| `Binding::close()` (`listener.rs:378`) | — | absent: dropping the Python `Binding` unbinds, because it holds the `Arc<weida::Binding>` (`runtime.rs:172-173`). What is missing is an awaited close that waits for the endpoint to go idle |
-| `Identity::fingerprint()` on the serving side | `binding.fingerprint()`, `binding.url(path)` | present, and both are Python-only conveniences with no single Rust counterpart: `url` formats `weida://{fingerprint}@{local}{path}`, which is the whole of a client's configuration — `runtime.rs:187-196`, asserted at `test_sync.py:136` |
-| `Runtime::drain(deadline: Duration)` → `Drained` | `await runtime.drain(seconds: float)` → `(delivered, outstanding)` | present — `runtime.rs:145-160`, `test_asyncio.py::test_a_drain_reports_what_it_achieved`. Seconds as a float, mandatory and finite. §9.4 |
-| `Runtime::drain` consumes `self` | the Python `Runtime` stays usable | present, deliberately: `weida::Runtime` is `Clone` and a clone shares the pool, the bindings and the drain state, so the binding drains a clone (`runtime.rs:152-155`) |
-| `Runtime::shutdown()` (`runtime.rs:323`) | — | absent from the asyncio surface: `drain` is the only end there, and the reactor otherwise dies with the last handle that can cause work on it (`endpoints.rs:10-12`). `weida.sync.Runtime.shutdown()` exists (`sync.rs:181-187`), so the gap is the asyncio surface's alone. §10 |
-| `Runtime::suppressed_duplicates()` (`runtime.rs:251`), `Runtime::config()` (`runtime.rs:416`) | — | absent: two read-only accessors with no Python spelling, and `runtime.rs:46-165` registers neither |
+| `Binding::local_addr()` | `binding.local_addr()` → `str` | present — `runtime.rs:205-207`, and port `0` resolved is what every test dials |
+| `Binding::close()` (`listener.rs:378`) | — | absent: dropping the Python `Binding` unbinds, because it holds the `Arc<weida::Binding>` (`runtime.rs:193-195`). What is missing is an awaited close that waits for the endpoint to go idle |
+| `Identity::fingerprint()` on the serving side | `binding.fingerprint()`, `binding.url(path)` | present, and both are Python-only conveniences with no single Rust counterpart: `url` formats `weida://{fingerprint}@{local}{path}`, which is the whole of a client's configuration — `runtime.rs:209-218`, asserted at `test_sync.py:136` |
+| `Runtime::drain(deadline: Duration)` → `Drained` | `await runtime.drain(seconds: float)` → `(delivered, outstanding)` | present — `runtime.rs:167-182`, `test_asyncio.py::test_a_drain_reports_what_it_achieved`. Seconds as a float, mandatory and finite. §9.4 |
+| `Runtime::drain` consumes `self` | the Python `Runtime` stays usable | present, deliberately: `weida::Runtime` is `Clone` and a clone shares the pool, the bindings and the drain state, so the binding drains a clone (`runtime.rs:174-177`) |
+| `Runtime::shutdown()` (`runtime.rs:323`) | — | absent from the asyncio surface: `drain` is the only end there, and the reactor otherwise dies with the last handle that can cause work on it (`endpoints.rs:10-12`). `weida.sync.Runtime.shutdown()` exists (`sync.rs:203-209`), so the gap is the asyncio surface's alone. §10 |
+| `Runtime::suppressed_duplicates()` (`runtime.rs:251`), `Runtime::config()` (`runtime.rs:416`) | — | absent: two read-only accessors with no Python spelling, and `runtime.rs:47-187` registers neither |
 | `Runtime::peer(tls)` → `Peer` (`runtime.rs:272`) | — | absent: the raw dialling core. §9.2 |
 
 ## 4. The asyncio surface, class by class
 
-Sixteen classes in `weida` (§1). Every call that waits is a coroutine and the waiting happens
+Twenty-one classes in `weida` (§1). Every call that waits is a coroutine and the waiting happens
 on the reactor with the GIL released; the Rust future starts at the **first `await`**, not at
 the call, so a coroutine that is never awaited does nothing at all
 (`crates/py/weida-py-core/src/bridge.rs:131-153`).
@@ -148,7 +149,29 @@ the call, so a coroutine that is never awaited does nothing at all
 | — | `await subscriber.recv_stream()` | present — `pubsub.rs:321-333` |
 | `Subscriber::filter_count()` (`endpoint.rs:542`) | — | absent on the Python `Subscriber`; the *publisher* side's `filter_count` is what the tests wait on (`test_patterns.py:42-53`) |
 
-### 4.4 The streamed transfer classes
+### 4.4 PAIR, SURVEY and BUS
+
+The three patterns the library gained after this binding was written, added on both surfaces
+by **B-244**. `crates/py/weida-py/src/patterns.rs`, and a `weida.Survey` in `values.rs`.
+
+| `crates/weida` | This binding | Verdict |
+| --- | --- | --- |
+| `Runtime::pair(tls)`, `Listener::pair(path)` — one type, two roles | `runtime.pair(trust)` and `binding.pair(path)`, both → `Paired` | present — `runtime.rs:139-149`, `runtime.rs:263-278`; what distinguishes the roles is which of them calls `connect`, as in Rust |
+| `Paired::connect(url)` refusing a second call with `LimitExceeded` | same, and the class is the library's | present — `patterns.rs:67-73`, asserted by `test_patterns.py::test_a_pair_carries_both_directions_and_keeps_its_first_peer`, which dials twice on one endpoint |
+| a **second peer** is refused per transfer, and the first keeps working | same, inherited | present, and it is the rule the test spends its bytes on: the newcomer's `connect` succeeds, its `send` raises `weida.LimitExceeded`, and the first peer's next `send` is still received — written past the 1 MiB stream window so the refusal cannot lose the race to the receipt ([0005](../decisions/0005-refusal-race.md)) |
+| `Paired::send/send_with`, `recv()`, `path()`, `peer_count()` | `await paired.send(payload)`, `await paired.recv(max_bytes)` → `(bytes, IncomingMeta)`, `paired.path()`, `paired.peer_count()` | present — `patterns.rs:56-133`. `send` sets `content_len` for the caller, as Req/Rep does |
+| `Paired::open(meta)` → `OutgoingTransfer` | — | absent: a pair has no streamed form here, for the reason §9.3 gives for `sync` — the whole-payload call is the one a Python caller reaches for, and the Rust API is the streamed one |
+| `Runtime::surveyor(tls)`, `Surveyor::connect/peer_count` | `runtime.surveyor(trust)`, `await surveyor.connect(url)`, `surveyor.peer_count()` | present — `runtime.rs:151-158`, `patterns.rs:142-153`; a surveyor accumulates peers on purpose, and the test connects two respondents on one binding |
+| `Surveyor::survey(body, deadline)` → `SurveyRun`, then `next(max_bytes)` per answer | `await surveyor.survey(payload, deadline_seconds, max_reply_bytes)` → **`weida.Survey`**, a value | present as a **collected value**, and this is the one shape that is a decision rather than a translation: the only channel out of a bridged future here is the errno family (`crates/py/weida-py-core/src/bridge.rs:154-158`), so an `async for` over answers would need a second error channel invented for `StopAsyncIteration` alone. The Rust `SurveyRun` stays the place answers arrive one at a time (`values.rs:206-216`, `patterns.rs:169-206`) |
+| `SurveyRun::respondents()`, `late()`, and a failed answer among the good ones | `Survey.asked`, `Survey.late`, `Survey.failed`, `Survey.replies`, `Survey.silent()` | present — `values.rs:217-250`. `silent()` is `asked` minus what answered either way, so **nobody answering is a number and never an exception**; `test_patterns.py::test_a_survey_collects_what_answers_and_counts_the_silence` asserts `asked == 2`, one reply, `failed == 0` and `silent() == 1` against a respondent that accepts the question and never answers |
+| the deadline is the **caller's** and nothing on the wire carries it | same, and mandatory: a non-finite or negative float is `weida.RuntimeFailure` | present — `patterns.rs:35-39`. The 0.5 s deadline is load-bearing in the test: with it ignored, the case fails on its own 15 s bound rather than passing |
+| `Listener::respondent(path)`, `Respondent::accept()` | `binding.respondent(path)`, `await respondent.accept(max_bytes)` → **`weida.Request`** | present, and the **same class a replier hands out** — `runtime.rs:280-292`, `patterns.rs:238-246`: a survey question is an exchange, byte for byte, so `reply`, `refuse` and the answered-once rule are the ones from §4.1 (`endpoints.rs:341-366` builds the object for both) |
+| `Listener::bus(path, tls)` — bound and dialling at once | `binding.bus(path, trust)` → `BusMember`, the one registration that takes a trust | present — `runtime.rs:294-311`, and the reason is in the docstring: a member accepts here and joins others with `connect` |
+| `BusMember::send(body)` → how many it reached, **never the sender** | `await member.send(payload)` → `int` | present — `patterns.rs:298-315`, asserted by `test_patterns.py::test_a_bus_message_reaches_every_other_member_and_never_the_sender`: `send` returns 1 for one other member, and a receive on the sender after everything is delivered times out rather than handing back its own message |
+| `BusMember::recv()`, `peer_count()`, `dropped()`, `path()` | all four | present — `patterns.rs:263-331`; `dropped` is the fan-out's counted loss, and the test asserts it is `0` for a bus both members read |
+| `BusMember::send_with(meta, body)` as a separate call | — | absent as a name: the binding sets `content_len` and there is no `weida.TransferMeta` to pass, exactly as for `Pusher.send` |
+
+### 4.5 The streamed transfer classes
 
 | `crates/weida` | This binding | Verdict |
 | --- | --- | --- |
@@ -175,6 +198,7 @@ the call, so a coroutine that is never awaited does nothing at all
 | `IncomingMeta::tracestate` | — | absent: forwarded unmodified by the library and not surfaced here. A caller that propagates a full trace context gets the `traceparent` and loses the vendor state |
 | `IncomingMeta::{report, report_mode, report_id}` | — | absent: the three cursor fields the library gained after this binding was written. The whole cursor surface is filed as **B-243**, and surfacing the metadata of a report a caller cannot act on would be worse than omitting it |
 | `PeerIdentity` as a type | `meta.peer` as `str` or `None` | present as text — `values.rs:157-161`: `sha256:…` over QUIC, `uid=…` over a local socket, `None` for an anonymous or in-process peer. Never from a header, so it can be authorized on rather than claimed ([0015](../decisions/0015-peer-authorization.md)); `test_asyncio.py:47` asserts the `None` for a client that presented no identity |
+| a survey's outcome: `SurveyRun`'s answers, `respondents()` and `late()` | `weida.Survey` — `replies`, `asked`, `failed`, `late`, `silent()` | present as a shared value class, on both surfaces (§4.4) — `values.rs:206-250` |
 | `TransferMeta::with_content_len` | set by the binding on `request`, `send`, `reply` | present implicitly — `endpoints.rs:112`, `188`, `323` |
 | `TransferMeta::with_content_type`, `with_trace` (`transfer.rs:44`, `56`) | — | absent: an outbound transfer cannot declare a content type or carry a trace from Python, although both are readable on arrival (§5 above) |
 | `weida::VERSION`, `weida::ALPN` | `weida.VERSION`, `weida.ALPN` | present as module constants — `lib.rs:102-103`, asserted at `test_asyncio.py:186-187` |
@@ -183,7 +207,7 @@ the call, so a coroutine that is never awaited does nothing at all
 ## 6. The `sync` surface, and exactly how it differs
 
 `weida.sync` is a **real submodule** placed in `sys.modules`, so `import weida.sync` works and
-a traceback names `weida.sync.Runtime` (`sync.rs:494-527`, asserted by
+a traceback names `weida.sync.Runtime` (`sync.rs:717-756`, asserted by
 `test_sync.py::test_the_submodule_is_importable_and_shares_its_values`). It implements no
 protocol behaviour: it is `weida::blocking` — where the `block_on`, the owned reactor and the
 refusal of a call from inside a Tokio runtime live (`crates/weida/src/blocking.rs:32-47`) —
@@ -193,8 +217,10 @@ is what makes one thread per endpoint the shape it is supposed to be
 (`test_sync.py::test_a_request_is_answered_with_no_event_loop` runs the serving half on a
 `threading.Thread`).
 
-Nine classes: `Runtime`, `Binding`, `Requester`, `Pusher`, `Subscriber`, `Replier`, `Request`,
-`Puller`, `Publisher` (`sync.rs:497-505`). The value classes are **shared, not copied** —
+Thirteen classes: `Runtime`, `Binding`, `Requester`, `Pusher`, `Subscriber`, `Replier`,
+`Request`, `Puller`, `Publisher`, `Paired`, `Surveyor`, `Respondent`, `BusMember`
+(`sync.rs:722-737`) — every pattern of §4, because B-244 added the three new ones to both
+surfaces at once. The value classes are **shared, not copied** —
 `weida.Trust`, `weida.Identity` and `weida.IncomingMeta` are the same objects on both surfaces
 (`sync.rs:50-52`, `sync.rs:62`) — and so is the whole exception family
 (`test_sync.py::test_the_failure_classes_are_the_same_on_both_surfaces`).
@@ -203,17 +229,19 @@ What differs, row by row:
 
 | Asyncio surface | `weida.sync` | Verdict |
 | --- | --- | --- |
-| every waiting call is a coroutine | the same call, blocking | present — `sync.rs:251-487` |
-| `Runtime.drain(seconds)` leaves the runtime usable | `drain` **consumes** the facade's runtime | present as a difference, and it is the facade's: `blocking::Runtime::drain` takes `self` (`crates/weida/src/blocking.rs:157`), so the second call raises `weida.RuntimeFailure` — `sync.rs:170-178`, asserted by `test_sync.py::test_a_runtime_is_shut_down_once` |
-| no `shutdown` | `runtime.shutdown()` | present here and absent there (§3) — `sync.rs:181-187` |
+| every waiting call is a coroutine | the same call, blocking | present — `sync.rs:267-715` |
+| `Runtime.drain(seconds)` leaves the runtime usable | `drain` **consumes** the facade's runtime | present as a difference, and it is the facade's: `blocking::Runtime::drain` takes `self` (`crates/weida/src/blocking.rs:157`), so the second call raises `weida.RuntimeFailure` — `sync.rs:186-200`, asserted by `test_sync.py::test_a_runtime_is_shut_down_once` |
+| no `shutdown` | `runtime.shutdown()` | present here and absent there (§3) — `sync.rs:203-209` |
 | `requester.open()`, `pusher.open()`, `publisher.open(topic)`, `puller.recv_stream()`, `subscriber.recv_stream()` | — | absent from `sync`, with the reason at `sync.rs:44-52`: the blocking facade takes whole payloads by design, a synchronous caller that wants to stream wants the asyncio surface or the Rust API, and a `sync` module that invented its own streaming would be inventing a second facade. §9.3 |
-| `OutgoingStream`, `IncomingStream`, `Reply`, `FanOut` | — | absent as classes, following from the row above: `sync.rs` registers nine classes and none of them is a stream |
-| `publisher.filter_count()` | — | absent: the synchronous publisher has `path`, `publish`, `subscriber_count` and `dropped` (`sync.rs:461-487`), so `test_sync.py:66-72` waits on `subscriber_count` where the asyncio tests wait on `filter_count` |
+| `OutgoingStream`, `IncomingStream`, `Reply`, `FanOut` | — | absent as classes, following from the row above: none of the thirteen classes `sync.rs` registers is a stream |
+| `publisher.filter_count()` | — | absent: the synchronous publisher has `path`, `publish`, `subscriber_count` and `dropped` (`sync.rs:504-529`), so `test_sync.py:66-72` waits on `subscriber_count` where the asyncio tests wait on `filter_count` |
 | `publisher.dropped_on(topic)` | — | absent: the per-cause breakdown is asyncio-only, and so it is in the facade (`crates/weida/src/blocking.rs:569-606`) |
-| `subscriber.peer_count()` (`pubsub.rs:336-338`) | — | absent: `sync.rs:308-342` gives the synchronous subscriber `connect`, `subscribe`, `unsubscribe` and `recv`, and the facade has no such accessor either (`crates/weida/src/blocking.rs:383-426`) |
-| `request.payload` / `request.meta` after answering | `weida.RuntimeFailure`, naming the spent request | present as a refusal — `sync.rs:65-72`, `380-396`: the blocking `Request` holds the payload inside the request it consumes, so reading it after `reply` is refused rather than stale |
-| `publish` is not a coroutine | `publish` does not block either | present, and it is the one call in the facade that waits for nothing (`crates/weida/src/blocking.rs:578-581`, `sync.rs:469-472`) |
+| `subscriber.peer_count()` (`pubsub.rs:336-338`) | — | absent: `sync.rs:352-386` gives the synchronous subscriber `connect`, `subscribe`, `unsubscribe` and `recv`, and the facade has no such accessor either (`crates/weida/src/blocking.rs:383-426`) |
+| `request.payload` / `request.meta` after answering | `weida.RuntimeFailure`, naming the spent request | present as a refusal — `sync.rs:65-72`, `422-440`: the blocking `Request` holds the payload inside the request it consumes, so reading it after `reply` is refused rather than stale |
+| `publish` is not a coroutine | `publish` does not block either | present, and it is the one call in the facade that waits for nothing (`crates/weida/src/blocking.rs:578-581`, `sync.rs:512-515`) |
 | — | `blocking::Requester::endpoint()` and the other `endpoint()` accessors, which hand out the async type | absent from Python: the escape hatch the facade offers a Rust caller (`crates/weida/src/blocking.rs:459-462`) has no Python spelling, because the asyncio surface *is* the escape hatch here |
+| `await surveyor.survey(...)` → `weida.Survey` | `surveyor.survey(...)` → the **same** `weida.Survey` | present, and the same value class rather than a synchronous twin of it (`sync.rs:594-628`): the collected shape is the right one on a surface with no event loop for the reason §4.4 gives, and it happens to be the right one on both |
+| `paired.peer_count()`, `member.dropped()`, `respondent.accept()` | all three | present — `sync.rs:532-715`; the synchronous `Respondent.accept` hands back `weida.sync.Request`, the class `Replier.accept` hands back, exactly as on the asyncio surface |
 
 ## 7. The exception family
 
@@ -327,7 +355,7 @@ The `Typing :: Typed` classifier was the third of the same kind and is handled i
 | Absent | What a caller does not get | Where it would be added |
 | --- | --- | --- |
 | the raw L0 surface, `Peer` and `Acceptor` (§9.2) | taking a stream without a pattern interpreting it; `Incoming::Transfer` vs `Incoming::Exchange` as the application's choice | a slice binding `Runtime.peer(trust)` and `Binding.acceptor(path)` with an `Incoming` the two arms of which are distinguishable in Python |
-| **PAIR, SURVEY and BUS** | three of weida's six patterns: a one-peer link, a deadline-scoped fan-out of exchanges, and an n-member bus | **B-244** — each costs both surfaces here, and a survey's deadline is the first weida concept whose Python shape is a design question rather than a translation |
+| a **streamed** form for PAIR (§4.4) | writing or reading a pair's payload in pieces; `Paired::open(meta)` is the Rust call | the same shape Push/Pull has here — one `paired.open()` returning an `OutgoingStream` — if a caller ever needs it. PAIR, SURVEY and BUS themselves landed on both surfaces in **B-244** |
 | the **cursor** surface: `TransferMeta`'s report order, `Cursors`, `Reporter`, and `IncomingMeta`'s three report fields (§9) | ordering a completion level per transfer and reading absolute byte offsets back; a Push producer's reliable `Accepted` without an exchange | **B-243** — a cursor's reader outlives the handle it came from, which is a lifetime question in Python rather than a translation |
 | a Python **server** on a local transport | `bind_inproc`, `bind_unix`, `bind_pipe` (`listener.rs:197`, `232`, `263`); the client side already dials all three (`endpoints.rs:59-62`) | three coroutines on `Runtime` beside `bind`, each returning the binding kind the library has, plus the `LocalPrincipal`/`WindowsPrincipal` reading that makes `uid=…` useful |
 | eight of `RuntimeConfig`'s nine fields, and all of `Limits` (§3) | every resource ceiling weida bounds — queue depths, connection counts, the subscriber budget, the guarantee set — is the library's default and cannot be moved from Python | a `weida.Limits` and keyword arguments on `Runtime`, in the shape [`mqtt-py.md`](mqtt-py.md) §5 uses for the two limits that surface there |
@@ -347,7 +375,7 @@ The `Typing :: Typed` classifier was the third of the same kind and is handled i
 ## 11. Sources
 
 - This binding: `crates/py/weida-py/src/` (`lib.rs`, `runtime.rs`, `endpoints.rs`,
-  `pubsub.rs`, `streams.rs`, `sync.rs`, `values.rs`, `errors.rs`),
+  `pubsub.rs`, `patterns.rs`, `streams.rs`, `sync.rs`, `values.rs`, `errors.rs`),
   `crates/py/weida-py/Cargo.toml`, `pyproject.toml`, `develop.sh`, `package.sh`, `smoke.py`,
   `README.md`.
 - The shared foundation: `crates/py/weida-py-core/src/` — `bridge.rs` (the coroutine and its
@@ -356,8 +384,9 @@ The `Typing :: Typed` classifier was the third of the same kind and is handled i
 - The API this document is the parity table of: `crates/weida/src/` — `lib.rs:67-99`,
   `config.rs`, `runtime.rs`, `listener.rs`, `endpoint.rs`, `transfer.rs`, `stream.rs`,
   `blocking.rs`.
-- Tests: `crates/py/weida-py/tests/` — `test_asyncio.py` (8), `test_patterns.py` (6),
-  `test_sync.py` (5).
+- Tests: `crates/py/weida-py/tests/` — `test_asyncio.py` (8), `test_patterns.py` (9),
+  `test_sync.py` (8). **Run** for B-244: 25 passed, and `smoke.py` reporting 46 names
+  through a freshly built wheel.
 - Normative documents the rows cite: [PROTOCOL.md](../PROTOCOL.md) §6.4 and §9.4,
   [PATTERNS.md](../PATTERNS.md) §4.1, [GUARANTEES.md](../GUARANTEES.md) §1,
   [INVARIANTS.md](../INVARIANTS.md), [FAILURE_MODEL.md](../FAILURE_MODEL.md).

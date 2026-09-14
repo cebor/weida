@@ -6,10 +6,16 @@
 //! test harness, a CLI or a thread pool that has none — and this repository's
 //! four protocol libraries all learned that, one facade each
 //! (`weida_zmq::blocking`, `weida_mqtt::blocking`, `weida_nng::blocking`).
-//! This is the same shape for weida's own patterns (B-194) — for the **six
-//! roles** of Req/Rep, Push/Pull and Pub/Sub. PAIR, SURVEY and BUS are
-//! asynchronous-only for now, and so is the cursor surface; both are filed
-//! (B-244, B-243) rather than half-wrapped here.
+//! This is the same shape for weida's own patterns (B-194, B-244) — for
+//! **every role of every pattern**: Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY
+//! and BUS. The cursor surface is the one thing still asynchronous-only, and
+//! it is filed (B-243) rather than half-wrapped here.
+//!
+//! One design question came with SURVEY rather than a translation, and it is
+//! answered in [`Survey`]: a deadline-bounded fan-out of exchanges yields
+//! answers as they arrive on the asynchronous surface, which is what a
+//! reactor is for, while a synchronous caller has nothing to do between two
+//! answers — so the blocking shape collects and returns counts.
 //!
 //! # It is a wrapper, and nothing else
 //!
@@ -123,6 +129,23 @@ impl Runtime {
         }
     }
 
+    /// A paired endpoint on this runtime, dialling.
+    ///
+    /// The bound half is [`Binding::pair`]; one type serves both roles here
+    /// because one type serves both on the asynchronous surface.
+    pub fn pair(&self, trust: impl Into<ClientTls>) -> Paired {
+        Paired {
+            endpoint: self.inner.pair(trust),
+        }
+    }
+
+    /// A surveyor on this runtime.
+    pub fn surveyor(&self, trust: impl Into<ClientTls>) -> Surveyor {
+        Surveyor {
+            endpoint: self.inner.surveyor(trust),
+        }
+    }
+
     /// Binds a QUIC socket and returns the listener's endpoints.
     ///
     /// The address includes the port the kernel chose, which is how a
@@ -217,6 +240,51 @@ impl Binding {
     pub fn publisher(&self, path: &str) -> Result<Publisher, Error> {
         Ok(Publisher {
             endpoint: self.listener.publisher(path)?,
+        })
+    }
+
+    /// Registers a paired endpoint at `path`, bound.
+    ///
+    /// Exactly one peer, and the **first** one is kept: a stream from any
+    /// other connection is refused with `LIMIT_EXCEEDED` while the first
+    /// keeps working ([decisions/0005](../../../docs/decisions/0005-refusal-race.md)).
+    ///
+    /// # Errors
+    ///
+    /// As [`Binding::replier`].
+    pub fn pair(&self, path: &str) -> Result<Paired, Error> {
+        Ok(Paired {
+            endpoint: self.listener.pair(path)?,
+        })
+    }
+
+    /// Registers a respondent at `path`, for surveys.
+    ///
+    /// A survey question is an exchange, so a respondent's route is a
+    /// replier's and its accepted request is the same [`Request`] type.
+    ///
+    /// # Errors
+    ///
+    /// As [`Binding::replier`].
+    pub fn respondent(&self, path: &str) -> Result<Respondent, Error> {
+        Ok(Respondent {
+            endpoint: self.listener.respondent(path)?,
+        })
+    }
+
+    /// Registers a bus member at `path`, which dials the other members on
+    /// `trust`'s terms.
+    ///
+    /// The one registration that takes both a path and dialling terms,
+    /// because a bus member is the one role that is bound and dialling at
+    /// once.
+    ///
+    /// # Errors
+    ///
+    /// As [`Binding::replier`].
+    pub fn bus(&self, path: &str, trust: impl Into<ClientTls>) -> Result<BusMember, Error> {
+        Ok(BusMember {
+            endpoint: self.listener.bus(path, trust)?,
         })
     }
 
@@ -605,6 +673,281 @@ impl Publisher {
     /// The asynchronous publisher underneath, for the streaming fan-out.
     pub fn endpoint(&self) -> &crate::Publisher {
         &self.endpoint
+    }
+}
+
+/// A paired endpoint: one peer, transfers in both directions, whole payloads.
+///
+/// One type for both roles, as on the asynchronous surface: a bound pair comes
+/// from [`Binding::pair`] and a dialling one from [`Runtime::pair`], and what
+/// distinguishes them is which of them calls [`Paired::connect`].
+pub struct Paired {
+    endpoint: crate::Paired,
+}
+
+dialling!(Paired, crate::Paired);
+
+impl Paired {
+    /// The endpoint path this pair uses; empty on a dialling pair that has
+    /// not connected yet.
+    pub fn path(&self) -> &str {
+        self.endpoint.path()
+    }
+
+    /// Peers connected: `0` or `1`.
+    pub fn peer_count(&self) -> usize {
+        self.endpoint.peer_count()
+    }
+
+    /// Sends `body` and waits for the peer's transport to acknowledge it.
+    ///
+    /// Waiting is the honest synchronous shape, for [`Pusher::send`]'s reason.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::LimitExceeded`] when the peer's pair already has a different
+    /// peer — the refusal is per stream, so the connection survives it —
+    /// plus everything [`Pusher::send`] reports.
+    pub fn send(&self, body: &[u8]) -> Result<(), Error> {
+        self.send_with(
+            TransferMeta::default().with_content_len(body.len() as u64),
+            body,
+        )
+    }
+
+    /// [`Paired::send`] with explicit metadata.
+    ///
+    /// # Errors
+    ///
+    /// As [`Paired::send`].
+    pub fn send_with(&self, meta: TransferMeta, body: &[u8]) -> Result<(), Error> {
+        outside_a_reactor()?;
+        drive(async {
+            let mut transfer = self.endpoint.open(meta).await?;
+            transfer.write_all(body).await?;
+            transfer.finish()?.delivered().await
+        })
+    }
+
+    /// Waits for the next transfer from the peer, at most `max_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Puller::recv`].
+    pub fn recv(&self, max_bytes: usize) -> Result<Message, Error> {
+        outside_a_reactor()?;
+        drive(async {
+            let transfer = self.endpoint.recv().await?;
+            let meta = transfer.meta().clone();
+            let payload = transfer.collect(max_bytes).await?;
+            Ok(Message { payload, meta })
+        })
+    }
+}
+
+/// What one survey collected before its deadline.
+///
+/// **The deadline is why this is a value rather than an iterator.** On the
+/// asynchronous surface a [`crate::SurveyRun`] yields answers as they arrive,
+/// which is what a reactor is for; a synchronous caller has nothing to do
+/// between two answers, so the blocking shape is "ask, wait out the deadline,
+/// here is what came" — and the counts that make the silence readable come
+/// with it rather than needing a second call.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Survey {
+    /// The answers, in arrival order.
+    pub replies: Vec<Vec<u8>>,
+    /// Respondents the question went to.
+    pub asked: usize,
+    /// Respondents that answered with an error — a refusal, a reset, a reply
+    /// past the ceiling. Counted rather than returned, because a survey's
+    /// result is the answers and its failures are a number
+    /// ([PATTERNS.md](../../../docs/PATTERNS.md) §5).
+    pub failed: usize,
+    /// Answers that arrived after the deadline: dropped, and counted.
+    pub late: u64,
+}
+
+impl Survey {
+    /// Respondents that said nothing at all before the deadline.
+    ///
+    /// `asked` minus what answered, one way or the other. "Nobody answered" is
+    /// an answer, so this is a number and never an error.
+    pub fn silent(&self) -> usize {
+        self.asked
+            .saturating_sub(self.replies.len())
+            .saturating_sub(self.failed)
+    }
+}
+
+/// A surveyor: one question to every respondent, bounded by a deadline.
+pub struct Surveyor {
+    endpoint: crate::Surveyor,
+}
+
+dialling!(Surveyor, crate::Surveyor);
+
+impl Surveyor {
+    /// Respondents currently connected.
+    pub fn peer_count(&self) -> usize {
+        self.endpoint.peer_count()
+    }
+
+    /// Asks every connected respondent and collects what arrives within
+    /// `deadline`, each answer at most `max_reply_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotConnected`] when no respondent is connected — an empty
+    /// survey is **not** an error, but having nobody to ask is — plus
+    /// [`Error::Runtime`] from inside a reactor.
+    pub fn survey(
+        &self,
+        body: &[u8],
+        deadline: Duration,
+        max_reply_bytes: usize,
+    ) -> Result<Survey, Error> {
+        self.survey_with(TransferMeta::default(), body, deadline, max_reply_bytes)
+    }
+
+    /// [`Surveyor::survey`] with explicit metadata.
+    ///
+    /// # Errors
+    ///
+    /// As [`Surveyor::survey`].
+    pub fn survey_with(
+        &self,
+        meta: TransferMeta,
+        body: &[u8],
+        deadline: Duration,
+        max_reply_bytes: usize,
+    ) -> Result<Survey, Error> {
+        outside_a_reactor()?;
+        drive(async {
+            let mut run = self.endpoint.survey_with(meta, body, deadline).await?;
+            let asked = run.respondents();
+            let mut replies = Vec::new();
+            let mut failed = 0usize;
+            while let Some(answer) = run.next(max_reply_bytes).await {
+                match answer {
+                    Ok(reply) => replies.push(reply),
+                    Err(_) => failed += 1,
+                }
+            }
+            Ok(Survey {
+                replies,
+                asked,
+                failed,
+                late: run.late(),
+            })
+        })
+    }
+}
+
+/// A respondent: accept a survey question, answer it, whole payloads both
+/// ways.
+///
+/// A question is an exchange, so this is a [`Replier`] in every respect and
+/// hands out the same [`Request`].
+pub struct Respondent {
+    endpoint: crate::Respondent,
+}
+
+impl Respondent {
+    /// The endpoint path this respondent serves.
+    pub fn path(&self) -> &str {
+        self.endpoint.path()
+    }
+
+    /// Waits for the next question and reads it, at most `max_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Replier::accept`].
+    pub fn accept(&self, max_bytes: usize) -> Result<Request, Error> {
+        outside_a_reactor()?;
+        drive(async {
+            let mut request = self.endpoint.accept().await?;
+            let meta = request.meta().clone();
+            let payload = request.take_body().collect(max_bytes).await?;
+            Ok(Request {
+                request,
+                message: Message { payload, meta },
+            })
+        })
+    }
+
+    /// The asynchronous respondent underneath.
+    pub fn endpoint(&self) -> &crate::Respondent {
+        &self.endpoint
+    }
+}
+
+/// A bus member: bound and dialling at once, every message to every other
+/// member.
+pub struct BusMember {
+    endpoint: crate::BusMember,
+}
+
+dialling!(BusMember, crate::BusMember);
+
+impl BusMember {
+    /// The endpoint path this member answers on.
+    pub fn path(&self) -> &str {
+        self.endpoint.path()
+    }
+
+    /// Sends `body` to every **other** member, returning how many it was
+    /// enqueued for.
+    ///
+    /// Never to the sender itself: structurally, because a send writes to the
+    /// members this one dialled. Best effort per member with counted drops,
+    /// exactly as a fan-out, so this does not wait for a receipt — there is no
+    /// single peer to get one from.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::LimitExceeded`] for a payload above
+    /// `Limits::subscriber_buffer_bytes`, [`Error::Runtime`] from inside a
+    /// reactor.
+    pub fn send(&self, body: &[u8]) -> Result<usize, Error> {
+        outside_a_reactor()?;
+        drive(self.endpoint.send(body))
+    }
+
+    /// [`BusMember::send`] with explicit metadata.
+    ///
+    /// # Errors
+    ///
+    /// As [`BusMember::send`].
+    pub fn send_with(&self, meta: TransferMeta, body: &[u8]) -> Result<usize, Error> {
+        outside_a_reactor()?;
+        drive(self.endpoint.send_with(meta, body))
+    }
+
+    /// Waits for the next message from another member, at most `max_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Puller::recv`].
+    pub fn recv(&self, max_bytes: usize) -> Result<Message, Error> {
+        outside_a_reactor()?;
+        drive(async {
+            let transfer = self.endpoint.recv().await?;
+            let meta = transfer.meta().clone();
+            let payload = transfer.collect(max_bytes).await?;
+            Ok(Message { payload, meta })
+        })
+    }
+
+    /// Members this one has dialled.
+    pub fn peer_count(&self) -> usize {
+        self.endpoint.peer_count()
+    }
+
+    /// Copies that never reached a member.
+    pub fn dropped(&self) -> u64 {
+        self.endpoint.dropped()
     }
 }
 

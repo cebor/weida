@@ -135,3 +135,129 @@ def test_the_submodule_is_importable_and_shares_its_values():
     binding = runtime.bind("127.0.0.1:0", weida.Identity.generate())
     assert binding.url("/x").startswith("weida://sha256:")
     runtime.shutdown()
+
+
+def test_a_pair_carries_both_directions_with_no_event_loop():
+    """PAIR on threads, and its one rule: the first peer is the one kept."""
+    server = sync.Runtime()
+    binding = server.bind("127.0.0.1:0", weida.Identity.generate())
+    bound = binding.pair("/link")
+    url = binding.url("/link")
+
+    client = sync.Runtime()
+    paired = client.pair(weida.Trust.by_address())
+    paired.connect(url)
+    assert paired.peer_count() == 1
+
+    heard = []
+    # A pair is symmetric, so both ends block on `recv`: the bound half
+    # answers from a thread of its own.
+    def answer():
+        heard.append(bound.recv(CAP))
+        bound.send(b"pong")
+
+    answering = threading.Thread(target=answer, daemon=True)
+    answering.start()
+    paired.send(b"ping")
+    assert paired.recv(CAP)[0] == b"pong"
+    answering.join(DEADLINE)
+    assert heard and heard[0][0] == b"ping"
+
+    # A second dialler is refused on the transfer, not on the connection,
+    # past the 1 MiB stream window (docs/decisions/0005-refusal-race.md).
+    newcomer = sync.Runtime()
+    second = newcomer.pair(weida.Trust.by_address())
+    second.connect(url)
+    with pytest.raises(weida.LimitExceeded):
+        second.send(b"z" * (2 << 20))
+
+    # The first peer still delivers.
+    kept = []
+    reading = threading.Thread(target=lambda: kept.append(bound.recv(CAP)), daemon=True)
+    reading.start()
+    paired.send(b"still mine")
+    reading.join(DEADLINE)
+    assert kept and kept[0][0] == b"still mine"
+
+    newcomer.shutdown()
+    client.shutdown()
+    server.shutdown()
+
+
+def test_a_survey_is_a_value_with_no_event_loop():
+    """SURVEY on threads: the deadline is the caller's, silence is a number."""
+    server = sync.Runtime()
+    binding = server.bind("127.0.0.1:0", weida.Identity.generate())
+    answering = binding.respondent("/poll")
+    quiet = binding.respondent("/quiet")
+
+    def answer():
+        question = answering.accept(CAP)
+        assert question.payload == b"who is there"
+        question.reply(b"me")
+
+    held = []
+
+    def say_nothing():
+        # Accepted and never answered: silence, not a failure. The request is
+        # held, because dropping it would report NO_REPLY.
+        held.append(quiet.accept(CAP))
+
+    threads = [
+        threading.Thread(target=answer, daemon=True),
+        threading.Thread(target=say_nothing, daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    client = sync.Runtime()
+    surveyor = client.surveyor(weida.Trust.by_address())
+    surveyor.connect(binding.url("/poll"))
+    surveyor.connect(binding.url("/quiet"))
+    assert surveyor.peer_count() == 2
+
+    survey = surveyor.survey(b"who is there", 0.5, CAP)
+    assert survey.asked == 2, repr(survey)
+    assert survey.replies == [b"me"], repr(survey)
+    assert survey.failed == 0, repr(survey)
+    assert survey.silent() == 1, repr(survey)
+
+    for thread in threads:
+        thread.join(DEADLINE)
+    client.shutdown()
+    server.shutdown()
+
+
+def test_a_bus_never_delivers_a_member_its_own_message():
+    """BUS on threads, and its one rule: never your own message."""
+    first = sync.Runtime()
+    first_binding = first.bind("127.0.0.1:0", weida.Identity.generate())
+    second = sync.Runtime()
+    second_binding = second.bind("127.0.0.1:0", weida.Identity.generate())
+
+    one = first_binding.bus("/bus1", weida.Trust.by_address())
+    two = second_binding.bus("/bus2", weida.Trust.by_address())
+    one.connect(second_binding.url("/bus2"))
+    two.connect(first_binding.url("/bus1"))
+    assert one.peer_count() == 1
+
+    heard = []
+    listening = threading.Thread(target=lambda: heard.append(two.recv(CAP)), daemon=True)
+    listening.start()
+    assert one.send(b"hello all") == 1, "one other member"
+    listening.join(DEADLINE)
+    assert heard and heard[0][0] == b"hello all"
+    assert heard[0][1].endpoint == "/bus2"
+
+    # The sender never hears itself: with that message delivered, a further
+    # send leaves nothing for `one` to receive and everything for `two`.
+    got = []
+    reading = threading.Thread(target=lambda: got.append(two.recv(CAP)), daemon=True)
+    reading.start()
+    assert one.send(b"mine alone") == 1
+    reading.join(DEADLINE)
+    assert got and got[0][0] == b"mine alone"
+    assert one.dropped() == 0
+
+    first.shutdown()
+    second.shutdown()

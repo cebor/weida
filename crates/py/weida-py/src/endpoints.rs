@@ -49,6 +49,7 @@ macro_rules! endpoint {
         }
     };
 }
+pub(crate) use endpoint;
 
 /// The addresses the two dialling endpoints accept, written once because
 /// their `connect` methods cannot share an implementation: PyO3 allows one
@@ -249,20 +250,8 @@ impl PyReplier {
         let bridge = self.bridge.clone();
         let runtime = Arc::clone(&self._runtime);
         self.bridge.awaitable(py, async move {
-            let mut request = endpoint.accept().await.map_err(errno_of)?;
-            let meta = PyIncomingMeta::of(request.meta());
-            let payload = request
-                .take_body()
-                .collect(max_bytes)
-                .await
-                .map_err(errno_of)?;
-            Ok(PyRequest {
-                request: std::sync::Mutex::new(Some(request)),
-                payload,
-                meta,
-                bridge,
-                _runtime: runtime,
-            })
+            let request = endpoint.accept().await.map_err(errno_of)?;
+            PyRequest::accepted(request, max_bytes, bridge, runtime).await
         })
     }
 
@@ -349,6 +338,33 @@ impl PyRequest {
 }
 
 impl PyRequest {
+    /// One accepted exchange with its body read, at most `max_bytes`.
+    ///
+    /// Built here and nowhere else, so that a replier and a **respondent**
+    /// hand back the same object: a survey question is an exchange, byte for
+    /// byte, and inventing a second request class for it would make a Python
+    /// caller learn two shapes for one thing (B-244).
+    pub(crate) async fn accepted(
+        mut request: weida::IncomingRequest,
+        max_bytes: usize,
+        bridge: Bridge,
+        runtime: Arc<Runtime>,
+    ) -> Result<PyRequest, weida_py_core::Errno> {
+        let meta = PyIncomingMeta::of(request.meta());
+        let payload = request
+            .take_body()
+            .collect(max_bytes)
+            .await
+            .map_err(errno_of)?;
+        Ok(PyRequest {
+            request: std::sync::Mutex::new(Some(request)),
+            payload,
+            meta,
+            bridge,
+            _runtime: runtime,
+        })
+    }
+
     /// Takes the request for the one answer it has, or reports that it is
     /// spent.
     fn take(&self) -> PyResult<weida::IncomingRequest> {
