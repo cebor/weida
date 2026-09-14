@@ -6,18 +6,20 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `f8e8051`, 2026-09-13 ~14:00 UTC. Tree clean, gate green on **two
-platforms**: Linux **1747 tests** (218 at the start of the session, 764 before the four
-parallel workstreams) and a Windows 11 VM with **1712 across 128 binaries** at the same commit,
-each with 37 ignored — the interop suites that need a library or a broker the machine does
-not have — plus the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`,
-`weida-nng`'s `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
+**Snapshot:** main `b5fa4a3`, 2026-09-14 ~02:00 UTC. Tree clean, gate green on Linux:
+**1754 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+37 ignored — the interop suites that need a library or a broker the machine does not have.
+The Windows 11 VM last ran at `f8e8051`: **1712 across 128 binaries**, the same 37 ignored. Add
+the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
+`blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
 items, and **every one of the four wheels built and smoke-tested with no Rust toolchain on
-`PATH`**. Nineteen decision notes (0001–0019): fourteen `accepted`, and 0015 (peer authorization), 0016
-(conflation), 0017 (the subscription verdict), 0018 (the minimal broker) and 0019 (the JVM
-binding) `provisional` — the first three because each answers an open question with a
-wire-affecting "no", the last two because they are the first step of a phase the user chooses.
+`PATH`**. Twenty-four decision notes (0001–0024): fourteen `accepted` and ten `provisional` —
+0015 (peer authorization), 0016 (conflation) and 0017 (the subscription verdict) because each
+answers an open question with a wire-affecting "no"; 0018 (the minimal broker) and 0019 (the
+JVM binding) because they are the first step of a phase the user chooses; and 0020–0024 (the
+cluster, consensus, the store, one control group, the cursor and the three families) because
+they are the phase now being built.
 One binary, `weida` (B-060), beside the library, `weida::blocking` (B-194) beside the async API,
 and **`weida-py`** (B-200, B-204, B-205), the sixth Python binding in the tree, the first of
 weida itself, the only one that reaches every pattern of its library including the streamed
@@ -125,7 +127,7 @@ a multipart refused at hop one, the smaller `max_message_bytes` deciding — are
 
 Every point is a merge into main behind the four-step gate of [LOOP.md](LOOP.md) §6. **The
 chart stops at the two-day stop it was drawn for** (`5ca1329`, 1678 tests); the sessions since
-took it to **1700** without changing its shape, so it is left as the picture of the parallel run
+took it to **1754** without changing its shape, so it is left as the picture of the parallel run
 rather than redrawn per merge. Two things it does not show: three review findings were caught **before** their merge by reading
 the branch (a reassembler counter that drifted on repeated sequence numbers, a runtime-wide
 mutex on the fire-and-forget path that cost 3 % in the header bench, a parked receipt that
@@ -179,17 +181,17 @@ Three things, and only three:
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1700 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  green at **1754 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session.
-- **12 items are `ready`, two are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
-  B-068, a licence and a publication target) and **one is `parked`** (A5's control tier by
-  0011 §4.3). Of **237** filed items, **209 are `done`**, and the remaining twelve `ready` are exactly two
-  kinds: **ten code slices of the two phases the user chooses between** (B-201..B-203, the
-  broker of [0018](decisions/0018-minimal-broker.md); B-211..B-217, the JVM binding of
-  [0019](decisions/0019-jvm-binding.md)), and **two sentences in a file this loop does not
-  write** (§6, B-107 and B-184). Nothing else is open: every requirement-driven item, every
-  library item and both binding slices of weida's own Python surface are closed.
+- **10 items are `ready`, 16 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
+  B-068, a licence and a publication target; the rest waiting on an item this session is
+  building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
+  tier by 0011 §4.3). Of **237** filed items, **210 are `done`**, and the ten `ready` are three
+  kinds: **the three patterns `ARCHITECTURE.md` §6b maps and nobody built** (B-236 PAIR, B-237
+  SURVEY, B-238 BUS), **five slices of the cluster and store phase** (B-219, B-220, B-224,
+  B-226, B-231), and **two sentences in a file this loop does not write** (§6, B-107 and
+  B-184).
 - **The requirement-driven backlog is closed.** All five requests of
   [requirements/zeughaus-video.md](requirements/zeughaus-video.md) are answered where they were
   filed: streaming fan-out **built** (B-064, `Publisher::open`), conflation **answered without a
