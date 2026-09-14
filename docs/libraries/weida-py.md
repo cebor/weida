@@ -343,9 +343,9 @@ caught them rather than recorded as living defects:
   sentence written before it landed — while `lib.rs:105` registered `weida.sync`. It now
   states what the module has on both surfaces and what is absent with the reason.
 - `pyproject.toml`'s and `Cargo.toml`'s descriptions said "Req/Rep and Push/Pull", which was
-  B-200's scope; Pub/Sub and the streamed surface landed in B-204 and are registered at
-  `lib.rs:99-104`, so the wheel's own summary understated the module it ships. Both now name
-  all three patterns and both surfaces.
+  B-200's scope; Pub/Sub and the streamed surface landed in B-204 and PAIR, SURVEY and BUS in
+  B-244, so the wheel's own summary understated the module it ships twice over. Both now name
+  all six patterns and both surfaces.
 
 The `Typing :: Typed` classifier was the third of the same kind and is handled in §10: it was
 **removed**, because a classifier is a claim and no stub file ships.
