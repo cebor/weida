@@ -48,8 +48,20 @@
 //! wants to stream wants the asyncio surface or the Rust API — and a `sync`
 //! module that invented its own streaming would be inventing a second
 //! facade. The value classes are shared, not copied: `weida.Trust`,
-//! `weida.Identity` and `weida.IncomingMeta` are the same objects on both
-//! surfaces.
+//! `weida.Identity`, `weida.IncomingMeta` and `weida.Survey` are the same
+//! objects on both surfaces.
+//!
+//! # The one call whose signature differs, and why
+//!
+//! `Cursors.changed(seconds)` takes a **deadline** where the asyncio
+//! `Cursors.changed()` takes nothing. There `asyncio.wait_for` bounds the
+//! wait and composes; here a parked thread is interrupted by nothing — and
+//! the wait is genuinely unbounded, because a peer that never reports opens
+//! no stream, a report that never starts never ends, and a connection both
+//! sides keep alive never closes. A deadline that passes raises
+//! `TimeoutError`, the builtin, because it is **not** the end of the report:
+//! returning `None` for it would make a caller stop reading a verdict that is
+//! still coming (B-243).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
