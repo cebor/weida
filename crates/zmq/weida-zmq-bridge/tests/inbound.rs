@@ -342,6 +342,55 @@ async fn a_foreign_sub_receives_from_a_weida_publisher() {
     weida_side.runtime.shutdown().await;
 }
 
+/// Claim: a publication past `max_message_bytes` costs that one message and
+/// not the bridge — the next publication still reaches the peer.
+///
+/// A refusal is per stream, which the outbound loops already say for the
+/// direction they serve. This loop used to hand the `LimitExceeded` out of
+/// `serve`, so one oversized publication ended the bridge and took every
+/// foreign subscriber down with it — for a message none of them ever saw.
+#[tokio::test]
+async fn an_oversized_publication_costs_one_message_not_the_bridge() {
+    let weida_side = WeidaSide::start().await;
+    let publisher = weida_side.listener.publisher("/feed").expect("publisher");
+
+    let mut config = InboundConfig::new(
+        "127.0.0.1:0".parse().expect("loopback"),
+        weida_side.url("/feed"),
+        Presenting::Pub,
+    );
+    // Small enough that the oversized publication below is unambiguous.
+    config.max_message_bytes = 64;
+    let (addr, bridge_runtime) = bridge(config).await;
+
+    let mut peer = Peer::connect(addr, SocketType::Sub).await;
+    peer.send_command(&Command::Subscribe(b"px.")).await;
+    while publisher.subscriber_count() == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Both selected by the peer's filter, so the small one arriving is the
+    // bridge still serving rather than the filter hiding the failure.
+    publisher
+        .publish("px.oversized", vec![b'x'; 4096])
+        .expect("publish");
+    publisher
+        .publish("px.eurusd", b"1.0921".to_vec())
+        .expect("publish");
+
+    let message = within(peer.read_message())
+        .await
+        .expect("the publication after the oversized one");
+    assert_eq!(
+        message,
+        vec![b"px.eurusd".to_vec(), b"1.0921".to_vec()],
+        "the oversized publication is dropped and the next one still arrives"
+    );
+
+    bridge_runtime.shutdown().await;
+    weida_side.runtime.shutdown().await;
+}
+
 /// Claim: a socket type that may not talk to the bridge is refused with
 /// `ERROR` before the close, which is what the specification asks for and what
 /// lets the peer's operator see why (§2).

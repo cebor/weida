@@ -38,6 +38,7 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use weida_amqp_codec::frame::{self, Frame, MIN_FRAME_SIZE};
 use weida_amqp_codec::protocol_header::{self, LEN as HEADER_LEN, ProtocolHeader};
 use weida_runtime::Exec;
@@ -332,6 +333,7 @@ impl Wire {
             FrameWriter {
                 write,
                 max_frame_size: self.max_frame_size,
+                last_write: Instant::now(),
             },
         )
     }
@@ -388,6 +390,16 @@ impl FrameReader {
 pub struct FrameWriter {
     write: tokio::io::WriteHalf<Stream>,
     max_frame_size: u32,
+    /// When this side last put a frame on the wire.
+    ///
+    /// The connection driver's keep-alive is "an empty frame at half the
+    /// interval the peer asked for", and *every* frame counts towards it
+    /// (Part 2 §2.4.5), not only the empty one. Recorded here because the
+    /// driver writes from five places — a `begin`, an `attach`, a session's
+    /// frame, the answers to an incoming frame, and the keep-alive itself —
+    /// and a clock kept in only some of them would let a talkative
+    /// connection heartbeat for no reason or a quiet one not at all.
+    last_write: Instant,
 }
 
 impl FrameWriter {
@@ -406,7 +418,14 @@ impl FrameWriter {
     pub async fn send(&mut self, bytes: &[u8]) -> Result<()> {
         self.write.write_all(bytes).await?;
         self.write.flush().await?;
+        self.last_write = Instant::now();
         Ok(())
+    }
+
+    /// When this side last wrote, for a keep-alive deadline to measure from.
+    #[must_use]
+    pub const fn last_write(&self) -> Instant {
+        self.last_write
     }
 
     /// Closes the write half, which is what "`close` is the last thing ever

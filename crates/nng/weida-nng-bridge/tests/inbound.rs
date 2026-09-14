@@ -441,6 +441,51 @@ async fn a_foreign_sub_receives_every_copy_and_filters_it_itself() {
     weida_side.runtime.shutdown().await;
 }
 
+/// Claim: a publication past `max_message_bytes` costs that one message and
+/// not the bridge — the next publication still reaches the SUB peer.
+///
+/// A refusal is per stream, which the outbound loops already say for the
+/// direction they serve. This loop used to hand the `LimitExceeded` out of
+/// `serve`, so one oversized publication ended the bridge and took every SP
+/// subscriber down with it — for a message none of them ever saw.
+#[tokio::test]
+async fn an_oversized_publication_costs_one_message_not_the_bridge() {
+    let weida_side = WeidaSide::start().await;
+    let publisher = weida_side.listener.publisher("/feed").expect("publisher");
+
+    let mut config = InboundConfig::new(
+        "127.0.0.1:0".parse().expect("loopback"),
+        weida_side.url("/feed"),
+        Presenting::Pub,
+    );
+    // Small enough that the oversized publication below is unambiguous.
+    config.max_message_bytes = 64;
+    let (addr, bridge_runtime) = bridge(config).await;
+
+    let mut peer = Peer::connect(addr, EndpointType::Sub).await;
+    while publisher.subscriber_count() == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    publisher
+        .publish("px.oversized", vec![b'x'; 4096])
+        .expect("publish");
+    publisher
+        .publish("px.eurusd", b"1.0921".to_vec())
+        .expect("publish");
+
+    let next = within(peer.recv())
+        .await
+        .expect("the publication after the oversized one");
+    assert_eq!(
+        next, b"px.eurusd1.0921",
+        "the oversized publication is dropped and the next one still arrives"
+    );
+
+    bridge_runtime.shutdown().await;
+    weida_side.runtime.shutdown().await;
+}
+
 /// Claim (loss L10, observable): an endpoint type that may not talk here is
 /// refused **before any traffic**, and the refusal is a close - SP has no
 /// error frame to carry a reason ([rfc-tcp §2], `docs/adapters/nng.md` §8).

@@ -307,6 +307,83 @@ async fn a_peer_that_never_answers_becomes_no_reply_at_the_deadline() {
     bridge_runtime.shutdown().await;
 }
 
+/// Claim: an exchange whose reply never comes expires **under traffic**, not
+/// only on an otherwise silent loop.
+///
+/// The companion of the test above, and the one that pins the mechanism. The
+/// reaper's timer used to be built inside the `select!`, so every accepted
+/// request, every message from the socket and every pipe event restarted it:
+/// with a sweep at a quarter of the deadline, anything above a few events a
+/// second postponed expiry indefinitely and the `ERROR{NO_REPLY}` the test
+/// above asserts simply never happened. The ZMTP bridge is fixed the same way
+/// and has the same test.
+#[tokio::test]
+async fn a_pending_exchange_expires_while_traffic_keeps_arriving() {
+    /// Short enough for a fast test, and divisible by eight below.
+    const REPLY_DEADLINE: Duration = Duration::from_millis(400);
+
+    let peer = PeerListener::start(EndpointType::Rep).await;
+    let mut config = OutboundConfig::new(
+        peer.addr(),
+        "127.0.0.1:0".parse().expect("loopback"),
+        "/rpc",
+        Dialling::Req,
+    );
+    config.reply_deadline = REPLY_DEADLINE;
+    let (url, bridge_runtime) = bridge(config).await;
+    let mut silent = peer.accept().await;
+
+    let client = client();
+    let requester = Arc::new(client.requester(ClientTls::new(Trust::by_address())));
+    within(requester.connect(&url)).await.expect("connect");
+
+    // The exchange under test. The peer reads it and never answers it.
+    let watched = tokio::spawn({
+        let requester = Arc::clone(&requester);
+        async move { requester.request(b"watched").await }
+    });
+    let request = within(silent.recv()).await.expect("the request arrived");
+    assert!(request.ends_with(b"watched"), "behind its backtrace");
+    let waiting_since = std::time::Instant::now();
+
+    // Then steady traffic through the same loop: a request every eighth of the
+    // deadline, so a quarter-deadline sweep never has a gap to itself.
+    let noise = tokio::spawn({
+        let requester = Arc::clone(&requester);
+        async move {
+            loop {
+                let asking = Arc::clone(&requester);
+                tokio::spawn(async move { asking.request(b"noise").await });
+                tokio::time::sleep(REPLY_DEADLINE / 8).await;
+            }
+        }
+    });
+    // The peer keeps reading, so the traffic reaches the bridge's loop rather
+    // than filling a socket buffer, and keeps saying nothing.
+    let draining = tokio::spawn(async move { while silent.recv().await.is_ok() {} });
+
+    let error = within(watched)
+        .await
+        .expect("task")
+        .expect_err("nobody ever answered this exchange");
+    assert!(
+        matches!(error, weida::Error::NoReply),
+        "an expired exchange is refused with NoReply, got {error:?}"
+    );
+    // Bounded rather than eventual: the sweep is a quarter of the deadline, so
+    // three deadlines is generous and a starved reaper cannot come in under it.
+    let took = waiting_since.elapsed();
+    assert!(
+        took < REPLY_DEADLINE * 3,
+        "expiry under load took {took:?}, which is not bounded by the deadline"
+    );
+
+    noise.abort();
+    draining.abort();
+    client.shutdown().await;
+    bridge_runtime.shutdown().await;
+}
+
 /// Claim: a peer that closes mid-exchange does not make the requester wait
 /// out the deadline - the close *is* the answer SP cannot give, so every
 /// pending exchange is refused at once.

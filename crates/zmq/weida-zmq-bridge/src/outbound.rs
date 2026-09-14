@@ -327,6 +327,7 @@ async fn serve_dealer(
     let cap = usize::try_from(config.max_message_bytes).unwrap_or(usize::MAX);
     let mut pending: HashMap<u64, Pending> = HashMap::new();
     let mut next_id: u64 = 0;
+    let mut sweep = expiry_sweep(config.reply_deadline);
 
     loop {
         tokio::select! {
@@ -394,7 +395,7 @@ async fn serve_dealer(
                     None => tracing::debug!(id, "a reply arrived for no pending exchange"),
                 }
             }
-            () = tokio::time::sleep(config.reply_deadline / 4) => {
+            _ = sweep.tick() => {
                 expire(&mut pending, config.reply_deadline).await;
             }
         }
@@ -430,6 +431,29 @@ fn split_reply(parts: Vec<Vec<u8>>) -> Result<(u64, Vec<u8>), BridgeError> {
         BridgeError::Protocol("the reply's envelope is not one this bridge sent".into())
     })?;
     Ok((u64::from_be_bytes(id), body))
+}
+
+/// The reaper's own clock: a quarter of the reply deadline, ticking whatever
+/// else the loop is doing.
+///
+/// Created once and kept across the turns of the `select!` that uses it,
+/// because a `sleep` built inside the loop body restarts from zero every time
+/// any *other* arm completes. With the default ten-second deadline that
+/// reaper needed two and a half seconds of total silence to run at all, so a
+/// connection carrying more than a handful of events a second starved it
+/// indefinitely and the `ERROR{NoReply}` an expired exchange is documented to
+/// get never happened.
+///
+/// `Delay` rather than the default `Burst`: a sweep the loop was too busy to
+/// take is not owed retroactively — the next one sees the same expired
+/// entries — and bursting would spend the catch-up ticks on nothing.
+fn expiry_sweep(deadline: Duration) -> tokio::time::Interval {
+    // `tokio::time::interval` panics on a zero period, and a deadline under
+    // four nanoseconds is configuration rather than a reason to abort.
+    let period = (deadline / 4).max(Duration::from_millis(1));
+    let mut sweep = tokio::time::interval(period);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    sweep
 }
 
 /// Tells every exchange past its deadline that no reply is coming.

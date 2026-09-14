@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use weida_amqp::options::{ConnectionOptions, Sasl};
-use weida_amqp::{Connection, Error, State};
+use weida_amqp::{Connection, Error, SessionOptions, State};
 use weida_amqp_codec::frame::{self, FrameKind, MIN_MAX_FRAME_SIZE};
 use weida_amqp_codec::performative::{Close, Open, Performative};
 use weida_amqp_codec::protocol_header::{self, ProtocolHeader};
@@ -624,6 +624,85 @@ async fn our_own_idle_threshold_closes_with_an_explanation() {
         State::Failed(why) => assert!(why.contains("idle threshold"), "{why}"),
         other => panic!("expected Failed, got {other:?}"),
     }
+    tokio::time::timeout(DEADLINE, server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// Claim: the read threshold is measured from the last frame that *arrived*,
+/// so a connection whose peer has silently gone is closed even while this
+/// side is still busy (Part 2 §2.4.5).
+///
+/// The companion of the test above, and the one that pins the mechanism: with
+/// the driver's timer rebuilt inside its `select!`, every command the
+/// application handed over restarted the threshold, so exactly the connection
+/// that is carrying work — the one worth noticing the loss of — never timed
+/// out at all.
+#[tokio::test]
+async fn our_idle_threshold_is_not_reset_by_our_own_traffic() {
+    let exec = Exec::current().unwrap();
+    let (listener, port) = Server::listen().await;
+
+    let server = tokio::spawn(async move {
+        let mut server = Server::accept(&listener).await;
+        let _ = server.read_protocol_header().await;
+        server.send_header(ProtocolHeader::AMQP).await;
+        let (_, name) = server.read_performative().await;
+        assert_eq!(name, "open");
+        // No idle-time-out of its own, so this side sends no keep-alive: every
+        // frame on the wire is one the application asked for.
+        server.send_open(None).await;
+        // Then answer nothing ever again, while still reading — a server that
+        // stopped reading would stall the client's writes and the test would
+        // be proving something else.
+        loop {
+            let (_, name) = server.read_performative().await;
+            if name == "begin" {
+                continue;
+            }
+            assert_eq!(
+                name, "close",
+                "the only other thing the client may send is its own close"
+            );
+            return;
+        }
+    });
+
+    let mut options = options();
+    options.idle_time_out = Some(Duration::from_millis(150));
+    let connection = tokio::time::timeout(
+        DEADLINE,
+        Connection::connect(&exec, "127.0.0.1", port, options),
+    )
+    .await
+    .expect("finished")
+    .expect("opened");
+
+    // Keep the driver working: a session request every 20 ms, well inside the
+    // 150 ms threshold, none of them answered. Each is a turn of the driver's
+    // loop, which is what used to postpone the threshold indefinitely.
+    let busy = {
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            loop {
+                let asking = connection.clone();
+                tokio::spawn(async move {
+                    let _ = asking.begin(SessionOptions::default()).await;
+                });
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    };
+
+    let state = tokio::time::timeout(DEADLINE, connection.closed())
+        .await
+        .expect("a busy connection reaches its own threshold too");
+    match state {
+        State::Failed(why) => assert!(why.contains("idle threshold"), "{why}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    busy.abort();
     tokio::time::timeout(DEADLINE, server)
         .await
         .unwrap()

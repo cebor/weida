@@ -435,7 +435,26 @@ async fn serve_pub(
     loop {
         let transfer = subscriber.recv().await?;
         let topic = transfer.meta().topic.clone().unwrap_or_default();
-        let payload = transfer.collect(cap).await?;
+        let announced = transfer.meta().content_len;
+        let payload = match transfer.collect(cap).await {
+            Ok(payload) => payload,
+            // A refusal is per stream, the same rule the outbound loops
+            // state: the publication is refused and lost, and the bridge
+            // keeps serving every SUB peer it has. Ending the loop here would
+            // have taken all of them down for one message none of them ever
+            // saw.
+            Err(weida::Error::LimitExceeded) => {
+                tracing::warn!(
+                    %topic,
+                    announced = ?announced,
+                    cap,
+                    "dropped a weida publication past max_message_bytes; NNG delivers a message \
+                     wholly or not at all, so a prefix of it is not deliverable"
+                );
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         let mut body = Vec::with_capacity(topic.len() + payload.len() + 1);
         body.extend_from_slice(topic.as_bytes());
         if let Some(byte) = config.topic_delimiter {

@@ -395,6 +395,81 @@ async fn a_request_the_foreign_peer_drops_is_refused_with_no_reply() {
     bridge_runtime.shutdown().await;
 }
 
+/// Claim: an exchange whose reply never comes expires **under traffic**, not
+/// only on an otherwise silent loop.
+///
+/// The companion of the test above, and the one that pins the mechanism. The
+/// reaper's timer used to be built inside the `select!`, so every accepted
+/// request restarted it: with a sweep at a quarter of the deadline, anything
+/// above a few events a second postponed expiry indefinitely and the
+/// `ERROR{NoReply}` the test above asserts simply never happened.
+#[tokio::test]
+async fn a_pending_exchange_expires_while_traffic_keeps_arriving() {
+    /// Short enough for a fast test, and divisible by eight below.
+    const REPLY_DEADLINE: Duration = Duration::from_millis(400);
+
+    let (addr, zmq) = Peer::listen().await;
+    let mut config = OutboundConfig::new(
+        addr,
+        "127.0.0.1:0".parse().expect("loopback"),
+        "/rpc",
+        Dialling::Dealer,
+    );
+    config.reply_deadline = REPLY_DEADLINE;
+    let (url, bridge_runtime) = bridge(config).await;
+    let mut peer = Peer::accept(&zmq, SocketType::Router).await;
+
+    let client = client();
+    let requester = Arc::new(client.requester(ClientTls::new(Trust::by_address())));
+    within(requester.connect(&url)).await.expect("connect");
+
+    // The exchange under test. The peer reads it and never answers it.
+    let watched = tokio::spawn({
+        let requester = Arc::clone(&requester);
+        async move { requester.request(b"watched").await }
+    });
+    let request = within(peer.read_message()).await.expect("the request");
+    assert_eq!(request[2], b"watched");
+    let waiting_since = std::time::Instant::now();
+
+    // Then steady traffic through the same loop: a request every eighth of the
+    // deadline, so a quarter-deadline sweep never has a gap to itself.
+    let noise = tokio::spawn({
+        let requester = Arc::clone(&requester);
+        async move {
+            loop {
+                let asking = Arc::clone(&requester);
+                tokio::spawn(async move { asking.request(b"noise").await });
+                tokio::time::sleep(REPLY_DEADLINE / 8).await;
+            }
+        }
+    });
+    // The peer keeps reading, so the traffic reaches the bridge's loop rather
+    // than filling a socket buffer, and keeps saying nothing.
+    let draining = tokio::spawn(async move { while peer.read_message().await.is_ok() {} });
+
+    let error = within(watched)
+        .await
+        .expect("task")
+        .expect_err("nobody ever answered this exchange");
+    assert!(
+        matches!(error, Error::NoReply),
+        "an expired exchange is refused with NoReply, got {error:?}"
+    );
+    // Bounded rather than eventual: the sweep is a quarter of the deadline, so
+    // three deadlines is generous and a starved reaper cannot come in under it.
+    let took = waiting_since.elapsed();
+    assert!(
+        took < REPLY_DEADLINE * 3,
+        "expiry under load took {took:?}, which is not bounded by the deadline"
+    );
+
+    noise.abort();
+    draining.abort();
+    client.shutdown().await;
+    bridge_runtime.shutdown().await;
+}
+
 /// Claim: the bridge heartbeats its own socket rather than trusting TCP (§3),
 /// and any inbound traffic counts as a sign of life.
 #[tokio::test]

@@ -411,7 +411,27 @@ async fn serve_pub(
             published = subscriber.recv() => match published {
                 Ok(transfer) => {
                     let topic = transfer.meta().topic.clone().unwrap_or_default();
-                    let payload = transfer.collect(cap).await?;
+                    let announced = transfer.meta().content_len;
+                    let payload = match transfer.collect(cap).await {
+                        Ok(payload) => payload,
+                        // A refusal is per stream, the same rule the outbound
+                        // loops state: the publication is refused and lost,
+                        // and the bridge keeps serving every subscriber it
+                        // has. Ending the loop here would have taken all of
+                        // them down for one message none of them ever saw.
+                        Err(weida::Error::LimitExceeded) => {
+                            tracing::warn!(
+                                %topic,
+                                announced = ?announced,
+                                cap,
+                                "dropped a weida publication past max_message_bytes; a ZeroMQ \
+                                 subscriber receives a message atomically, so a prefix of it is \
+                                 not deliverable"
+                            );
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                     // Which subscribers want it, and what happens to the ones
                     // that are not keeping up, are the socket's: it matches
                     // the topic frame against each peer's prefixes and drops
@@ -445,10 +465,18 @@ async fn serve_pub(
 }
 
 /// Is this the weida publisher going away rather than a real failure?
+///
+/// Two errors and no more. `Error::Indeterminate` is deliberately absent: it
+/// means the operation may already have taken effect, so whether to do it
+/// again is the application's decision and never a bridge's — redialling on
+/// it would be this bridge choosing to repeat an effect it cannot see. It also
+/// cannot reach here, since only a sender's transport receipt and a
+/// requester's `ReplyStream::recv` ever construct it, and this predicate
+/// guards a `Subscriber::recv`.
 fn reconnectable(e: &weida::Error) -> bool {
     matches!(
         e,
-        weida::Error::ConnectionLost(_) | weida::Error::NotConnected | weida::Error::Indeterminate
+        weida::Error::ConnectionLost(_) | weida::Error::NotConnected
     )
 }
 

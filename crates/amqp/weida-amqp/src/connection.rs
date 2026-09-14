@@ -621,6 +621,15 @@ impl Driver {
         // Ours to send: an empty frame at half the interval the peer asked
         // for. Ours to enforce: our own threshold, measured from the last
         // frame that arrived.
+        //
+        // Both are deadlines that outlive a turn of the loop below, not
+        // timers built inside it. A `Sleep` created in the loop body restarts
+        // from zero whenever any *other* `select!` branch completes, so
+        // neither sentence above would hold under traffic: a connection with
+        // commands flowing would never emit the empty frame and the peer
+        // would close on its own threshold, and its read threshold would
+        // never be reached however long the peer had been silent, because
+        // this side's own sends kept postponing it.
         let keepalive = self
             .remote
             .idle_time_out
@@ -643,19 +652,28 @@ impl Driver {
         let mut close_done: Option<oneshot::Sender<Result<()>>> = None;
         let outcome: State;
 
+        // Both start from the handshake — a peer that says nothing at all
+        // after its `open` must still be timed out — and are re-armed at the
+        // top of each turn from the event their rule names: `tick` from the
+        // last frame *this side* wrote, which the writer records for every
+        // path that writes one, and `expiry` from the last frame that
+        // arrived. Re-arming beats rebuilding: a `Sleep` is one slot on the
+        // timer wheel either way, and resetting it here is the only place
+        // that has to be read to see what each deadline measures.
+        let mut last_frame = tokio::time::Instant::now();
+        let mut tick = std::pin::pin!(self.exec.sleep(Duration::ZERO));
+        let mut expiry = std::pin::pin!(self.exec.sleep(Duration::ZERO));
+
         loop {
-            let tick = async {
-                match keepalive {
-                    Some(period) => self.exec.sleep(period).await,
-                    None => std::future::pending().await,
-                }
-            };
-            let expiry = async {
-                match deadline {
-                    Some(period) => self.exec.sleep(period).await,
-                    None => std::future::pending().await,
-                }
-            };
+            // The guards on the two timer arms disable them when the
+            // connection asked for no timeout, so an unarmed `Sleep` is never
+            // awaited.
+            if let Some(period) = keepalive {
+                tick.as_mut().reset(writer.last_write() + period);
+            }
+            if let Some(period) = deadline {
+                expiry.as_mut().reset(last_frame + period);
+            }
 
             tokio::select! {
                 biased;
@@ -744,6 +762,11 @@ impl Driver {
 
                 incoming = frames.recv() => match incoming {
                     Some(Ok(bytes)) => {
+                        // The one event the read threshold measures from. It
+                        // moves here and nowhere else, so a connection whose
+                        // peer has silently gone is timed out even while this
+                        // side keeps sending.
+                        last_frame = tokio::time::Instant::now();
                         match self.handle(&bytes, &mut writer, closing).await {
                             Ok(None) => {}
                             Ok(Some(state)) => {
@@ -779,7 +802,7 @@ impl Driver {
                     }
                 },
 
-                () = tick, if keepalive.is_some() => {
+                () = tick.as_mut(), if keepalive.is_some() => {
                     if closing {
                         continue;
                     }
@@ -792,7 +815,7 @@ impl Driver {
                     }
                 }
 
-                () = expiry, if deadline.is_some() => {
+                () = expiry.as_mut(), if deadline.is_some() => {
                     let after_ms = u32::try_from(
                         deadline.unwrap_or_default().as_millis()
                     ).unwrap_or(u32::MAX);
