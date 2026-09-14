@@ -272,18 +272,37 @@ other end.
 
 ## 6. What needs a human
 
-Four things:
+Two open questions, then four entries that record how the others were closed or why they stay
+manual.
 
-1. **Whether anything is published, and from where** — the one question the website makes
-   concrete. The licence half of this is **settled and done**: `MIT OR Apache-2.0` with both
-   files in the tree, `repository` and `homepage` in `[workspace.package]`, and `cargo package
-   --workspace --no-verify` clean for every publishable crate (B-068). What is left is not
-   mechanical: there is **no release** — no crate on any registry, no tag, no binary — and
-   `crates/site` renders a site that nothing serves. Two answers are yours: which host serves
-   `weida.doodleshnookie.net`, and whether the site goes up before there is something to
-   install. Until then the site says so on every page and B-254 holds the work
-   ([0025](decisions/0025-the-website.md) §4.6).
-2. **Nothing, since 2026-09-15 — the gate's two blind spots are closed** (B-107 and B-184).
+1. **The broker's design, and the names of the components that are missing** (B-203,
+   `blocked`). Both reversible choices the item was stopped for are **answered** and neither
+   needs the owner any more: consumer settlement is a cursor on a cursor stream, so a delivery
+   keeps the one-way topology a queue delivery has, and the alternative
+   [0018](decisions/0018-minimal-broker.md) §6 named — a frame kind `6` carrying batched acks
+   in RabbitMQ's `multiple` shape — is spent, because kind `6` is the cursor stream and a
+   cursor is already cumulative. What is open is what the owner stopped it for: the design
+   changes they have in mind and the component names that do not exist yet. Guide chapter 3
+   (B-258) and all of Phase D wait behind it.
+2. **Which language Phase C binds next, which is a question about reach and not about
+   mechanism.** [LOOP.md](LOOP.md) §9 says "Python first, then Java, then Node" and **no
+   document says why** — the ordering is an assertion from the first week, and
+   [0019](decisions/0019-jvm-binding.md) answered only *how* a JVM binding would be built
+   (JNI, not Panama, against an LTS floor), never whether the JVM is the next row worth its
+   cost. Since then the Python row has proved the shape five bindings wide and two facts have
+   moved: an N-API addon reaches Node, Bun and Deno as **one** artifact, and there is no JDK on
+   this machine at all. The answer belongs in a decision note with the C8B framing of
+   [0026](decisions/0026-the-guide-and-the-c8b-question.md) §0 as its yardstick, because
+   "reaches eight billion people" is a statement about how many runtimes can call this and
+   through what substrate — a C ABI is the thing ZeroMQ's own reach was built on and this
+   workspace does not have one.
+3. **Closed by parking, not by answering (2026-09-15).** The website exists in the tree and
+   renders on demand — `cargo run -p weida-site`, 56 pages, a link checker that fails the
+   build on a dangling link — and goes **nowhere** while the library is unpublished, because a
+   site is a promise of something to install and the workspace is `0.1.0`, untagged (B-254,
+   `parked`). CI is the owner's own project now, so this loop does not design one (B-061,
+   `parked`); what it leaves behind is a gate written down rather than practised.
+4. **Closed by a paste: the gate's two blind spots** (B-107 and B-184, both `done`).
    [LOOP.md](LOOP.md) §6 now names the five default-off configurations (`blocking` on `weida`,
    `weida-zmq`, `weida-mqtt`, `weida-nng`; `cluster` on `weida-broker`) and the **850 tests**
    behind them, the two features excluded with their reason (`nng-interop` and
@@ -296,10 +315,10 @@ Four things:
    set. What the hole cost while open: **four** `cfg`-gated links, three of them invisible to
    every `--workspace` doc run ever made here, the last one an hour old when the measurement
    found it (`00eff38`).
-3. **The Windows gate is manual.** The VM that unblocked B-039 (`ssh win11-geselle`) is in no
-   CI, so `C:\work\gate.ps1` runs beside the Linux one by hand, and B-061's CI is where that
-   would stop being true — itself `blocked`, because the Forgejo host has 2 vCPUs, 3 GB of RAM
-   and a 600 s job limit. The `STATUS_IN_PAGE_ERROR`/`LNK1201` faults that turned every
+5. **The Windows gate stays manual, and one disk still wants attention.** The VM that
+   unblocked B-039 (`ssh win11-geselle`) is in no CI — B-061 is `parked` on the owner's own CI
+   work — so `C:\work\gate.ps1` runs beside the Linux one by hand.
+   The `STATUS_IN_PAGE_ERROR`/`LNK1201` faults that turned every
    Windows pass into two to four runs are **found and fixed, and the disk was innocent**: the
    images (`/var/lib/geselle/vm/win11/{base,run}.qcow2`) live on btrfs, which checksums every
    data write, and `vm.sh` gave them to QEMU as `cache=none,aio=native`, so the guest can
@@ -315,7 +334,7 @@ Four things:
    manual, and the *other* NVMe (980 PRO 2 TB, `/mnt/win`, 100 % full) reports 630 media and
    data integrity errors, 86 % spare left and three self-tests that ended in failed segments
    — back that one up.
-4. **Nothing on this list any more, and that is the change.** The two decisions the review
+6. **Nothing else, and that is the change.** The two decisions the review
    round filed rather than took — because each changes what a peer observes — are both taken:
    the unconditional `traceparent` is gone, a context is propagated and never minted, and a
    64-byte push went from 135 B to **76 B**
@@ -335,13 +354,13 @@ Four things:
   the website's own gate run kept its log, the failure named itself
   (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
   a cross-test helper rather than the timing assertion it looked like (B-252).
-- **5 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
-  gate; B-254, serving the site; four guide chapters, each on the slice it
-  needs; the rest waiting on an item this session is
-  building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **258** filed items, **233 are `done`**, and every `ready` one is a
-  slice of the **cluster and store phase** (B-219, B-220, B-224, B-226, B-231): nothing else
-  in the backlog is actionable without a decision of yours.
+- **5 items are `ready`, 17 are `blocked`, 3 are `parked`** (B-254, the site, and B-061, CI,
+  both parked by the owner this session; A5's control tier by 0011 §4.3; the blocked ones are
+  four guide chapters, each on the slice it needs, and the rest waiting on an item this
+  session is building or on a toolchain this machine does not have). Of **258** filed items,
+  **233 are `done`**, and every `ready` one is a slice of the **cluster and store phase**
+  (B-219, B-220, B-224, B-226, B-231): nothing else in the backlog is actionable without a
+  decision of yours.
   **Every surface of the library is bound**: B-244 and B-243 closed the two this session's
   plan deliberately left alone, so `weida::blocking` and both `weida-py` halves now carry all
   six patterns and the cursor surface.
