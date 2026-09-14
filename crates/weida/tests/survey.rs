@@ -139,13 +139,22 @@ async fn a_late_reply_is_counted_and_not_delivered() {
 
 #[tokio::test]
 async fn an_answer_that_arrived_in_time_survives_a_caller_that_reads_late() {
-    // The deadline bounds **waiting**, not what already arrived. A caller
+    // The deadline bounds **waiting**, not what already arrived: a caller
     // that surveys, does other work past its own deadline and then drains
-    // must still get the answers that came in time: `within` selects without
-    // bias, so at a spent deadline a ready answer and the elapsed sleep are
-    // both ready and the answer used to be lost to the coin flip — neither
-    // delivered nor counted in `late`. Four rounds, because one round only
-    // catches that half the time.
+    // must still get the answers that came in time.
+    //
+    // What makes this worth pinning is how narrowly it held before. `next`
+    // used to consult only `Exec::within`, whose `select!` has no `biased;`,
+    // so an answer already in the channel and an elapsed deadline were both
+    // ready and the winner was a coin flip — except that a `tokio` sleep of
+    // zero duration is *not* ready on its first poll, so the answer won
+    // every time and the contract held by accident. Measured both ways: with
+    // the deadline branch forced first by a `biased;` the old code still
+    // passed, which is what an accident looks like. `next` now takes the
+    // buffer before it consults the deadline, and what the deadline branch
+    // finds there it counts in `late` instead of dropping, so the contract
+    // holds on purpose and the narrow race — an answer landing in the same
+    // poll the timer fires — is counted rather than silent.
     let server = Server::start().await;
     let respondent = server.listener.respondent("/poll").expect("respondent");
     let answering = answer_with(respondent, b"prompt");
@@ -156,13 +165,13 @@ async fn an_answer_that_arrived_in_time_survives_a_caller_that_reads_late() {
         .await
         .expect("connect");
 
-    for round in 0..4 {
-        let mut run = within(surveyor.survey(b"who is there", Duration::from_millis(80)))
+    for round in 0..2 {
+        let mut run = within(surveyor.survey(b"who is there", Duration::from_millis(40)))
             .await
             .expect("survey");
         // Long enough that the answer is in the channel and the deadline is
         // spent before the first read.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
         let answer = within(run.next(1024))
             .await
             .unwrap_or_else(|| panic!("round {round}: the answer arrived inside the deadline"));
