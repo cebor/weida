@@ -85,15 +85,16 @@ and about 27 messages per second at that width. The width interval in the guide 
 settles how a fan-out fails: a stalled subscriber is refused by the **byte budget** when that
 budget is below the connection's 0.6-1.5 MiB absorption band and by the **queue** when it is
 above it — which is why `dropped_on(topic)` separates the two causes.
-The Windows 11 VM ran at the previous commit: **1851 across 142
+The Windows 11 VM ran at this commit: **1853 across 142
 binaries**, the same 37 ignored, with fmt, clippy in both configurations and rustdoc clean. The
 runs that got there are named in the nightlog rather than counted: the shared local framing
 broke the Windows build in a way no Linux gate can see (`pipe.rs` is `#[cfg(windows)]`), one
 test lost 0005's refusal race on that platform while passing here, and **the VM's storage
-faulted six times in one evening** — `STATUS_IN_PAGE_ERROR` five times and `LNK1201` once,
-each without a source line and each cleared by a `cargo clean` or by simply running again,
-which is §6 point 3 at a rate
-of minutes rather than hours. Add
+faulted twelve times in one evening** — `STATUS_IN_PAGE_ERROR` eleven times and `LNK1201`
+once, each without a source line and each cleared by a `cargo clean` or by simply running
+again. The rate is §6 point 3's "every few hours" at minutes, and the **shape changed** in the
+last run: six faults in one 78-second attempt, spread over five crates, where it used to be
+one per run. Add
 the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
@@ -294,9 +295,12 @@ Four things:
 3. **The Windows gate is manual.** The VM that unblocked B-039 (`ssh win11-geselle`) is in no
    CI, so `C:\work\gate.ps1` runs beside the Linux one by hand, and B-061's CI is where that
    would stop being true — itself `blocked`, because the Forgejo host has 2 vCPUs, 3 GB of RAM
-   and a 600 s job limit. The VM's storage also throws `STATUS_IN_PAGE_ERROR` mid-compile
-   every few hours; each occurrence is a corrupted artifact cleared by hand, never a code
-   problem.
+   and a 600 s job limit. The VM's storage also throws `STATUS_IN_PAGE_ERROR` mid-compile —
+   filed as the environment problem it is, never a code one: no occurrence has ever carried a
+   source line, and each is cleared by a `cargo clean` or by running again. **It is getting
+   worse**: the rate was every few hours, then twelve faults in one evening, and the last run
+   took six of them in 78 seconds across five crates. A Windows gate that fails in seconds
+   should be read as a disk before it is read as a diff, and the machine wants attention.
 4. **Nothing on this list any more, and that is the change.** The two decisions the review
    round filed rather than took — because each changes what a peer observes — are both taken:
    the unconditional `traceparent` is gone, a context is propagated and never minted, and a
