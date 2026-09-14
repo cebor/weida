@@ -459,3 +459,82 @@ async fn a_drain_closes_a_local_connection_the_way_shutdown_does() {
 
     harness.shutdown().await;
 }
+
+/// B-249's number: **a fire-and-forget producer at full rate never reaches the
+/// parked set's cap**, so the sweep that walks it never runs.
+///
+/// `ConnDrain::park` runs inside `Drop for Delivery`, on the fire-and-forget
+/// path of every pattern, and at its cap it polls **every** parked receipt
+/// while holding a `std::sync::Mutex` — each poll taking `quinn`'s own
+/// connection-state lock. That is O(parked) under a lock on the hot send path,
+/// and the question the item asked was whether it is reachable.
+///
+/// It is not, on a healthy connection, and the reason is structural rather
+/// than lucky: a receipt settles when the peer's transport acknowledges the
+/// FIN, and a stream's concurrency slot frees at the same moment. So the
+/// parked set and the in-flight stream count are bounded by the same
+/// quantity — the peer's granted stream budget — and `open` waits for a slot
+/// before the set can outgrow it. The eviction counter is what makes that
+/// observable: `Drained::outstanding` includes every receipt thrown away at
+/// the cap, so a zero here is the assertion that nothing ever was.
+///
+/// What this does *not* claim: that the sweep is cheap. It claims that
+/// reaching it needs a peer that stops acknowledging while this side keeps
+/// opening streams, which the stream budget makes a bounded window rather
+/// than an unbounded one.
+#[tokio::test]
+async fn a_fire_and_forget_producer_never_fills_the_parked_receipt_set() {
+    /// Well past the default stream budget in either direction, so a set that
+    /// grew with the message count rather than with what is in flight would
+    /// have hit its cap many times over.
+    const MESSAGES: usize = 20_000;
+
+    let server = Server::start().await;
+    let puller = server.listener.puller("/jobs").expect("puller");
+    let draining = tokio::spawn(async move {
+        let mut seen = 0usize;
+        while let Ok(transfer) = puller.recv().await {
+            if transfer.collect(64).await.is_err() {
+                break;
+            }
+            seen += 1;
+        }
+        seen
+    });
+
+    let client = server.client_runtime();
+    let pusher = client.pusher(server.trust());
+    within(pusher.connect(&server.url("/jobs")))
+        .await
+        .expect("connect");
+
+    let started = std::time::Instant::now();
+    for _ in 0..MESSAGES {
+        // `send` drops the `Delivery`, which is the park (`drain.rs`).
+        within(pusher.send(b"job")).await.expect("send");
+    }
+    let elapsed = started.elapsed();
+
+    let drained = within(client.clone().drain(Duration::from_secs(5))).await;
+    println!(
+        "B-249: {MESSAGES} fire-and-forget sends in {elapsed:?} ({:.1} Kmsg/s), \
+         {} delivered, {} outstanding",
+        MESSAGES as f64 / elapsed.as_secs_f64() / 1000.0,
+        drained.delivered,
+        drained.outstanding
+    );
+    assert_eq!(
+        drained.outstanding, 0,
+        "a receipt evicted at the cap counts as outstanding, and none was: {drained:?}"
+    );
+    assert!(
+        drained.delivered > 0,
+        "the drain waited on parked receipts and they settled, so the peer really did \
+         acknowledge: {drained:?}"
+    );
+
+    // The puller waits for the next transfer from *any* peer, so it does not
+    // end when this one goes; the numbers above are the observation.
+    draining.abort();
+    server.runtime.shutdown().await;
+}

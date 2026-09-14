@@ -7,13 +7,15 @@ at the commit named below, and those files remain the source of truth. The diagr
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
 **Snapshot:** main `4bc50b0`, 2026-09-14 ~21:00 UTC. Tree clean, gate green on Linux:
-**1868 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+**1873 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
-plus `weida --features blocking` at **270**, 1 ignored. Sixty-four of those tests arrived in
-the last four rounds: twenty-four regression tests from the review, seventeen that hold the
+plus `weida --features blocking` at **270**, 1 ignored. Sixty-nine of those tests arrived in
+the last five rounds: twenty-four regression tests from the review, seventeen that hold the
 website to the document set it renders, seventeen that hold **the guide** to the programs
-it teaches with, three that hold the trace decision to the wire, and three that hold the
-`AF_UNIX` cancellation guarantee the transport silently did not have. The intermittent failure
+it teaches with, three that hold the trace decision to the wire, three that hold the
+`AF_UNIX` cancellation guarantee the transport silently did not have, and five from the
+review-finding sweep — one refusal table, one `unsafe` guard over seven crates, the framing's
+byte identity and the parked-receipt measurement. The intermittent failure
 this snapshot used to
 carry a caveat about is **found and fixed**: it was a port race in the cross-protocol tests,
 not a timing assertion (B-252).
@@ -282,26 +284,26 @@ Four things:
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1868 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  green at **1873 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session. The one caveat this section used to carry — a
   failure in roughly one full-workspace run in twenty that nobody had seen — is **closed**:
   the website's own gate run kept its log, the failure named itself
   (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
   a cross-test helper rather than the timing assertion it looked like (B-252).
-- **13 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
+- **9 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
   gate; B-254, serving the site; four guide chapters, each on the slice it
   needs; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **258** filed items, **225 are `done`**, and the `ready` ones are four
+  tier by 0011 §4.3). Of **258** filed items, **229 are `done`**, and the `ready` ones are three
   kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231),
   **the surfaces this session's work has not reached yet** (B-243, the cursor API in the two
   Python halves; B-244, the three new patterns in `weida::blocking` and both Python halves),
-  **four findings the review round filed rather than fixed** (B-248 the `unsafe` guard,
-  B-249 the parked-receipt sweep, B-250 the per-message header allocations, B-251 one refusal
-  table — B-247's fan-out measurement, B-246's trace decision and B-245's `AF_UNIX` reset loss
-  are now closed), and
-  **two sentences in a file this loop does not write** (§6, B-107 and B-184).
+  and **two sentences in a file this loop does not write** (§6, B-107 and B-184).
+  **All six findings of the review round are closed**, the last two by measurement rather than
+  by change: B-250's one-buffer send is inside this machine's spread and kept for the simpler
+  code, and B-249's sweep turned out to be unreachable while a peer acknowledges — 20 000
+  fire-and-forget sends evict zero receipts against a cap of 3 072.
   Nothing else is open: every requirement-driven item, every library item, the website itself
   and both binding slices of weida's own Python surface are closed.
 - **The requirement-driven backlog is closed.** All five requests of

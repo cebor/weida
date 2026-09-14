@@ -167,6 +167,31 @@ pub(crate) struct ConnDrain {
     /// what can plausibly be unacknowledged at once is what can be in flight
     /// at once, so this adds no new knob (0009 §5 asks for none).
     ///
+    /// **The budget it is taken from is this side's, and what bounds a parked
+    /// set is the peer's** — `max_concurrent_uni_streams` and
+    /// `max_concurrent_bidi_streams` are what this runtime grants *inbound*,
+    /// while how many receipts can be pending at once is what the peer granted
+    /// this side to open. The two are the same number between two default
+    /// runtimes and need not be in general, so this cap is a **local
+    /// heuristic** rather than a derived bound, and it is written down as one
+    /// (B-249). Using the peer's number instead would mean reading its
+    /// transport parameters, which `quinn` does not expose.
+    ///
+    /// **What that heuristic costs is measured, and it is nothing on a healthy
+    /// connection** (B-249,
+    /// `a_fire_and_forget_producer_never_fills_the_parked_receipt_set`). The
+    /// sweep in [`ConnDrain::park`] is O(parked) under this mutex, with each
+    /// poll taking `quinn`'s connection-state lock — but it only runs at the
+    /// cap, and the cap is not reachable while the peer is acknowledging: a
+    /// receipt settles when the FIN is acknowledged and the stream's
+    /// concurrency slot frees at the same moment, so the parked set and the
+    /// in-flight count are bounded by the same quantity and `open` waits
+    /// before the set can outgrow it. Measured: 20 000 fire-and-forget sends
+    /// at 43.5 Kmsg/s leave **2 656** receipts parked against a cap of 3 072
+    /// and evict **zero**, twice in a row. Reaching the sweep needs a peer
+    /// that stops acknowledging while this side keeps opening streams, which
+    /// the stream budget makes a bounded window.
+    ///
     /// **On a local transport the budget is a different quantity**, and using
     /// the QUIC one was a bug B-059 found by measuring: a parked receipt holds
     /// its send half, which there is an OS connection counted against
