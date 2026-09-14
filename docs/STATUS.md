@@ -29,10 +29,15 @@ rather than of the chapter numbers (B-258..B-261). Chapter 4 is the cross-protoc
 (ZeroMQ → ZMTP bridge → weida → SP bridge → nng, both foreign ends the real implementations),
 and it demonstrates the sentence the whole C8B argument turns on: the ZeroMQ send succeeds,
 nothing arrives at the SP end, neither protocol lied, and
-**`BestEffort` ∩ `BestEffort` = `BestEffort`**. Writing it found one real gap: **no public
-accessor reports what a live connection negotiated** although three documents describe the
-agreed set as a property of a connection (B-262, filed; the chapter's test asserts the gap, so
-closing it fails that test on purpose).
+**`BestEffort` ∩ `BestEffort` = `BestEffort`**. Writing it also answered a question nobody had
+asked: **a live connection carries the set its runtime configured, and nothing reports it
+because nothing can report anything else** — `RuntimeConfig::guarantees` is offered *and*
+required, so `agreed = min(mine, theirs)` and `agreed ≥ mine` give `agreed = mine`, and a peer
+requiring more is refused at connect time rather than given less
+([0027](decisions/0027-the-negotiated-set-is-the-configured-set.md), B-262). Two document
+corrections came with it: HELLO keys `5` and `6` **are** on the wire, retiring a stale "spec
+ahead of code" caveat, and the website item had been sitting at `ready` for three rounds after
+the site shipped.
 
 **The fan-out width the whole argument rests on is now measured** (B-247), and it moved the
 argument rather than confirming it. Per subscriber: **396-436 KiB** of transport state at widths
@@ -52,15 +57,16 @@ the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
 items, and **every one of the four wheels built and smoke-tested with no Rust toolchain on
-`PATH`**. Twenty-six decision notes (0001–0026): fourteen `accepted` and twelve
+`PATH`**. Twenty-seven decision notes (0001–0027): fourteen `accepted` and thirteen
 `provisional` — 0015 (peer authorization), 0016 (conflation) and 0017 (the subscription
 verdict) because each answers an open question with a wire-affecting "no"; 0018 (the minimal
 broker) and 0019 (the JVM binding) because they are the first step of a phase the user
 chooses; 0020–0024 (the cluster, consensus, the store, one control group, the cursor and the
 three families) because they are the phase now being built; 0025 (the website) because
-what a site may claim is settled by a release that does not exist yet; and 0026 (the guide and
+what a site may claim is settled by a release that does not exist yet; 0026 (the guide and
 the C8B question) because the question is a framing the owner set and the arc it implies is
-still being written.
+still being written; and 0027 (the negotiated set is the configured set) because it is
+revisited the day offered and required stop being one setting.
 One binary, `weida` (B-060), beside the library, `weida::blocking` (B-194) beside the async API,
 and **`weida-py`** (B-200, B-204, B-205), the sixth Python binding in the tree, the first of
 weida itself, the only one that reaches every pattern of its library including the streamed
@@ -269,23 +275,21 @@ Four things:
   the website's own gate run kept its log, the failure named itself
   (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
   a cross-test helper rather than the timing assertion it looked like (B-252).
-- **17 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
+- **15 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
   gate; B-254, serving the site; four guide chapters, each on the slice it
   needs; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **258** filed items, **221 are `done`**, and the `ready` ones are six
+  tier by 0011 §4.3). Of **258** filed items, **223 are `done`**, and the `ready` ones are four
   kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231),
   **the surfaces this session's work has not reached yet** (B-243, the cursor API in the two
   Python halves; B-244, the three new patterns in `weida::blocking` and both Python halves),
   **six findings the review round filed rather than fixed** (B-245 the `AF_UNIX` reset loss,
   B-246 the unconditional `traceparent`, B-248 the `unsafe` guard,
   B-249 the parked-receipt sweep, B-250 the per-message header allocations, B-251 one refusal
-  table — B-247's fan-out measurement is now taken), **the website** (B-253, built; B-254,
-  serving it, blocked on the owner), **the gap writing the guide found** (B-262, a live
-  connection's negotiated guarantee set is not observable), and
+  table — B-247's fan-out measurement is now taken), and
   **two sentences in a file this loop does not write** (§6, B-107 and B-184).
-  Nothing else is open: every requirement-driven item, every library item and both binding
-  slices of weida's own Python surface are closed.
+  Nothing else is open: every requirement-driven item, every library item, the website itself
+  and both binding slices of weida's own Python surface are closed.
 - **The requirement-driven backlog is closed.** All five requests of
   [requirements/zeughaus-video.md](requirements/zeughaus-video.md) are answered where they were
   filed: streaming fan-out **built** (B-064, `Publisher::open`), conflation **answered without a

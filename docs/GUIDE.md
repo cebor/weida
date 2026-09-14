@@ -706,19 +706,19 @@ boundaries unchanged.
 
 ### 4.5 The intersection, as arithmetic
 
-**Claim §4.5: the intersection is arithmetic a caller can do, and the runtime's own answer is
-not observable.**
+**Claim §4.5: the intersection is arithmetic a caller can do — and never has to ask about,
+because a live connection carries the set the caller configured.**
 
 ```text
 core ∩ core = BestEffort delivery, TransportReceipt acknowledgement
 core ∩ (AtLeastOnce, Accepted) = BestEffort delivery, TransportReceipt acknowledgement
-can an application ask a live connection what it negotiated? false
+a peer requiring more than core connected to a core peer: false (negotiation failed)
 ```
 
-The second line is the one that carries the claim, and the first cannot: `core ∩ core` is
-symmetric, so it would read the same if the arithmetic took the **stronger** level. A hop
-offering `AtLeastOnce` delivery and a broker's `Accepted` completion still agrees on core with
-a hop that offers neither, and the chapter's test asserts *that* pair for exactly this reason.
+The second line carries the claim and the first cannot: `core ∩ core` is symmetric, so it would
+read the same if the arithmetic took the **stronger** level. A hop offering `AtLeastOnce`
+delivery and a broker's `Accepted` completion still agrees on core with a hop that offers
+neither, and the chapter's test asserts *that* pair for exactly this reason.
 
 `GuaranteeSet::intersect` is the whole mechanism, and it is a public function: per dimension
 the weaker of the two levels, an exact match required for the dimensions that are not ordered,
@@ -728,16 +728,27 @@ requires. There is no downgrade path ([GUARANTEES.md](GUARANTEES.md) §4,
 [decisions/0006](decisions/0006-guarantee-sets.md) §4.4). Both sides run it on their own and
 the peer's HELLO, so both reach the same verdict without a round trip.
 
-**And then the honest half.** No public accessor reports the negotiated set of a *live*
-connection: the value is computed, stored and enforced inside the runtime, and `Agreed` is
-`pub(crate)`. An application that wants to know what its connection agreed to has to read the
-adapter's mapping document instead of asking the connection. The chapter's test asserts that
-gap — `observable_on_a_connection` is `false` — so that adding an accessor breaks the test and
-forces this paragraph to be rewritten rather than left quietly wrong.
+**The third line is the useful one, and it is why there is nothing to ask.**
+`RuntimeConfig::guarantees` is what a runtime offers *and* what it requires — one setting, by
+decision. So for any connection that is **live**, the agreed set is the minimum of two offers
+that each reached the requirement, which is the configured set exactly:
 
-That is not a large defect, and it is exactly the kind a guide finds: the specification
-documents describe a negotiated set as an observable property of a connection, the API does not
-expose it, and nobody noticed until a chapter tried to print it. Filed as **B-262**.
+> **agreed = min(mine, theirs)** and **agreed ≥ mine** (or there would be no connection), so
+> **agreed = mine.**
+
+A `connection.guarantees()` would hand a caller its own configuration back. What a peer that
+wants more gets is not less — it is **nothing**: `Error::Negotiation` at connect time, before
+any message exists, which the program demonstrates against a real handshake rather than
+arguing. The observation an application needs is the connection having succeeded.
+
+One detail the program's own output shows, and the test deliberately does not pin: the
+refusal's *wording* depends on which side observes the close first — `negotiation failed` when
+the dial has read the peer's CONNECTION_CLOSE reason, `connection lost` when the local teardown
+wins that race. Both were observed on the same commit from the same program. The claim is the
+refusal; the wording is a coin flip, and §1.3 already paid for that lesson.
+
+This is the chapter that went looking for an accessor and found it was not needed — a small
+piece of API this library correctly does not have (B-262).
 
 ### 4.6 What this chapter does not tell you
 

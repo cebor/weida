@@ -33,7 +33,8 @@ use nng::options::Options;
 // `Delivery` is the transfer receipt in this library's public surface, so the
 // guarantee dimension is re-exported as `DeliveryLevel`.
 use weida::{
-    Acknowledgement, ClientTls, DeliveryLevel, GuaranteeSet, Identity, Runtime, ServerTls, Trust,
+    Acknowledgement, ClientTls, DeliveryLevel, GuaranteeSet, Identity, Runtime, RuntimeConfig,
+    ServerTls, Trust,
 };
 use weida_nng_bridge::{
     Dialling as SpDialling, Inbound as SpInbound, InboundConfig as SpInboundConfig,
@@ -514,7 +515,8 @@ pub async fn refused_at_the_first_hop() -> RefusedAtTheEdge {
 
 // --- §4.5 The intersection, as arithmetic -----------------------------------
 
-/// What intersecting two guarantee sets produced.
+/// What intersecting two guarantee sets produced, and what a peer that wants
+/// more than its peer offers gets instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intersection {
     /// The set a weida hop offers by default.
@@ -523,15 +525,19 @@ pub struct Intersection {
     pub agreed: GuaranteeSet,
     /// The set a hop that could promise more would offer.
     pub stronger: GuaranteeSet,
-    /// What a core hop and that stronger hop agree on — the number that shows
+    /// What a core hop and that stronger hop agree on — the value that shows
     /// the direction of the arithmetic, which `core ∩ core` cannot.
     pub agreed_with_stronger: GuaranteeSet,
-    /// Whether a caller can ask a live connection what it negotiated.
-    pub observable_on_a_connection: bool,
+    /// Whether a core peer accepted a connection from a peer configured with
+    /// `stronger`.
+    pub stronger_peer_connected: bool,
+    /// What that peer was told instead, if anything.
+    pub stronger_peer_was_told: Option<String>,
 }
 
-/// Claim §4.5: **the intersection is arithmetic you can do yourself, and the
-/// runtime's own answer is not observable.**
+/// Claim §4.5: **the intersection is arithmetic you can do yourself — and you
+/// never have to ask a connection what it agreed to, because a live
+/// connection's set is the one you configured.**
 ///
 /// `GuaranteeSet::intersect` is the whole mechanism: per dimension the weaker
 /// of the two levels, an exact match required for the dimensions that are not
@@ -542,18 +548,24 @@ pub struct Intersection {
 /// run it on their own and the peer's HELLO, so both reach the same verdict
 /// without a round trip.
 ///
-/// The honest second half is what this program cannot show: **no public
-/// accessor reports the negotiated set of a live connection.** The value is
-/// computed, stored and enforced inside the runtime, and an application that
-/// wants to know what its connection agreed to has to read the adapter's
-/// mapping document instead of asking. That is a gap this chapter names rather
-/// than papers over, and the field below reports it as `false` so a future
-/// accessor breaks this test.
+/// **And then the consequence, which is why this API has no accessor for a
+/// negotiated set.** `RuntimeConfig::guarantees` is what a runtime offers
+/// *and* what it requires — one setting, on purpose. So for any connection
+/// that is **live**: the agreed set is the minimum of the two offers, and it
+/// reached what each side required, therefore it is exactly the configured
+/// set. A `connection.guarantees()` would hand a caller its own
+/// configuration back.
+///
+/// The second half of this program is that theorem's other side: a peer
+/// configured to require more than its peer offers does not get less, it gets
+/// **nothing** — `Error::Negotiation`, at connect time, before any message
+/// exists. That is the observation an application actually needs, and it is
+/// the connection succeeding.
 ///
 /// # Errors
 ///
-/// Never.
-pub fn intersection() -> Intersection {
+/// Never: a failure to bind a loopback socket panics with the reason.
+pub async fn intersection() -> Intersection {
     let core = GuaranteeSet::CORE;
     let agreed = core
         .intersect(&core)
@@ -573,15 +585,40 @@ pub fn intersection() -> Intersection {
         .intersect(&stronger)
         .expect("the two sets differ only in ordered dimensions");
 
+    // A core peer, and a dialling peer that requires more than core.
+    let identity = Identity::generate().expect("identity");
+    let fingerprint = identity.fingerprint().expect("fingerprint");
+    let server = Runtime::new(RuntimeConfig::default()).expect("server runtime");
+    let listener = server.listener();
+    let binding = listener
+        .bind_quic("127.0.0.1:0".parse().expect("a loopback literal"), identity)
+        .await
+        .expect("bind");
+    let url = format!(
+        "weida://{fingerprint}@127.0.0.1:{}/sink",
+        binding.local_addr().port()
+    );
+    let _puller = listener.puller("/sink").expect("puller");
+
+    let config = RuntimeConfig {
+        guarantees: stronger,
+        ..RuntimeConfig::default()
+    };
+    let strict = Runtime::new(config).expect("a runtime that requires more");
+    let pusher = strict.pusher(Trust::by_address());
+    let outcome = pusher.connect(&url).await;
+    let stronger_peer_connected = outcome.is_ok();
+    let stronger_peer_was_told = outcome.err().map(|e| e.to_string());
+    strict.shutdown().await;
+    server.shutdown().await;
+
     Intersection {
         core,
         agreed,
         stronger,
         agreed_with_stronger,
-        // There is no `Connection::guarantees()`, no `Endpoint::negotiated()`
-        // and nothing on `Runtime`: `Agreed` is `pub(crate)`. Checked by hand
-        // against the public surface of `weida` at this commit.
-        observable_on_a_connection: false,
+        stronger_peer_connected,
+        stronger_peer_was_told,
     }
 }
 
@@ -621,7 +658,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     println!("§4.5 the intersection, as arithmetic");
-    let intersected = intersection();
+    let intersected = intersection().await;
     println!(
         "     core ∩ core = {:?} delivery, {:?} acknowledgement",
         intersected.agreed.delivery, intersected.agreed.acknowledgement
@@ -634,8 +671,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         intersected.agreed_with_stronger.acknowledgement
     );
     println!(
-        "     can an application ask a live connection what it negotiated? {}",
-        intersected.observable_on_a_connection
+        "     a peer requiring more than core connected to a core peer: {} ({})",
+        intersected.stronger_peer_connected,
+        intersected
+            .stronger_peer_was_told
+            .as_deref()
+            .unwrap_or("no error")
     );
     Ok(())
 }

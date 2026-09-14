@@ -117,20 +117,29 @@ async fn a_loss_at_the_first_hop_is_total_and_silent() {
     );
 }
 
-/// Claim §4.5: the intersection is arithmetic a caller can do, and the
-/// runtime's own answer is not observable.
+/// Claim §4.5: the intersection is arithmetic a caller can do, and a live
+/// connection's set is the one the caller configured.
 ///
-/// The first assertion is the arithmetic: `core ∩ core` is `core`, and its
-/// delivery and acknowledgement levels are the weakest two in the vocabulary,
-/// which is what makes a chain of them `BestEffort` end to end.
+/// Three assertions, and the third is the one that makes the claim useful.
 ///
-/// The second is the gap, asserted so that closing it breaks this test rather
-/// than leaving the guide's §4.5 quietly wrong: if a public accessor for a
-/// live connection's negotiated set is ever added, this fails and the chapter
-/// gets rewritten.
-#[test]
-fn the_intersection_is_arithmetic_and_the_result_is_not_observable() {
-    let intersected = intersection();
+/// The **arithmetic** is `core ∩ core = core`, whose delivery and
+/// acknowledgement levels are the weakest two in the vocabulary — which is
+/// what makes a chain of them `BestEffort` end to end.
+///
+/// The **direction** needs a second pair, because `core ∩ core` is symmetric
+/// and would read the same if the intersection took the stronger level. A hop
+/// offering `AtLeastOnce` delivery and `Accepted` completion still agrees on
+/// core with a hop that offers neither.
+///
+/// The **consequence** is why this library needs no accessor for a negotiated
+/// set: `RuntimeConfig::guarantees` is offered *and* required, so a live
+/// connection's agreed set is the minimum of two offers that each reached the
+/// requirement — the configured set exactly. A peer that requires more does
+/// not get less; it gets `Error::Negotiation` at connect time. That is
+/// asserted here against a real handshake rather than argued.
+#[tokio::test]
+async fn the_intersection_is_arithmetic_and_a_live_connection_carries_what_you_configured() {
+    let intersected = within(intersection()).await;
     assert_eq!(
         intersected.agreed, intersected.core,
         "core intersected with core is core"
@@ -141,10 +150,6 @@ fn the_intersection_is_arithmetic_and_the_result_is_not_observable() {
         Acknowledgement::TransportReceipt
     );
 
-    // The direction, which `core ∩ core` cannot show because it is symmetric:
-    // a hop offering more still agrees on the weaker set, per dimension. A
-    // change that took the stronger level instead would pass every assertion
-    // above and fail here.
     assert_eq!(
         intersected.stronger.delivery,
         DeliveryLevel::AtLeastOnce,
@@ -156,8 +161,21 @@ fn the_intersection_is_arithmetic_and_the_result_is_not_observable() {
     );
 
     assert!(
-        !intersected.observable_on_a_connection,
-        "a public accessor for a live connection's negotiated set now exists: \
-         GUIDE.md §4.5 says it does not, and one of the two has to change"
+        !intersected.stronger_peer_connected,
+        "a peer requiring more than its peer offers must be refused, not quietly given less"
+    );
+    let told = intersected
+        .stronger_peer_was_told
+        .as_deref()
+        .expect("a refused dial reports why");
+    // Only that it was told something, not what. The wording depends on which
+    // side observes the close first: this dial reports `negotiation failed`
+    // when it has read the peer's CONNECTION_CLOSE reason and `connection
+    // lost` when the local teardown wins that race — both observed, on the
+    // same commit, from the same program. Pinning either would pin a coin
+    // flip, which is the lesson chapter 1 §1.3 already paid for.
+    assert!(
+        !told.is_empty(),
+        "the refusal carries a reason, whichever of the two it is"
     );
 }

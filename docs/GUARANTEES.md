@@ -451,8 +451,18 @@ Four rules govern configuration:
   it offers and the set it requires; negotiation computes the per-dimension intersection —
   the weaker level of the two offers — and fails the connection with `NEGOTIATION_FAILED`
   when the result does not reach what the peer requires. There is no downgrade path
-  [0006 §4.4], [PROTOCOL.md](PROTOCOL.md) §2.3. *Spec ahead of code: the HELLO fields that
-  carry the declarations are not on the wire yet.*
+  [0006 §4.4], [PROTOCOL.md](PROTOCOL.md) §2.3. Both declarations are **on the wire**, as
+  HELLO keys `5` and `6`, and a `core` set is omitted so that a v0 HELLO stays byte-identical
+  ([PROTOCOL.md](PROTOCOL.md) §6.1); a header that requires more than it offers is rejected by
+  the decoder rather than negotiated.
+- **A live connection therefore carries the set its runtime configured, and nothing reports
+  it.** `RuntimeConfig::guarantees` is offered *and* required — one setting by
+  [0006](decisions/0006-guarantee-sets.md) §4.4 — so for any connection that came up the
+  agreed set is the minimum of two offers that each reached the requirement, which is that
+  configured set exactly. An accessor for it would hand a caller its own configuration back,
+  which is why there is none ([0027](decisions/0027-the-negotiated-set-is-the-configured-set.md)).
+  A peer that requires more than its peer offers is refused at connect time and receives no
+  weaker connection.
 
 ---
 
