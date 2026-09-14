@@ -37,7 +37,7 @@ and about 27 messages per second at that width. The width interval in the guide 
 settles how a fan-out fails: a stalled subscriber is refused by the **byte budget** when that
 budget is below the connection's 0.6-1.5 MiB absorption band and by the **queue** when it is
 above it — which is why `dropped_on(topic)` separates the two causes.
-The Windows 11 VM ran at the bookkeeping commit of this round (`2830be2`): **1830 across 141
+The Windows 11 VM ran at this round's bookkeeping commit (`752f7b7`): **1835 across 141
 binaries**, the same 37 ignored, in one clean pass — fmt, clippy in both configurations and
 rustdoc included, with the guide's suite among the binaries. Add
 the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
