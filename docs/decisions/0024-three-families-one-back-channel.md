@@ -139,12 +139,18 @@ frame is "header followed by opaque payload bytes until FIN" [PROTOCOL §4], so:
 
 Either blocker alone settles it. **Cursors get their own unidirectional stream: frame kind `6`, a
 head frame naming the payload stream it reports about, then `(level, offset)` records until FIN**
-([0023 §4.3]). The identifier is QUIC's own `StreamId`, which `quinn` exposes as
-`SendStream::id()` and `RecvStream::id()`, encoded as the varint both ends already share — not an
-application-visible identifier, and not the per-transfer correlation machinery
-[ARCHITECTURE §1] deleted: there is no pending table, no cancellation frame and no
-reply-arrival notification, because closing the payload stream ends the reporting and the FIN of
-the cursor stream says there is no more.
+([0023 §4.3]). **The identifier is a `report_id` the ordering DATA header allocates**, not
+QUIC's own `StreamId`, and the correction came from building it (B-233). Two reasons, either
+sufficient. A `StreamId` exists only on QUIC: `handle_local` carries no stream-kind
+vocabulary at all [0012 §4.3], so the inproc, `AF_UNIX` and named-pipe transports would have
+had no identifier to name — and a back channel that works on one of four transports is not a
+mechanism. And a `StreamId` is chosen by the *peer*, so a receiver would have to accept an id
+it never issued and map it; a `report_id` is allocated by the side that **orders** the report,
+so the lookup finds state that side created, and an id that was never handed out allocates
+nothing (`PROTOCOL.md` §6.7 rule 3). It is still not application-visible and still not the
+per-transfer correlation machinery [ARCHITECTURE §1] deleted: there is no pending table, no
+cancellation frame and no reply-arrival notification, because closing the payload stream ends
+the reporting and the FIN of the cursor stream says there is no more.
 
 **4.4a The answer to "uni, uni und bidi — oder grundsaetzlich bidi?": the payload topology does
 not change at all.** It is the pattern's business, and the cursor stream is orthogonal to it.
@@ -170,11 +176,12 @@ removals: "the correlation machinery existed only because replies rode separate 
 whose entire job was to undo a choice made one layer down". A reply on its own stream must be
 matched back; a reply on the bidi's other half is matched by the stream. That stays.
 
-One subtlety, recorded because it is the kind of thing that is discovered twice: a **bidi** stream
-has one id for both directions, so a cursor stream naming it appears ambiguous. It is not. The
-reporter can only report on bytes it **received**, so the pair (who opened the cursor stream, which
-stream id) is unique — the responder's cursor stream about bidi *X* reports the request direction,
-the requester's reports the reply direction. No direction field is needed.
+One subtlety, recorded because it is the kind of thing that is discovered twice: a **bidi**
+stream reports in both directions, so one identifier for it would appear ambiguous. With
+`report_id` it is not even a question: each side allocates ids from its own space and orders a
+report in its own header, so the responder's cursor stream carries the id the *request* header
+allocated and the requester's carries the id the *reply* header allocated. No direction field
+is needed, and no shared numbering rule either.
 
 **Datagrams are rejected, and the reason is worth keeping.** An earlier draft put progress cursors
 on QUIC datagrams, and the analysis stands as far as it went: an absolute cursor can afford loss,
@@ -225,7 +232,7 @@ ack maps to `fin_only` and says so.
 payload stream** is the measurement attached to §4.4. At very high fan-out — millions of small
 messages, each ordering cursors — a stream per transfer doubles stream accounting, and the
 alternative is one long-lived cursor stream per connection carrying records for many payload
-streams, which the head frame's stream id already makes expressible. That is a pure optimization
+streams, which the head frame's `report_id` already makes expressible. That is a pure optimization
 of the same design, not a different one, and it needs a number: streams created per second and
 memory per in-flight report, against the same workload with cursors off.
 
@@ -263,7 +270,7 @@ note: done. The onion was never wrong about dependencies and always wrong as a u
 ## 6. What this note does not decide
 
 - **Whether many payload streams ever share one cursor stream.** §4.8's optimization: the head
-  frame's stream id makes it expressible, and the measurement decides whether it is worth a second
+  frame's `report_id` makes it expressible, and the measurement decides whether it is worth a second
   code path.
 - **Whether a broker ever *requires* cursors.** It prescribes which levels it reports; whether it
   refuses a producer that asks for none is a broker policy question, and queue admission

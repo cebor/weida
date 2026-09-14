@@ -35,6 +35,13 @@ pub enum FrameKind {
     /// duplicated frame changes nothing. Only a queue serves it; a path with
     /// no queue refuses the stream with `UNSUPPORTED`.
     Credit,
+    /// A report about one payload stream; header-only followed by records.
+    ///
+    /// A head frame naming the stream, then `(level, offset)` records until
+    /// FIN. Never shares a stream with payload
+    /// ([decisions/0024](../../../docs/decisions/0024-three-families-one-back-channel.md)
+    /// §4.4).
+    Cursor,
 }
 
 impl FrameKind {
@@ -47,6 +54,7 @@ impl FrameKind {
             FrameKind::Subscribe => 3,
             FrameKind::Unsubscribe => 4,
             FrameKind::Credit => 5,
+            FrameKind::Cursor => 6,
         }
     }
 
@@ -61,6 +69,7 @@ impl FrameKind {
             3 => Some(FrameKind::Subscribe),
             4 => Some(FrameKind::Unsubscribe),
             5 => Some(FrameKind::Credit),
+            6 => Some(FrameKind::Cursor),
             _ => None,
         }
     }
@@ -80,6 +89,7 @@ impl fmt::Display for FrameKind {
             FrameKind::Subscribe => "SUBSCRIBE",
             FrameKind::Unsubscribe => "UNSUBSCRIBE",
             FrameKind::Credit => "CREDIT",
+            FrameKind::Cursor => "CURSOR",
         };
         f.write_str(s)
     }
@@ -198,12 +208,13 @@ mod tests {
             (FrameKind::Subscribe, 3),
             (FrameKind::Unsubscribe, 4),
             (FrameKind::Credit, 5),
+            (FrameKind::Cursor, 6),
         ];
         for (kind, code) in all {
             assert_eq!(kind.to_u8(), code);
             assert_eq!(FrameKind::from_u8(code), Some(kind));
         }
-        for code in 6u8..=255 {
+        for code in 7u8..=255 {
             assert_eq!(FrameKind::from_u8(code), None, "kind {code}");
         }
     }
@@ -217,6 +228,7 @@ mod tests {
             FrameKind::Subscribe,
             FrameKind::Unsubscribe,
             FrameKind::Credit,
+            FrameKind::Cursor,
         ] {
             assert!(!k.has_payload(), "{k}");
         }
@@ -282,10 +294,12 @@ mod tests {
 
     #[test]
     fn unknown_kind_is_a_violation() {
-        // Kind `6` is the first free one: `5` became CREDIT with the L2 queue
-        // (`docs/decisions/0018-minimal-broker.md` §4.6).
-        let err = parse_preamble(&[MAGIC, 0x06, 0x00], CAP).unwrap_err();
-        assert_eq!(err, PreambleError::UnknownKind(6));
+        // Kind `7` is the first free one: `5` became CREDIT with the L2 queue
+        // (`docs/decisions/0018-minimal-broker.md` §4.6) and `6` became
+        // CURSOR with the cursor stream
+        // (`docs/decisions/0024-three-families-one-back-channel.md` §4.4).
+        let err = parse_preamble(&[MAGIC, 0x07, 0x00], CAP).unwrap_err();
+        assert_eq!(err, PreambleError::UnknownKind(7));
         assert!(err.is_violation());
     }
 

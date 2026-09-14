@@ -24,6 +24,8 @@ use minicbor::data::Type;
 use minicbor::{Decoder, Encoder};
 use weida_core::Error;
 
+use crate::varint::{VarintError, decode_varint, encode_varint};
+
 /// Decoder limits. The string caps are normative
 /// (`docs/PROTOCOL.md` §6); the list and depth caps are defensive
 /// implementation limits documented in the same section.
@@ -53,6 +55,14 @@ pub mod limits {
     /// Without it, a hostile peer could pin `max_concurrent_uni_streams`
     /// worth of large `Vec<u64>`s by opening many HELLO streams.
     pub const MAX_LIST_ITEMS: usize = 64;
+    /// Cap on the number of levels a DATA header may order a report for
+    /// (`docs/PROTOCOL.md` §6.2, key `10`).
+    ///
+    /// A report order is a remote-controlled list, so it needs a cap for the
+    /// same reason [`MAX_LIST_ITEMS`] exists; 16 is more levels than the level
+    /// space defines below the application floor, so it constrains nothing a
+    /// sender legitimately wants.
+    pub const MAX_REPORT_LEVELS: usize = 16;
     /// Nesting depth allowed when skipping an unknown field.
     pub const MAX_SKIP_DEPTH: usize = 8;
 }
@@ -79,6 +89,9 @@ mod data_key {
     pub const SEQUENCE: u64 = 6;
     pub const PRODUCER: u64 = 7;
     pub const ACHIEVED: u64 = 8;
+    pub const REPORT_ID: u64 = 9;
+    pub const REPORT: u64 = 10;
+    pub const REPORT_MODE: u64 = 11;
 }
 
 /// ERROR keys.
@@ -98,6 +111,11 @@ mod credit_key {
     pub const ENDPOINT: u64 = 0;
     pub const FILTER: u64 = 1;
     pub const LIMIT: u64 = 2;
+}
+
+/// CURSOR head-frame keys.
+mod cursor_key {
+    pub const REPORT_ID: u64 = 0;
 }
 
 /// The topic filter grammar of `docs/PROTOCOL.md` §6.4.
@@ -217,7 +235,7 @@ mod guarantee_key {
 macro_rules! wire_enum {
     ($(#[$meta:meta])* $name:ident { $($(#[$vmeta:meta])* $variant:ident = $value:literal),+ $(,)? }) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub enum $name {
             $($(#[$vmeta])* $variant,)+
         }
@@ -349,6 +367,72 @@ wire_enum! {
         Fingerprint = 0,
         /// A name supplied above L0, carried in DATA key `7`.
         Stable = 1,
+    }
+}
+
+wire_enum! {
+    /// How often a reporter emits a record (`docs/PROTOCOL.md` §6.2, key
+    /// `11`).
+    ///
+    /// **Not ordered**: these are two shapes of the same report, not two
+    /// strengths. A cursor is never load-bearing, so neither mode is a
+    /// guarantee and neither is negotiated
+    /// ([decisions/0023](../../../docs/decisions/0023-completion-is-a-cursor.md)
+    /// §4.5).
+    ReportMode {
+        /// Records as the level advances, coalesced at the reporter's own
+        /// granularity.
+        #[default]
+        Progress = 0,
+        /// One record per level, at the end.
+        FinalOnly = 1,
+    }
+}
+
+/// A level a cursor can name: one weida defines, or one the application does.
+///
+/// The level space is **open**
+/// ([decisions/0023](../../../docs/decisions/0023-completion-is-a-cursor.md)
+/// §4.4): values below [`CursorLevel::APPLICATION_FLOOR`] are weida's own
+/// ladder, [`Acknowledgement`], and everything at or above it is an
+/// application stage weida carries and orders but never interprets. An
+/// undefined value *below* the floor is a protocol violation rather than an
+/// application level, because the reserved range is where a later version of
+/// this specification will put its own stages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CursorLevel {
+    /// A level this version of the protocol defines.
+    Known(Acknowledgement),
+    /// An application stage, at or above the floor.
+    Application(u64),
+}
+
+impl CursorLevel {
+    /// First wire value an application may name.
+    pub const APPLICATION_FLOOR: u64 = 16;
+
+    /// The wire value.
+    pub fn to_wire(self) -> u64 {
+        match self {
+            CursorLevel::Known(level) => level.to_wire(),
+            CursorLevel::Application(value) => value,
+        }
+    }
+
+    /// Interprets a wire value, or `None` if it is an undefined value in the
+    /// reserved range.
+    pub fn from_wire(value: u64) -> Option<CursorLevel> {
+        if value >= CursorLevel::APPLICATION_FLOOR {
+            Some(CursorLevel::Application(value))
+        } else {
+            Acknowledgement::from_wire(value).map(CursorLevel::Known)
+        }
+    }
+
+    /// An application stage, or `None` below the floor: the reserved range is
+    /// not an application's to name.
+    pub fn application(value: u64) -> Option<CursorLevel> {
+        (value >= CursorLevel::APPLICATION_FLOOR).then_some(CursorLevel::Application(value))
     }
 }
 
@@ -680,6 +764,7 @@ impl_wire_level!(
     Deduplication,
     Backpressure,
     ProducerNaming,
+    ReportMode,
 );
 
 /// Why a header was rejected. Every variant is a protocol violation.
@@ -732,6 +817,10 @@ pub enum HeaderError {
     InvalidGuarantees(&'static str),
     /// A topic filter violated the grammar of `docs/PROTOCOL.md` §6.4.
     InvalidFilter(&'static str),
+    /// A DATA header's report order is malformed: the levels do not ascend,
+    /// there are too many of them, or the order and its id disagree
+    /// (`docs/PROTOCOL.md` §6.2, keys `9`-`11`).
+    InvalidReport(&'static str),
 }
 
 impl std::fmt::Display for HeaderError {
@@ -764,6 +853,7 @@ impl std::fmt::Display for HeaderError {
             }
             HeaderError::InvalidGuarantees(why) => write!(f, "invalid guarantee set: {why}"),
             HeaderError::InvalidFilter(why) => write!(f, "invalid topic filter: {why}"),
+            HeaderError::InvalidReport(reason) => write!(f, "invalid report: {reason}"),
         }
     }
 }
@@ -1024,6 +1114,43 @@ impl<'a, 'b> MapReader<'a, 'b> {
         Ok(out)
     }
 
+    /// Reads a report order: a definite-length array of strictly ascending
+    /// cursor levels, capped at [`limits::MAX_REPORT_LEVELS`].
+    ///
+    /// Ascent is checked here rather than after the fact for the same reason
+    /// map keys are: it makes duplicate detection complete in constant space,
+    /// and it makes the wire form canonical, so two peers ordering the same
+    /// levels send the same bytes.
+    fn report_levels(&mut self) -> Result<Vec<CursorLevel>, HeaderError> {
+        let len = self
+            .d
+            .array()
+            .map_err(|_| HeaderError::Malformed("expected an array"))?
+            .ok_or(HeaderError::Indefinite)?;
+        if len > limits::MAX_REPORT_LEVELS as u64 {
+            return Err(HeaderError::InvalidReport("too many report levels"));
+        }
+        // `len` is now bounded by MAX_REPORT_LEVELS, so reserving is safe.
+        let mut out: Vec<CursorLevel> = Vec::with_capacity(len as usize);
+        let mut last: Option<u64> = None;
+        for _ in 0..len {
+            let value = self.u64()?;
+            if let Some(prev) = last
+                && value <= prev
+            {
+                return Err(HeaderError::InvalidReport("report levels must ascend"));
+            }
+            last = Some(value);
+            out.push(
+                CursorLevel::from_wire(value).ok_or(HeaderError::UnknownLevel {
+                    dimension: "report",
+                    value,
+                })?,
+            );
+        }
+        Ok(out)
+    }
+
     fn skip(&mut self) -> Result<(), HeaderError> {
         skip_value(self.d, limits::MAX_SKIP_DEPTH)
     }
@@ -1251,6 +1378,26 @@ pub struct DataHeader {
     ///
     /// [GUARANTEES.md]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/GUARANTEES.md
     pub achieved: Option<Acknowledgement>,
+    /// Identifier the sender assigns to the report it orders (key `9`).
+    ///
+    /// Present exactly when [`DataHeader::report`] is non-empty. It names the
+    /// CURSOR stream that will report on *this* transfer, and it is scoped to
+    /// the connection and to the direction that allocated it: a peer reports
+    /// only on transfers it received, so the two directions cannot collide.
+    pub report_id: Option<u64>,
+    /// Levels the sender asks to be reported, strictly ascending (key `10`).
+    ///
+    /// An **order**, not a guarantee: a receiver that cannot reach a level
+    /// simply does not report it, and the transfer does not fail for it. A
+    /// level a peer must reach is the negotiated `acknowledgement` dimension
+    /// of HELLO instead
+    /// ([decisions/0006](../../../docs/decisions/0006-guarantee-sets.md)
+    /// §4.4).
+    pub report: Vec<CursorLevel>,
+    /// How often the reporter should emit a record (key `11`).
+    ///
+    /// [`ReportMode::Progress`] is the default and is never written.
+    pub report_mode: ReportMode,
 }
 
 impl DataHeader {
@@ -1280,7 +1427,10 @@ impl DataHeader {
             + u64::from(self.topic.is_some())
             + u64::from(self.sequence.is_some())
             + u64::from(self.producer.is_some())
-            + u64::from(self.achieved.is_some());
+            + u64::from(self.achieved.is_some())
+            + u64::from(self.report_id.is_some())
+            + u64::from(!self.report.is_empty())
+            + u64::from(self.report_mode != ReportMode::default());
         encode_with(|e| {
             e.map(count)?;
             if let Some(endpoint) = &self.endpoint {
@@ -1311,6 +1461,22 @@ impl DataHeader {
             }
             if let Some(achieved) = self.achieved {
                 e.u64(data_key::ACHIEVED)?.u64(achieved.to_wire())?;
+            }
+            if let Some(report_id) = self.report_id {
+                e.u64(data_key::REPORT_ID)?.u64(report_id)?;
+            }
+            if !self.report.is_empty() {
+                e.u64(data_key::REPORT)?.array(self.report.len() as u64)?;
+                for level in &self.report {
+                    e.u64(level.to_wire())?;
+                }
+            }
+            // `Progress` is never written: an absent key already says it, so
+            // a header that orders a report in the default mode stays as
+            // short as the mode is uninteresting (§6.5's rule for levels).
+            if self.report_mode != ReportMode::default() {
+                e.u64(data_key::REPORT_MODE)?
+                    .u64(self.report_mode.to_wire())?;
             }
             Ok(())
         })
@@ -1353,11 +1519,25 @@ impl DataHeader {
                             },
                         )?);
                     }
+                    data_key::REPORT_ID => header.report_id = Some(m.u64()?),
+                    data_key::REPORT => header.report = m.report_levels()?,
+                    data_key::REPORT_MODE => {
+                        header.report_mode = level(m.u64()?, "report_mode")?;
+                    }
                     _ => m.skip()?,
                 }
             }
         }
         finish(&d)?;
+        // Keys 9 and 10 are one statement in two halves: an order with no
+        // stream to report on, or a stream with nothing to report, names a
+        // report nobody can serve.
+        if !header.report.is_empty() && header.report_id.is_none() {
+            return Err(HeaderError::InvalidReport("report without report_id"));
+        }
+        if header.report_id.is_some() && header.report.is_empty() {
+            return Err(HeaderError::InvalidReport("report_id without report"));
+        }
         Ok(header)
     }
 }
@@ -1580,6 +1760,94 @@ impl CreditHeader {
     }
 }
 
+/// CURSOR head frame (kind `6`).
+///
+/// One key, required: which report this stream carries. The stream then
+/// carries `(level, offset)` records until FIN and **never any payload**
+/// ([decisions/0024](../../../docs/decisions/0024-three-families-one-back-channel.md)
+/// §4.4) — which is why the head frame needs no length, no endpoint and no
+/// correlation beyond the id the DATA header allocated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorHeader {
+    /// The `report_id` of the DATA header that ordered this report.
+    pub report_id: u64,
+}
+
+impl CursorHeader {
+    /// Encodes the header.
+    pub fn encode(&self) -> Vec<u8> {
+        encode_with(|e| {
+            e.map(1)?;
+            e.u64(cursor_key::REPORT_ID)?.u64(self.report_id)?;
+            Ok(())
+        })
+    }
+
+    /// Decodes the header.
+    pub fn decode(bytes: &[u8]) -> Result<CursorHeader, HeaderError> {
+        let mut d = Decoder::new(bytes);
+        let mut report_id = None;
+        {
+            let mut m = MapReader::new(&mut d)?;
+            while let Some(key) = m.next_key()? {
+                match key {
+                    cursor_key::REPORT_ID => report_id = Some(m.u64()?),
+                    _ => m.skip()?,
+                }
+            }
+            m.require(cursor_key::REPORT_ID)?;
+        }
+        finish(&d)?;
+        Ok(CursorHeader {
+            report_id: report_id.expect("presence checked above"),
+        })
+    }
+}
+
+/// Longest possible cursor record: two 8-byte QUIC varints.
+pub const MAX_CURSOR_RECORD_LEN: usize = 2 * crate::varint::MAX_ENCODED_LEN;
+
+/// Appends one `(level, offset)` record to `out`.
+///
+/// Records are QUIC varint pairs rather than CBOR: a record is hot-path and
+/// self-delimiting, and a CBOR map per record would cost a map header per
+/// reported byte range for no gain — the head frame already carries every
+/// field a record could need to name.
+pub fn encode_cursor_record(
+    level: CursorLevel,
+    offset: u64,
+    out: &mut Vec<u8>,
+) -> Result<(), VarintError> {
+    encode_varint(level.to_wire(), out)?;
+    encode_varint(offset, out)
+}
+
+/// Decodes one record from the front of `input`.
+///
+/// `Ok(None)` means the input ends inside a record: read more bytes and
+/// retry. That is **not** a violation — a reader sees whatever slice the
+/// transport handed it, and a record is at most
+/// [`MAX_CURSOR_RECORD_LEN`] bytes, so the retry is bounded. An undefined
+/// level in the reserved range *is* a violation: the value decides what the
+/// receiver believes about its own transfer.
+pub fn decode_cursor_record(
+    input: &[u8],
+) -> Result<Option<(CursorLevel, u64, usize)>, HeaderError> {
+    // `decode_varint` accepts the whole representable range, so its only
+    // failure is a value the input ended inside of.
+    let Ok((raw_level, level_len)) = decode_varint(input) else {
+        return Ok(None);
+    };
+    let Ok((offset, offset_len)) = decode_varint(&input[level_len..]) else {
+        return Ok(None);
+    };
+    let level = CursorLevel::from_wire(raw_level).ok_or(HeaderError::UnknownLevel {
+        dimension: "cursor",
+        value: raw_level,
+    })?;
+    Ok(Some((level, offset, level_len + offset_len)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1776,6 +2044,13 @@ mod tests {
             sequence: Some(u64::MAX),
             producer: Some([0x5A; limits::PRODUCER_BYTES]),
             achieved: Some(Acknowledgement::Processed),
+            report_id: Some(7),
+            report: vec![
+                CursorLevel::Known(Acknowledgement::Accepted),
+                CursorLevel::Known(Acknowledgement::Processed),
+                CursorLevel::Application(CursorLevel::APPLICATION_FLOOR),
+            ],
+            report_mode: ReportMode::FinalOnly,
         };
         assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
     }
@@ -1805,6 +2080,9 @@ mod tests {
             sequence: Some(9),
             producer: Some([0u8; limits::PRODUCER_BYTES]),
             achieved: Some(Acknowledgement::Accepted),
+            report_id: Some(1),
+            report: vec![CursorLevel::Known(Acknowledgement::Stored)],
+            report_mode: ReportMode::FinalOnly,
         };
         let bytes = h.encode();
         let mut d = Decoder::new(&bytes);

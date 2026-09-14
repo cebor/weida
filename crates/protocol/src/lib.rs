@@ -21,7 +21,8 @@ pub use frame::{
     parse_preamble,
 };
 pub use header::{
-    CreditHeader, DataHeader, ErrorHeader, HeaderError, Hello, SubscriptionHeader, filter,
+    CreditHeader, CursorHeader, CursorLevel, DataHeader, ErrorHeader, HeaderError, Hello,
+    ReportMode, SubscriptionHeader, decode_cursor_record, encode_cursor_record, filter,
     limits as header_limits,
 };
 pub use negotiate::{Agreed, NegotiateError, negotiate};

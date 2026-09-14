@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use weida::{Identity, Listener, Publisher, Puller, Runtime, RuntimeConfig, TransferMeta, Trust};
-use weida_protocol::{DataHeader, FrameKind, encode_frame};
+use weida_protocol::{DataHeader, FrameKind, ReportMode, encode_frame};
 
 const PAYLOAD: usize = 1024;
 
@@ -397,6 +397,9 @@ fn wire_bytes(endpoint: &str, meta: &TransferMeta, payload: usize) -> usize {
         sequence: None,
         producer: None,
         achieved: meta.achieved,
+        report_id: None,
+        report: Vec::new(),
+        report_mode: ReportMode::default(),
     };
     encode_frame(FrameKind::Data, &header.encode()).len() + payload
 }

@@ -324,9 +324,9 @@ a defect because it lets a remote peer choose the allocation size.
 ### 3.2 Conditions that MUST close the connection with PROTOCOL_VIOLATION
 
 - Magic byte not equal to `0x57`.
-- Unknown `kind` value, i.e. anything in `6..=255`. Kind `5` was reserved for the L2 credit
-  frame and is now defined (§6.6): the reservation was a promise not to reuse the number, and
-  the promise was kept when the number was spent.
+- Unknown `kind` value, i.e. anything in `7..=255`. Kinds `5` and `6` were reserved for the
+  L2 credit frame and the cursor stream and are now defined (§6.6, §6.7): the reservation was
+  a promise not to reuse the number, and the promise was kept when the number was spent.
 - `header_len` greater than the local `limits.max_header_bytes` (§3.1).
 - CBOR parse failure of the header.
 - A required key missing from the header.
@@ -358,8 +358,9 @@ connection-fatal framing violation.
 | `3` | SUBSCRIBE | header only, FIN directly after the header | uni |
 | `4` | UNSUBSCRIBE | header only, FIN directly after the header | uni |
 | `5` | CREDIT | header only, FIN directly after the header | uni |
+| `6` | CURSOR | head frame, then (level, offset) records until FIN | uni |
 
-Kinds `6..=255` are reserved and MUST close the connection with `PROTOCOL_VIOLATION`. This
+Kinds `7..=255` are reserved and MUST close the connection with `PROTOCOL_VIOLATION`. This
 is not a forward-compatibility hook: a receiver cannot know whether an unknown stream kind
 carries payload it would have to drain.
 
@@ -368,7 +369,18 @@ carries payload it would have to drain.
 for one subscription (§6.6). A peer that does not run a queue **ignores** it rather than
 closing the connection — credit is idempotent state, not a transfer, and the frame has no
 reply half to refuse on — which is the same position SUBSCRIBE takes for a path no publisher
-has claimed. Kind `6` is now the first free number.
+has claimed.
+
+**Kind `6` is known as of B-233**, and it is the cursor stream of
+[decisions/0023](decisions/0023-completion-is-a-cursor.md) and
+[decisions/0024](decisions/0024-three-families-one-back-channel.md) §4.4: a report about one
+payload stream, on a unidirectional stream of its own. It is the one kind that is neither
+header-only nor payload-carrying — a head frame naming the report, then `(level, offset)`
+records until FIN (§6.7) — and it **never shares a stream with payload**, which is what
+makes a report add nothing to a pattern's topology. A peer that ordered no report has no
+state for the id a CURSOR stream names and resets that stream with `CANCELED` rather than
+closing the connection: nothing was allocated for an id it never handed out. Kind `7` is now
+the first free number.
 
 HELLO, ERROR, SUBSCRIBE, UNSUBSCRIBE and CREDIT are header-only frames: the sender MUST FIN
 the stream immediately after the header. Receiver handling of bytes appearing after the
@@ -381,13 +393,14 @@ a DATA stream.
 
 ### 4.1 Which frame may open which stream
 
-- A **uni stream** MUST open with HELLO, DATA, SUBSCRIBE, UNSUBSCRIBE or CREDIT. An ERROR
-  frame on a uni stream is a violation (§3.2): an ERROR is the alternative to a reply, and it
-  therefore has meaning only where a reply would have gone.
+- A **uni stream** MUST open with HELLO, DATA, SUBSCRIBE, UNSUBSCRIBE, CREDIT or CURSOR. An
+  ERROR frame on a uni stream is a violation (§3.2): an ERROR is the alternative to a reply,
+  and it therefore has meaning only where a reply would have gone.
 - A **bidi stream** MUST open with DATA on its initiating half. Any other kind there is a
   violation.
 - The **reply half** of a bidi stream MUST carry either DATA or ERROR, exactly one frame,
-  followed by FIN.
+  followed by FIN. **A report does not change this.** A cursor rides a uni stream of its own,
+  so ordering one adds no frame to a reply half and no half to an exchange.
 
 ---
 
@@ -478,6 +491,9 @@ configuration error, not a negotiation position.
 | `6` | `uint` | `sequence` | no | — | per-producer sequence number; **written by a publisher whose connection negotiated `PerProducer` ordering**, absent under `core` |
 | `7` | `bstr` | `producer` | no | exactly 32 B | producer identity, the raw digest; coded, **written by no v0 sender** |
 | `8` | `uint` | `achieved` | no | one of §6.5's `acknowledgement` values | the completion level the sender **achieved** for the message it is answering; the L2 publisher confirm |
+| `9` | `uint` | `report_id` | no | — | identifier of the CURSOR stream that will report on this transfer (§6.7) |
+| `10` | `array` of `uint` | `report` | no | 16 items, strictly ascending | levels the sender **orders** a report for; an order, not a guarantee |
+| `11` | `uint` | `report_mode` | no | one of §6.2's `report_mode` values | `0` `progress` (default, never written), `1` `final-only` |
 
 **Every key is optional at the decoder, and that is deliberate.** A decoder sees a byte
 slice, not a stream: it cannot tell an initiating half from a reply half, so it cannot
@@ -566,6 +582,38 @@ one: the measured cost of writing the text form was +80 B and −9 % of the mess
 
 `sequence` and `producer` are independent: either may appear without the other. Ordering and
 deduplication are separate guarantee dimensions and neither implies the other [0001 §7.1].
+
+**Keys `9`, `10` and `11` order a report** — the cursor of
+[decisions/0023](decisions/0023-completion-is-a-cursor.md). They say: report these levels
+for *this* transfer, on a CURSOR stream (§6.7) carrying this id. They add no half to the
+stream they ride and no frame to a reply, which is what lets a Push producer get a verdict
+without an exchange ([0024](decisions/0024-three-families-one-back-channel.md) §4.4a).
+
+- **The level space is open.** Values `0..=15` are weida's own ladder, the `acknowledgement`
+  levels of §6.5; values `16` and above are application stages weida carries and orders but
+  never interprets. An undefined value **below** `16` is a protocol violation, not an
+  application level: the reserved range is where a later version of this specification will
+  put its own stages, and reading one as an opaque stage now would spend the number twice.
+- **Keys `9` and `10` travel together.** `report` without `report_id` names no stream, and
+  `report_id` without `report` names no levels; both MUST close the connection with
+  `PROTOCOL_VIOLATION`.
+- **The order is canonical.** The array MUST be strictly ascending, which makes a duplicate
+  a violation for free and makes two peers ordering the same levels send the same bytes. It
+  MUST carry at most 16 entries, which is more than the defined space below the application
+  floor and therefore constrains nothing a sender legitimately wants.
+- **`report_mode = 0` is never written.** `progress` is what an absent key already says, on
+  §6.5's rule for `core` levels.
+- **An order is not a guarantee.** A receiver that cannot reach an ordered level simply does
+  not report it, and the transfer does not fail for it. A level a peer MUST reach is the
+  negotiated `acknowledgement` dimension of §6.5 instead
+  ([decisions/0006](decisions/0006-guarantee-sets.md) §4.4).
+- **`report_id` is scoped to the connection and to the direction that allocated it.** A peer
+  reports only on transfers it received, so the two directions' id spaces cannot collide and
+  no shared numbering rule is needed. `0` is never allocated, so an id that was never handed
+  out cannot masquerade as one.
+- The reply half of an exchange may order its own report. That is how the **reply
+  direction** is reported without a second header field: the responder orders levels in its
+  own reply header, on its own id.
 
 ### 6.3 ERROR (kind 2)
 
@@ -757,6 +805,56 @@ deliver beyond the limit it has accepted, and a limit it declines to honour in f
 error to report: the consumer observes it as delivery stopping, which is exactly what credit
 means.
 
+### 6.7 CURSOR (kind 6)
+
+A CURSOR stream is a report about **one** payload stream: a head frame naming the report,
+then a sequence of records until FIN. It carries no payload and never shares a stream with
+payload ([decisions/0024](decisions/0024-three-families-one-back-channel.md) §4.4), which is
+what makes a report add nothing to any pattern's topology — a Push transfer that orders a
+report is still one unidirectional stream of payload.
+
+The head frame is a CBOR header under §5's rules, with one key:
+
+| Key | CBOR type | Name | Required at the decoder | Cap | Meaning |
+| --- | --- | --- | --- | --- | --- |
+| `0` | `uint` | `report_id` | **yes** | — | the `report_id` the DATA header of §6.2 allocated |
+
+The id is required for the same reason CREDIT's `limit` is: a stream that names no report
+reports on nothing. Everything else a record could need to name — which transfer, which
+endpoint, which direction — is already fixed by the id.
+
+**Records are QUIC varint pairs, not CBOR.** After the head frame the stream carries zero or
+more records, each
+
+```
+[level: varint][offset: varint]
+```
+
+with `level` from the open space of §6.2 key `10` and `offset` an **absolute byte offset**
+into the payload of the transfer the report is about. A record is self-delimiting and at most
+16 bytes; a CBOR map per record would cost a map header per reported range and buy nothing,
+because the head frame already carries every field a record would otherwise name.
+
+Four rules govern a reader:
+
+1. **A cursor is absolute, so coalescing is free.** A receiver keeps the **maximum** offset
+   per level. A record that repeats or moves an offset backwards changes nothing and is not
+   an error: that is the whole reason a completion is a cursor rather than a verdict
+   ([0023](decisions/0023-completion-is-a-cursor.md) §4.3b).
+2. **A level that was never ordered is ignored**, and so is a level the reporter cannot
+   honour — it is simply absent from the report. Neither is fatal, because a cursor is never
+   load-bearing.
+3. **An unknown `report_id` resets the stream with `CANCELED`** (§7) and the connection
+   survives. No state is allocated for an id the receiver never handed out, which is the
+   hostile case this rule exists for.
+4. **A record truncated at FIN is a protocol violation.** A record is at most 16 bytes and a
+   sender writes whole records, so half of one at FIN is a codec bug rather than a race. A
+   short read *before* FIN is not: the reader reads more bytes and retries.
+
+An undefined level below the application floor is a protocol violation at the decoder,
+exactly as an undefined `achieved` value is (§6.2): the number decides what a sender believes
+about its own transfer.
+
 ---
 
 ## 7. QUIC application error codes
@@ -839,6 +937,21 @@ SUB    {endpoint:"/md", filter:"ctl.#"}      (rest wildcard, final segment)
 
 SUB    {endpoint:"/md", filter:""}           (every topic)
        57 03 08  A2 00 63 2F 6D 64 01 60
+
+CURSOR {report_id:1}                         (head frame of a report)
+       57 06 03  A1 00 01
+
+RECORD (accepted, 64)                        (a record, not a frame: no preamble)
+       02 40 40
+
+RECORD (stored, 1000000)
+       03 80 0F 42 40
+
+DATA   {endpoint:"/t", report_id:1, report:[2]}
+       57 01 0A  A3 00 62 2F 74 09 01 0A 81 02
+
+DATA   {endpoint:"/t", report_id:1, report:[3,17], report_mode:1}
+       57 01 0D  A4 00 62 2F 74 09 01 0A 82 03 11 0B 01
 ```
 
 Decoded field lists:
@@ -897,6 +1010,34 @@ the pairs are pinned together in `crates/weida/src/pubsub.rs`.
 `header_len = 0x0C` (12 bytes), CBOR map of 2 entries: key `0` `endpoint = "/md"`, key `5`
 `topic = "px.*"`. A **`topic` is never a pattern** (§6.2, §6.4): the `*` here is an ordinary
 byte, and the filter `px.*` selects this topic exactly as it selects `px.eur`.
+
+**CURSOR head vector** — magic `0x57`, kind `0x06` (CURSOR), `header_len = 0x03` (3 bytes),
+CBOR map of 1 entry: key `0` `report_id = 1`. That is the whole head frame: a report names
+its id and nothing else, because the DATA header that ordered it already fixed which
+transfer, which levels and which direction (§6.7).
+
+**CURSOR record vectors** — **not frames**: these are the bytes that follow a head frame on
+the same stream, so they carry no preamble. `02 40 40` is `(level 2 = Accepted, offset 64)`:
+the level is a one-byte varint, and `64` needs the two-byte form because the one-byte form
+stops at `63`. `03 80 0F 42 40` is `(level 3 = Stored, offset 1000000)`, the four-byte varint
+form. A record is at most 16 bytes — two eight-byte varints — which is what bounds a reader's
+retry when a record is split across reads (§6.7).
+
+**Report-ordering DATA vector** — magic `0x57`, kind `0x01` (DATA), `header_len = 0x0A`
+(10 bytes), CBOR map of 3 entries: key `0` `endpoint = "/t"`, key `9` `report_id = 1`, key
+`10` `report = [2]` — one level, `Accepted`. Key `11` is **absent**: `progress` is the
+default mode and is never written, on §6.5's rule for `core` levels. This is a Push transfer
+that will get a verdict without an exchange
+([decisions/0024](decisions/0024-three-families-one-back-channel.md) §4.4a): ten header
+bytes, one unidirectional payload stream, and a CURSOR stream carrying the answer.
+
+**Final-only report vector** — the same three keys with `report = [3, 17]` and key `11`
+`report_mode = 1` (`final-only`); `header_len = 0x0D` (13 bytes). Two things it pins. The
+array is **strictly ascending**, so two peers ordering `Stored` and application stage `17`
+send the same bytes. And `17` is above the application floor of `16`, so weida carries it
+without interpreting it, while `15` in the same position would be a protocol violation —
+the reserved range belongs to a later version of this specification, not to an application
+(§6.2).
 
 Every vector §8 once deferred has now landed with its codec. The DATA key `6` and `7`
 vectors and the extended HELLO below pin encodings rather than describe traffic:

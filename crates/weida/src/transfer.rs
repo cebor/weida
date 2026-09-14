@@ -22,7 +22,7 @@ use std::task::{Context, Poll};
 use crate::transport::{RecvHalf, SendHalf};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use weida_core::{Error, ErrorCode, PeerIdentity, TraceContext};
-use weida_protocol::header::Acknowledgement;
+use weida_protocol::header::{Acknowledgement, ReportMode};
 use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes, encode_preamble};
 
 use crate::conn::{ConnHandle, Ctl, read_frame, write_error_frame};
@@ -206,6 +206,9 @@ pub(crate) fn data_header(
         sequence: None,
         producer: None,
         achieved: meta.achieved,
+        report_id: None,
+        report: Vec::new(),
+        report_mode: ReportMode::default(),
     };
     (header, trace)
 }

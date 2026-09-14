@@ -499,6 +499,12 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
         FrameKind::Subscribe => handle_subscription(ctx, &header, true).await,
         FrameKind::Unsubscribe => handle_subscription(ctx, &header, false).await,
         FrameKind::Credit => handle_credit(ctx, &header).await,
+        // A report for an id this side never handed out: reset the stream and
+        // keep the connection ([`refuse_cursor`]).
+        FrameKind::Cursor => {
+            drop(send);
+            refuse_cursor(recv)
+        }
         FrameKind::Data => {
             ctx.negotiated().await?;
             let decoded = match DataHeader::decode(&header) {
@@ -556,6 +562,17 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
 /// that arrived too late.
 fn refuse_uni(mut stream: RecvHalf) {
     stream.stop(codes::SHUTDOWN);
+}
+
+/// Refuses a CURSOR stream naming a report this side never ordered.
+///
+/// A cursor is never load-bearing, so an unknown `report_id` costs a stream
+/// reset and nothing else: no state was allocated for an id we never handed
+/// out, which is exactly the hostile case (`docs/PROTOCOL.md` §6.7 rule 3).
+/// The connection survives.
+fn refuse_cursor(mut stream: RecvHalf) -> Result<(), Error> {
+    stream.stop(codes::CANCELED);
+    Ok(())
 }
 
 /// Reads one preamble byte by byte, enforcing the header cap before allocating.
@@ -636,6 +653,7 @@ async fn handle_stream(
         FrameKind::Subscribe => handle_subscription(ctx, &header, true).await,
         FrameKind::Unsubscribe => handle_subscription(ctx, &header, false).await,
         FrameKind::Credit => handle_credit(ctx, &header).await,
+        FrameKind::Cursor => refuse_cursor(stream),
     }
 }
 

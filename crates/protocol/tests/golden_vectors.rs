@@ -12,9 +12,12 @@
 //! what makes the documented frames byte-exact as published.
 
 use weida_core::ErrorCode;
-use weida_protocol::header::{Acknowledgement, GuaranteeSet, HeaderError, OrderingMode};
+use weida_protocol::header::{
+    Acknowledgement, CursorLevel, GuaranteeSet, HeaderError, OrderingMode, ReportMode, limits,
+};
 use weida_protocol::{
-    CreditHeader, DataHeader, ErrorHeader, FrameKind, Hello, SubscriptionHeader, encode_frame,
+    CreditHeader, CursorHeader, DataHeader, ErrorHeader, FrameKind, Hello, SubscriptionHeader,
+    decode_cursor_record, encode_cursor_record, encode_frame,
 };
 
 /// Asserts one documented frame, and that its header half decodes back.
@@ -362,4 +365,190 @@ fn a_credit_header_without_a_limit_is_refused() {
     let err = CreditHeader::decode(&[0xA2, 0x00, 0x62, 0x2F, 0x71, 0x01, 0x60])
         .expect_err("no limit key");
     assert!(matches!(err, HeaderError::MissingKey(2)), "{err:?}");
+}
+
+#[test]
+fn golden_cursor_head_frame() {
+    // Kind 6, one required key: which report this stream carries. No length,
+    // no endpoint, no correlation beyond the id the DATA header allocated
+    // (`docs/decisions/0024-three-families-one-back-channel.md` §4.4).
+    let h = CursorHeader { report_id: 1 };
+    assert_frame(
+        "CURSOR head",
+        FrameKind::Cursor,
+        h.encode(),
+        &[0x57, 0x06, 0x03, 0xA1, 0x00, 0x01],
+    );
+    assert_eq!(CursorHeader::decode(&h.encode()).unwrap(), h);
+}
+
+#[test]
+fn golden_cursor_records() {
+    // Records are QUIC varint pairs, not CBOR: `Accepted` at byte 64 is three
+    // bytes, and the 2-byte offset form is the shortest that carries 64.
+    let mut out = Vec::new();
+    encode_cursor_record(CursorLevel::Known(Acknowledgement::Accepted), 64, &mut out).unwrap();
+    assert_eq!(out, [0x02, 0x40, 0x40]);
+    assert_eq!(
+        decode_cursor_record(&out).unwrap(),
+        Some((CursorLevel::Known(Acknowledgement::Accepted), 64, 3))
+    );
+
+    let mut out = Vec::new();
+    encode_cursor_record(
+        CursorLevel::Known(Acknowledgement::Stored),
+        1_000_000,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(out, [0x03, 0x80, 0x0F, 0x42, 0x40]);
+    assert_eq!(
+        decode_cursor_record(&out).unwrap(),
+        Some((CursorLevel::Known(Acknowledgement::Stored), 1_000_000, 5))
+    );
+}
+
+#[test]
+fn golden_data_orders_a_report() {
+    // Keys 9 and 10: the id of the CURSOR stream to expect, and the single
+    // level ordered on it. The mode stays absent because `Progress` is the
+    // default, exactly as a `core` guarantee declaration is never written.
+    let h = DataHeader {
+        report_id: Some(1),
+        report: vec![CursorLevel::Known(Acknowledgement::Accepted)],
+        ..DataHeader::addressed("/t")
+    };
+    assert_frame(
+        "DATA orders a report",
+        FrameKind::Data,
+        h.encode(),
+        &[
+            0x57, 0x01, 0x0A, 0xA3, 0x00, 0x62, 0x2F, 0x74, 0x09, 0x01, 0x0A, 0x81, 0x02,
+        ],
+    );
+    assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
+}
+
+#[test]
+fn golden_data_orders_final_only() {
+    // Two levels — one weida's, one the application's — and the non-default
+    // mode. The array is strictly ascending, which is what makes the wire
+    // form canonical.
+    let h = DataHeader {
+        report_id: Some(1),
+        report: vec![
+            CursorLevel::Known(Acknowledgement::Stored),
+            CursorLevel::Application(17),
+        ],
+        report_mode: ReportMode::FinalOnly,
+        ..DataHeader::addressed("/t")
+    };
+    assert_frame(
+        "DATA orders final-only",
+        FrameKind::Data,
+        h.encode(),
+        &[
+            0x57, 0x01, 0x0D, 0xA4, 0x00, 0x62, 0x2F, 0x74, 0x09, 0x01, 0x0A, 0x82, 0x03, 0x11,
+            0x0B, 0x01,
+        ],
+    );
+    assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
+}
+
+/// One rejection per decoder rule of §6.2 keys `9`-`11`.
+///
+/// Each of these is a header a hostile or buggy peer can send, and each names
+/// a different error: a report nobody can serve, a non-canonical order, an
+/// unbounded one, a level from the range a later version of this
+/// specification will fill, and a mode this one does not define.
+#[test]
+fn a_malformed_report_order_is_refused_rule_by_rule() {
+    // `A1 0A 81 02`: key 10 with no key 9 — an order with no stream.
+    let err = DataHeader::decode(&[0xA1, 0x0A, 0x81, 0x02]).expect_err("report without id");
+    assert_eq!(err, HeaderError::InvalidReport("report without report_id"));
+
+    // `A1 09 01`: key 9 with no key 10 — a stream with nothing to report.
+    let err = DataHeader::decode(&[0xA1, 0x09, 0x01]).expect_err("id without report");
+    assert_eq!(err, HeaderError::InvalidReport("report_id without report"));
+
+    // `A2 09 01 0A 82 03 02`: levels 3 then 2 — descending.
+    let err = DataHeader::decode(&[0xA2, 0x09, 0x01, 0x0A, 0x82, 0x03, 0x02])
+        .expect_err("descending levels");
+    assert_eq!(err, HeaderError::InvalidReport("report levels must ascend"));
+
+    // The same level twice is the same violation: ascent is strict, which is
+    // what makes duplicate detection free.
+    let err = DataHeader::decode(&[0xA2, 0x09, 0x01, 0x0A, 0x82, 0x02, 0x02])
+        .expect_err("repeated level");
+    assert_eq!(err, HeaderError::InvalidReport("report levels must ascend"));
+
+    // 17 ascending application levels: one past the cap.
+    let over_cap = DataHeader {
+        report_id: Some(1),
+        report: (0..=limits::MAX_REPORT_LEVELS as u64)
+            .map(|i| CursorLevel::Application(CursorLevel::APPLICATION_FLOOR + i))
+            .collect(),
+        ..DataHeader::reply()
+    };
+    let err = DataHeader::decode(&over_cap.encode()).expect_err("too many levels");
+    assert_eq!(err, HeaderError::InvalidReport("too many report levels"));
+
+    // `A2 09 01 0A 81 0F`: level 15 — reserved, and not an application's to
+    // name, so it is refused rather than carried as an opaque stage.
+    let err =
+        DataHeader::decode(&[0xA2, 0x09, 0x01, 0x0A, 0x81, 0x0F]).expect_err("reserved level 15");
+    assert_eq!(
+        err,
+        HeaderError::UnknownLevel {
+            dimension: "report",
+            value: 15
+        }
+    );
+
+    // `A3 09 01 0A 81 02 0B 02`: report mode 2.
+    let err = DataHeader::decode(&[0xA3, 0x09, 0x01, 0x0A, 0x81, 0x02, 0x0B, 0x02])
+        .expect_err("unknown report mode");
+    assert_eq!(
+        err,
+        HeaderError::UnknownLevel {
+            dimension: "report_mode",
+            value: 2
+        }
+    );
+}
+
+#[test]
+fn a_cursor_head_frame_without_a_report_id_is_refused() {
+    // `A0`: the empty map. The id is the only thing a CURSOR stream names, so
+    // an absent one names no report at all.
+    let err = CursorHeader::decode(&[0xA0]).expect_err("no report id");
+    assert_eq!(err, HeaderError::MissingKey(0));
+}
+
+#[test]
+fn a_cursor_record_that_ends_mid_value_asks_for_more_bytes() {
+    // A record is at most 16 bytes and self-delimiting, so a reader that sees
+    // half of one reads more rather than closing the connection: only an
+    // undefined reserved level is a violation.
+    let mut whole = Vec::new();
+    encode_cursor_record(
+        CursorLevel::Known(Acknowledgement::Stored),
+        1_000_000,
+        &mut whole,
+    )
+    .unwrap();
+    for cut in 0..whole.len() {
+        assert_eq!(
+            decode_cursor_record(&whole[..cut]),
+            Ok(None),
+            "a {cut}-byte prefix is not a violation"
+        );
+    }
+    assert_eq!(
+        decode_cursor_record(&[0x0F, 0x00]),
+        Err(HeaderError::UnknownLevel {
+            dimension: "cursor",
+            value: 15
+        })
+    );
 }

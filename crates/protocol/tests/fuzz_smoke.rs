@@ -15,7 +15,7 @@
 //! * every accepted value respects the documented caps.
 
 use weida_core::{ErrorCode, TraceContext};
-use weida_protocol::header::{Acknowledgement, limits};
+use weida_protocol::header::{Acknowledgement, CursorLevel, ReportMode, limits};
 use weida_protocol::{
     CreditHeader, DataHeader, ErrorHeader, Hello, SubscriptionHeader, encode_frame, parse_preamble,
 };
@@ -134,6 +134,12 @@ fn fuzz_smoke_data_header_from_valid_bytes() {
             sequence: Some(u64::MAX),
             producer: Some([0xA5; 32]),
             achieved: Some(Acknowledgement::Processed),
+            report_id: Some(1),
+            report: vec![
+                CursorLevel::Known(Acknowledgement::Stored),
+                CursorLevel::Application(CursorLevel::APPLICATION_FLOOR),
+            ],
+            report_mode: ReportMode::FinalOnly,
         },
     ];
     let mut accepted = 0usize;
@@ -380,6 +386,20 @@ fn arbitrary_data_header(rng: &mut Rng) -> DataHeader {
             _ => Some("x".repeat(rng.below(max + 1))),
         }
     };
+    // Keys 9-11 travel together: an order with no id, and an id with no
+    // order, are both headers §6.2 rejects, so the generator never builds
+    // one. The levels ascend for the same reason.
+    let report: Vec<CursorLevel> = match rng.below(4) {
+        0 => Vec::new(),
+        1 => vec![CursorLevel::Known(Acknowledgement::Accepted)],
+        2 => vec![
+            CursorLevel::Known(Acknowledgement::Stored),
+            CursorLevel::Application(CursorLevel::APPLICATION_FLOOR + 1),
+        ],
+        _ => (0..limits::MAX_REPORT_LEVELS as u64)
+            .map(|i| CursorLevel::Application(CursorLevel::APPLICATION_FLOOR + i))
+            .collect(),
+    };
     DataHeader {
         endpoint: text(rng, limits::MAX_ENDPOINT_BYTES),
         content_len: if rng.below(2) == 0 {
@@ -416,5 +436,12 @@ fn arbitrary_data_header(rng: &mut Rng) -> DataHeader {
             5 => Some(Acknowledgement::Processed),
             _ => None,
         },
+        report_id: (!report.is_empty()).then(|| rng.next_u64()),
+        report_mode: if rng.below(2) == 0 {
+            ReportMode::FinalOnly
+        } else {
+            ReportMode::Progress
+        },
+        report,
     }
 }
