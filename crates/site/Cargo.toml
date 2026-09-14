@@ -1,0 +1,19 @@
+[package]
+name = "weida-site"
+description = "The weida website, rendered from the repository's own documents"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# Not a library anyone depends on and not a protocol: a tool that renders this
+# repository's documents into the site at `homepage`. Publishing it to a
+# registry would offer a crate nobody can use for anything.
+publish = false
+
+[dependencies]
+pulldown-cmark.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
