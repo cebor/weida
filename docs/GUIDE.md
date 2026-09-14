@@ -17,18 +17,20 @@ are in the same chapter as the success case rather than in an appendix.
 
 1. **Every program here is a file in this repository, and a test drives that file.** The
    chapters do not carry snippets written for the page. `examples/guide_one_transfer.rs` is
-   chapter 1's program; `crates/weida/tests/guide.rs` includes it as a module and asserts the
-   claims the chapter makes. A claim added to this document without a program and an assertion
-   fails `every_claim_the_chapter_makes_has_a_program_and_a_test`.
+   chapter 1's program and `examples/guide_many_peers.rs` is chapter 2's;
+   `crates/weida/tests/guide.rs` includes each as a module and asserts the claims its chapter
+   makes. A claim added to this document without a program and an assertion fails
+   `every_claim_the_chapters_make_has_a_program_and_a_test`.
 2. **No number here is an estimate.** Measured figures name the item that measured them
    ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4); arithmetic derived from them says so in the
    sentence. Where nothing has been measured, the guide says *that* instead of guessing — and
-   §0 has one such gap, named.
+   §0.4 names the gaps.
 
-Run chapter 1 before reading it:
+Run the chapters before reading them:
 
 ```text
 cargo run -p weida --example guide_one_transfer
+cargo run -p weida --example guide_many_peers   # --release for the timing figures
 cargo test -p weida --test guide
 ```
 
@@ -61,24 +63,40 @@ The measured pieces, all from this repository's own runs on one desktop machine
 | Bytes on the wire for that message | **135 B** frame for 64 B of payload | B-009 |
 | Resident memory per live connection, both ends together | **750-850 KiB** | B-011 |
 | Cold handshake | **1.04-1.10 ms**; a pooled dial 3.8 µs | B-011 |
-| Subscriber byte budget, default | **8 MiB** per subscriber | `Limits` |
+| Publish cost at 256 subscribers | **22.94 µs** per message → **88.8 ns per subscriber** | B-247 |
+| Fan-out delivery rate at 256 subscribers | **276-279 Kcopies/s** | B-247 |
+| Transport state per subscriber, both ends | **396-436 KiB** | B-247 |
+| Latency to a subscriber at width 256, idle | **507-539 µs** median, **816-989 µs** p99 | B-247 |
 | Topic filter match | **14 ns**, shape-independent | B-021 |
 
-Everything below is **arithmetic on those numbers**, not a measurement.
+Everything below is **arithmetic on those numbers**, and says so where it is.
 
 **One sender cannot do it.** 8·10⁹ ÷ 179,400 ≈ **12.4 hours** for one producer to hand out one
 message each. So the shape has to be a tree, and the only question is how wide and how deep.
 
-**How wide can one node be?** A fan-out node pays two things per subscriber: transport state,
-and the byte budget its slow-reader policy reserves. At the measured ~400 KiB per side and the
-default 8 MiB budget, a node with 64 GiB of memory holds on the order of **10³ to 10⁴**
-subscribers — 10³ comfortably, 10⁴ only with the budget cut to about a megabyte, which is a
-configuration decision and not a code change ([PATTERNS.md](PATTERNS.md) §4). Call the width
-*d* ∈ [10³, 10⁴].
+**How wide can one node be?** Not a memory question, which is the first thing the measurement
+corrected. At **396-436 KiB** of transport state per subscriber, 64 GiB holds on the order of
+**1.5·10⁵** of them, and the publisher's CPU is no obstacle either: 88.8 ns per subscriber is
+**0.9 ms** of work to hand one message to 10⁴ subscribers. What binds is the **delivery rate**,
+276-279 Kcopies/s measured at width 256:
+
+| Width *d* | One message to all of them | Messages per second that width sustains |
+| --- | --- | --- |
+| 10³ | ~3.6 ms | ~276 |
+| 10⁴ | ~36 ms | ~27 |
+| 10⁵ | ~360 ms | ~2.8 |
+
+So the width is a **choice against a message rate** rather than a ceiling: a node serves 10³
+subscribers at a few hundred messages a second, or 10⁴ at tens. Call the width *d* ∈ [10³, 10⁴]
+— the same interval the first version of this section derived from memory, for an entirely
+different reason.
 
 **Then the depth is tiny.** log(8·10⁹) ÷ log(10³) ≈ 3.3, and ÷ log(10⁴) ≈ 2.5. So
 
 > **two to four hops reach everybody.**
+
+At *d* = 10⁴ that is **8·10⁵ leaf nodes**, 80 above them and one root; the leaf hop spends
+36 ms of its delivery capacity on the message and the whole path is **~0.1 s** of fan-out work.
 
 That single line is why this project's design decisions look the way they do. The scaling
 problem at C8B is not throughput — 8·10⁹ ÷ 179,400 ÷ 10⁶ nodes is microseconds of work per
@@ -114,7 +132,12 @@ that matters — a 4 GiB payload crosses with **14.4 MiB of peak resident memory
 **Fan-out drops and counts; it never blocks.** One slow subscriber out of 10⁴ must not stall the
 other 9,999, so a publisher's answer to overload is a counted drop rather than backpressure
 ([PATTERNS.md](PATTERNS.md) §4) — and the count is per topic and per cause, because "something
-was dropped" is not an operational answer.
+was dropped" is not an operational answer. What a stalled subscriber costs the publisher is
+measured on both sides of the crossover the defaults put at a **32 KiB** message: below it the
+queue refuses first (0.34-1.19 MiB held per stalled subscriber at 1 KiB), above it the byte
+budget does (9.3-10.7 MiB at 64 KiB), and the counter says which
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-247). Chapter 2 §2.3 is that experiment as a
+program.
 
 ### 0.3 What the arithmetic says about the bytes
 
@@ -134,10 +157,17 @@ it here rather than leaving a reader to discover it with a packet capture.
 
 Honesty is part of the method, so the gaps are named where the arithmetic needs them:
 
-- **The fan-out width above is derived, not measured.** Nothing in this repository has measured
-  a publisher at 10³ or 10⁴ subscribers; the largest measured fan-out is **eight** (65.2 µs to
-  publish and drain 1 KiB to 8 subscribers, B-021's bench). The width *d* is the single number
-  the whole depth argument rests on, and it is filed as B-247 for exactly that reason.
+- **The width is measured to 256 subscribers, and *d* is 10³ to 10⁴.** B-247 replaced the
+  derivation this section used to carry, but it replaced it with a measurement one order of
+  magnitude below the number the depth argument uses: 256 subscribers on one desktop, both ends
+  in one process, over loopback. The per-subscriber cost is flat from 16 to 256 — 396-436 KiB
+  and a falling CPU cost per subscriber — which is the shape that extrapolates, and an
+  extrapolation is what it remains. What a real 10⁴-subscriber node does with **one** network
+  interface, across hosts, is not known here.
+- **Nothing is measured across machines at all.** Every number in the table above is loopback
+  with both ends in one process, which is the right way to isolate this library's own cost and
+  the wrong way to learn what a deployment does: it has no propagation delay, no NIC, no packet
+  loss, and a congestion controller that never sees a real bottleneck.
 - **Federation across organisations is unbuilt.** Two to four hops inside one operator's
   network is the easy reading of §0.1. Eight billion people are not one operator's network, and
   what a hop between two *administrations* may claim is a question [0006](decisions/0006-guarantee-sets.md)
@@ -340,14 +370,196 @@ What to take from it:
 Chapter 1 is one transfer between two peers. Nothing in it is wrong at scale, and nothing in it
 is *enough* at scale:
 
-- one peer per side, so no selection policy, no fan-out, no drops;
+- one peer per side, so no selection policy, no fan-out, no drops — chapter 2;
 - both ends in one process on loopback, so no reconnection and no partition;
 - no hop in the middle, so responsibility never transfers;
 - nothing durable, so no restart survives anything.
 
-Those are the next chapters, and they are filed rather than written: this document grows one
-chapter per slice, each with its programs and its assertions, because a guide whose examples do
-not run is worse than no guide ([decisions/0025](decisions/0025-the-website.md) §2 is the same
-argument about a landing page). The arc is in
+The rest are filed rather than written: this document grows one chapter per slice, each with
+its programs and its assertions, because a guide whose examples do not run is worse than no
+guide ([decisions/0025](decisions/0025-the-website.md) §2 is the same argument about a landing
+page). The arc is in
 [decisions/0026](decisions/0026-the-guide-and-the-c8b-question.md) §4.4, and the backlog holds
 the slices.
+
+---
+
+## 2. Many peers, and the drop
+
+The program: `examples/guide_many_peers.rs`. The test: the same `crates/weida/tests/guide.rs`.
+
+One peer on each side is the only configuration in which a send has no policy. From two peers
+on, every pattern answers the same three questions — **which peer, what if it cannot keep up,
+and who else is affected** — and the answers differ per pattern on purpose. This chapter is
+those answers, and it is where the C8B arithmetic of §0.1 gets its numbers.
+
+### 2.1 Selection is the pattern's, not the call's
+
+**Claim §2.1: the pattern chooses the peer set; the call does not change.**
+
+The program connects one sender to three peers three times over, and sends the same way each
+time:
+
+```text
+6 pushes over 3 pullers:      [2, 2, 2]
+2 publishes to 3 subscribers: [2, 2, 2]
+3 BUS members, one send each: [2, 2, 2]   <- never itself
+```
+
+Three policies, one call shape:
+
+| Pattern | Who gets it | Mechanism |
+| --- | --- | --- |
+| Push | **one** live peer per send, rotating | one `fetch_add` on a cursor, `crates/weida/src/stream.rs` |
+| Pub/Sub | **every** subscriber whose filter matches the topic | one stream per subscriber per message |
+| BUS | **every** member except the sender | one writer per joined member |
+
+Nothing at the call site selects a policy, and that is the design: `pusher.send(&body)` and
+`publisher.publish(topic, body)` are the same statement about one message, and the peer set is
+a property of the endpoint you built ([PATTERNS.md](PATTERNS.md) §3, §4, §7). ZeroMQ readers
+will recognise this exactly — it is `zmq_socket(3)`'s socket-type table, with the type chosen
+by a factory call instead of a constant.
+
+The round-robin is worth one sentence more, because it is the one people assume wrongly: it
+rotates over **live peers at the moment of the send**, so a peer that died is skipped rather
+than waited for, and a peer that arrives joins the rotation. There is no hashing, no affinity,
+and no ordering across peers — a Push fan-in is a work queue, not a partitioned log.
+
+### 2.2 A subscriber that stops reading
+
+**Claim §2.2: a subscriber that stops reading costs its neighbour nothing — and costs itself
+nothing either, until the publisher outruns its transport.**
+
+Two subscribers at the default limits. One drains; the other never calls `recv` once. The
+program runs the publisher twice over the same pair:
+
+```text
+paced:    512 published, all 512 enqueued for both, the reader got 512, 0 dropped
+flat out: 1537 more absorbed by a subscriber that has never read, then 1 dropped, cause: the queue
+```
+
+**The first line is the isolation claim, and it is the whole argument for a stream per
+subscriber.** The reading subscriber received every message while its neighbour read nothing at
+all. In a design with one queue per socket, the silent subscriber's backlog is the reader's
+problem; here it is not, because each subscriber has its own stream, its own queue and its own
+byte budget ([PATTERNS.md](PATTERNS.md) §1.3). What that isolation costs is measured in B-247
+and quoted in §2.4.
+
+**The second line is the part that surprises people, including the author of this program.**
+A subscriber that has read nothing for two megabytes loses nothing at all while the publisher
+is paced — and the reason is that a publisher's byte budget is released when the bytes reach
+the **wire**, not when somebody reads them. QUIC absorbs the difference. The loss starts only
+when the publisher outruns the silent subscriber's *transport*, which on this machine took
+another ~1500 messages.
+
+> **Overload is a rate, not a backlog.**
+
+That sentence is why the drop counters are per cause rather than per subscriber, and why the
+first two versions of this program measured the wrong thing: a paced publisher reported zero
+drops for a subscriber that had read nothing, and a tiny budget starved the reader as well as
+the silent one. Both attempts are in the program's doc comment, because the mistakes are more
+instructive than the result.
+
+### 2.3 Which ceiling binds, and how you know
+
+**Claim §2.3: a stalled subscriber is bounded twice, and the counter says which bound it hit.**
+
+A subscriber costs a publisher two bounded resources: `endpoint_queue` **messages** and
+`Limits::subscriber_buffer_bytes` of **payload**. Which one refuses first is not a matter of
+taste, and it is not the payload size either:
+
+```text
+budget   64 KiB:   321 messages ( 321 KiB) accepted, then the byte budget
+budget 8192 KiB:  1665 messages (1665 KiB) accepted, then the queue
+```
+
+One variable, two outcomes, and the mechanism is QUIC. A copy's budget permit is released when
+its bytes reach the wire, and a connection absorbs a window's worth before it stops — 0.6 to
+1.5 MiB on this machine. So a budget **below** that band is spent while QUIC is still
+accepting, and the budget refuses; a budget **above** it never fills, because the wire stops
+the writer first and then the queue backs up. `benches/fanout.rs` sees the same thing at the
+defaults (B-247): the 8 MiB default means the **queue** is what refuses, at 1153-1537 messages
+of 1 KiB.
+
+**The operational point is the counter, not the rule.** `dropped_on(topic)` separates
+`subscriber_budget` from `subscriber_queue` from `no_parked_connection`, so a starving
+subscriber is a lookup rather than a packet capture — and the two answers mean different
+remedies: a budget refusal wants a bigger budget or a smaller payload, a queue refusal wants a
+faster consumer or a deeper queue. "Messages are being dropped" is not an operational answer,
+which is why this API does not offer it.
+
+What a stalled subscriber costs in **memory** is the second half, measured in B-247: 0.34-1.19
+MiB resident per stalled subscriber at a 1 KiB payload, 9.3-10.7 MiB at 64 KiB. And one
+correction that a reader sizing a node will want: `subscribers × subscriber_buffer_bytes`
+**overstates** the cost, because one `publish` is one `Bytes` that every copy shares. The
+budget is an accounting bound; the resident cost is one payload per distinct message.
+
+### 2.4 What width costs the publisher
+
+**Claim §2.4: the publisher's cost per message grows with the width, and its cost per
+subscriber falls.**
+
+The program prints its own numbers — in a debug build unless you pass `--release`, and it says
+so. The figures worth quoting are the benchmark's, from B-247
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4), because they are release builds over three runs:
+
+| Width | One publish | Per subscriber | Idle latency, median | Transport state per subscriber |
+| --- | --- | --- | --- | --- |
+| 1 | **287 ns** | — | 34.7-37.9 µs | 1.63-1.76 MiB (includes the one-off endpoint state) |
+| 16 | **3.04 µs** | 184 ns | 76.2-77.8 µs | 402-418 KiB |
+| 256 | **22.94 µs** | **88.8 ns** | 507-539 µs | 396-436 KiB |
+
+Three things to take from that table.
+
+**The marginal cost per subscriber falls as the width grows** — 184 ns at 16 against 88.8 ns at
+256 — because the fixed cost of a publish is amortized and the registry walk gets its cache.
+So the number to plan with is the wide one, and a node's publisher CPU at 10⁴ subscribers is
+about **0.9 ms per message**.
+
+**Neither memory nor CPU is what limits the width.** At ~420 KiB per subscriber, 64 GiB of
+transport state is on the order of 1.5·10⁵ subscribers. What binds is the delivery rate:
+**276-279 Kcopies/s**, so one message to 10⁴ subscribers spends ~36 ms of a node's capacity and
+one to 10³ spends ~3.6 ms. §0.1's width table is that division, and it is the reason the C8B
+arithmetic has a width of 10³-10⁴ rather than 10⁵.
+
+**A wide publisher is not a slow publisher, it is a *late* one.** The median latency at width
+256 is 507 µs against 35 µs at width 1 — fourteen times worse, on an idle machine, with
+nothing else running. A subscriber at the far end of a wide fan-out waits for the publisher to
+get to it, and the only structural answer is another hop, which is §0.1's depth.
+
+### 2.5 A peer that never answers
+
+**Claim §2.5: a survey is a fan-out with a deadline, so a silent peer is a number rather than a
+hang.**
+
+Push rotates past a dead peer and Pub/Sub drops a copy, but neither has to answer the hardest
+version of the question: what if a peer takes the message and then says nothing? SURVEY is the
+pattern that must, and its answer is the deadline the caller passes:
+
+```text
+asked 3, answered 2, silent 1 within the deadline
+```
+
+The silent respondent in that program is not unreachable, not refusing and not slow to connect
+— it completed the handshake, accepted the question and held it. The surveyor returns what
+arrived, `late()` counts what arrived after the deadline, and `respondents()` says how many
+were asked ([PATTERNS.md](PATTERNS.md) §5). No configuration, no retry policy, no circuit
+breaker: **the deadline is the caller's and the result is a count**.
+
+That shape is the pattern's whole contribution, and it is worth naming because the alternative
+is so common: a fan-out that waits for everybody has its availability set by its worst member,
+which at C8B scale is a certainty rather than a risk.
+
+### 2.6 What this chapter does not tell you
+
+- **Every number here is one process on loopback.** No propagation delay, no NIC, no loss, and
+  a congestion controller that never sees a real bottleneck (§0.4).
+- **The widest fan-out measured anywhere in this repository is 256.** The C8B arithmetic uses
+  10³-10⁴, which is an extrapolation from a flat per-subscriber cost between 16 and 256 (§0.4).
+- **A drop is invisible to the subscriber here.** It need not be: the sequence key of
+  [PROTOCOL.md](PROTOCOL.md) §6.2 and the `PerProducer` detect level turn a fan-out drop into a
+  reported `Gap`, and [PATTERNS.md](PATTERNS.md) §4 has the mechanism. It is implemented and
+  this chapter does not teach it yet.
+- **Nothing here takes responsibility for a message.** Every peer in this chapter forgets
+  immediately, which is the next question rather than an omission — a hop that takes
+  responsibility is chapter 3, and it needs a queue that survives its consumer.

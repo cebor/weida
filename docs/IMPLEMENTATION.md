@@ -1364,6 +1364,77 @@ replaced would have been ~0.5 ns per comparison in isolation, so a hot-path-only
 have preferred it; what it could not do is express a segment boundary at all, which is the
 trade 0007 recorded and these numbers price.
 
+### Verified results — per-subscriber fan-out at width (B-247)
+
+The number the whole C8B argument of [GUIDE.md](GUIDE.md) §0.1 rests on, and the one this
+repository had never taken: before this item the largest fan-out ever measured here was
+**eight** subscribers (B-021's table above), while [PATTERNS.md](PATTERNS.md) §1.3 makes an
+isolation claim — a stream nobody reads does not delay its siblings — whose whole point is
+that it holds at width.
+
+`crates/weida/benches/fanout.rs`, one client runtime per subscriber as in B-011, both ends in
+this process, loopback QUIC, `RuntimeConfig::default()`, 1 KiB payload, release profile, three
+consecutive runs on the same idle desktop. The publisher's own cost is a criterion
+distribution; latency and memory are set measurements printed by the bench, because a *set* of
+subscribers has no criterion shape — the same reason B-011's memory figures are printed.
+
+**Two latencies are reported and they differ by two orders of magnitude**, which is why the
+first version of this bench was wrong: publishing 64 messages back to back and then measuring
+arrival gives the backlog, not the path. The *idle* figure publishes one message and waits for
+every copy before the next; the *burst* figure publishes 64 without waiting. Both are below,
+labelled.
+
+| Measured | Command | Result |
+| --- | --- | --- |
+| Publish cost, width 1 | `cargo bench -p weida --bench fanout` | **287 ns** (282-294 ns) per call |
+| Publish cost, width 16 | same | **3.04 µs** (3.01-3.08 µs) |
+| Publish cost, width 256 | same | **22.94 µs** (22.78-23.12 µs) → **88.8 ns per additional subscriber** against width 1 |
+| Idle latency, width 1 | same | **34.7-37.9 µs** median, **79-98 µs** p99 |
+| Idle latency, width 16 | same | **76.2-77.8 µs** median, **142-494 µs** p99 |
+| Idle latency, width 256 | same | **507-539 µs** median, **816-989 µs** p99, **0.91-1.22 ms** max |
+| Burst drain, width 256 | same | 64 messages enqueued in **1.6-1.9 ms**, 16 384 copies delivered in **58.7-59.4 ms** → **276-279 Kcopies/s**; burst latency **20.6-22.4 ms** median |
+| Transport state per subscriber | same | **396-436 KiB** at widths 16 and 256, covering **both** ends; width 1 is 1.63-1.76 MiB because it also pays the one-off crypto and endpoint state, exactly as B-011 saw |
+| Drops while every subscriber keeps up | same | **zero**, at every width, asserted by the bench rather than observed |
+
+**The per-subscriber publish cost falls as the width grows.** 184 ns per subscriber at width 16
+against **88.8 ns** at 256: the fixed cost of a publish is amortized and the registry walk gets
+its cache. So the number to plan with at scale is the larger width's, and a fan-out node's
+publisher CPU is **~0.9 ms per message at 10⁴ subscribers** — arithmetic, from 88.8 ns.
+
+**Which of the two ceilings binds is a function of the payload, and both sides are measured.**
+A subscriber that stalls is bounded by its queue (`RuntimeConfig::endpoint_queue`, 256
+messages) and by its byte budget (`Limits::subscriber_buffer_bytes`, 8 MiB). Those cross where
+the message size is `8 MiB / 256` = **32 KiB**, so the bench stalls 16 subscribers on each side
+of that and reports the drop **cause** from `dropped_on`:
+
+| Payload | Messages accepted before the first drop | Held, per stalled subscriber | Bound reached |
+| --- | --- | --- | --- |
+| 1 KiB | **1153-1537** | **0.34-1.19 MiB** resident | **the queue** (`subscriber_queue`, budget counter zero) |
+| 64 KiB | **219-281** | **9.3-10.7 MiB** resident | **the byte budget** (`subscriber_budget`, queue counter zero) |
+
+Three things follow, and the third is the one that matters for sizing a node.
+
+First, **the accepted count is throughput to first refusal, not held bytes**: a budget permit
+is released when the copy leaves the queue for its stream, so a stalled subscriber absorbs
+15-17 MiB of 64 KiB messages against an 8 MiB budget before anything is dropped — the rest is
+in quinn's send state and the peer's receive state. The resident column is the cost; the
+accepted column is the tolerance.
+
+Second, **the budget is an accounting bound and not a memory bound.** One `publish` is one
+`Bytes` allocation that every copy shares, so 16 stalled subscribers at 1 KiB accounted
+18-24 MiB of budget while holding 5.4-19.0 MiB resident *in total* — the resident cost is one
+payload per distinct message, not one per copy. Sizing a node by `width × subscriber_buffer_bytes`
+overstates it by the width.
+
+Third, **the fan-out width one node holds is bounded by copies per second, not by memory.**
+At 402-436 KiB per subscriber, 64 GiB of transport state is on the order of 1.5·10⁵
+subscribers; at 88.8 ns of publisher CPU per subscriber, 10⁴ subscribers is 0.9 ms per message.
+Neither binds at 10⁴. The delivery rate does: **276-279 Kcopies/s** means one message to 10⁴
+subscribers takes **~36 ms** of a node's delivery capacity and one message to 10³ takes
+**~3.6 ms**, so a node at width 10⁴ sustains about **27 messages per second** and one at width
+10³ about **276**. That is the number a topology is designed against, and it is not the one the
+guide's first derivation used.
+
 ### Verified results — the dedup key's allocation per call (B-040)
 
 `DedupWindow::is_duplicate` builds its lookup key with `scope: scope.into()`, which allocates

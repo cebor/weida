@@ -78,5 +78,11 @@ harness = false
 name = "transports"
 harness = false
 
+# What per-subscriber fan-out costs at width (B-247): the number the guide's
+# C8B arithmetic rests on.
+[[bench]]
+name = "fanout"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"

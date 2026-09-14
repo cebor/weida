@@ -1,19 +1,27 @@
 //! The guide's claims, asserted against the guide's own programs.
 //!
 //! `docs/GUIDE.md` §1 makes five claims and `examples/guide_one_transfer.rs`
-//! is the program that demonstrates each. This file drives **that** file,
-//! included as a module, so what is asserted is the code a reader runs and
-//! not a second copy of it written to be testable — the discipline
-//! `crates/zmq/weida-zmq/tests/zguide_pirates.rs` already applies to the
-//! zguide's recipes.
+//! is the program that demonstrates each; §2 makes five more and
+//! `examples/guide_many_peers.rs` is that chapter's program. This file drives
+//! **those** files, included as modules, so what is asserted is the code a
+//! reader runs and not a second copy of it written to be testable — the
+//! discipline `crates/zmq/weida-zmq/tests/zguide_pirates.rs` already applies
+//! to the zguide's recipes.
 //!
-//! One of the five claims is a **race**, and it is asserted as one: a
+//! One of chapter 1's claims is a **race**, and it is asserted as one: a
 //! one-way transfer to a path nobody serves may be reported delivered,
 //! because the FIN can be acknowledged before the dispatcher's refusal
 //! travels back ([decisions/0005](../../../docs/decisions/0005-refusal-race.md)).
 //! Pinning either side of that would be pinning a coin flip; what the test
 //! pins is the guarantee that survives it — the answer is never
 //! `Indeterminate`, and the same misroute as an exchange is definite.
+//!
+//! Chapter 2's claims are about a fan-out, where the same discipline applies
+//! to **rates**: how many messages a stalled subscriber absorbs before the
+//! first loss is a property of the connection on the day, so the tests assert
+//! the *mechanism* — that nothing is dropped while the publisher is paced,
+//! that something is once it is not, and which counter names it — and print
+//! the numbers rather than pinning them.
 
 mod common;
 
@@ -25,6 +33,11 @@ use weida::Error;
 #[allow(dead_code)]
 mod guide_one_transfer;
 
+#[path = "../examples/guide_many_peers.rs"]
+#[allow(dead_code)]
+mod guide_many_peers;
+
+use guide_many_peers::{ceilings, selection, slow_reader, survey_with_a_silent_peer, width};
 use guide_one_transfer::{Outcome, STREAMED, gigabyte, hello, how_far, outcome, receipt_cost};
 
 /// Generous ceiling: the streaming claim moves 64 MiB twice over loopback.
@@ -127,16 +140,163 @@ async fn both_send_shapes_deliver_and_one_of_them_waits() {
     );
 }
 
-/// The guide's own rule, checked against the guide: every claim §1 makes is
-/// one of the tests above.
+/// Claim §2.1: the pattern chooses the peer set; the call does not change.
 ///
-/// Not a test of prose — a test of the **count**. `docs/GUIDE.md` §1 numbers
-/// its claims `§1.1` to `§1.5`, and each is a `pub` entry point in
-/// `examples/guide_one_transfer.rs`. A sixth claim added to the document
-/// without a program and a test fails here, which is the only mechanism that
-/// keeps a guide from drifting into prose nobody runs.
+/// Every number here is structural rather than timed: six pushes over three
+/// pullers is two each because the selection cursor is one `fetch_add` per
+/// send, a publish reaches every matching subscriber, and a bus member reaches
+/// every other member and never itself.
+#[tokio::test]
+async fn the_pattern_chooses_the_peer_set() {
+    let selected = within(selection()).await.expect("the three fan-outs");
+    assert_eq!(
+        selected.push_per_peer,
+        vec![2, 2, 2],
+        "round-robin over three peers divides six messages evenly"
+    );
+    assert_eq!(
+        selected.fanout_per_subscriber,
+        vec![2, 2, 2],
+        "a publish reaches every subscriber whose filter matches"
+    );
+    assert_eq!(
+        selected.bus_per_member,
+        vec![2, 2, 2],
+        "three members, one send each, and nobody hears itself"
+    );
+}
+
+/// Claim §2.2: a subscriber that stops reading costs its neighbour nothing,
+/// and costs itself nothing until the publisher outruns its transport.
+///
+/// The mechanism is asserted, the rate is printed. How many messages the
+/// silent subscriber absorbs before the first loss depends on the connection's
+/// in-flight capacity on the day, so pinning it would pin a machine.
+#[tokio::test]
+async fn a_silent_subscriber_costs_its_neighbour_nothing() {
+    let slow = within(slow_reader()).await.expect("the two phases");
+    assert_eq!(
+        slow.healthy_received, slow.published,
+        "the reading subscriber lost nothing while its neighbour read nothing at all"
+    );
+    assert_eq!(
+        slow.reached_both, slow.published,
+        "the silent subscriber never left: every copy was enqueued for both"
+    );
+    assert_eq!(
+        slow.dropped_while_paced, 0,
+        "a paced publisher loses nothing, however far behind a subscriber is"
+    );
+    assert!(
+        slow.absorbed > 0,
+        "the unpaced phase published at least one message"
+    );
+    assert!(
+        slow.dropped > 0 && slow.cause != "nothing was dropped",
+        "an unpaced publisher outruns a silent subscriber and the loss is counted by cause: \
+         {slow:?}"
+    );
+    println!(
+        "§2.2 paced {} of {} received, then {} absorbed before the first drop on {}",
+        slow.healthy_received, slow.published, slow.absorbed, slow.cause
+    );
+}
+
+/// Claim §2.3: the two ceilings are distinguishable, and which one refuses
+/// follows from the budget rather than from the payload.
+///
+/// Structural, not timed: a budget an order of magnitude below the
+/// connection's in-flight capacity must be exhausted while QUIC is still
+/// accepting, and one an order of magnitude above it cannot be, so the queue
+/// is what backs up. Both directions are asserted because a change that broke
+/// either would make `dropped_on` lie.
+#[tokio::test]
+async fn each_ceiling_names_itself_when_it_is_the_one_that_binds() {
+    let found = within(ceilings()).await.expect("both budgets");
+    assert_eq!(found.len(), 2, "one row per budget");
+    assert_eq!(
+        found[0].bound, "the byte budget",
+        "a 64 KiB budget is spent before QUIC stops accepting: {:?}",
+        found[0]
+    );
+    assert_eq!(
+        found[1].bound, "the queue",
+        "an 8 MiB budget outlasts the connection's capacity, so the queue fills: {:?}",
+        found[1]
+    );
+    assert!(
+        found[0].bytes >= found[0].budget,
+        "the budget was actually reached: {:?}",
+        found[0]
+    );
+    println!(
+        "§2.3 {} KiB budget -> {} after {} KiB; {} KiB budget -> {} after {} KiB",
+        found[0].budget >> 10,
+        found[0].bound,
+        found[0].bytes >> 10,
+        found[1].budget >> 10,
+        found[1].bound,
+        found[1].bytes >> 10
+    );
+}
+
+/// Claim §2.4: the publisher's cost per message grows with the width, and
+/// every copy still arrives.
+///
+/// The arrival count and the drop count are asserted; the timing is printed.
+/// One timing comparison is safe enough to assert because it spans a factor of
+/// five and is structurally necessary — a publish to 32 subscribers does 32
+/// times the enqueueing of a publish to one.
+#[tokio::test]
+async fn width_costs_the_publisher_and_loses_nothing() {
+    let widths = within(width(&[1, 32], 16)).await.expect("both widths");
+    assert_eq!(widths.len(), 2);
+    for measured in &widths {
+        assert_eq!(
+            measured.copies,
+            measured.subscribers * 16,
+            "every subscriber received every message: {measured:?}"
+        );
+        assert_eq!(measured.dropped, 0, "nobody was starved: {measured:?}");
+    }
+    assert!(
+        widths[1].per_publish > widths[0].per_publish,
+        "a publish to 32 subscribers costs more than a publish to one: {widths:?}"
+    );
+    println!(
+        "§2.4 {:?} at width {}, {:?} at width {}",
+        widths[0].per_publish, widths[0].subscribers, widths[1].per_publish, widths[1].subscribers
+    );
+}
+
+/// Claim §2.5: a survey is a fan-out with a deadline, so a silent peer is a
+/// number rather than a hang.
+#[tokio::test]
+async fn a_silent_respondent_is_a_number() {
+    let surveyed = within(survey_with_a_silent_peer())
+        .await
+        .expect("the survey");
+    assert_eq!(surveyed.asked, 3);
+    assert_eq!(
+        surveyed.answered, 2,
+        "the two answering respondents answered inside the deadline"
+    );
+    assert_eq!(
+        surveyed.missing, 1,
+        "the respondent that accepted the question and never answered is a count, not a stall"
+    );
+}
+
+/// The guide's own rule, checked against the guide: every claim a chapter
+/// makes is one of the tests above.
+///
+/// Not a test of prose — a test of the **count**. Each chapter numbers its
+/// claims `§N.1` upward, and each is a `pub` entry point in that chapter's
+/// example. A claim added to the document without a program and a test fails
+/// here, which is the only mechanism that keeps a guide from drifting into
+/// prose nobody runs.
 #[test]
-fn every_claim_the_chapter_makes_has_a_program_and_a_test() {
+fn every_claim_the_chapters_make_has_a_program_and_a_test() {
     let guide = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/GUIDE.md")
@@ -145,21 +305,27 @@ fn every_claim_the_chapter_makes_has_a_program_and_a_test() {
     )
     .expect("read the guide");
 
-    let claims: Vec<&str> = guide
-        .lines()
-        .filter(|line| line.starts_with("**Claim §1."))
-        .collect();
-    assert_eq!(
-        claims.len(),
-        5,
-        "chapter 1 states these claims, and this file asserts five of them: {claims:?}"
-    );
-    for (n, claim) in claims.iter().enumerate() {
-        let expected = format!("**Claim §1.{}", n + 1);
-        assert!(
-            claim.starts_with(&expected),
-            "the claims are numbered in order; expected {expected}, found {claim}"
+    // One row per written chapter: the chapter number and how many claims this
+    // file asserts for it.
+    for (chapter, asserted) in [(1usize, 5usize), (2, 5)] {
+        let prefix = format!("**Claim §{chapter}.");
+        let claims: Vec<&str> = guide
+            .lines()
+            .filter(|line| line.starts_with(&prefix))
+            .collect();
+        assert_eq!(
+            claims.len(),
+            asserted,
+            "chapter {chapter} states these claims, and this file asserts {asserted} of them: \
+             {claims:?}"
         );
+        for (n, claim) in claims.iter().enumerate() {
+            let expected = format!("**Claim §{chapter}.{}", n + 1);
+            assert!(
+                claim.starts_with(&expected),
+                "the claims are numbered in order; expected {expected}, found {claim}"
+            );
+        }
     }
 }
 

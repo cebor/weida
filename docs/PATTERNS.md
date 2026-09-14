@@ -500,6 +500,27 @@ subscriber as a `Gap`.
 `a_dropped_fan_out_copy_shows_up_as_a_gap`,
 `a_full_hold_reports_the_pub_sub_drop_it_was_waiting_for`.*
 
+**What the width costs, measured** (B-247, [IMPLEMENTATION.md](IMPLEMENTATION.md) §4). The
+per-subscriber stream above is what buys the isolation one shared queue per socket cannot, and
+until B-247 nothing here priced it beyond eight subscribers. At 1 KiB on loopback with both
+ends in one process: **396-436 KiB** of transport state per subscriber, **88.8 ns** of
+publisher CPU per subscriber per message (22.94 µs for a publish at width 256, against 287 ns
+at width 1), **276-279 Kcopies/s** delivered, and a median idle latency of **507-539 µs** at
+width 256 against 34.7-37.9 µs at width 1. The consequence for sizing: neither memory nor the
+publisher's CPU binds at 10⁴ subscribers — the delivery rate does, at about **27 messages per
+second** to 10⁴ subscribers or **276** to 10³.
+
+**Which ceiling a stalled subscriber reaches is a function of the payload**, and both sides are
+measured. A subscriber that stops reading is bounded twice, by `endpoint_queue` messages and by
+`subscriber_buffer_bytes` of payload, so the two cross where the message size is
+`subscriber_buffer_bytes / endpoint_queue` — **32 KiB** at the defaults. Below it the queue
+refuses first and the publisher holds **0.34-1.19 MiB** per stalled subscriber; above it the
+budget refuses first and the publisher holds **9.3-10.7 MiB**. `dropped_on(topic)` distinguishes
+the two causes, which is what makes this diagnosable in production rather than in a benchmark.
+One correction that follows: sizing a publisher by `subscribers × subscriber_buffer_bytes`
+overstates it, because one `publish` is one `Bytes` that every copy shares — the budget is an
+accounting bound and the resident cost is one payload per distinct message.
+
 ### 4.1 Streaming fan-out: a payload the publisher never holds
 
 `Publisher::open(topic)` returns a `FanOut`: one stream per matched subscriber, written
