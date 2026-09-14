@@ -125,12 +125,12 @@ main {
   flex: 1 1 auto;
   min-width: 0;
   max-width: var(--measure);
-}
-
-main h1 {
-  font-size: 1.9rem;
-  line-height: 1.25;
-  margin: 0 0 1rem;
+  /* The documents name their own tests, and a name like
+     `a_zmtp_multipart_is_refused_at_the_first_hop_and_never_reaches_the_second`
+     is one word. Without this it sets the minimum width of the whole column
+     and pushes the prose off a phone's screen; `pre` keeps its own scroll
+     bar instead, because breaking a line of bytes would be a lie. */
+  overflow-wrap: break-word;
 }
 
 main h2 {
@@ -240,15 +240,23 @@ footer {
 }
 
 @media (max-width: 55rem) {
+  /* `align-items: flex-start` is what keeps the sidebar from stretching in
+     the two-column layout, and it is exactly wrong once the layout is a
+     column: a flex-start item sizes to its own content, so `main` came out
+     612 px wide inside a 430 px viewport and the prose ran off the screen. */
   .frame {
     flex-direction: column;
+    align-items: stretch;
     gap: 1rem;
   }
 
+  /* Fifty-two entries above the prose would bury it on a phone: the nav
+     keeps its own scroll region so the document starts one screen in
+     rather than five. */
   nav {
     position: static;
     flex: 1 1 auto;
-    max-height: none;
+    max-height: 40vh;
     width: 100%;
     border-bottom: 1px solid var(--rule);
     padding-bottom: 1rem;
