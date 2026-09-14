@@ -6,10 +6,12 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `80928eb`, 2026-09-14 ~06:05 UTC. Tree clean, gate green on Linux:
-**1803 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+**Snapshot:** main `87cf7bb`, 2026-09-14 ~09:40 UTC. Tree clean, gate green on Linux:
+**1827 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
-plus `weida --features blocking` at **237**, 1 ignored.
+plus `weida --features blocking` at **237**, 1 ignored. The twenty-four new tests are the
+review round's regression tests: what each one kills is in the [NIGHTLOG](NIGHTLOG.md) entry
+for it, and eight of them were confirmed to fail on the code they replaced.
 The Windows 11 VM ran at `2a38c47`, nine tests back: **1772 across 136 binaries**, the same 37
 ignored, after two storage faults (`LNK1201`, then `STATUS_IN_PAGE_ERROR`) cleared by a
 `cargo clean` — §6 point 3, not a code problem. Add
@@ -181,7 +183,7 @@ other end.
 
 ## 6. What needs a human
 
-Three things, and only three:
+Four things:
 
 1. **A licence, and where this is published** (B-068, now `blocked`). `cargo package
    --workspace --no-verify` succeeds for all 24 crates and every one of them warns `manifest
@@ -205,25 +207,39 @@ Three things, and only three:
    and a 600 s job limit. The VM's storage also throws `STATUS_IN_PAGE_ERROR` mid-compile
    every few hours; each occurrence is a corrupted artifact cleared by hand, never a code
    problem.
+4. **Two decisions the review round filed rather than took**, because each changes what a peer
+   observes: whether every DATA header keeps paying for an unconditional 55-byte `traceparent`
+   (B-246 — it is the largest single item in a 135-byte frame for a 64-byte push, against
+   ZMTP's one to nine bytes and SP's eight, and no decision note justifies it), and which shape
+   closes the `AF_UNIX` reset loss (B-245 — per-write framing as the named-pipe transport has
+   it, or one end-of-stream marker per transfer and a nine-byte lookahead in the reader; the
+   kernel offers no third option, which was measured rather than assumed).
 
 ## 7. Where the loop stands
 
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1803 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  green at **1827 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
-  gate yet and were run by hand this session.
-- **9 items are `ready`, 14 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
+  gate yet and were run by hand this session. One caveat worth stating rather than hiding:
+  one full-workspace run out of twenty this session reported a single failure whose output the
+  measuring pipeline consumed, and nineteen runs — including eight at `--test-threads=32` —
+  did not reproduce it. It is recorded here so the next occurrence is captured rather than
+  rediscovered.
+- **16 items are `ready`, 14 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
   B-068, a licence and a publication target; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **240** filed items, **216 are `done`**, and the nine `ready` are three
+  tier by 0011 §4.3). Of **247** filed items, **216 are `done`**, and the `ready` ones are four
   kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231),
   **the surfaces this session's work has not reached yet** (B-243, the cursor API in the two
   Python halves; B-244, the three new patterns in `weida::blocking` and both Python halves),
-  and **two sentences in a file this loop does not write** (§6, B-107 and B-184). Nothing else is open: every
-  requirement-driven item, every library item and both binding slices of weida's own Python
-  surface are closed.
+  **seven findings the review round filed rather than fixed** (B-245 the `AF_UNIX` reset loss,
+  B-246 the unconditional `traceparent`, B-247 fan-out unpriced, B-248 the `unsafe` guard,
+  B-249 the parked-receipt sweep, B-250 the per-message header allocations, B-251 one refusal
+  table), and **two sentences in a file this loop does not write** (§6, B-107 and B-184).
+  Nothing else is open: every requirement-driven item, every library item and both binding
+  slices of weida's own Python surface are closed.
 - **The requirement-driven backlog is closed.** All five requests of
   [requirements/zeughaus-video.md](requirements/zeughaus-video.md) are answered where they were
   filed: streaming fan-out **built** (B-064, `Publisher::open`), conflation **answered without a
