@@ -15,12 +15,14 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 use weida_core::{Error, ErrorCode, Limits, LossCause, PeerIdentity};
-use weida_protocol::header::GuaranteeSet;
+use weida_protocol::header::{GuaranteeSet, MAX_CURSOR_RECORD_LEN};
 use weida_protocol::{
-    Agreed, CreditHeader, DataHeader, ErrorHeader, FrameKind, Hello, MAX_PREAMBLE_LEN, Preamble,
-    PreambleError, SubscriptionHeader, codes, encode_frame, negotiate, parse_preamble,
+    Agreed, CreditHeader, CursorHeader, DataHeader, ErrorHeader, FrameKind, Hello,
+    MAX_PREAMBLE_LEN, Preamble, PreambleError, SubscriptionHeader, codes, decode_cursor_record,
+    encode_frame, negotiate, parse_preamble,
 };
 
+use crate::cursor::CursorSet;
 use crate::dedup::DedupWindow;
 use crate::listener::{Namespace, Route};
 use crate::ordering::{GapDetector, Reassembler, Sequencer};
@@ -76,6 +78,12 @@ pub(crate) struct ConnCtx {
     /// Receipts of finished transfers on this connection that nobody is
     /// waiting on, for [`crate::Runtime::drain`].
     pub parked: crate::drain::ConnDrain,
+    /// Reports **this** side ordered: the ids handed out with a DATA header's
+    /// key `9`, and the channel each one's cursors arrive on
+    /// (`docs/PROTOCOL.md` §6.7). Bounded by the [`crate::Cursors`] handles
+    /// the application holds, so it needs no remote-facing cap: a peer can
+    /// only report on ids we allocated.
+    pub reports: crate::cursor::ReportTable,
     /// Counters and flags shared with every other connection of this
     /// runtime: the duplicate count and the drain's admission flag.
     pub shared: Arc<Shared>,
@@ -122,6 +130,7 @@ impl ConnCtx {
                 limits.max_dedup_entries,
             ),
             parked: crate::drain::ConnDrain::new(&limits, streams_are_local),
+            reports: crate::cursor::ReportTable::new(),
             shared,
             agreed: agreed_rx,
         });
@@ -499,11 +508,12 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
         FrameKind::Subscribe => handle_subscription(ctx, &header, true).await,
         FrameKind::Unsubscribe => handle_subscription(ctx, &header, false).await,
         FrameKind::Credit => handle_credit(ctx, &header).await,
-        // A report for an id this side never handed out: reset the stream and
-        // keep the connection ([`refuse_cursor`]).
+        // A report about a transfer we sent on this connection. Both
+        // dispatchers route it to the same place, so QUIC, inproc and the two
+        // grouped local transports share one implementation.
         FrameKind::Cursor => {
             drop(send);
-            refuse_cursor(recv)
+            handle_cursor(ctx, recv, &header).await
         }
         FrameKind::Data => {
             ctx.negotiated().await?;
@@ -523,6 +533,7 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
                         IncomingTransfer::new(
                             recv,
                             Arc::new(IncomingMeta::from_header(&decoded, ctx.peer.clone())),
+                            Arc::clone(ctx),
                         ),
                         send,
                         Arc::clone(ctx),
@@ -537,6 +548,7 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
                         IncomingTransfer::new(
                             recv,
                             Arc::new(IncomingMeta::from_header(&decoded, ctx.peer.clone())),
+                            Arc::clone(ctx),
                         ),
                         send,
                         Arc::clone(ctx),
@@ -572,6 +584,76 @@ fn refuse_uni(mut stream: RecvHalf) {
 /// The connection survives.
 fn refuse_cursor(mut stream: RecvHalf) -> Result<(), Error> {
     stream.stop(codes::CANCELED);
+    Ok(())
+}
+
+/// Applies one inbound CURSOR stream to the report it names.
+///
+/// Four rules of `docs/PROTOCOL.md` §6.7, in this order:
+///
+/// * a malformed head frame is a connection violation, exactly as every other
+///   malformed header is;
+/// * an unknown `report_id` resets the stream and the connection survives —
+///   no state exists for an id we never handed out, which is the hostile
+///   case;
+/// * a record that repeats an offset or moves one backwards changes nothing,
+///   and neither does a level the sender never ordered: [`CursorSet::advance`]
+///   keeps the maximum, so the peer is told nothing and no notification is
+///   sent;
+/// * a record truncated at FIN **is** a violation. A record is at most
+///   `MAX_CURSOR_RECORD_LEN` bytes and a sender writes whole records, so half
+///   of one at FIN is a codec bug rather than a race.
+async fn handle_cursor(ctx: &ConnHandle, mut stream: RecvHalf, header: &[u8]) -> Result<(), Error> {
+    let head = match CursorHeader::decode(header) {
+        Ok(head) => head,
+        Err(e) => return violation(ctx, &e.to_string()),
+    };
+    let Some(tx) = ctx.reports.claim(head.report_id) else {
+        return refuse_cursor(stream);
+    };
+
+    // One record is at most 16 bytes; the buffer holds a few so a burst costs
+    // one read rather than one per record, and `pending` never grows past a
+    // record plus one read.
+    let mut buf = [0u8; 64];
+    let mut pending: Vec<u8> = Vec::with_capacity(64 + MAX_CURSOR_RECORD_LEN);
+    let mut set = CursorSet::default();
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(Some(0)) => continue,
+            Ok(Some(n)) => {
+                pending.extend_from_slice(&buf[..n]);
+                let mut at = 0;
+                while let Some((level, offset, used)) = match decode_cursor_record(&pending[at..]) {
+                    Ok(record) => record,
+                    Err(e) => return violation(ctx, &e.to_string()),
+                } {
+                    at += used;
+                    if set.advance(level, offset) {
+                        tx.send_replace(set);
+                    }
+                }
+                pending.drain(..at);
+            }
+            Ok(None) => {
+                if !pending.is_empty() {
+                    return violation(ctx, "a cursor stream ended inside a record");
+                }
+                break;
+            }
+            // The peer reset the cursor stream, or the connection went away.
+            // Neither is a failure of anything: a cursor is never
+            // load-bearing, and the reader learns it by the channel closing.
+            Err(e) => {
+                tracing::debug!(error = %e, report_id = head.report_id, "cursor stream ended");
+                break;
+            }
+        }
+    }
+    // Dropping the last sender is what turns `Cursors::changed()` into
+    // `None`; the table entry has to go first, or ours would not be the last.
+    ctx.reports.release(head.report_id);
+    drop(tx);
     Ok(())
 }
 
@@ -653,7 +735,7 @@ async fn handle_stream(
         FrameKind::Subscribe => handle_subscription(ctx, &header, true).await,
         FrameKind::Unsubscribe => handle_subscription(ctx, &header, false).await,
         FrameKind::Credit => handle_credit(ctx, &header).await,
-        FrameKind::Cursor => refuse_cursor(stream),
+        FrameKind::Cursor => handle_cursor(ctx, stream, &header).await,
     }
 }
 
@@ -880,7 +962,11 @@ async fn handle_data(ctx: &ConnHandle, stream: RecvHalf, header: &[u8]) -> Resul
             path: path.clone(),
         };
         for (held, gap) in ctx.reorder.admit(scope, header.sequence, held) {
-            let transfer = IncomingTransfer::new(held.stream, Arc::new(held.meta.with_gap(gap)));
+            let transfer = IncomingTransfer::new(
+                held.stream,
+                Arc::new(held.meta.with_gap(gap)),
+                Arc::clone(ctx),
+            );
             dispatch(ctx, &held.path, transfer).await;
         }
         return Ok(());
@@ -891,7 +977,7 @@ async fn handle_data(ctx: &ConnHandle, stream: RecvHalf, header: &[u8]) -> Resul
     dispatch(
         ctx,
         &path,
-        IncomingTransfer::new(stream, Arc::new(meta.with_gap(gap))),
+        IncomingTransfer::new(stream, Arc::new(meta.with_gap(gap)), Arc::clone(ctx)),
     )
     .await;
     Ok(())
@@ -988,6 +1074,7 @@ async fn handle_bi(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Resu
         IncomingTransfer::new(
             recv,
             Arc::new(IncomingMeta::from_header(&header, ctx.peer.clone())),
+            Arc::clone(ctx),
         ),
         send,
         Arc::clone(ctx),

@@ -312,6 +312,7 @@ async fn pump(served: &Served) {
             trace: message.trace,
             topic: message.topic.clone(),
             achieved: None,
+            ..TransferMeta::default()
         };
         match consumer.deliver(meta, &message.body).await {
             Ok(()) => {}

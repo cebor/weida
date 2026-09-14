@@ -202,6 +202,9 @@ mod tests {
             sequence: None,
             gap: None,
             achieved: None,
+            report: Vec::new(),
+            report_mode: weida::ReportMode::default(),
+            report_id: None,
         }
     }
 

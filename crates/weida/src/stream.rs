@@ -25,8 +25,8 @@ use crate::config::ClientTls;
 use crate::conn::ConnHandle;
 use crate::runtime::RuntimeInner;
 use crate::transfer::{
-    IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream, TransferMeta, data_header,
-    write_data_preamble,
+    IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream, TransferMeta,
+    outgoing_header, write_data_preamble,
 };
 
 /// One connected peer: the connection and the path that was dialled on it.
@@ -166,11 +166,11 @@ impl Peer {
     /// under `core` it carries none and the sequencer is never touched.
     pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
         let (conn, path) = self.peers.pick()?;
-        let (mut header, trace) = data_header(Some(&path), &meta, None);
+        let (mut header, trace, cursors) = outgoing_header(&conn, Some(&path), &meta, None)?;
         header.sequence = conn.sequencer.next(&path);
         let mut stream = conn.open_uni().await?;
         write_data_preamble(&mut stream, &header).await?;
-        Ok(OutgoingTransfer::new(stream, trace, conn))
+        Ok(OutgoingTransfer::new(stream, trace, conn, cursors))
     }
 
     /// Opens a bidirectional stream — an exchange — to the next peer.
@@ -182,13 +182,13 @@ impl Peer {
         meta: TransferMeta,
     ) -> Result<(OutgoingTransfer, ReplyStream), Error> {
         let (conn, path) = self.peers.pick()?;
-        let (header, trace) = data_header(Some(&path), &meta, None);
+        let (header, trace, cursors) = outgoing_header(&conn, Some(&path), &meta, None)?;
         let (mut send, recv) = conn.open_bi().await?;
         // The peer learns of the stream with this write, so it never sees a
         // bidirectional stream it cannot classify.
         write_data_preamble(&mut send, &header).await?;
         Ok((
-            OutgoingTransfer::new(send, trace, Arc::clone(&conn)),
+            OutgoingTransfer::new(send, trace, Arc::clone(&conn), cursors),
             ReplyStream::new(recv, conn),
         ))
     }
@@ -374,12 +374,13 @@ impl Consumer {
     /// the message rather than one this hop invents.
     pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
         let mut send = self.conn.open_uni().await?;
-        let (header, trace) = crate::transfer::data_header(Some(&self.path), &meta, None);
+        let (header, trace, cursors) = outgoing_header(&self.conn, Some(&self.path), &meta, None)?;
         crate::transfer::write_data_preamble(&mut send, &header).await?;
         Ok(OutgoingTransfer::new(
             send,
             trace,
             ConnHandle::clone(&self.conn),
+            cursors,
         ))
     }
 

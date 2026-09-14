@@ -22,10 +22,12 @@ use std::task::{Context, Poll};
 use crate::transport::{RecvHalf, SendHalf};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use weida_core::{Error, ErrorCode, PeerIdentity, TraceContext};
-use weida_protocol::header::{Acknowledgement, ReportMode};
+use weida_protocol::header::limits::MAX_REPORT_LEVELS;
+use weida_protocol::header::{Acknowledgement, CursorLevel, ReportMode};
 use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes, encode_preamble};
 
 use crate::conn::{ConnHandle, Ctl, read_frame, write_error_frame};
+use crate::cursor::{Cursors, Reporter, order_report};
 use crate::drain::Receipt;
 use crate::ordering::Gap;
 
@@ -56,6 +58,29 @@ pub struct TransferMeta {
     /// §4.6. A v0 application leaves it `None`, which claims nothing beyond
     /// the transport receipt.
     pub achieved: Option<Acknowledgement>,
+    /// Levels to ask the receiver to report on, as cursors (DATA keys `9`
+    /// and `10`).
+    ///
+    /// An **order, not a guarantee**: a receiver that cannot reach a level
+    /// simply does not report it, and the transfer does not fail for it. A
+    /// level a peer must reach is the negotiated `acknowledgement` dimension
+    /// of HELLO instead
+    /// ([0006](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0006-guarantee-sets.md)
+    /// §4.4).
+    ///
+    /// Ordering levels changes **nothing** about the transfer's topology: the
+    /// report rides a unidirectional stream of its own, so a Push transfer
+    /// that orders cursors is still one unidirectional stream
+    /// ([0024](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0024-three-families-one-back-channel.md)
+    /// §4.4a). The cursors arrive on the handle
+    /// [`OutgoingTransfer::cursors`] hands out.
+    pub report: Vec<CursorLevel>,
+    /// How often the receiver should report (DATA key `11`).
+    ///
+    /// [`ReportMode::Progress`] is the default and costs no header byte. The
+    /// *granularity* of progress is the reporter's own number and is never
+    /// negotiated.
+    pub report_mode: ReportMode,
 }
 
 impl TransferMeta {
@@ -90,6 +115,27 @@ impl TransferMeta {
     /// took responsibility for the message.
     pub fn with_achieved(mut self, achieved: Acknowledgement) -> TransferMeta {
         self.achieved = Some(achieved);
+        self
+    }
+
+    /// Orders a report for `levels`.
+    ///
+    /// The levels are sorted and deduplicated, so the wire form is canonical
+    /// whatever order a caller names them in. More than
+    /// [`weida_protocol::header::limits::MAX_REPORT_LEVELS`] distinct levels
+    /// fails the send with [`Error::LimitExceeded`] and puts nothing on the
+    /// wire.
+    pub fn with_report(mut self, levels: impl IntoIterator<Item = CursorLevel>) -> TransferMeta {
+        let mut levels: Vec<CursorLevel> = levels.into_iter().collect();
+        levels.sort_unstable();
+        levels.dedup();
+        self.report = levels;
+        self
+    }
+
+    /// Asks for one record per level at the end rather than progress.
+    pub fn with_report_mode(mut self, mode: ReportMode) -> TransferMeta {
+        self.report_mode = mode;
         self
     }
 }
@@ -140,6 +186,21 @@ pub struct IncomingMeta {
     /// has taken responsibility for the message in memory. `None` is the v0
     /// case and claims nothing beyond the transport receipt.
     pub achieved: Option<Acknowledgement>,
+    /// Levels the sender **ordered** a report for (DATA key `10`).
+    ///
+    /// Empty is the ordinary case. Where it is not, [`IncomingTransfer::reporter`]
+    /// hands out the [`Reporter`] bound to this transfer; a level this side
+    /// cannot honour is simply not reported, and the transfer does not fail
+    /// for it.
+    pub report: Vec<CursorLevel>,
+    /// How often the sender asked to be told (DATA key `11`).
+    pub report_mode: ReportMode,
+    /// The id the sender allocated for the report (DATA key `9`).
+    ///
+    /// Present exactly when [`IncomingMeta::report`] is non-empty; it names
+    /// the CURSOR stream a reporter opens, and it is the sender's number, not
+    /// ours.
+    pub report_id: Option<u64>,
 }
 
 impl IncomingMeta {
@@ -158,6 +219,9 @@ impl IncomingMeta {
             sequence: header.sequence,
             gap: None,
             achieved: header.achieved,
+            report: header.report.clone(),
+            report_mode: header.report_mode,
+            report_id: header.report_id,
         }
     }
 
@@ -188,11 +252,20 @@ pub(crate) fn new_trace_context() -> TraceContext {
 /// `endpoint` is `Some` on an initiating stream and `None` on the reply half of
 /// an exchange, which is the only distinction the header still makes: the
 /// stream itself carries the role and the correlation.
+///
+/// `report_id` is the id [`outgoing_header`] allocated, and it must be `Some`
+/// exactly when `meta.report` is non-empty — the decoder refuses either half
+/// without the other (`docs/PROTOCOL.md` §6.2). The level cap is enforced
+/// here rather than at each pattern, so every send path inherits it.
 pub(crate) fn data_header(
     endpoint: Option<&str>,
     meta: &TransferMeta,
     tracestate: Option<String>,
-) -> (DataHeader, TraceContext) {
+    report_id: Option<u64>,
+) -> Result<(DataHeader, TraceContext), Error> {
+    if meta.report.len() > MAX_REPORT_LEVELS {
+        return Err(Error::LimitExceeded);
+    }
     let trace = meta.trace.unwrap_or_else(new_trace_context);
     let header = DataHeader {
         endpoint: endpoint.map(str::to_owned),
@@ -206,11 +279,37 @@ pub(crate) fn data_header(
         sequence: None,
         producer: None,
         achieved: meta.achieved,
-        report_id: None,
-        report: Vec::new(),
-        report_mode: ReportMode::default(),
+        report_id,
+        report: meta.report.clone(),
+        report_mode: meta.report_mode,
     };
-    (header, trace)
+    Ok((header, trace))
+}
+
+/// Builds an outgoing transfer's header and, where it orders a report,
+/// allocates the id and the channel that report's cursors will arrive on.
+///
+/// The allocation happens **before** the header is written, so the table entry
+/// exists by the time a peer can answer: a reporter that is faster than the
+/// sender's next line of code still finds an id to report on.
+pub(crate) fn outgoing_header(
+    conn: &ConnHandle,
+    endpoint: Option<&str>,
+    meta: &TransferMeta,
+    tracestate: Option<String>,
+) -> Result<(DataHeader, TraceContext, Option<Cursors>), Error> {
+    if meta.report.is_empty() {
+        let (header, trace) = data_header(endpoint, meta, tracestate, None)?;
+        return Ok((header, trace, None));
+    }
+    // The cap is checked before an id is spent, so a refused send leaves the
+    // table exactly as it was.
+    if meta.report.len() > MAX_REPORT_LEVELS {
+        return Err(Error::LimitExceeded);
+    }
+    let (report_id, cursors) = order_report(conn);
+    let (header, trace) = data_header(endpoint, meta, tracestate, Some(report_id))?;
+    Ok((header, trace, Some(cursors)))
 }
 
 /// An outgoing transfer: one QUIC send stream, owned outright.
@@ -226,21 +325,45 @@ pub struct OutgoingTransfer {
     /// parked so a drain can wait on it
     /// (`docs/decisions/0009-drain.md` §4.2).
     conn: ConnHandle,
+    /// The report this transfer ordered, until the caller takes it.
+    ///
+    /// Kept here so that a caller which never asks releases the report's
+    /// table entry by dropping the transfer, and a caller which does asks
+    /// gets a handle that **outlives** the transfer: the terminal cursor
+    /// arrives after the payload's FIN.
+    cursors: Option<Cursors>,
 }
 
 impl OutgoingTransfer {
-    pub(crate) fn new(stream: SendHalf, trace: TraceContext, conn: ConnHandle) -> OutgoingTransfer {
+    pub(crate) fn new(
+        stream: SendHalf,
+        trace: TraceContext,
+        conn: ConnHandle,
+        cursors: Option<Cursors>,
+    ) -> OutgoingTransfer {
         OutgoingTransfer {
             stream,
             trace,
             settled: false,
             conn,
+            cursors,
         }
     }
 
     /// The trace context propagated with this transfer.
     pub fn trace(&self) -> TraceContext {
         self.trace
+    }
+
+    /// The cursors this transfer ordered, once.
+    ///
+    /// `None` when nothing was ordered, and `None` on every call after the
+    /// first: there is one report, so there is one reader. The handle is
+    /// independent of the transfer and stays usable after
+    /// [`OutgoingTransfer::finish`], which is the point — a verdict such as
+    /// `Accepted` arrives *after* the FIN.
+    pub fn cursors(&mut self) -> Option<Cursors> {
+        self.cursors.take()
     }
 
     /// Writes the whole buffer.
@@ -400,16 +523,23 @@ impl std::fmt::Debug for Delivery {
 pub struct IncomingTransfer {
     stream: RecvHalf,
     meta: Arc<IncomingMeta>,
+    /// The connection this transfer arrived on: where a report goes back.
+    conn: ConnHandle,
     /// Set once the payload ended, was reset, or was refused: `Drop` then has
     /// nothing left to stop.
     done: bool,
 }
 
 impl IncomingTransfer {
-    pub(crate) fn new(stream: RecvHalf, meta: Arc<IncomingMeta>) -> IncomingTransfer {
+    pub(crate) fn new(
+        stream: RecvHalf,
+        meta: Arc<IncomingMeta>,
+        conn: ConnHandle,
+    ) -> IncomingTransfer {
         IncomingTransfer {
             stream,
             meta,
+            conn,
             done: false,
         }
     }
@@ -417,6 +547,30 @@ impl IncomingTransfer {
     /// Metadata from the DATA header.
     pub fn meta(&self) -> &IncomingMeta {
         &self.meta
+    }
+
+    /// A reporter for the levels the sender ordered, if it ordered any.
+    ///
+    /// The report rides a unidirectional stream of its own, so this adds
+    /// nothing to the transfer's topology and the transfer never waits on it.
+    /// A level this side cannot honour is simply not reported; the sender
+    /// observes the absence rather than a failure.
+    ///
+    /// On an exchange the request's reporter comes from
+    /// [`IncomingRequest::body`], and the **reply** direction is reported by
+    /// the responder ordering levels in its own reply header — so there is one
+    /// accessor rather than two.
+    pub fn reporter(&self) -> Option<Reporter> {
+        let report_id = self.meta.report_id?;
+        if self.meta.report.is_empty() {
+            return None;
+        }
+        Some(Reporter::new(
+            ConnHandle::clone(&self.conn),
+            report_id,
+            self.meta.report.clone(),
+            self.meta.report_mode,
+        ))
     }
 
     /// Refuses the payload with `STOP_SENDING(code)` and forgets the transfer.
@@ -645,13 +799,17 @@ impl IncomingRequest {
             _ => meta,
         };
         // No endpoint: the stream is the correlation, so the reply half
-        // addresses nothing.
-        let (header, trace) = data_header(None, &meta, self.meta.tracestate.clone());
+        // addresses nothing. A reply may order its own report, and that is
+        // how the **reply** direction is reported: the responder allocates
+        // from its own id space and the requester reports on it.
+        let (header, trace, cursors) =
+            outgoing_header(&self.reply.conn, None, &meta, self.meta.tracestate.clone())?;
         write_data_preamble(&mut send, &header).await?;
         Ok(OutgoingTransfer::new(
             send,
             trace,
             Arc::clone(&self.reply.conn),
+            cursors,
         ))
     }
 
@@ -748,7 +906,11 @@ impl ReplyStream {
             FrameKind::Data => {
                 let header = DataHeader::decode(&header)?;
                 let meta = Arc::new(IncomingMeta::from_header(&header, self.conn.peer.clone()));
-                Ok(IncomingTransfer::new(recv, meta))
+                Ok(IncomingTransfer::new(
+                    recv,
+                    meta,
+                    ConnHandle::clone(&self.conn),
+                ))
             }
             FrameKind::Error => {
                 let header = ErrorHeader::decode(&header)?;
@@ -819,7 +981,7 @@ mod tests {
     #[test]
     fn initiating_headers_carry_the_endpoint_and_a_trace_context() {
         let meta = TransferMeta::default().with_content_len(3);
-        let (header, trace) = data_header(Some("/transform"), &meta, None);
+        let (header, trace) = data_header(Some("/transform"), &meta, None, None).unwrap();
         assert_eq!(header.endpoint.as_deref(), Some("/transform"));
         assert_eq!(header.content_len, Some(3));
         assert_eq!(
@@ -832,10 +994,41 @@ mod tests {
 
     #[test]
     fn reply_headers_carry_no_endpoint_but_keep_tracestate() {
-        let (header, _) = data_header(None, &TransferMeta::default(), Some("vendor=x".into()));
+        let (header, _) = data_header(
+            None,
+            &TransferMeta::default(),
+            Some("vendor=x".into()),
+            None,
+        )
+        .unwrap();
         assert_eq!(header.endpoint, None);
         assert_eq!(header.tracestate.as_deref(), Some("vendor=x"));
         assert_eq!(DataHeader::decode(&header.encode()).unwrap(), header);
+    }
+
+    #[test]
+    fn a_report_order_is_sorted_deduplicated_and_capped() {
+        let accepted = CursorLevel::Known(Acknowledgement::Accepted);
+        let stored = CursorLevel::Known(Acknowledgement::Stored);
+        let app = CursorLevel::Application(17);
+        // A caller's order is arbitrary; the wire form is canonical, so two
+        // peers ordering the same levels send the same bytes.
+        let meta = TransferMeta::default().with_report([app, stored, accepted, stored]);
+        assert_eq!(meta.report, vec![accepted, stored, app]);
+        let (header, _) = data_header(Some("/t"), &meta, None, Some(1)).unwrap();
+        assert_eq!(header.report_id, Some(1));
+        assert_eq!(DataHeader::decode(&header.encode()).unwrap(), header);
+
+        // One past the cap fails the send and puts nothing on the wire. The
+        // levels are distinct, so `with_report` keeps all of them.
+        let over = TransferMeta::default().with_report(
+            (0..=MAX_REPORT_LEVELS as u64)
+                .map(|i| CursorLevel::Application(CursorLevel::APPLICATION_FLOOR + i)),
+        );
+        assert!(matches!(
+            data_header(Some("/t"), &over, None, Some(1)),
+            Err(Error::LimitExceeded)
+        ));
     }
 
     #[test]

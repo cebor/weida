@@ -86,9 +86,12 @@ acceptance: a sender states per message which levels it wants and in which mode 
 note: the mode is configuration, not protocol: the frame of B-233 is unchanged by all three.
 
 ### B-240 — The cursor stream, orthogonal to every pattern
-kind: code | size: 60 | status: blocked | needs: [B-239]
-acceptance: the reporting side opens a uni cursor stream per payload stream it reports on, and the payload topology is **unchanged** in every case ([0024](decisions/0024-three-families-one-back-channel.md) §4.4a). Proved where it is surprising: a Push transfer with cursors ordered is still **one unidirectional** payload stream with unchanged round-robin selection, refusal behaviour and delivery semantics, plus a reliable verdict on a separate stream; with none ordered it is byte-for-byte today's transfer. An exchange reporting both directions has **two** cursor streams and one bidi, and a test asserts that the pair (opener, stream id) disambiguates them without a direction field. Two load-bearing negatives: a stalled or never-read cursor stream blocks no transfer, and a peer that ignores cursor streams entirely completes every transfer and every guarantee.
+kind: code | size: 60 | status: in_progress | needs: [B-239]
+acceptance: the reporting side opens a uni cursor stream per payload stream it reports on, and the payload topology is **unchanged** in every case ([0024](decisions/0024-three-families-one-back-channel.md) §4.4a). Proved where it is surprising: a Push transfer with cursors ordered is still **one unidirectional** payload stream with unchanged round-robin selection, refusal behaviour and delivery semantics, plus a reliable verdict on a separate stream; with none ordered it is byte-for-byte today's transfer. An exchange reporting both directions has **two** cursor streams and one bidi, and a test asserts that each side's own `report_id` space disambiguates them without a direction field. Two load-bearing negatives: a stalled or never-read cursor stream blocks no transfer, and a peer that ignores cursor streams entirely completes every transfer and every guarantee.
 note: the reply half stays the application's, so the broker's confirm (DATA key `8`, B-201) is untouched and `fin_only` on an exchange needs no cursor stream at all.
+
+note: the stream half landed with the cursor API in `weida`: `CursorSet`, `Cursors`, `Reporter`, `TransferMeta::with_report`, `OutgoingTransfer::cursors` and `IncomingTransfer::reporter`, with `crates/weida/tests/cursors.rs` proving the topology against a **raw** peer — the library's own API cannot assert "one uni stream and no bidi one". The item stays open on B-239's three modes.
+
 ### B-241 — ARCHITECTURE §1: three vocabularies instead of an onion
 kind: spec | size: 30 | status: done | needs: []
 acceptance: [ARCHITECTURE.md](ARCHITECTURE.md) §1 no longer opens with "weida is three layers" and a stack diagram, but with the surface a user actually chooses from — stream, message, broker — the overlap between the families and the reason for it, and the dependency direction as a single sentence rather than a picture. The L0/L1/L2 names survive only where they name crate boundaries, which is what they are.
@@ -108,6 +111,11 @@ note: the only pattern of the family with a time dimension, which is why it is w
 kind: code | size: 90 | status: ready | needs: [B-236]
 acceptance: the mapping of [ARCHITECTURE.md](ARCHITECTURE.md) §6b made real — each member holds a `Peer` per remote plus an `Acceptor` on its own path — with the property that distinguishes a bus from a fan-out: a message sent by a member reaches every **other** member and never the sender itself. Joining and leaving are ordinary connect and disconnect, a member that dies is dropped from the set without affecting the others, and the fan-out is best effort per peer with the same counted drops as Pub/Sub. No relay: a bus of *n* members is *n* × (*n*-1) deliveries and weida does not forward on anyone's behalf, which is the trade nanomsg's BUS makes too.
 note: completes the nanomsg pattern set (PAIR, REQREP, PUBSUB, PIPELINE, SURVEY, BUS) and with it [ARCHITECTURE.md](ARCHITECTURE.md) §6b's table.
+
+### B-243 — The cursor API in `weida-py`
+kind: code | size: 90 | status: ready | needs: [B-240]
+acceptance: `crates/py/weida-py` reaches the cursor surface from both of its halves, the asyncio one and `sync`, because it mirrors the pattern surface explicitly in each and neither inherits from the other: `TransferMeta`'s report order, the cursor handle a send returns (an async iterator on the asyncio side, a blocking `changed()` on the `sync` one) and the reporter an inbound transfer hands out. `IncomingMeta` gains the three fields it already carries in Rust. Tests: a Push producer that orders `Accepted` observes it, a receiver that never reports fails no transfer, and an application level round-trips uninterpreted — one pair per half, as `tests/test_pubsub.py` does for the fan-out.
+note: filed rather than built with B-240 because a binding costs three surfaces (asyncio, `sync`, the value classes both share) and a cursor is the first weida concept whose reader outlives the handle it came from — which is a lifetime question in Python, not a translation.
 
 ### B-233 — Frame kind `6`: the cursor stream
 kind: code | size: 90 | status: done | needs: []

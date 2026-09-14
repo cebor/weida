@@ -44,6 +44,7 @@ pub mod blocking;
 
 mod config;
 mod conn;
+mod cursor;
 mod dedup;
 mod drain;
 mod endpoint;
@@ -74,6 +75,7 @@ pub use weida_protocol::{ALPN, VERSION, codes, filter};
 pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
 
 pub use config::{ClientTls, Discovery, Identity, Pem, RuntimeConfig, ServerTls, Trust};
+pub use cursor::{CursorSet, Cursors, Reporter};
 pub use drain::Drained;
 pub use endpoint::{
     Endpoint, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher, Rep, Replier, Req, Requester,
@@ -96,6 +98,6 @@ pub use transfer::{
     TransferMeta,
 };
 pub use weida_protocol::header::{
-    Acknowledgement, Backpressure, Deduplication, Delivery as DeliveryLevel, Durability,
-    GuaranteeSet, OrderingMode, ProducerNaming,
+    Acknowledgement, Backpressure, CursorLevel, Deduplication, Delivery as DeliveryLevel,
+    Durability, GuaranteeSet, OrderingMode, ProducerNaming, ReportMode,
 };
