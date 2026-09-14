@@ -25,7 +25,9 @@ use std::time::Duration;
 use common::{Server, raw};
 use weida::{Acknowledgement, CursorLevel, Error, ReportMode, TransferMeta, codes};
 use weida_protocol::header::limits::MAX_REPORT_LEVELS;
-use weida_protocol::{CursorHeader, FrameKind, encode_cursor_record, encode_preamble};
+use weida_protocol::{
+    CursorHeader, FrameKind, decode_cursor_record, encode_cursor_record, encode_preamble,
+};
 
 /// Generous ceiling: every assertion below should settle in milliseconds.
 const DEADLINE: Duration = Duration::from_secs(15);
@@ -52,6 +54,47 @@ async fn report_raw(conn: &quinn::Connection, report_id: u64, records: &[(Cursor
     let mut stream = conn.open_uni().await.expect("open uni");
     stream.write_all(&bytes).await.expect("write cursor stream");
     stream.finish().expect("finish cursor stream");
+}
+
+/// Pushes one whole transfer on a fresh unidirectional stream, headers and
+/// all, so a test can order a report the library's own API would not.
+async fn push_raw(conn: &quinn::Connection, header: &weida_protocol::DataHeader, body: &[u8]) {
+    let encoded = header.encode();
+    let mut bytes = Vec::new();
+    encode_preamble(FrameKind::Data, encoded.len() as u64, &mut bytes);
+    bytes.extend_from_slice(&encoded);
+    bytes.extend_from_slice(body);
+    let mut stream = conn.open_uni().await.expect("open uni");
+    stream.write_all(&bytes).await.expect("write transfer");
+    stream.finish().expect("finish transfer");
+}
+
+/// Reads one whole cursor stream and returns its records in wire order.
+///
+/// Counting **records** is the only way to measure a granularity: the
+/// reader-side API deliberately keeps the latest value per level, so a
+/// coalesced report and a verbose one are indistinguishable there — which is
+/// the property under test, not a gap in it.
+async fn read_report(conn: &quinn::Connection, report_id: u64) -> Vec<(CursorLevel, u64)> {
+    let (mut stream, header) = raw::accept_frame(conn, FrameKind::Cursor).await;
+    let head = CursorHeader::decode(&header).expect("decode cursor head");
+    assert_eq!(head.report_id, report_id);
+
+    let mut bytes = Vec::new();
+    let mut chunk = vec![0u8; 4096];
+    while let Some(n) = stream.read(&mut chunk).await.expect("read cursor stream") {
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+    let mut records = Vec::new();
+    let mut at = 0;
+    while let Some((level, offset, used)) =
+        decode_cursor_record(&bytes[at..]).expect("a well-formed record")
+    {
+        at += used;
+        records.push((level, offset));
+    }
+    assert_eq!(at, bytes.len(), "the stream ended on a record boundary");
+    records
 }
 
 #[tokio::test]
@@ -467,4 +510,152 @@ async fn a_reporter_whose_peer_vanished_reports_without_failing() {
     within(reporter.finish())
         .await
         .expect("finishing a report that never opened is not an error");
+}
+
+#[tokio::test]
+async fn coalescing_loses_nothing() {
+    // The claim of 0023 §4.3b, measured: a reporter that drops every
+    // intermediate record leaves the reader at exactly the same offset as one
+    // that writes all hundred. The counts come from a raw peer, because the
+    // reader-side API keeps only the latest value by design.
+    let server = Server::start().await;
+    let puller = server.listener.puller("/jobs").expect("puller");
+
+    // Coarse: a megabyte or an hour, so nothing after the first record is
+    // worth writing.
+    let coarse =
+        run_with_granularity(&server, &puller, 1024 * 1024, Duration::from_secs(3600), 1).await;
+    // Fine: every call is worth writing.
+    let fine = run_with_granularity(&server, &puller, 0, Duration::ZERO, 2).await;
+
+    // Two records against a hundred — the first, which is always written, and
+    // the terminal flush.
+    assert_eq!(coarse.len(), 2, "{coarse:?}");
+    assert_eq!(fine.len(), 100);
+    // And the numbers that matter are identical.
+    assert_eq!(coarse.last().expect("a record").1, 100);
+    assert_eq!(fine.last().expect("a record").1, 100);
+}
+
+/// Pushes one raw transfer ordering `Stored`, has the puller report a hundred
+/// advances at `bytes`/`interval`, and returns the records that reached the
+/// wire.
+async fn run_with_granularity(
+    server: &Server,
+    puller: &weida::Puller,
+    bytes: u64,
+    interval: Duration,
+    report_id: u64,
+) -> Vec<(CursorLevel, u64)> {
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    let header = weida_protocol::DataHeader {
+        report_id: Some(report_id),
+        report: vec![STORED],
+        ..weida_protocol::DataHeader::addressed("/jobs")
+    };
+    push_raw(&conn, &header, b"body").await;
+
+    let transfer = within(puller.recv()).await.expect("recv");
+    let mut reporter = transfer
+        .reporter()
+        .expect("a reporter")
+        .with_granularity(bytes, interval);
+    let _ = within(transfer.collect(1024)).await.expect("collect");
+    for offset in 1..=100u64 {
+        within(reporter.report(STORED, offset))
+            .await
+            .expect("report");
+    }
+    within(reporter.finish()).await.expect("finish");
+
+    read_report(&conn, report_id).await
+}
+
+#[tokio::test]
+async fn final_only_emits_exactly_one_record_per_level() {
+    let server = Server::start().await;
+    let puller = server.listener.puller("/jobs").expect("puller");
+
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    let header = weida_protocol::DataHeader {
+        report_id: Some(1),
+        report: vec![ACCEPTED, STORED],
+        report_mode: ReportMode::FinalOnly,
+        ..weida_protocol::DataHeader::addressed("/jobs")
+    };
+    push_raw(&conn, &header, b"body").await;
+
+    let transfer = within(puller.recv()).await.expect("recv");
+    let mut reporter = transfer.reporter().expect("a reporter");
+    assert_eq!(reporter.mode(), ReportMode::FinalOnly);
+    let _ = within(transfer.collect(1024)).await.expect("collect");
+    for offset in 1..=10u64 {
+        within(reporter.report(ACCEPTED, offset))
+            .await
+            .expect("report");
+        within(reporter.report(STORED, offset * 2))
+            .await
+            .expect("report");
+    }
+    within(reporter.finish()).await.expect("finish");
+
+    // Twenty calls, two records: one per level, each the last offset that
+    // level reached. The granularity is irrelevant in this mode.
+    let records = read_report(&conn, 1).await;
+    assert_eq!(records, vec![(ACCEPTED, 10), (STORED, 20)]);
+}
+
+#[tokio::test]
+async fn a_level_the_reporter_cannot_honour_is_absent_rather_than_fatal() {
+    // The order is a request for reporting, not a guarantee: a level this
+    // side cannot reach is simply missing from the report, and the transfer
+    // succeeds. A level a peer *must* reach is the negotiated
+    // `acknowledgement` dimension of HELLO instead.
+    let server = Server::start().await;
+    let puller = server.listener.puller("/jobs").expect("puller");
+
+    let receiver = tokio::spawn(async move {
+        let transfer = within(puller.recv()).await.expect("recv");
+        let reporter = transfer.reporter().expect("a reporter");
+        assert_eq!(reporter.levels(), [STORED]);
+        let body = within(transfer.collect(1024)).await.expect("collect");
+        // This side has no store, so it reports nothing at all — not a zero,
+        // and not an error.
+        within(reporter.finish()).await.expect("finish");
+        body
+    });
+
+    let client = server.client_runtime();
+    let pusher = client.pusher(server.trust());
+    within(pusher.connect(&server.url("/jobs")))
+        .await
+        .expect("connect");
+
+    let mut transfer = within(pusher.open(TransferMeta::default().with_report([STORED])))
+        .await
+        .expect("open");
+    let mut cursors = transfer.cursors().expect("cursors");
+    within(transfer.write_all(b"durable?"))
+        .await
+        .expect("write");
+    let delivery = transfer.finish().expect("finish");
+    within(delivery.delivered()).await.expect("delivered");
+    assert_eq!(receiver.await.expect("receiver"), b"durable?");
+
+    // No cursor stream was ever opened, so the reader learns only that no
+    // more are coming, and `Stored` is absent from the final snapshot.
+    client.shutdown().await;
+    assert_eq!(within(cursors.changed()).await, None);
+    assert_eq!(cursors.snapshot().offset(STORED), None);
+    assert!(cursors.snapshot().is_empty());
 }

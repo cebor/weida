@@ -27,9 +27,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use weida_core::Error;
+use weida_protocol::header::MAX_CURSOR_RECORD_LEN;
 use weida_protocol::header::limits::MAX_REPORT_LEVELS;
 use weida_protocol::{
     CursorHeader, CursorLevel, FrameKind, ReportMode, encode_cursor_record, encode_preamble,
@@ -256,6 +258,15 @@ impl std::fmt::Debug for ReportGuard {
 /// reporting — so a failed write is logged at `debug` and the reporter goes
 /// quiet. That is the "nothing waits on a cursor" rule seen from the writing
 /// side.
+///
+/// **The granularity is the reporter's own number and is never negotiated**
+/// ([0023](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0023-completion-is-a-cursor.md)
+/// §4.5): more often is always allowed, less often never. The default is
+/// [`Reporter::DEFAULT_BYTES`] or [`Reporter::DEFAULT_INTERVAL`], whichever
+/// comes first, and [`Reporter::with_granularity`] changes it. Coalescing
+/// loses nothing because cursors are absolute, and
+/// [`Reporter::finish`] always flushes the latest offset per level — so the
+/// terminal cursor is never the one that got coalesced away.
 pub struct Reporter {
     conn: ConnHandle,
     report_id: u64,
@@ -268,9 +279,38 @@ pub struct Reporter {
     /// Set once a write failed: the report is over, and retrying would only
     /// cost the application time.
     broken: bool,
+    /// Bytes a level must advance before another record is worth writing.
+    bytes: u64,
+    /// Time that must pass before another record is worth writing.
+    interval: Duration,
+    /// The latest offset reported per level, and the last one **emitted**.
+    ///
+    /// Both are needed: the latest is what `finish` flushes, and the emitted
+    /// one is what the two granularity tests are measured against. Fixed at
+    /// the level cap, so a reporter costs no allocation per record.
+    pending: [Option<Pending>; MAX_REPORT_LEVELS],
+}
+
+/// What a reporter remembers about one level between records.
+#[derive(Clone, Copy, Debug)]
+struct Pending {
+    level: CursorLevel,
+    /// Latest offset the application reported.
+    latest: u64,
+    /// Offset of the last record actually written, if any.
+    emitted: Option<u64>,
+    /// When that record was written.
+    at: Option<Instant>,
 }
 
 impl Reporter {
+    /// Default byte granularity: a level must advance this far before another
+    /// record is worth writing.
+    pub const DEFAULT_BYTES: u64 = 1024 * 1024;
+    /// Default time granularity: a level may be reported again this often
+    /// however little it advanced.
+    pub const DEFAULT_INTERVAL: Duration = Duration::from_millis(100);
+
     pub(crate) fn new(
         conn: ConnHandle,
         report_id: u64,
@@ -284,7 +324,24 @@ impl Reporter {
             mode,
             stream: None,
             broken: false,
+            bytes: Reporter::DEFAULT_BYTES,
+            interval: Reporter::DEFAULT_INTERVAL,
+            pending: [None; MAX_REPORT_LEVELS],
         }
+    }
+
+    /// Sets how often progress records are worth writing.
+    ///
+    /// "Every `bytes` or every `interval`, **whichever comes first**". The
+    /// number is this side's own and is never negotiated: a sender orders
+    /// *which* levels it wants, not how finely
+    /// ([0023](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0023-completion-is-a-cursor.md)
+    /// §4.5). It has no effect in [`ReportMode::FinalOnly`], where there is
+    /// exactly one record per level whatever the granularity says.
+    pub fn with_granularity(mut self, bytes: u64, interval: Duration) -> Reporter {
+        self.bytes = bytes;
+        self.interval = interval;
+        self
     }
 
     /// The levels the sender ordered, ascending.
@@ -303,23 +360,62 @@ impl Reporter {
     /// order says what the sender wants to hear, and volunteering more would
     /// put records on the wire nobody reads.
     ///
-    /// Never fails for a transport reason. The `Result` is the shape the
-    /// reporting side needs once a mode does its own bookkeeping; a broken
-    /// cursor stream yields `Ok(())`.
+    /// What reaches the wire depends on the mode the sender asked for:
+    ///
+    /// * [`ReportMode::Progress`] writes a record when the level has advanced
+    ///   by the byte granularity **or** the interval has passed since that
+    ///   level's last record, whichever comes first; otherwise the offset is
+    ///   only remembered.
+    /// * [`ReportMode::FinalOnly`] writes nothing at all and remembers the
+    ///   offset; [`Reporter::finish`] emits one record per level.
+    ///
+    /// Either way nothing is lost, because a cursor is absolute:
+    /// [`Reporter::finish`] flushes the latest offset per level.
+    ///
+    /// Never fails for a transport reason: a broken cursor stream yields
+    /// `Ok(())`, because a cursor is never load-bearing.
     pub async fn report(&mut self, level: CursorLevel, offset: u64) -> Result<(), Error> {
         if !self.levels.contains(&level) {
             return Ok(());
         }
-        self.emit(level, offset).await;
+        let Some(slot) = self.slot(level) else {
+            return Ok(());
+        };
+        let entry = self.pending[slot].get_or_insert(Pending {
+            level,
+            latest: offset,
+            emitted: None,
+            at: None,
+        });
+        // Absolute offsets: a record that would move a level backwards says
+        // nothing the receiver would keep, so it is not worth a write either.
+        entry.latest = entry.latest.max(offset);
+        let latest = entry.latest;
+        if self.mode == ReportMode::FinalOnly || !self.worth_writing(slot) {
+            return Ok(());
+        }
+        self.emit(slot, latest).await;
         Ok(())
     }
 
-    /// FINs the cursor stream.
+    /// Flushes the latest offset per level and FINs the cursor stream.
     ///
-    /// A reporter that emitted nothing opened no stream and has nothing to
-    /// FIN, which is the honest form of "this level could not be reported":
-    /// the sender sees the level missing from its final snapshot.
+    /// The flush is what makes coalescing lossless: whatever the granularity
+    /// suppressed, the last number each level reached is on the wire before
+    /// the FIN. A level that was never reported produces **no** record at
+    /// all, which is the honest form of "this side could not report it" — the
+    /// sender sees the level missing from its final snapshot rather than a
+    /// failure.
     pub async fn finish(mut self) -> Result<(), Error> {
+        for slot in 0..MAX_REPORT_LEVELS {
+            let Some(entry) = self.pending[slot] else {
+                continue;
+            };
+            if entry.emitted == Some(entry.latest) {
+                continue;
+            }
+            self.emit(slot, entry.latest).await;
+        }
         if let Some(mut stream) = self.stream.take()
             && let Err(e) = stream.finish()
         {
@@ -328,9 +424,47 @@ impl Reporter {
         Ok(())
     }
 
-    /// Writes one record, opening the stream if this is the first.
-    async fn emit(&mut self, level: CursorLevel, offset: u64) {
+    /// The slot this level occupies, allocating one on first use.
+    ///
+    /// `None` only past the cap, which the decoder already refuses: the
+    /// ordered levels are at most `MAX_REPORT_LEVELS`.
+    fn slot(&self, level: CursorLevel) -> Option<usize> {
+        self.levels.iter().position(|l| *l == level)
+    }
+
+    /// Is another record for this level worth a write yet?
+    fn worth_writing(&self, slot: usize) -> bool {
+        let Some(entry) = self.pending[slot] else {
+            return false;
+        };
+        match (entry.emitted, entry.at) {
+            // Nothing written for this level yet: the first record is always
+            // worth it, however small the advance.
+            (None, _) | (_, None) => true,
+            (Some(emitted), Some(at)) => {
+                entry.latest.saturating_sub(emitted) >= self.bytes || at.elapsed() >= self.interval
+            }
+        }
+    }
+
+    /// Writes one record for `slot`, opening the stream if this is the first.
+    ///
+    /// Records what was written and when, which is what the granularity is
+    /// measured against — and what makes a `finish` after a fresh record
+    /// write nothing rather than a duplicate.
+    async fn emit(&mut self, slot: usize, offset: u64) {
         if self.broken {
+            return;
+        }
+        let Some(entry) = self.pending[slot] else {
+            return;
+        };
+        let mut record = Vec::with_capacity(MAX_CURSOR_RECORD_LEN);
+        if let Err(e) = encode_cursor_record(entry.level, offset, &mut record) {
+            // An application level above the varint range. Refusing the
+            // record rather than the transfer keeps the rule that a cursor
+            // fails nothing.
+            tracing::debug!(error = %e, "a cursor level has no wire representation");
             return;
         }
         if self.stream.is_none() {
@@ -343,18 +477,15 @@ impl Reporter {
                 }
             }
         }
-        let mut record = Vec::with_capacity(16);
-        if let Err(e) = encode_cursor_record(level, offset, &mut record) {
-            // An application level above the varint range. Refusing the
-            // record rather than the transfer keeps the rule that a cursor
-            // fails nothing.
-            tracing::debug!(error = %e, "a cursor level has no wire representation");
-            return;
-        }
         let stream = self.stream.as_mut().expect("opened just above");
         if let Err(e) = stream.write_all(&record).await {
             tracing::debug!(error = %e, "failed to write a cursor record");
             self.broken = true;
+            return;
+        }
+        if let Some(entry) = self.pending[slot].as_mut() {
+            entry.emitted = Some(offset);
+            entry.at = Some(Instant::now());
         }
     }
 

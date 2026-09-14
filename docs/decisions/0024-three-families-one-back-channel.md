@@ -112,18 +112,30 @@ semantic**: without it an application that wants progress builds an explicit bac
 stream and a correlation scheme by hand; with QUIC it is nearly free. No pattern changes shape
 because cursors were added, and a pattern used without them behaves exactly as it does today.
 
-**4.3 Three modes, and `fin-only` is what makes the classic model a configuration.**
+**4.3 Two modes on the wire, three shapes of report, and `final-only` is what makes the classic
+model a configuration.**
 
 | Mode | What is reported | When it is right |
 | --- | --- | --- |
-| `per_chunk` | a cursor whenever the reporter's own unit advances | progress that a human or a scheduler watches |
-| `coalesced { bytes, interval }` | the same, batched — "every *N* bytes or every *T* ms" | the default: cheap, and lossless because cursors are absolute |
-| `fin_only` | exactly one cursor, at the end | a message-shaped application that wants a verdict and nothing else |
+| `progress` (`0`) | records as a level advances, at the reporter's own granularity | the default: cheap, and lossless because cursors are absolute |
+| `final-only` (`1`) | exactly one record per level, at the end | a message-shaped application that wants a verdict and nothing else |
 
-`fin_only` is the important one politically: the whole-message acknowledgement that RabbitMQ, AMQP
-and MQTT all have is **this system's degenerate case**, not a different mechanism. A migrating
-application asks for `fin_only` and gets what it had; nothing in the design has to argue that
-whole-message verdicts are obsolete.
+**The granularity is not a third mode, and an earlier draft of this table got that wrong.** It
+listed `per_chunk` and `coalesced { bytes, interval }` as separate wire modes — but §4.5 of
+[0023] says the granularity is the **reporter's own number and is never negotiated**, and a
+`{ bytes, interval }` pair in the sender's header is exactly a negotiated granularity. The two
+cannot both hold. So the wire carries which levels and *whether progress is wanted at all*, and
+`weida::Reporter::with_granularity` carries how finely — `per_chunk` is that granularity set to
+zero, and the default is 1 MiB or 100 ms, whichever comes first. Nothing is lost: a reporter's
+`finish` flushes the latest offset per level before the FIN, so coalescing can drop every
+intermediate record and the reader still ends at the same number.
+
+`final-only` is the important one politically: the whole-message acknowledgement that RabbitMQ,
+AMQP and MQTT all have is **this system's degenerate case**, not a different mechanism. A
+migrating application asks for `final-only` and gets what it had; nothing in the design has to
+argue that whole-message verdicts are obsolete. What it does *not* do is reproduce the classic
+confirm's bytes: a broker's publisher confirm is still DATA key `8` on an exchange's reply half
+(B-201), untouched, and `final-only` on an exchange needs no cursor stream at all.
 
 **4.4 A cursor never shares a stream with payload.** Two requirements from the owner, in order.
 First, reliability: "auf die ack muss man sich trotzdem verlassen koennen, wenigstens auf das fin"
