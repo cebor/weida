@@ -77,13 +77,46 @@ async fn settle() {
     tokio::time::sleep(Duration::from_millis(250)).await;
 }
 
-async fn free_port() -> (SocketAddr, String) {
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+/// Listens on an ephemeral port and reports the one the kernel actually gave,
+/// asked of the library that did the listening.
+///
+/// The shape this replaces was a probe: bind `127.0.0.1:0` with a
+/// `TcpListener`, read the port, **drop the listener** and hand the number to
+/// a foreign library to bind. Between the drop and that bind the port is
+/// free, and this workspace's suite binds loopback ports by the hundred in
+/// parallel — so roughly one full-workspace run in twenty failed here with
+/// `AddrInUse`, on whichever of these eight tests lost the race (B-252).
+/// Neither library needs the guess: `nng` reports the URL it resolved and
+/// `zeromq`'s `bind` returns the resolved endpoint.
+///
+/// **`Url`, not `LocalAddr`.** Both options exist on an `nng` listener and
+/// they do not agree: on a listener bound to port `0`, `LocalAddr` answers
+/// with a port nothing is listening on (`tcp://127.0.0.1:49074` against the
+/// URL's `45759` in one measured run), so a chain dialling it reaches nobody
+/// — which the three tests here that assert an *arrival* catch and the three
+/// that assert a *loss* would have passed vacuously.
+fn nng_listen(socket: &nng::Socket) -> SocketAddr {
+    let listener = nng::Listener::new(socket, "tcp://127.0.0.1:0").expect("nng listens");
+    let url = listener
+        .get_opt::<nng::options::Url>()
+        .expect("the url nng resolved");
+    url.trim_start_matches("tcp://")
+        .parse()
+        .unwrap_or_else(|e| panic!("{url}: {e}"))
+}
+
+/// The same for a `zeromq` socket, which answers with the endpoint it
+/// resolved — "port # resolved, for example", as its own documentation says.
+async fn zmq_bind<S: Socket>(socket: &mut S) -> SocketAddr {
+    let endpoint = within(socket.bind("tcp://127.0.0.1:0"))
         .await
-        .expect("probe bind");
-    let addr = probe.local_addr().expect("probe addr");
-    drop(probe);
-    (addr, format!("tcp://{addr}"))
+        .expect("zmq.rs binds");
+    match endpoint {
+        zeromq::Endpoint::Tcp(host, port) => format!("{host}:{port}")
+            .parse()
+            .expect("a loopback address and the port it bound"),
+        other => panic!("a tcp bind answered with {other}"),
+    }
 }
 
 /// Starts a ZMTP inbound bridge: foreign ZeroMQ peers in, weida onward.
@@ -203,9 +236,8 @@ fn one_frame(message: &ZmqMessage) -> &[u8] {
 /// asserting the payload is enough to assert both.
 #[tokio::test]
 async fn a_zmq_req_reaches_an_nng_rep_and_the_reply_returns() {
-    let (nng_addr, nng_url) = free_port().await;
     let rep = nng_socket(nng::Protocol::Rep0);
-    rep.listen(&nng_url).expect("nng listens");
+    let nng_addr = nng_listen(&rep);
     let responder = std::thread::spawn(move || {
         let request = rep.recv().expect("a request");
         let mut answer = b"re:".to_vec();
@@ -255,9 +287,8 @@ async fn a_zmq_req_reaches_an_nng_rep_and_the_reply_returns() {
 /// stronger.
 #[tokio::test]
 async fn a_zmq_push_reaches_an_nng_pull() {
-    let (nng_addr, nng_url) = free_port().await;
     let pull = nng_socket(nng::Protocol::Pull0);
-    pull.listen(&nng_url).expect("nng listens");
+    let nng_addr = nng_listen(&pull);
 
     let (weida_url, sp_runtime) = sp_out(SpOutboundConfig::new(
         nng_addr,
@@ -314,11 +345,8 @@ async fn a_zmq_push_reaches_an_nng_pull() {
 /// NUL delimiter is what lets the last step be undone by whoever reads it.
 #[tokio::test]
 async fn a_zmq_pub_reaches_an_nng_sub_through_both_topic_conventions() {
-    let (zmq_addr, zmq_url) = free_port().await;
     let mut publisher = zeromq::PubSocket::new();
-    within(publisher.bind(&zmq_url))
-        .await
-        .expect("zmq.rs binds");
+    let zmq_addr = zmq_bind(&mut publisher).await;
 
     let mut zmq_config = ZmqOutboundConfig::new(
         zmq_addr,
@@ -396,9 +424,8 @@ async fn a_zmq_pub_reaches_an_nng_sub_through_both_topic_conventions() {
 /// a real ZeroMQ `PULL`.
 #[tokio::test]
 async fn an_nng_push_reaches_a_zmq_pull() {
-    let (zmq_addr, zmq_url) = free_port().await;
     let mut pull = zeromq::PullSocket::new();
-    within(pull.bind(&zmq_url)).await.expect("zmq.rs binds");
+    let zmq_addr = zmq_bind(&mut pull).await;
 
     let (weida_url, zmq_runtime) = zmtp_out(ZmqOutboundConfig::new(
         zmq_addr,
@@ -446,9 +473,8 @@ async fn an_nng_push_reaches_a_zmq_pull() {
 /// then a ZMTP frame of its own.
 #[tokio::test]
 async fn an_nng_pub_reaches_a_zmq_sub_through_both_topic_conventions() {
-    let (nng_addr, nng_url) = free_port().await;
     let publisher = nng_socket(nng::Protocol::Pub0);
-    publisher.listen(&nng_url).expect("nng listens");
+    let nng_addr = nng_listen(&publisher);
 
     let mut sp_config = SpOutboundConfig::new(
         nng_addr,
@@ -515,9 +541,8 @@ async fn an_nng_pub_reaches_a_zmq_sub_through_both_topic_conventions() {
 /// be read as promising more than.
 #[tokio::test]
 async fn the_chain_is_best_effort_end_to_end() {
-    let (nng_addr, nng_url) = free_port().await;
     let pull = nng_socket(nng::Protocol::Pull0);
-    pull.listen(&nng_url).expect("nng listens");
+    let nng_addr = nng_listen(&pull);
 
     let (weida_url, sp_runtime) = sp_out(SpOutboundConfig::new(
         nng_addr,
@@ -553,8 +578,21 @@ async fn the_chain_is_best_effort_end_to_end() {
     // it, which a fresh puller on the same address proves by receiving
     // nothing.
     let late = nng_socket(nng::Protocol::Pull0);
+    let url = format!("tcp://{nng_addr}");
     let missed = tokio::task::spawn_blocking(move || {
-        let _ = late.listen(&nng_url);
+        // The address the first puller just released, because the chain dials
+        // that one. A `let _ =` on this listen would make the assertion below
+        // pass for the wrong reason — a puller that never bound receives
+        // nothing either — so the bind is retried briefly and then asserted.
+        let mut bound = late.listen(&url);
+        for _ in 0..50 {
+            if bound.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            bound = late.listen(&url);
+        }
+        bound.expect("the late puller takes the address the first one released");
         late.recv().is_err()
     });
     assert!(
@@ -578,9 +616,8 @@ async fn the_chain_is_best_effort_end_to_end() {
 /// the first hop is not repaired by the second protocol's capabilities.
 #[tokio::test]
 async fn a_zmtp_multipart_is_refused_at_the_first_hop_and_never_reaches_the_second() {
-    let (nng_addr, nng_url) = free_port().await;
     let pull = nng_socket(nng::Protocol::Pull0);
-    pull.listen(&nng_url).expect("nng listens");
+    let nng_addr = nng_listen(&pull);
 
     let (weida_url, sp_runtime) = sp_out(SpOutboundConfig::new(
         nng_addr,
@@ -632,9 +669,8 @@ async fn a_zmtp_multipart_is_refused_at_the_first_hop_and_never_reaches_the_seco
 /// 1 MiB default) and asserts that an 8 KiB message dies there.
 #[tokio::test]
 async fn the_smaller_cap_decides_and_the_far_edge_buffers_nothing() {
-    let (nng_addr, nng_url) = free_port().await;
     let pull = nng_socket(nng::Protocol::Pull0);
-    pull.listen(&nng_url).expect("nng listens");
+    let nng_addr = nng_listen(&pull);
 
     let sp_config = SpOutboundConfig::new(
         nng_addr,
