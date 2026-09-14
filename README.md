@@ -46,8 +46,16 @@ are the forwarders beside them, joining foreign peers and weida endpoints in bot
 
 ## Documents
 
+**Start with the guide.** The rest of this table specifies; [docs/GUIDE.md](docs/GUIDE.md)
+teaches, in the shape ZeroMQ's zguide established — every program in it is a file in this
+repository and a test asserts the claim the text makes. It is organised around one question,
+**C8B: how do you scale a software system to eight billion people?**, which is this project's
+C10K: utopian on purpose, and useful because the arithmetic settles structural questions before
+anything is built ([decisions/0026](docs/decisions/0026-the-guide-and-the-c8b-question.md)).
+
 | Document | What it covers |
 | --- | --- |
+| [docs/GUIDE.md](docs/GUIDE.md) | the guide: the C8B question and its arithmetic, then one chapter per scaling step, each with programs you can run |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layer model, terminology, addressing, crate map, runtime internals, public API v0 |
 | [docs/PATTERNS.md](docs/PATTERNS.md) | the pattern reference: per-pattern tables in the shape of `zmq_socket(3)`, and what QUIC streams do underneath, measured |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | normative wire protocol v0: framing, frame headers, golden vectors, limits |

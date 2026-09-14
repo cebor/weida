@@ -430,6 +430,10 @@ impl Site {
 fn manifest(root: &Path) -> io::Result<Vec<(String, Group)>> {
     let mut pages = vec![("README.md".to_owned(), Group::Start)];
     for named in [
+        // The guide first: it is the document that teaches, and a reader who
+        // wants to build something should not have to pick it out of a
+        // specification set ([0026](../../../docs/decisions/0026-the-guide-and-the-c8b-question.md)).
+        "docs/GUIDE.md",
         "docs/ARCHITECTURE.md",
         "docs/PATTERNS.md",
         "docs/PROTOCOL.md",
