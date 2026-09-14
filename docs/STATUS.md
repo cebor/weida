@@ -25,9 +25,9 @@ everybody**, which makes the hard problem at that scale neither throughput nor d
 a hop may claim — and an acknowledgement per recipient converging on one root is 1.1 TB for one
 message. Chapter 1 is written; the arc is filed slice by slice, in the order of what can be
 asserted rather than of the chapter numbers (B-256..B-261).
-The Windows 11 VM ran at the same commit: **1823 across 140 binaries**, the same 37
-ignored, after the storage fault took two runs and a `cargo clean`
-— §6 point 3, not a code problem. Add
+The Windows 11 VM ran at the bookkeeping commit of this round (`2830be2`): **1830 across 141
+binaries**, the same 37 ignored, in one clean pass — fmt, clippy in both configurations and
+rustdoc included, with the guide's suite among the binaries. Add
 the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
