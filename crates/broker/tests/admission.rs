@@ -81,7 +81,12 @@ async fn a_confirm_arrives_with_no_consumer_registered() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.requester("/jobs").await;
 
-    let reply = tokio::time::timeout(DEADLINE, producer.request(b"work"))
+    // Nine bytes, not four: the queue charges the body's *allocation*, and
+    // `Vec<u8>` never allocates fewer than eight bytes — so a shorter payload
+    // would make the charge below an allocator's minimum rather than the
+    // message's own size, which is not what this assertion is about.
+    let body = b"work item";
+    let reply = tokio::time::timeout(DEADLINE, producer.request(body))
         .await
         .expect("the confirm arrives well inside the deadline")
         .expect("the queue accepts the message");
@@ -97,7 +102,7 @@ async fn a_confirm_arrives_with_no_consumer_registered() {
         .stats("/jobs")
         .expect("the queue is registered");
     assert_eq!(stats.messages, 1);
-    assert_eq!(stats.bytes, PER_MESSAGE_OVERHEAD + b"work".len());
+    assert_eq!(stats.bytes, PER_MESSAGE_OVERHEAD + body.len());
 }
 
 /// A confirm says `Accepted` and nothing stronger: the reply carries no

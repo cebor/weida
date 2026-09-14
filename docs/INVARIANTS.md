@@ -117,14 +117,32 @@ the single-message case (B-096, `docs/libraries/zmq.md` §9).
 broker's queue is the case: `weida_broker::BrokerConfig::queue_bytes` (8 MiB per queue)
 bounds what a queue holds, but a producer of zero-byte messages costs zero payload bytes and
 one live `QueuedMessage` each, so the byte budget alone would bound nothing at all. Each
-message is therefore charged `PER_MESSAGE_OVERHEAD` (256 B) plus its payload plus the labels
-the queue retains, which makes `queue_bytes / PER_MESSAGE_OVERHEAD` the ceiling on the
-message count as well. Two further bounds belong to that config rather than to `Limits`,
-because a queue outlives every connection that touches it: `max_queues` (checked before any
-path is claimed) and `max_unacked` (the ceiling on any credit the broker will honour). The
-payload is read under the queue's *remaining* budget, never under the producer's advisory
-`content_len`, so an over-budget message is refused rather than buffered and then rejected
-(B-201, [decisions/0018](decisions/0018-minimal-broker.md) §4.8).
+message is therefore charged `PER_MESSAGE_OVERHEAD` (256 B) plus its body's **allocation**
+plus the labels the queue retains, which makes `queue_bytes / PER_MESSAGE_OVERHEAD` the
+ceiling on the message count as well. The allocation rather than the payload length, because
+a body arrives through `IncomingTransfer::collect`, which grows a `Vec` from empty in 64 KiB
+reads: a 2 MiB + 64 KiB message comes to rest in a 4 MiB allocation, so charging its length
+would let a queue hold close to twice `queue_bytes` of resident payload, with the factor
+chosen by the producer's message size. One further bound belongs to that config rather than
+to `Limits`, because a queue outlives every connection that touches it: `max_queues`,
+checked before any path is claimed. `max_unacked` is **not** a bound today — no code reads
+it, and it could not be enforced against a *cumulative* credit limit without capping a
+subscription's lifetime delivery count rather than its outstanding one; it becomes live with
+the acknowledgement of B-203. The payload is read under the queue's *remaining* budget,
+never under the producer's advisory `content_len`, so an over-budget message is refused
+rather than buffered and then rejected (B-201,
+[decisions/0018](decisions/0018-minimal-broker.md) §4.8).
+
+**A grant that arrives before its subscription is state a peer can create, so it is capped
+too.** A CREDIT frame and the SUBSCRIBE it belongs to ride two separate unidirectional
+streams handled by two independent tasks, so the credit can arrive first; dropping it left
+the consumer starved in silence, so the broker holds it until the subscription lands. The
+peer chooses both halves of the key — its connection and the filter — and a connection that
+only ever grants credit registers no consumer route, so nothing ever tells the queue that it
+went away. The table is therefore a fixed 64 entries with the oldest evicted rather than a
+map that grows until an `Unsubscribed` that may never come, and eviction rather than refusal
+because refusing the newest entry would let one peer's stale grants deny the mechanism to
+every other consumer on the queue (`crates/broker/src/consumers.rs`).
 
 **The queue's refusal is the opposite choice from `weida-zmq`'s, and deliberately so.** A
 ZeroMQ queue that refused the only message in an empty queue would deadlock a pattern that

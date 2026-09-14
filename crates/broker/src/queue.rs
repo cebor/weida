@@ -45,10 +45,24 @@ pub struct QueuedMessage {
 }
 
 impl QueuedMessage {
-    /// What this message charges against the queue's budget.
+    /// What this message charges against the queue's budget: its
+    /// **allocation**, not its payload.
+    ///
+    /// `body.capacity()` rather than `body.len()`, because a payload arrives
+    /// through `IncomingTransfer::collect`, which grows a `Vec` from empty in
+    /// 64 KiB reads — so a 2 MiB + 64 KiB message comes to rest in a 4 MiB
+    /// allocation. Charging the length would let a queue hold close to twice
+    /// `queue_bytes` of resident payload, with the factor chosen by the
+    /// producer's message size, and `docs/INVARIANTS.md` states that number as
+    /// the bound on what a queue *holds*. The slack is real memory; it is
+    /// charged to whoever caused it.
+    ///
+    /// [`Queue::push`], [`Queue::take`] and [`Queue::push_front`] all
+    /// recompute this from the same `Vec`, so an add and its release are the
+    /// same number and the running total cannot drift.
     pub fn charge(&self) -> usize {
         PER_MESSAGE_OVERHEAD
-            + self.body.len()
+            + self.body.capacity()
             + self.topic.as_ref().map_or(0, |t| t.len())
             + self.content_type.as_ref().map_or(0, |t| t.len())
     }
@@ -95,25 +109,37 @@ impl Queue {
         }
     }
 
-    /// How many payload bytes would still fit, given what a message's labels
-    /// already cost.
+    /// How many payload bytes would still fit, or `None` when no message fits
+    /// at all.
     ///
-    /// This is the cap the payload is *read* under, so a producer's advisory
-    /// `content_len` never decides how much is buffered — the queue's own
-    /// remaining budget does. Zero means the next message cannot be admitted
-    /// at all, however small its payload.
-    pub fn room_for(&self, meta: &IncomingMeta) -> usize {
+    /// `Some(n)` is the cap the payload is *read* under, so a producer's
+    /// advisory `content_len` never decides how much is buffered — the queue's
+    /// own remaining budget does. `Some(0)` is a real answer: a message whose
+    /// labels and overhead fill the budget exactly is admitted with an empty
+    /// payload, and [`Queue::push`] accepts it. `None` is the refusal, and it
+    /// is [`Queue::push`]'s own arithmetic read backwards — `charged + labels`
+    /// already past the budget — so the two cannot disagree at the boundary.
+    ///
+    /// The one thing this cannot promise is that a payload of exactly `n`
+    /// bytes is admitted: [`QueuedMessage::charge`] counts the allocation, and
+    /// a `Vec` that ends at `n` bytes may have reserved more. That is the
+    /// whole remaining gap between this answer and `push`'s, and it is stated
+    /// where `push` refuses.
+    pub fn room_for(&self, meta: &IncomingMeta) -> Option<usize> {
         let labels = PER_MESSAGE_OVERHEAD
             + meta.topic.as_ref().map_or(0, |t| t.len())
             + meta.content_type.as_ref().map_or(0, |t| t.len());
-        self.budget.saturating_sub(self.charged + labels)
+        self.budget.checked_sub(self.charged + labels)
     }
 
     /// Admits a message, or refuses it because the queue is full.
     ///
-    /// The authority on the bound: [`Queue::room_for`] is what the payload was
-    /// read under, but two producers can pass that check concurrently, so the
-    /// charge is re-checked here under the same lock that mutates the queue.
+    /// The authority on the bound, and the only one: [`Queue::room_for`] is
+    /// this same comparison asked before the payload is read, so a message
+    /// that passed that check is refused here only when its `Vec` reserved
+    /// more than it was read under ([`QueuedMessage::charge`]). Nothing else
+    /// can intervene — a queue's events are one loop, so no second admission
+    /// runs between the question and the answer.
     pub fn push(&mut self, message: QueuedMessage) -> Result<(), Refusal> {
         let charge = message.charge();
         if self.charged + charge > self.budget {
@@ -229,11 +255,68 @@ mod tests {
     #[test]
     fn the_read_cap_shrinks_as_the_queue_fills() {
         let mut queue = Queue::new(PER_MESSAGE_OVERHEAD * 2 + 100);
-        assert_eq!(queue.room_for(&empty_meta()), PER_MESSAGE_OVERHEAD + 100);
+        assert_eq!(
+            queue.room_for(&empty_meta()),
+            Some(PER_MESSAGE_OVERHEAD + 100)
+        );
         queue.push(message(60)).expect("within budget");
-        assert_eq!(queue.room_for(&empty_meta()), 40);
+        assert_eq!(queue.room_for(&empty_meta()), Some(40));
         queue.push(message(40)).expect("exactly the remaining room");
-        assert_eq!(queue.room_for(&empty_meta()), 0);
+        assert_eq!(
+            queue.room_for(&empty_meta()),
+            None,
+            "not even a message's own overhead fits now, and that is the refusal"
+        );
+    }
+
+    #[test]
+    fn a_message_that_fits_exactly_is_admitted_rather_than_refused() {
+        // The boundary the two authorities used to disagree on: a payload cap
+        // of zero says a message fits, not that the queue is full, and
+        // `push` agrees.
+        let mut queue = Queue::new(PER_MESSAGE_OVERHEAD * 2);
+        let meta = empty_meta();
+        queue.push(message(0)).expect("within budget");
+        let room = queue.room_for(&meta).expect("one empty message fits");
+        assert_eq!(room, 0);
+        queue.push(message(room)).expect("what the cap admits");
+        assert_eq!(queue.room_for(&meta), None);
+    }
+
+    #[test]
+    fn a_bodys_allocation_is_charged_and_not_its_payload() {
+        // A payload read in 64 KiB chunks comes to rest in a geometrically
+        // grown `Vec`, so the slack is real memory the producer's message size
+        // chose. Charging the length would let this queue hold both messages.
+        fn slack(len: usize, capacity: usize) -> QueuedMessage {
+            let mut body = Vec::with_capacity(capacity);
+            body.resize(len, 0u8);
+            QueuedMessage {
+                body,
+                topic: None,
+                content_type: None,
+                trace: None,
+            }
+        }
+
+        let mut queue = Queue::new(PER_MESSAGE_OVERHEAD * 2 + 100);
+        queue.push(slack(10, 100)).expect("the first fits");
+        assert_eq!(
+            queue.push(slack(10, 100)),
+            Err(Refusal::Full),
+            "two ten-byte payloads fit this budget; two hundred-byte \
+             allocations do not"
+        );
+        // And the release is the same number the add was.
+        let taken = queue.take(0).expect("the first is still held");
+        assert_eq!(taken.body.len(), 10);
+        assert_eq!(
+            queue.stats(),
+            QueueStats {
+                messages: 0,
+                bytes: 0
+            }
+        );
     }
 
     #[test]

@@ -40,10 +40,16 @@
 //! queue exists for.
 //!
 //! Two properties are worth stating because they are what a credit scheme is
-//! bought for. The limit is **absolute and monotone at the broker**, so a
-//! duplicated or reordered grant changes nothing. And a consumer **pauses by
-//! restating the count it has already received**: delivery stops with no
-//! stream reset and no connection close, and a later, larger grant resumes it.
+//! bought for. The limit is **absolute, cumulative and monotone at the
+//! broker** — the highest limit seen wins — so a duplicated or reordered
+//! grant changes nothing, which is what makes credit safe on a transport that
+//! does not order the streams control frames ride. And **the only pause is
+//! the `0` a fresh subscription starts at**: restating the count already
+//! delivered is not above the standing limit, so it changes nothing at all
+//! unless that count had already reached it. v0 offers no way to lower a
+//! standing limit, so a consumer that wants to stay in control grants in
+//! increments it is willing to receive rather than one large number it means
+//! to withdraw later.
 //!
 //! # What this slice does not do
 //!

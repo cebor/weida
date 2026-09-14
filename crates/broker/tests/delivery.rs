@@ -78,8 +78,10 @@ impl Harness {
         let subscriber = runtime.subscriber(self.client.clone());
         subscriber.subscribe(filter).await.expect("subscribe");
         subscriber.connect(&self.url(path)).await.expect("connect");
-        // The SUBSCRIBE is in flight; wait until the broker has it, so a test
-        // that then grants credit cannot have the grant overtake it.
+        // The SUBSCRIBE is in flight; wait until the broker has it, so that a
+        // test asserting `consumer_count` sees a settled registry. A grant
+        // that arrives first is held and applied by the broker — that is the
+        // subject of its own test, not a hazard every test has to dodge.
         let before = self.broker.consumer_count(path).expect("queue");
         let deadline = tokio::time::Instant::now() + DEADLINE;
         while self.broker.consumer_count(path) == Some(before) {
@@ -225,10 +227,15 @@ async fn a_consumer_at_its_limit_yields_to_one_with_credit() {
     assert_eq!(harness.broker.stats("/jobs").expect("queue").messages, 0);
 }
 
-/// A consumer pauses by restating what it has already received, and the queue
+/// A subscription that has spent its limit stops receiving, and the queue
 /// keeps its messages, its connection and its streams.
+///
+/// Restating the delivered count is *not* how a consumer pauses — the limit is
+/// monotone, so a grant that is not above the standing one changes nothing.
+/// What stops delivery here is the limit of 1 being spent; the restatement is
+/// in the test to prove it is the no-op it claims to be.
 #[tokio::test]
-async fn credit_at_the_delivered_count_pauses_without_a_reset() {
+async fn a_spent_limit_stops_delivery_without_a_reset() {
     let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
     let producer = harness.producer("/jobs").await;
     let (_consumer_rt, consumer) = harness.consumer("/jobs", "").await;
@@ -237,9 +244,9 @@ async fn credit_at_the_delivered_count_pauses_without_a_reset() {
     consumer.grant("", 1).await.expect("grant");
     assert_eq!(next(&consumer).await, "job-0");
 
-    // "Credit zero" against an absolute baseline: the limit equals what has
-    // been delivered, so nothing more may go out.
-    consumer.grant("", 1).await.expect("pause");
+    // The limit equals what has been delivered, so nothing more may go out —
+    // and restating it neither delivers anything nor lowers anything.
+    consumer.grant("", 1).await.expect("restate");
     nothing(&consumer).await;
 
     // The connection is untouched by the pause: the producer still gets
@@ -252,6 +259,51 @@ async fn credit_at_the_delivered_count_pauses_without_a_reset() {
     assert_eq!(next(&consumer).await, "job-1");
     assert_eq!(next(&consumer).await, "job-2");
     assert_eq!(next(&consumer).await, "job-0");
+    assert_eq!(harness.broker.stats("/jobs").expect("queue").messages, 0);
+}
+
+/// A grant that overtakes its own SUBSCRIBE is kept, and the message arrives.
+///
+/// The two orders ride two separate unidirectional streams and are handled by
+/// two independent tasks, so the broker sees them in whichever order those
+/// tasks reach its queue — and the credit path is the shorter one. Nothing
+/// restates a grant: `Subscriber::grant` is a one-shot application call, so a
+/// dropped one left its consumer receiving nothing, forever, with no error on
+/// either side.
+///
+/// The order is forced rather than raced: the consumer connects with no
+/// filters registered, so `connect` sends no SUBSCRIBE at all and the CREDIT
+/// is the first thing the queue sees. Nothing here waits for
+/// `consumer_count` to move, which is exactly what the other tests in this
+/// file do to keep this race out of their way.
+#[tokio::test]
+async fn a_grant_that_overtakes_its_subscribe_is_kept_and_delivers() {
+    let harness = Harness::start(BrokerConfig::with_queues(["/jobs"])).await;
+    let producer = harness.producer("/jobs").await;
+    harness.fill(&producer, 1).await;
+
+    let consumer_rt = Runtime::new(RuntimeConfig::default()).expect("consumer runtime");
+    let consumer = consumer_rt.subscriber(harness.client.clone());
+    let url = harness.url("/jobs");
+    consumer.connect(&url).await.expect("connect");
+    consumer.grant("", 5).await.expect("grant");
+
+    // Long enough on loopback that the credit frame has been handled against a
+    // queue with no subscription whatsoever, which is the case under test.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        harness.broker.consumer_count("/jobs"),
+        Some(0),
+        "the grant must have been handled before any subscription existed"
+    );
+
+    consumer.subscribe("").await.expect("subscribe");
+    assert_eq!(
+        next(&consumer).await,
+        "job-0",
+        "the held grant applies when the subscription lands, and the \
+         subscription itself triggers the delivery scan"
+    );
     assert_eq!(harness.broker.stats("/jobs").expect("queue").messages, 0);
 }
 
