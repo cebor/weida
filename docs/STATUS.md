@@ -14,9 +14,9 @@ the last two rounds: twenty-four regression tests from the review, and seventeen
 the website to the document set it renders. The intermittent failure this snapshot used to
 carry a caveat about is **found and fixed**: it was a port race in the cross-protocol tests,
 not a timing assertion (B-252).
-The Windows 11 VM ran at `93568c9`: **1805 across 136 binaries**, the same 37
-ignored, after one storage fault (`STATUS_IN_PAGE_ERROR`) cleared by a
-`cargo clean` — §6 point 3, not a code problem. Add
+The Windows 11 VM ran at the same commit: **1823 across 140 binaries**, the same 37
+ignored, after the storage fault took two runs and a `cargo clean`
+— §6 point 3, not a code problem. Add
 the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
