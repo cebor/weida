@@ -6,12 +6,12 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `c1975a7`, 2026-09-14 ~14:00 UTC. Tree clean, gate green on Linux:
-**1852 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+**Snapshot:** main `08ec2ec`, 2026-09-14 ~16:00 UTC. Tree clean, gate green on Linux:
+**1857 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
-plus `weida --features blocking` at **237**, 1 ignored. Forty-eight of those tests arrived in
+plus `weida --features blocking` at **237**, 1 ignored. Fifty-three of those tests arrived in
 the last three rounds: twenty-four regression tests from the review, seventeen that hold the
-website to the document set it renders, and seven that hold **the guide** to the programs it
+website to the document set it renders, and twelve that hold **the guide** to the programs it
 teaches with. The intermittent failure this snapshot used to
 carry a caveat about is **found and fixed**: it was a port race in the cross-protocol tests,
 not a timing assertion (B-252).
@@ -23,8 +23,20 @@ C10K, utopian on purpose — and every program in it is a file in the tree that 
 earns the framing: at this repository's own measured numbers, **two to four hops reach
 everybody**, which makes the hard problem at that scale neither throughput nor depth but what
 a hop may claim — and an acknowledgement per recipient converging on one root is 1.1 TB for one
-message. Chapter 1 is written; the arc is filed slice by slice, in the order of what can be
-asserted rather than of the chapter numbers (B-256..B-261).
+message. Chapters 1 and 2 are written, ten claims with ten programs; the rest of the arc is
+filed slice by slice, in the order of what can be asserted rather than of the chapter numbers
+(B-256, B-258..B-261).
+
+**The fan-out width the whole argument rests on is now measured** (B-247), and it moved the
+argument rather than confirming it. Per subscriber: **396-436 KiB** of transport state at widths
+16 and 256, **88.8 ns** of publisher CPU per message, **507-539 µs** of median idle latency at
+width 256. So neither memory nor CPU binds at 10⁴ subscribers — the **delivery rate** does, at
+**276-279 Kcopies/s**, which is 36 ms of a node's capacity for one message to 10⁴ subscribers
+and about 27 messages per second at that width. The width interval in the guide survived
+(10³-10⁴) for a different reason than the one it was derived from. A second measured answer
+settles how a fan-out fails: a stalled subscriber is refused by the **byte budget** when that
+budget is below the connection's 0.6-1.5 MiB absorption band and by the **queue** when it is
+above it — which is why `dropped_on(topic)` separates the two causes.
 The Windows 11 VM ran at the bookkeeping commit of this round (`2830be2`): **1830 across 141
 binaries**, the same 37 ignored, in one clean pass — fmt, clippy in both configurations and
 rustdoc included, with the guide's suite among the binaries. Add
@@ -249,18 +261,19 @@ Four things:
   the website's own gate run kept its log, the failure named itself
   (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
   a cross-test helper rather than the timing assertion it looked like (B-252).
-- **18 items are `ready`, 20 are `blocked`** (B-061, CI: the Forgejo host cannot run this
-  gate; B-254, serving the site; five guide chapters, each on the measurement or the slice it
+- **17 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
+  gate; B-254, serving the site; four guide chapters, each on the slice it
   needs; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **257** filed items, **218 are `done`**, and the `ready` ones are six
+  tier by 0011 §4.3). Of **257** filed items, **220 are `done`**, and the `ready` ones are six
   kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231),
   **the surfaces this session's work has not reached yet** (B-243, the cursor API in the two
   Python halves; B-244, the three new patterns in `weida::blocking` and both Python halves),
-  **seven findings the review round filed rather than fixed** (B-245 the `AF_UNIX` reset loss,
-  B-246 the unconditional `traceparent`, B-247 fan-out unpriced, B-248 the `unsafe` guard,
+  **six findings the review round filed rather than fixed** (B-245 the `AF_UNIX` reset loss,
+  B-246 the unconditional `traceparent`, B-248 the `unsafe` guard,
   B-249 the parked-receipt sweep, B-250 the per-message header allocations, B-251 one refusal
-  table), **the website** (B-253, built; B-254, serving it, blocked on the owner), **the next
+  table — B-247's fan-out measurement is now taken), **the website** (B-253, built; B-254,
+  serving it, blocked on the owner), **the next
   guide chapter that can be asserted today** (B-256, depth and what a chain may claim), and
   **two sentences in a file this loop does not write** (§6, B-107 and B-184).
   Nothing else is open: every requirement-driven item, every library item and both binding
