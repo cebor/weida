@@ -159,6 +159,17 @@ pub enum Error {
         /// The ceiling this client set.
         max: usize,
     },
+    /// A delivery carried more `User Property` pairs than
+    /// [`crate::Limits::max_user_properties`].
+    ///
+    /// **The protocol has no ceiling for this either.** `User Property` "is
+    /// allowed to appear multiple times" (3.3.2.3.7) [mqtt5 §3] and the only
+    /// limit on the wire is the packet size, so the number is this client's
+    /// and is named in [`crate::Limits`].
+    TooManyUserProperties {
+        /// The ceiling this client set.
+        max: usize,
+    },
     /// A Topic Name or Topic Filter breaks the grammar of 4.7 [mqtt5 §4.1],
     /// refused before the packet reaches the wire.
     ///
@@ -286,6 +297,11 @@ impl fmt::Display for Error {
                 f,
                 "a delivery carried more than {max} subscription identifiers, which is this \
                  client's ceiling because the protocol has none"
+            ),
+            Error::TooManyUserProperties { max } => write!(
+                f,
+                "a delivery carried more than {max} user properties, which is this client's \
+                 ceiling because the protocol has none"
             ),
             Error::Protocol(error) => write!(f, "the server broke the protocol: {error}"),
             Error::Encode(error) => write!(f, "cannot send this packet: {error}"),

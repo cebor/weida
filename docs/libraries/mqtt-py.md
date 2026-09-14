@@ -136,7 +136,7 @@ byte" (`options.rs:1-8`, `234-240`).
 | `client.message_retry_set(seconds)` | — | absent, and the absence is the library's rule: retransmission happens once, just after a CONNACK with `Session Present` 1, and there is no retry timer anywhere ([`mqtt.md`](mqtt.md) §4) |
 | — | `max_subscription_ids=`, `incoming_queue=` | present, and paho has no counterpart: the two resources MQTT bounds nowhere ([`mqtt.md`](mqtt.md) §9.1) are caller arguments — `options.rs:223-228` |
 | — | `connect_timeout=`, `ping_timeout=` | present, and paho has neither as a number the caller sets: the specification puts no deadline on the CONNACK and none on a missing PINGRESP, and an unbounded wait is a hang — `options.rs:229-232` |
-| `Limits::max_addresses` (the library's cap on a resolver's answer) | — | absent from the Python surface: it is the one `Limits` field with no keyword argument (`crates/mqtt/weida-mqtt/src/limits.rs:93-95` against `options.rs:214-228`), so a Python caller gets the library's default of 8 and cannot change it |
+| `Limits::max_addresses` (the library's cap on a resolver's answer), `Limits::max_user_properties` (its cap on `User Property` pairs per delivery) | — | absent from the Python surface: these are the two `Limits` fields with no keyword argument (`crates/mqtt/weida-mqtt/src/limits.rs` against `options.rs:214-228`), so a Python caller gets the library's defaults of 8 and 64 and cannot change either. The second followed the first deliberately when it was added rather than widening the pyo3 signature |
 | `client.enable_logger()`, `on_log` | — | absent — §6 |
 | `client.manual_ack=True`, `client.ack(mid, qos)` | — | absent: acknowledgements are the connection task's, and a delivery reaching the iterator has already been acknowledged at its QoS. What paho's manual ack buys — backpressure — is `incoming_queue`, which stops the reader rather than delaying an ack |
 
@@ -360,10 +360,10 @@ pins the absence: passing `timeout=1.0` is a `TypeError`.
 
 ### 9.6 Bounds this binding inherits and exposes
 
-The four ceilings [`mqtt.md`](mqtt.md) §9.1 adds because the protocol has none are keyword
+The ceilings [`mqtt.md`](mqtt.md) §9.1 adds because the protocol has none are keyword
 arguments here rather than constants: `max_subscription_ids` (32), `incoming_queue` (1024),
-`connect_timeout` (10 s) and `ping_timeout` (the Keep Alive). The fifth, `max_addresses` (8),
-is the one with no Python spelling (§5). Every duration in this surface is **seconds as a
+`connect_timeout` (10 s) and `ping_timeout` (the Keep Alive). Two have no Python spelling —
+`max_addresses` (8) and `max_user_properties` (64), §5. Every duration in this surface is **seconds as a
 float**, and a negative or non-finite one is a `ValueError` at the call that wrote it
 (`options.rs:18-29`, `values.rs:55-66`, `sync.rs:64-75`).
 
@@ -390,7 +390,7 @@ The clauses of B-151, B-152 and B-185, each with its verdict and the section tha
 | A synchronous surface over the same client, no loop in the process | yes | §9.2, `test_no_event_loop_exists_in_this_process` |
 | No second implementation of any protocol behaviour in the binding | yes, `weida_mqtt.sync` over the library's `blocking` module | §9.2 |
 | A receive deadline where the asynchronous surface has cancellation | yes, and `publish` deliberately has none | §9.4 |
-| Options honoured under a name or refused at configuration time | yes, 19 CONNECT keywords, `validate()` at construction; one library field (`max_addresses`) has no keyword and the row says so | §5 |
+| Options honoured under a name or refused at configuration time | yes, 19 CONNECT keywords, `validate()` at construction; two library fields (`max_addresses`, `max_user_properties`) have no keyword and the row says so | §5 |
 | TLS absent by construction, with `is_encrypted` saying so | yes | §3, §9.1 |
 | The wheel builds and runs with no Rust toolchain | yes: `package.sh` builds the `abi3` wheel, installs it into a fresh virtualenv and runs `smoke.py` with `PATH` scrubbed to `/usr/bin:/bin`; both files exist and B-151's and B-152's merge notes record the runs. **Not re-run for this document** | §8, `package.sh`, `smoke.py` |
 | Interop against the Python reference implementation | **not met**: paho-mqtt is not pinned, not installed and never run against this binding, and §8 says what would close it | §8, §9.7 |

@@ -246,6 +246,7 @@ bound at all. A client is on the exposed side of each, so `Limits` names them an
 | Bound | Default | Why the protocol has none |
 | --- | --- | --- |
 | `Limits::max_subscription_identifiers` | 32 | a server MAY send one copy carrying every matching identifier ([MQTT-3.3.4-4]) and the only limit on the wire is the packet size |
+| `Limits::max_user_properties` | 64 | `User Property` is repeatable per delivery (3.3.2.3.7) and a pair's minimal wire form is five octets, so even the default 1 MiB `Maximum Packet Size` admits over 200 000 of them and a 268 MB one over 50 million |
 | `Limits::incoming_queue` | 1024 | deliveries held for the application; QoS 0 has no flow control at all |
 | `Limits::max_addresses` | 8 | a resolver's answer is remote input |
 | `ConnectOptions::effective_ping_timeout` | the Keep Alive | "a Client SHOULD close the connection within a reasonable amount of time" with **no number** (sheet §1); an unbounded wait is a hang with a rationale ([LOOP.md](../LOOP.md) §2) |

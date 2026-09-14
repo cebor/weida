@@ -918,8 +918,17 @@ impl Task {
                             });
                         }
                         Packet::Publish(publish) => {
-                            self.receive(&publish).await?;
-                            last_write = std::time::Instant::now();
+                            // Only a QoS 1 or 2 PUBLISH answers with a PUBACK
+                            // or PUBREC; a QoS 0 one writes nothing, so it
+                            // must not reset the Keep Alive clock. Resetting
+                            // it there would let a stream of QoS 0
+                            // publications keep a silent client from ever
+                            // reaching the idle step, so no PINGREQ would go
+                            // out and the server would close the connection
+                            // at 1.5x Keep Alive ([MQTT-3.1.2-22]).
+                            if self.receive(&publish).await? {
+                                last_write = std::time::Instant::now();
+                            }
                         }
                         Packet::Puback(puback) => {
                             self.settle(
@@ -1453,7 +1462,15 @@ impl Task {
     /// **QoS 2's duplicate suppression is here and only here.** A repeat of a
     /// Packet Identifier already awaiting its PUBREL is answered with another
     /// PUBREC and MUST NOT be delivered again ([MQTT-4.3.3-10]) [mqtt5 §6].
-    async fn receive(&mut self, publish: &Publish<'_>) -> Result<()> {
+    ///
+    /// Returns whether anything was written, so the caller can reset the
+    /// keep-alive timer — as [`Task::auth`] does. A QoS 0 delivery only
+    /// reaches the application, so it answers `false`: Keep Alive "bounds the
+    /// gap from finishing one Client packet to starting the next"
+    /// ([MQTT-3.1.2-20]), and counting an inbound packet as a write would let
+    /// QoS 0 traffic suppress every PINGREQ until the server closed the
+    /// connection at 1.5x ([MQTT-3.1.2-22]).
+    async fn receive(&mut self, publish: &Publish<'_>) -> Result<bool> {
         let mut delivery = Delivery::read(publish, &self.limits)?;
         // The Topic Alias is resolved **before** the delivery reaches the
         // application, so nothing above this line ever sees a zero-length
@@ -1467,12 +1484,14 @@ impl Task {
         match (publish.qos, publish.packet_id) {
             (QoS::AtMostOnce, _) => {
                 self.deliver(delivery).await;
+                Ok(false)
             }
             (QoS::AtLeastOnce, Some(packet_id)) => {
                 self.deliver(delivery).await;
                 self.writer
                     .send(&Packet::Puback(Puback::new(packet_id)))
                     .await?;
+                Ok(true)
             }
             (QoS::ExactlyOnce, Some(packet_id)) => {
                 let first_sight = self.session.inbound_qos2_received(packet_id)?;
@@ -1482,12 +1501,12 @@ impl Task {
                 self.writer
                     .send(&Packet::Pubrec(Pubrec::new(packet_id)))
                     .await?;
+                Ok(true)
             }
             // The codec refuses a QoS > 0 PUBLISH without an identifier
             // ([MQTT-2.2.1-3]), so this is unreachable from the wire.
-            (_, None) => return Err(Error::Protocol(DecodeError::InvalidPacketIdentifier)),
+            (_, None) => Err(Error::Protocol(DecodeError::InvalidPacketIdentifier)),
         }
-        Ok(())
     }
 
     async fn deliver(&mut self, delivery: Delivery) {

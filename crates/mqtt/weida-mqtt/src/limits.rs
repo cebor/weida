@@ -83,6 +83,17 @@ pub struct Limits {
     /// ours, and a delivery that exceeds it is a Protocol Error rather than a
     /// growing vector.
     pub max_subscription_identifiers: usize,
+    /// `User Property` pairs this client will keep on one delivery.
+    ///
+    /// **The protocol has no ceiling for this one either.** `User Property`
+    /// "is allowed to appear multiple times to represent multiple name, value
+    /// pairs" (3.3.2.3.7) [mqtt5 §3], and the only limit on the wire is again
+    /// the packet size: a pair's minimal form is five octets, so even the
+    /// default `maximum_packet_size` of 1 MiB admits over 200,000 of them and
+    /// a 268 MB one admits over 50 million. The number is ours, and a
+    /// delivery that exceeds it is a Protocol Error rather than a growing
+    /// vector of peer-controlled strings.
+    pub max_user_properties: usize,
     /// Deliveries held for the application before the reader stops reading.
     ///
     /// **The protocol has no ceiling for this one either**, and QoS 0 has no
@@ -115,6 +126,12 @@ impl Default for Limits {
             // A client with more than 32 overlapping subscriptions matching
             // one topic has a topic design problem, not a limits problem.
             max_subscription_identifiers: 32,
+            // Properties are metadata, not payload: a delivery that needs
+            // more than 64 named pairs to describe itself is carrying its
+            // payload in its header. 64 is an order above the handful that
+            // tracing and content-negotiation conventions use, which is the
+            // same reasoning that sizes `max_subscription_identifiers`.
+            max_user_properties: 64,
             incoming_queue: 1024,
             max_addresses: 8,
         }
@@ -134,8 +151,8 @@ impl Limits {
     /// [`Error::Configuration`] for a `Receive Maximum` of 0 or a
     /// `Maximum Packet Size` of 0, both Protocol Errors on the wire
     /// [mqtt5 §11]; for a `Maximum Packet Size` above what the encoding can
-    /// express; and for a zero queue or address budget, which would make
-    /// progress impossible.
+    /// express; and for a zero per-delivery ceiling, queue or address budget,
+    /// which would make progress impossible.
     pub fn validate(&self) -> Result<()> {
         if self.receive_maximum == 0 {
             return Err(Error::Configuration(
@@ -159,6 +176,11 @@ impl Limits {
         if self.max_subscription_identifiers == 0 {
             return Err(Error::Configuration(
                 "Limits::max_subscription_identifiers must be at least 1".into(),
+            ));
+        }
+        if self.max_user_properties == 0 {
+            return Err(Error::Configuration(
+                "Limits::max_user_properties must be at least 1".into(),
             ));
         }
         if self.incoming_queue == 0 {
@@ -485,6 +507,10 @@ mod tests {
             },
             Limits {
                 max_subscription_identifiers: 0,
+                ..Limits::default()
+            },
+            Limits {
+                max_user_properties: 0,
                 ..Limits::default()
             },
             Limits {

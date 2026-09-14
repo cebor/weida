@@ -14,7 +14,7 @@ use weida_mqtt::{
     Client, ConnectOptions, ConnectReasonCode, Context, DisconnectReasonCode, Error, Event,
     Feature, QoS,
 };
-use weida_mqtt_codec::{Connack, Packet, PacketType, Properties};
+use weida_mqtt_codec::{Connack, Packet, PacketType, Properties, Publish};
 
 /// A CONNACK with the properties a test wants and Success.
 fn connack(properties: Properties<'_>) -> Vec<u8> {
@@ -319,6 +319,65 @@ async fn a_pingreq_is_sent_when_nothing_else_has_been() {
             PacketType::Disconnect
         ]
     );
+}
+
+/// [MQTT-3.1.2-20] measures the interval from the last packet **this side
+/// sent**, so inbound traffic must not reset it. A QoS 0 PUBLISH is answered
+/// with nothing at all, and a client that counted one as a write would never
+/// reach its idle step while a busy topic kept delivering — so it would say
+/// nothing and the server would close the connection at 1.5x Keep Alive
+/// ([MQTT-3.1.2-22]). The symptom is a broker that looks flaky.
+#[tokio::test]
+async fn an_inbound_qos_0_stream_does_not_suppress_the_pingreq() {
+    let delivery = bytes(&Packet::Publish(Publish {
+        topic: "busy/topic",
+        payload: b"tick",
+        qos: QoS::AtMostOnce,
+        ..Publish::default()
+    }));
+    // A publication every 400 ms across the whole two-second interval, so
+    // inbound traffic alone never leaves the client idle for a Keep Alive.
+    let mut script = vec![Act::Send(connack(Properties::new()))];
+    for _ in 0..6 {
+        script.push(Act::Send(delivery.clone()));
+        script.push(Act::Idle(Duration::from_millis(400)));
+    }
+    // The PINGREQ, which by now is waiting to be read if it was sent on time.
+    script.push(Act::Expect);
+    script.push(Act::Send(bytes(&Packet::Pingresp)));
+    // The script ends the connection itself, so `finished` resolves on the
+    // PINGREQ having been read rather than on the client going away.
+    script.push(Act::Close);
+    let mut server = Server::start(script).await;
+
+    let context = Context::new().expect("ambient");
+    let mut options = options();
+    options.keep_alive = Duration::from_secs(2);
+    let (_client, mut events) = Client::connect(&context, &server.address(), options)
+        .await
+        .expect("connects");
+
+    // The deadline is the protocol's own: 1.5x Keep Alive is where a server
+    // "MUST close the connection" ([MQTT-3.1.2-22]). The script takes 2.4 s,
+    // so an on-time PINGREQ is read well inside it, while a client whose
+    // timer the deliveries reset would not ping until 4 s.
+    tokio::time::timeout(Duration::from_secs(3), server.finished())
+        .await
+        .expect("the PINGREQ arrived before 1.5x Keep Alive would have closed the connection");
+
+    assert_eq!(
+        server.seen().await,
+        [PacketType::Connect, PacketType::Pingreq],
+        "an inbound QoS 0 delivery is not this side's traffic"
+    );
+
+    // And the stream really did arrive, so the PINGREQ was sent *despite* it.
+    for _ in 0..6 {
+        let Some(Event::Delivered(message)) = events.next().await else {
+            panic!("a delivery")
+        };
+        assert_eq!(message.topic, "busy/topic");
+    }
 }
 
 /// The number the specification declines to give: a PINGRESP that never comes

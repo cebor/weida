@@ -249,6 +249,11 @@ pub struct DeliveryProperties {
     /// `Correlation Data`.
     pub correlation_data: Option<Vec<u8>>,
     /// `User Property` pairs, in the order the publisher sent them.
+    ///
+    /// `User Property` "is allowed to appear multiple times" (3.3.2.3.7)
+    /// [mqtt5 §3] and the protocol puts **no ceiling** on how many one
+    /// delivery may carry, so [`Limits::max_user_properties`] does — see
+    /// [`DeliveryProperties::read`].
     pub user_properties: Vec<(String, String)>,
     /// The Subscription Identifiers this delivery was caused by.
     ///
@@ -267,10 +272,13 @@ impl DeliveryProperties {
     /// # Errors
     ///
     /// [`Error::TooManySubscriptionIdentifiers`] above
-    /// [`Limits::max_subscription_identifiers`]. The bound is this client's
-    /// because the protocol has none: the only limit on the wire is the packet
+    /// [`Limits::max_subscription_identifiers`], and
+    /// [`Error::TooManyUserProperties`] above
+    /// [`Limits::max_user_properties`]. Both bounds are this client's because
+    /// the protocol has neither: the only limit on the wire is the packet
     /// size, so at a 268 MB `Maximum Packet Size` a single delivery could
-    /// carry tens of millions of them.
+    /// carry tens of millions of identifiers, or — a pair's minimal form
+    /// being five octets — tens of millions of pairs.
     pub fn read(properties: &Properties<'_>, limits: &Limits) -> Result<DeliveryProperties> {
         let mut subscription_identifiers = Vec::new();
         for identifier in properties.subscription_identifiers() {
@@ -281,16 +289,22 @@ impl DeliveryProperties {
             }
             subscription_identifiers.push(identifier);
         }
+        let mut user_properties = Vec::new();
+        for (key, value) in properties.user_properties() {
+            if user_properties.len() >= limits.max_user_properties {
+                return Err(Error::TooManyUserProperties {
+                    max: limits.max_user_properties,
+                });
+            }
+            user_properties.push((key.to_owned(), value.to_owned()));
+        }
         Ok(DeliveryProperties {
             payload_format_indicator: properties.payload_format_indicator,
             message_expiry_interval: properties.message_expiry_interval,
             content_type: properties.content_type.map(str::to_owned),
             response_topic: properties.response_topic.map(str::to_owned),
             correlation_data: properties.correlation_data.map(<[u8]>::to_vec),
-            user_properties: properties
-                .user_properties()
-                .map(|(key, value)| (key.to_owned(), value.to_owned()))
-                .collect(),
+            user_properties,
             subscription_identifiers,
         })
     }
@@ -489,6 +503,37 @@ mod tests {
         let properties = Properties::new().with_subscription_identifiers(&ids);
         let read = DeliveryProperties::read(&properties, &limits).expect("at the ceiling");
         assert_eq!(read.subscription_identifiers, [7, 9]);
+    }
+
+    /// The other ceiling the protocol does not provide: `User Property` is
+    /// equally repeatable (3.3.2.3.7), so a delivery carrying more pairs than
+    /// this client will hold is refused on the same policy as its neighbour
+    /// rather than growing a vector of peer-controlled strings.
+    #[test]
+    fn a_delivery_past_the_user_property_ceiling_is_refused() {
+        let limits = Limits {
+            max_user_properties: 2,
+            ..Limits::default()
+        };
+        let pairs = [("a", "1"), ("b", "2"), ("c", "3")];
+        let properties = Properties::new().with_user_properties(&pairs);
+        let error = DeliveryProperties::read(&properties, &limits).expect_err("refused");
+        assert!(
+            matches!(error, Error::TooManyUserProperties { max: 2 }),
+            "{error}"
+        );
+
+        // At the ceiling it is read, and in the publisher's order: the pairs
+        // are an ordered list and not a map ([MQTT-3.3.2-17]).
+        let pairs = [("b", "2"), ("a", "1")];
+        let properties = Properties::new().with_user_properties(&pairs);
+        let read = DeliveryProperties::read(&properties, &limits).expect("at the ceiling");
+        let seen: Vec<(&str, &str)> = read
+            .user_properties
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(seen, [("b", "2"), ("a", "1")]);
     }
 
     #[test]
