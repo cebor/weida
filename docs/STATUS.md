@@ -92,9 +92,8 @@ broke the Windows build in a way no Linux gate can see (`pipe.rs` is `#[cfg(wind
 test lost 0005's refusal race on that platform while passing here, and **the VM's storage
 faulted twelve times in one evening** — `STATUS_IN_PAGE_ERROR` eleven times and `LNK1201`
 once, each without a source line and each cleared by a `cargo clean` or by simply running
-again. The rate is §6 point 3's "every few hours" at minutes, and the **shape changed** in the
-last run: six faults in one 78-second attempt, spread over five crates, where it used to be
-one per run. Add
+again, the last attempt taking six faults in 78 seconds across five crates. **That cause is
+now found and fixed on the host, and it was never the disk**: §6 point 3. Add
 the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
@@ -284,23 +283,40 @@ Four things:
    `weida.doodleshnookie.net`, and whether the site goes up before there is something to
    install. Until then the site says so on every page and B-254 holds the work
    ([0025](decisions/0025-the-website.md) §4.6).
-2. **Two sentences in [LOOP.md](LOOP.md) §6** (B-184 and B-107). The loop does not edit its own
-   standing instructions, so the checks are run by hand and recorded in each item's note. They
-   are not theoretical: running B-184's own command this session found a third `cfg`-gated
-   intra-doc link — `Identity::generate` in `crates/weida/src/config.rs` — which failed
-   `cargo doc -p weida --no-default-features` and was invisible to every `--workspace` doc run
-   ever made here. It is fixed; the instruction that would have caught it is yours. B-107 is
-   the same shape for the `blocking` feature, re-verified this session at 245, 150 and 138
-   tests for `weida-zmq`, `weida-mqtt` and `weida-nng`.
+2. **One paste into [LOOP.md](LOOP.md) §6** (B-184 and B-107, now `blocked: needs the owner`).
+   The loop does not edit its own standing instructions, so the replacement text is drafted
+   with **measured** runtimes and waits on you. The choice was made this session — cover the
+   features in the gate rather than declare them out of scope — and the numbers say why it is
+   cheap: the five default-off configurations (`blocking` on `weida`, `weida-zmq`,
+   `weida-mqtt`, `weida-nng`; `cluster` on `weida-broker`) cost **89 s** warm for clippy plus
+   test and cover **850 tests** no `--workspace` command compiles; the ten rustdoc runs — five
+   `--no-default-features`, five `--all-features` — cost **8 s**; and `cargo clean --doc`
+   before the doc step, which is what makes a green doc step a check rather than a cache hit,
+   costs **0.1 s** plus **3.6 s** to re-document everything. The holes are not theoretical and
+   not shrinking: measuring them found the **fourth** `cfg`-gated intra-doc link of the year —
+   `crate::blocking::Cursors::changed` in `crates/weida/src/cursor.rs`, written an hour
+   earlier in B-243, which broke `cargo doc -p weida --no-default-features` while every
+   `--workspace` doc run in the session was green (fixed in `00eff38`). The run that proves
+   the gate needs the command is the run that finds the next one.
 3. **The Windows gate is manual.** The VM that unblocked B-039 (`ssh win11-geselle`) is in no
    CI, so `C:\work\gate.ps1` runs beside the Linux one by hand, and B-061's CI is where that
    would stop being true — itself `blocked`, because the Forgejo host has 2 vCPUs, 3 GB of RAM
-   and a 600 s job limit. The VM's storage also throws `STATUS_IN_PAGE_ERROR` mid-compile —
-   filed as the environment problem it is, never a code one: no occurrence has ever carried a
-   source line, and each is cleared by a `cargo clean` or by running again. **It is getting
-   worse**: the rate was every few hours, then twelve faults in one evening, and the last run
-   took six of them in 78 seconds across five crates. A Windows gate that fails in seconds
-   should be read as a disk before it is read as a diff, and the machine wants attention.
+   and a 600 s job limit. The `STATUS_IN_PAGE_ERROR`/`LNK1201` faults that turned every
+   Windows pass into two to four runs are **found and fixed, and the disk was innocent**: the
+   images (`/var/lib/geselle/vm/win11/{base,run}.qcow2`) live on btrfs, which checksums every
+   data write, and `vm.sh` gave them to QEMU as `cache=none,aio=native`, so the guest can
+   change a page after btrfs has taken its checksum of it. The block then reads back `EIO`
+   while the drive reports nothing — **2145 `corruption_errs` against 0 read, write and flush
+   errors** in `btrfs device stats /`, all of them on the two image inodes, up from 76 two
+   days earlier, on an NVMe with **0 media and data integrity errors and 3 % wear** whose
+   `base.qcow2` re-reads its 8.67 GiB clean today. It is also why `cargo clean` always
+   "fixed" it: a rewritten block gets a checksum that matches it again. `vm.sh` now sets
+   `chattr +C` on the image directory before creating an image, so every new overlay is
+   `No_COW` and unchecksummed; it applies at the next `vm.sh run`, and a VM started before
+   that change still runs on the old overlay. Two things stay human: this gate is still
+   manual, and the *other* NVMe (980 PRO 2 TB, `/mnt/win`, 100 % full) reports 630 media and
+   data integrity errors, 86 % spare left and three self-tests that ended in failed segments
+   — back that one up.
 4. **Nothing on this list any more, and that is the change.** The two decisions the review
    round filed rather than took — because each changes what a peer observes — are both taken:
    the unconditional `traceparent` is gone, a context is propagated and never minted, and a
@@ -321,13 +337,13 @@ Four things:
   the website's own gate run kept its log, the failure named itself
   (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
   a cross-test helper rather than the timing assertion it looked like (B-252).
-- **7 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
-  gate; B-254, serving the site; four guide chapters, each on the slice it
-  needs; the rest waiting on an item this session is
+- **5 items are `ready`, 21 are `blocked`** (B-061, CI: the Forgejo host cannot run this
+  gate; B-254, serving the site; B-107 and B-184, one paste into LOOP §6; four guide chapters,
+  each on the slice it needs; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **258** filed items, **231 are `done`**, and the `ready` ones are two
-  kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231)
-  and **two sentences in a file this loop does not write** (§6, B-107 and B-184).
+  tier by 0011 §4.3). Of **258** filed items, **231 are `done`**, and every `ready` one is a
+  slice of the **cluster and store phase** (B-219, B-220, B-224, B-226, B-231): nothing else
+  in the backlog is actionable without a decision of yours.
   **Every surface of the library is bound**: B-244 and B-243 closed the two this session's
   plan deliberately left alone, so `weida::blocking` and both `weida-py` halves now carry all
   six patterns and the cursor surface.
