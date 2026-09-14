@@ -54,7 +54,9 @@ pub(crate) struct PipeStream {
     exec: Exec,
 }
 
-enum PipeIo {
+/// Crate-visible because it appears in this transport's `Stream::Reader` and
+/// `Stream::Writer`, which the shared framing is generic over.
+pub(crate) enum PipeIo {
     /// The instance that accepted, on the serving side.
     Server(NamedPipeServer),
     /// The handle that dialled.
