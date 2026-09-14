@@ -6,14 +6,25 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main, 2026-09-14 ~12:20 UTC. Tree clean, gate green on Linux:
-**1845 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+**Snapshot:** main `c1975a7`, 2026-09-14 ~14:00 UTC. Tree clean, gate green on Linux:
+**1852 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
-plus `weida --features blocking` at **237**, 1 ignored. Forty-one of those tests arrived in
-the last two rounds: twenty-four regression tests from the review, and seventeen that hold
-the website to the document set it renders. The intermittent failure this snapshot used to
+plus `weida --features blocking` at **237**, 1 ignored. Forty-eight of those tests arrived in
+the last three rounds: twenty-four regression tests from the review, seventeen that hold the
+website to the document set it renders, and seven that hold **the guide** to the programs it
+teaches with. The intermittent failure this snapshot used to
 carry a caveat about is **found and fixed**: it was a port race in the cross-protocol tests,
 not a timing assertion (B-252).
+
+**There is now a document that teaches.** [GUIDE.md](GUIDE.md) is organised around one
+question — **C8B: how do you scale a software system to eight billion people?**, this project's
+C10K, utopian on purpose — and every program in it is a file in the tree that a test drives
+([0026](decisions/0026-the-guide-and-the-c8b-question.md)). §0's arithmetic is the part that
+earns the framing: at this repository's own measured numbers, **two to four hops reach
+everybody**, which makes the hard problem at that scale neither throughput nor depth but what
+a hop may claim — and an acknowledgement per recipient converging on one root is 1.1 TB for one
+message. Chapter 1 is written; the arc is filed slice by slice, in the order of what can be
+asserted rather than of the chapter numbers (B-256..B-261).
 The Windows 11 VM ran at the same commit: **1823 across 140 binaries**, the same 37
 ignored, after the storage fault took two runs and a `cargo clean`
 — §6 point 3, not a code problem. Add
@@ -21,13 +32,15 @@ the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
 items, and **every one of the four wheels built and smoke-tested with no Rust toolchain on
-`PATH`**. Twenty-five decision notes (0001–0025): fourteen `accepted` and eleven
+`PATH`**. Twenty-six decision notes (0001–0026): fourteen `accepted` and twelve
 `provisional` — 0015 (peer authorization), 0016 (conflation) and 0017 (the subscription
 verdict) because each answers an open question with a wire-affecting "no"; 0018 (the minimal
 broker) and 0019 (the JVM binding) because they are the first step of a phase the user
 chooses; 0020–0024 (the cluster, consensus, the store, one control group, the cursor and the
-three families) because they are the phase now being built; and 0025 (the website) because
-what a site may claim is settled by a release that does not exist yet.
+three families) because they are the phase now being built; 0025 (the website) because
+what a site may claim is settled by a release that does not exist yet; and 0026 (the guide and
+the C8B question) because the question is a framing the owner set and the arc it implies is
+still being written.
 One binary, `weida` (B-060), beside the library, `weida::blocking` (B-194) beside the async API,
 and **`weida-py`** (B-200, B-204, B-205), the sixth Python binding in the tree, the first of
 weida itself, the only one that reaches every pattern of its library including the streamed
@@ -229,25 +242,27 @@ Four things:
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1845 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  green at **1852 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session. The one caveat this section used to carry — a
   failure in roughly one full-workspace run in twenty that nobody had seen — is **closed**:
   the website's own gate run kept its log, the failure named itself
   (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
   a cross-test helper rather than the timing assertion it looked like (B-252).
-- **17 items are `ready`, 15 are `blocked`** (B-061, CI: the Forgejo host cannot run this
-  gate; B-254, serving the site; the rest waiting on an item this session is
+- **18 items are `ready`, 20 are `blocked`** (B-061, CI: the Forgejo host cannot run this
+  gate; B-254, serving the site; five guide chapters, each on the measurement or the slice it
+  needs; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **250** filed items, **217 are `done`**, and the `ready` ones are five
+  tier by 0011 §4.3). Of **257** filed items, **218 are `done`**, and the `ready` ones are six
   kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231),
   **the surfaces this session's work has not reached yet** (B-243, the cursor API in the two
   Python halves; B-244, the three new patterns in `weida::blocking` and both Python halves),
   **seven findings the review round filed rather than fixed** (B-245 the `AF_UNIX` reset loss,
   B-246 the unconditional `traceparent`, B-247 fan-out unpriced, B-248 the `unsafe` guard,
   B-249 the parked-receipt sweep, B-250 the per-message header allocations, B-251 one refusal
-  table), **the website** (B-253, built; B-254, serving it, blocked on the owner), and **two
-  sentences in a file this loop does not write** (§6, B-107 and B-184).
+  table), **the website** (B-253, built; B-254, serving it, blocked on the owner), **the next
+  guide chapter that can be asserted today** (B-256, depth and what a chain may claim), and
+  **two sentences in a file this loop does not write** (§6, B-107 and B-184).
   Nothing else is open: every requirement-driven item, every library item and both binding
   slices of weida's own Python surface are closed.
 - **The requirement-driven backlog is closed.** All five requests of
