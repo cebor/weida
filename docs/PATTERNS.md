@@ -132,14 +132,28 @@ from — one per dialled path, per §1.3 — and that is the whole mechanism
 connection of the path its subscription names, never at L0 [0003 §4.2, as amended by
 [0011](decisions/0011-answered-where-it-arrived.md) §4.3].
 
-### 1.5 Cancel: never EOF, not a retraction
+### 1.5 Cancel: not a retraction, and never EOF except over `AF_UNIX`
 
 `OutgoingTransfer::cancel` (and dropping an unfinished transfer) resets the stream. The reader
-never observes the transfer as complete: `AsyncRead` fails with `io::ErrorKind::ConnectionReset`,
+never observes the transfer as complete — on every transport but one, and the exception is the
+paragraph after this one: `AsyncRead` fails with `io::ErrorKind::ConnectionReset`,
 `read_capped`/`collect` with `Error::Canceled`, never `Ok(0)`. Bytes the reader already took
 are unaffected. Bytes already buffered at the receiver may still be read before the reset is
 processed: cancellation guarantees the peer cannot mistake the transfer for a whole one, not
 that the peer saw fewer bytes.
+
+**That guarantee holds on QUIC, in process and over a named pipe, and not over `AF_UNIX`.** A
+stream socket has no abort — `SO_LINGER` with a zero timeout followed by `close` is
+byte-for-byte indistinguishable from a plain close at the reader, data then a clean EOF — so
+`crates/weida/src/unix.rs` implements the transport's `finish` and `reset` identically, both
+`drop(writer)` with the code discarded. A cancelled transfer, a transfer dropped without
+`finish()` and a producer that died mid-payload therefore all read as a **complete** transfer
+over `weida+unix://`: `collect` returns `Ok(truncated_bytes)` and the `AsyncRead` returns EOF,
+and the application takes half a message for a whole one. The other two local transports do
+carry the distinction — in process the reader checks the writer's reset flag before reporting
+EOF, and a named pipe frames every write and carries a `CHUNK_RESET` with its code — so
+`AF_UNIX` is the single outlier, and closing it means paying for framing there too
+([decisions/0012](decisions/0012-local-connection-grouping.md) §4.7, B-245).
 
 *`cancel_discards_unread_bytes_and_keeps_read_ones`, `push_cancel_mid_transfer`,
 `cancel_mid_transfer`.*
@@ -228,10 +242,10 @@ cost that answer has, named here rather than discovered.
 
 ### 1.10 What a local transport changes
 
-Everything above is written against QUIC. Over the two local transports of
-[0010](decisions/0010-local-transport.md) five of those statements mean something else, and
-the difference is always the same cause: there is no QUIC connection to share, because one
-transfer is one channel pair (inproc) or one OS connection (`AF_UNIX`).
+Everything above is written against QUIC. Over the three local transports of
+[0010](decisions/0010-local-transport.md) six of those statements mean something else, and the
+first five have the same cause: there is no QUIC connection to share, because one transfer is
+one channel pair (inproc) or one OS connection (`AF_UNIX`, a named pipe).
 
 - **§1.2's window arithmetic does not apply.** A receipt still means the peer's transport
   holds the bytes, but "beyond the window" has no local analogue: inproc hands over a buffer
@@ -264,6 +278,15 @@ transfer is one channel pair (inproc) or one OS connection (`AF_UNIX`).
   subscriber byte budget of §4: the copy is dropped, counted in `Publisher::dropped`, and the
   subscription survives. A subscriber that parks nothing is refused at `connect` rather than
   silently receiving nothing.
+- **§1.5's cancellation guarantee is lost over `AF_UNIX`, and only there.** A stream socket
+  cannot abort, so `unix.rs`'s `finish` and `reset` are the same call and a reset arrives as a
+  clean EOF: a cancelled or interrupted transfer is returned to the reader as a complete one,
+  truncated. In process the reader checks the writer's reset flag before reporting EOF, and a
+  named pipe frames its writes and carries the reset code in a `CHUNK_RESET` chunk, so both of
+  those keep the guarantee. Every statement in this document of the form "a reset is never
+  mistaken for a FIN" — §1.5, §1.11, §3's cancellation row, §4's streamed-fan-out rows — is
+  therefore an `AF_UNIX` exception, and it is a **loss** rather than a design choice: 0012 §4.7
+  records it with the two ways out and what each costs, and B-245 is the item that closes it.
 
 *`crates/weida/tests/transports.rs`: the three pattern bodies over all three transports,
 `a_unix_peer_presents_the_principal_the_kernel_proved`,
@@ -283,10 +306,13 @@ decision over:
 > **Within a connection, QUIC retransmits; when the connection ends, an unfinished stream is
 > gone, and weida does not resend it.**
 
-What the two sides observe is already exact. The sender gets `ConnectionLost` before FIN and `Ok`
-after it (§1.1, the pattern tables below); the receiver never sees an unfinished stream as
-complete — `AsyncRead` fails with `ConnectionReset`, `collect` with `Error::Canceled`, **never**
-`Ok(0)` (§1.5). "Half a frame is not a frame" (§4.1) is the rule, not a special case.
+What the two sides observe is already exact, on every transport but one. The sender gets
+`ConnectionLost` before FIN and `Ok` after it (§1.1, the pattern tables below); the receiver
+never sees an unfinished stream as complete — `AsyncRead` fails with `ConnectionReset`,
+`collect` with `Error::Canceled`, **never** `Ok(0)` (§1.5) — **except over `AF_UNIX`**, where a
+reset is indistinguishable from a FIN and the interrupted stream is handed over as a complete,
+truncated one (§1.10, B-245). "Half a frame is not a frame" (§4.1) is the rule, not a special
+case; over `AF_UNIX` it is a rule the transport cannot enforce.
 
 What happens next is the **application's** choice, and there are exactly three, one of which is
 usually wrong:
@@ -330,7 +356,9 @@ interrupted before FIN is a definite `ConnectionLost` for the sender
 (*`a_transfer_interrupted_before_fin_is_connection_lost_for_the_sender`*); a reader never sees
 an interrupted stream as complete, with `collect` failing `Canceled`, `AsyncRead` failing
 `ConnectionReset` and **never** `Ok(0)`
-(*`a_reader_never_sees_an_interrupted_stream_as_complete`*); a requester learns
+(*`a_reader_never_sees_an_interrupted_stream_as_complete`*, which is a statement about QUIC,
+inproc and named pipes — over `AF_UNIX` the same interruption is read as a complete transfer,
+§1.10); a requester learns
 `Indeterminate` and can re-issue (*`a_reqrep_requester_can_reissue_after_an_indeterminate_outcome`*);
 a Push producer is the only side that can (*`a_push_producer_is_the_only_side_that_can_reschedule`*);
 a lost fan-out copy is counted and never re-sent
@@ -401,7 +429,7 @@ One unidirectional stream per message. Fire-and-forget with an optional transpor
 | Ordering | `None` | |
 | Delivery signal | none (`send`) or the transport receipt (§1.2) | none; EOF is EOF |
 | Backpressure | `max_concurrent_uni_streams` on `open` (§1.4), then the windows (§1.3) | a puller that stops reading stalls its pushers after the budget; nothing is dropped |
-| Cancellation | `cancel` or drop: the puller's read fails, never EOF (§1.5) | drop an unread transfer: `STOP_SENDING(REJECTED)` |
+| Cancellation | `cancel` or drop: the puller's read fails, never EOF (§1.5) — over `AF_UNIX` it *is* EOF, and the puller takes the truncated payload for a whole one (§1.10) | drop an unread transfer: `STOP_SENDING(REJECTED)` |
 
 Failure modes, from the pusher's side:
 
@@ -454,7 +482,7 @@ Failure modes:
 | Publisher's connection lost | — | `recv` keeps waiting; filters are remembered and re-sent on the next `connect` |
 | Too many filters on one connection | closes it with `LIMIT_EXCEEDED` | `connect`/`subscribe` fails |
 | Message beyond the budget | `LimitExceeded`, nothing sent | — |
-| Streamed transfer a subscriber cannot keep up with | that subscriber's stream is reset with `CANCELED` and the drop counted; the others keep receiving | a partial payload, ended by a reset rather than a FIN, so it is never mistaken for a whole one |
+| Streamed transfer a subscriber cannot keep up with | that subscriber's stream is reset with `CANCELED` and the drop counted; the others keep receiving | a partial payload, ended by a reset rather than a FIN, so it is never mistaken for a whole one — except over `AF_UNIX`, where the reset *is* a FIN (§1.10) |
 
 This is the one place weida answers overload by discarding, and it is confined to fan-out
 ([GUARANTEES.md](GUARANTEES.md) §6). Today a subscriber cannot detect a drop; **subscriber-side
@@ -488,7 +516,7 @@ has no ceiling.
 | `write_within(chunk, limit)` | waits up to `limit` for a subscriber with no room, then drops **that** subscriber's copy. The bound is mandatory and finite for the reason `drain(Duration)`'s is ([decisions/0009](decisions/0009-drain.md) §4.4): an unbounded wait is how a publisher hangs on a peer, and never waiting would make a payload larger than the budget undeliverable to anybody — the publisher would outrun its own budget and abort every copy |
 | `write_now(chunk)` | never waits: a subscriber without room right now loses the transfer. Fan-out's `Drop` in its purest form, and the right call where a later chunk supersedes an earlier one |
 | `finish()` | FIN on every remaining copy; returns how many subscribers got all of it as far as this side can tell. A fan-out copy carries no receipt, so the acknowledgement is the drain's business and nobody else's |
-| dropping the handle | resets every copy, so no subscriber mistakes a partial payload for a whole one |
+| dropping the handle | resets every copy, so no subscriber mistakes a partial payload for a whole one — over `AF_UNIX` every subscriber does (§1.10) |
 
 **This is also v0's conflation**, and that is decided rather than a workaround
 ([decisions/0016](decisions/0016-conflation.md) §4.3): a producer that wants "keep the newest,
@@ -549,7 +577,8 @@ the same calls: **one-way transfers in both directions**, one connection, one pe
 | Send/receive pattern | `connect` once, then `send`/`open` and `recv` concurrently | `send`/`open` and `recv` concurrently |
 | Outgoing routing | the one connection it dialled | the one connection its peer dialled |
 | Action with no peer | a second `connect` is `Error::LimitExceeded` | the first send **waits** for a peer to appear |
-| Second peer | — | refused with `LIMIT_EXCEEDED`, and the first is **kept** |
+| Second peer | — | refused with `LIMIT_EXCEEDED` while the first is **live**, and the first is **kept** |
+| Backpressure | `Block`: `open` waits for the peer's `max_concurrent_uni_streams` (§1.4) and then for the two windows (§1.3); a peer that stops calling `recv` fills its `endpoint_queue`, which the dispatcher awaits a slot in, so the sender stalls once the budget is spent. Nothing is dropped | the same, preceded by one wait more — and the only wait in this library with **no bound at all** |
 
 Two rules a caller can get wrong. **The first peer is kept**: ZeroMQ's PAIR drops the newcomer
 silently, weida refuses it and says so, because a capacity decision is reported
@@ -558,8 +587,30 @@ silently, weida refuses it and says so, because a capacity decision is reported
 it has not heard from, so its first send waits rather than buffering: a queue there would be a
 guarantee nobody asked for.
 
+**The claim is on a connection, not on eternity.** A pair whose peer went away — a restarted
+process, a connection past `idle_timeout`, an ordinary shutdown — is claimable again, and the
+next peer to speak takes it. Holding a bound endpoint against a connection that no longer
+exists would make one peer's shutdown permanent, which is neither ZeroMQ's behaviour nor
+nanomsg's and is not what "one peer at a time" means. A dialling pair likewise releases its
+path when it is dropped, so the next pair on the same pooled connection can claim it.
+
+**That first wait is unbounded, which the "Action with no peer" row understates.** A bound
+pair's `open` blocks in `PairOwner::peer` until some connection has claimed the endpoint, and
+that wait has no deadline, no timeout knob and no idle timer under it — nothing has been dialled
+yet, so none of §1.8's bounds apply. It is the caller's to bound: wrap the send in
+`Exec::within`, or drop the future. Everything after it is ordinary `Block` backpressure, the
+same on both halves.
+
+Both halves also **number their transfers** under a negotiated `PerProducer` ordering. That is
+worth saying because the two halves are different send paths in the code, and one link with
+two ordering behaviours — numbered one way, unnumbered the other, neither side told — is the
+failure that shape invites.
+
 *`both_directions_carry_transfers_concurrently`,
 `a_second_connection_is_refused_and_the_first_keeps_working`,
+`a_peer_that_goes_away_leaves_the_endpoint_claimable`,
+`a_dropped_pair_releases_its_path_on_a_pooled_connection`,
+`both_halves_of_a_pair_number_their_transfers`,
 `a_pair_talks_to_a_bare_peer_and_acceptor_on_the_same_path`.*
 
 ### 6.2 SURVEY
@@ -573,8 +624,8 @@ until the deadline. A `Respondent` is a `Replier` with a different name: same ro
 | --- | --- | --- |
 | Direction | connects, and **accumulates** peers on purpose | binds |
 | Outgoing routing | every live peer, one exchange each | the exchange that asked |
-| Deadline | the caller's, per survey; nothing on the wire carries it | never learns it |
-| A late answer | dropped and **counted** in `late()` | cannot tell |
+| Deadline | the caller's, per survey — it bounds the **asking** as well as the collecting; nothing on the wire carries it | never learns it |
+| A late answer | dropped and **counted** in `late()`; an answer that arrived *in time* is delivered even to a caller that reads after the deadline | cannot tell |
 | No respondents | an empty run, not an error | — |
 
 Three rules. The deadline is **not negotiated** and a respondent never learns it, so a survey
@@ -585,9 +636,17 @@ a survey with no respondents returns a run whose first `next` is `None`, never
 `Error::NotConnected`.
 
 A respondent that refuses or dies mid-reply is **one `Err` among the answers** and ends
-nothing: the exchanges are independent.
+nothing: the exchanges are independent. A respondent that accepts a question and stops reading
+is bounded by the same deadline: asking is two awaits the peer controls — its stream budget and
+its flow-control window — so the deadline covers them, and a respondent that could not be asked
+inside it is simply not counted in `respondents()`. Dropping a `SurveyRun` ends the exchanges
+it was collecting, which is what frees their streams: a respondent that never answers is told,
+exactly as a requester that walks away tells its replier.
 
 *`every_respondent_answers_within_the_deadline`, `a_late_reply_is_counted_and_not_delivered`,
+`an_answer_that_arrived_in_time_survives_a_caller_that_reads_late`,
+`a_respondent_that_never_reads_cannot_hold_the_survey_open`,
+`dropping_a_run_ends_the_exchanges_it_was_collecting`,
 `a_respondent_that_refuses_is_one_error_among_replies`,
 `a_respondent_that_dies_mid_reply_does_not_end_the_survey`,
 `a_survey_with_no_respondents_is_empty_not_an_error`.*
@@ -603,7 +662,8 @@ ordinary `connect`, leaving an ordinary disconnect; there is no membership proto
 | Compatible peer | another `BusMember` on the same path |
 | Send/receive pattern | `connect` per member, then `send` → every other member, `recv` |
 | Outgoing routing | every member this one dialled; **never itself** |
-| Backpressure | one writer per member; a full writer queue drops and counts |
+| Backpressure | `Drop`, per member: one writer each, bounded twice — `endpoint_queue` messages and `subscriber_buffer_bytes` of payload — and a copy that fits neither is dropped and counted in `dropped()` |
+| Payload | one `Bytes` for the whole fan-out, at most `subscriber_buffer_bytes`; larger is `LimitExceeded` before any member is charged |
 | Ordering | `None` across members, per stream within one |
 | Relay | none: *n* members is *n* × (*n* − 1) deliveries |
 
@@ -616,10 +676,20 @@ sender exhausts `max_concurrent_uni_streams` and its next `send` blocks. With on
 member costs its own copies — counted in `dropped()`, at the queue when it is full and at the
 wire when a write fails — and never the sender's time.
 
+The two bounds are the same pair Pub/Sub charges per subscriber, and for the same reason: a
+queue counted only in messages bounds nothing, because a bus send costs `endpoint_queue` ×
+`body.len()` per member and then multiplies by the members, and `body.len()` is the
+application's number. A body above the byte budget is refused to the **sender**
+(`LimitExceeded`) rather than dropped once per member, because such a message could not be
+enqueued for anybody, and one copy of it is made for the whole fan-out: every member's queue
+holds a reference to the same `Bytes`, so *n* members cost one copy rather than *n*.
+
 *`every_member_sees_every_other_members_message`,
 `a_sender_never_receives_its_own_message`,
 `a_dead_member_is_dropped_and_the_others_continue`,
-`a_slow_member_is_dropped_and_counted_rather_than_blocking`.*
+`a_slow_member_is_dropped_and_counted_rather_than_blocking`,
+`a_body_above_the_fan_out_budget_is_refused_rather_than_dropped_for_everyone`,
+`a_slow_member_is_bounded_in_bytes_before_its_message_count`.*
 
 ---
 

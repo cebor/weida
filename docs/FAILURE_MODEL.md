@@ -136,6 +136,10 @@ Normative. There is no separate outcome enum and no pending-transfer table: the 
 the transfer, so a sender's outcome is whatever `write_all`, `finish()` and the resulting
 `Delivery` report.
 
+**The table below is QUIC's.** Three of its rows turn on the gap between "the FIN went out"
+and "the peer acknowledged it", and on a local transport there is no such gap; the local rules
+are stated in the same shape in their own subsection below.
+
 | Event | Local state | Result | Rationale |
 | --- | --- | --- | --- |
 | Connection lost | before local FIN | `write_all` fails with `Error::ConnectionLost(cause)`; `is_definite_failure()` is true | The receiver discards partial transfers on reset or connection loss ([PROTOCOL.md](PROTOCOL.md) §9), so the payload was definitely not delivered. Definite failure, not indeterminate. The `cause` says why the connection went, and never changes whether the failure is definite. |
@@ -157,6 +161,33 @@ because keeping it apart from failure is the whole point of master doc §22, and
 `NoReply`: a replier that declines to answer has still read the request and may well have
 acted on it, so only the answer is missing. The exclusions, and every member except
 `Untrusted`, are pinned by `definite_failures_exclude_the_unknowable_ones`.
+
+### Local transports: the receipt is the peer's buffer
+
+The rules above are QUIC's. On the three local transports of
+[decisions/0010](decisions/0010-local-transport.md) — in process, `AF_UNIX` and Windows named
+pipes — one transfer is one channel pair or one OS connection [0010 §4.2], nothing
+acknowledges anything, and the receipt therefore says less than its QUIC counterpart.
+
+| Event | Local state | Result | Rationale |
+| --- | --- | --- | --- |
+| Connection lost | before local FIN | the write fails definitely: `Error::Canceled` where the peer closed its read side under the write, `Error::ConnectionLost(PeerClosed)` where the connection was already known dead; `is_definite_failure()` is true either way | A closed channel or socket takes no bytes, so the payload was definitely not delivered — the same reason QUIC's row is definite. Which of the two words appears is only which operation noticed first, and neither is a second outcome. |
+| Connection lost | after local FIN, before the receipt | **cannot occur**, because there is no interval to lose the connection in | The receipt does not wait for anything, so nothing can happen between the FIN and it. |
+| Receipt resolves | after local FIN | `Delivery::delivered()` yields `Ok(())` as soon as the writer's FIN is set, with no involvement from the peer | The bounded channel (in process) or the kernel's socket buffer (`AF_UNIX`, named pipes) **is** the peer's transport, so a write that completed already put the bytes in it. `inproc::LocalSend::stopped` resolves on the writer's own finished flag; `grouped::LocalSend::stopped` is `Ok(None)` unconditionally. The receipt adds nothing to what `write_all` and `finish()` already returned. |
+| `STOP_SENDING` observed | any | **there is none.** In process a refusal still reaches the receipt, because the reader sets a flag the receipt reads and `stop_reason` maps it to the same typed error QUIC's stop code does. Over `AF_UNIX` it reaches the **write** instead, as `Error::Canceled`, and never `delivered()`. Over a named pipe it reaches neither | A local stream carries no application error code [0012 §4.7]. Closing an `AF_UNIX` reader's half makes the writer's next write `EPIPE`, which is a refusal without a code and arrives from `write_all`. A named-pipe reader cannot even do that — the writer's direction is the only one it could signal on and the reply owns it — so it **drains** the rest of the payload in the background and the writer finishes normally (`crates/weida/src/pipe.rs`). |
+
+Two consequences, both load-bearing for an application that moves between transports:
+
+- **On a local transport `Delivery::delivered()` is a statement about the peer's buffer, not
+  about an acknowledgement.** It resolves without the peer's participation, so it is exactly as
+  strong as the write that preceded it and not one bit stronger. The weaker reading that holds
+  on every transport — a transport receipt is never an application read
+  ([GUARANTEES.md](GUARANTEES.md) §3) — is the one to write applications against.
+- **`Indeterminate` is a QUIC-only sender outcome.** It exists because a QUIC FIN travels and
+  its acknowledgement may not come back; a local FIN does not travel at all, so a local
+  sender's receipt is always definite. What is *not* local-only is the reply-side rule below: a
+  replier that read the request and died leaves the exchange indeterminate on every transport,
+  because that uncertainty is about the peer's **application** rather than about its transport.
 
 ### Reply-side rules
 
@@ -189,7 +220,7 @@ No frame cancels anything; cancellation is entirely QUIC stream state.
 
 | Situation | Mechanism | What the peer observes |
 | --- | --- | --- |
-| Sender abandons its own outgoing payload | `RESET_STREAM(CANCELED)` — `OutgoingTransfer::cancel`, or a drop without `finish()` | the transfer is never observable as complete: the read in progress fails — `Error::Canceled` through `read_capped`, `io::ErrorKind::ConnectionReset` on the `AsyncRead` — and never returns EOF |
+| Sender abandons its own outgoing payload | `RESET_STREAM(CANCELED)` — `OutgoingTransfer::cancel`, or a drop without `finish()` | the transfer is never observable as complete: the read in progress fails — `Error::Canceled` through `read_capped`, `io::ErrorKind::ConnectionReset` on the `AsyncRead` — and never returns EOF. **Over `AF_UNIX` this does not hold**: the reset is indistinguishable from a FIN and a truncated payload is returned as complete (below, and [decisions/0012](decisions/0012-local-connection-grouping.md) §4.7) |
 | Receiver refuses an inbound payload | `STOP_SENDING(REJECTED)` — `IncomingTransfer` dropped mid-payload, or a payload past `read_capped`'s cap | `Error::Rejected` from `write_all` or from `delivered()` |
 | Requester abandons the reply | drop `ReplyStream` before `recv()`, which stops the reply half with `CANCELED` | `IncomingRequest::canceled()` resolves; subsequent reply writes fail with `Error::Canceled` |
 | Replier will not answer | ERROR `{NO_REPLY}` + FIN on the reply half — `IncomingRequest` dropped without `reply()` | `ReplyStream::recv()` yields `Error::NoReply` |
@@ -200,8 +231,16 @@ a handler takes it before `reply()` consumes the request, then selects on it bes
 reply writes. A long reply nobody wants otherwise burns the peer's flow-control window, and
 this is how the handler learns to stop.
 
-`cancel()` guarantees an outcome, not a retraction. What holds is that the receiver can never
-mistake the transfer for a complete one: it observes a reset error and never EOF. What does
+`cancel()` guarantees an outcome, not a retraction — **on QUIC, in process and over a named
+pipe**. What holds there is that the receiver can never mistake the transfer for a complete
+one: it observes a reset error and never EOF. Over `AF_UNIX` it does not hold at all, and the
+qualifier is not a detail: `crates/weida/src/unix.rs` implements the transport's `finish` and
+`reset` **identically** — both are `drop(writer)` and the code is discarded, because a stream
+socket has no abort — so a cancelled transfer, a transfer dropped without `finish()` and a
+producer that died mid-payload all arrive as a clean end of payload, `collect` returns
+`Ok(truncated_bytes)` and the `AsyncRead` returns EOF. An application over `weida+unix://`
+therefore takes half a message for a whole one with nothing on the wire to warn it
+([decisions/0012](decisions/0012-local-connection-grouping.md) §4.7, B-245). What does
 **not** hold is that the peer saw fewer bytes. The receiver's assembler is cleared when the
 reset is *processed*, so a reader that gets there first is still served whatever was already
 buffered: `cancel_discards_unread_bytes_and_keeps_read_ones` in
