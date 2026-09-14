@@ -6,7 +6,7 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main, 2026-09-14 ~19:00 UTC. Tree clean, gate green on Linux:
+**Snapshot:** main `4bc50b0`, 2026-09-14 ~21:00 UTC. Tree clean, gate green on Linux:
 **1868 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
 plus `weida --features blocking` at **270**, 1 ignored. Sixty-four of those tests arrived in
@@ -60,10 +60,12 @@ and about 27 messages per second at that width. The width interval in the guide 
 settles how a fan-out fails: a stalled subscriber is refused by the **byte budget** when that
 budget is below the connection's 0.6-1.5 MiB absorption band and by the **queue** when it is
 above it — which is why `dropped_on(topic)` separates the two causes.
-The Windows 11 VM ran at this commit (`cecae03`): **1840 across 142
-binaries**, the same 37 ignored, in one clean pass — fmt, clippy in both configurations and
-rustdoc included, with both guide suites among the binaries; chapter 4's cross-protocol chain
-runs there too, `nng`'s C library and all. Add
+The Windows 11 VM ran at this commit: **1843 across 142
+binaries**, the same 37 ignored, with fmt, clippy in both configurations and rustdoc clean. It
+took four attempts and each is named in the nightlog rather than counted: the shared local
+framing broke the Windows build in a way no Linux gate can see (`pipe.rs` is
+`#[cfg(windows)]`), one test lost 0005's refusal race on that platform while passing here, and
+the VM's storage faulted twice in between. Add
 the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
