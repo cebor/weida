@@ -402,7 +402,7 @@ Applied to LOOP.md §9 on acceptance.
 > Each foreign protocol family is its own directory under `crates/<family>/` and produces two
 > products: a **standalone library** that a user of that protocol can use with no weida in the
 > picture, and a **forwarder** between a weida endpoint and that library's sockets
-> ([decisions/0013](decisions/0013-competitor-libraries.md)). Six slices in this order:
+> ([decisions/0013](0013-competitor-libraries.md)). Six slices in this order:
 > (1) sans-I/O codec with golden vectors and a fuzz target, with an empty `[dependencies]`;
 > (2) `docs/adapters/<proto>.md` — stream, credit and guarantee mapping, transfer points and
 > named losses, derived from the research sheet;
@@ -418,9 +418,9 @@ Applied to LOOP.md §9 on acceptance.
 > with the guarantees of both mapping documents asserted.
 > Slice 3 is where the mass is: for ZeroMQ it is about eight times the three bridge slices it
 > replaces. Slices 1, 2 and the bridges already exist for B1 and B2 and are not rebuilt from
-> zero — [0013](decisions/0013-competitor-libraries.md) §5.2 says which code moves where.
+> zero — [0013](0013-competitor-libraries.md) §5.2 says which code moves where.
 > B1 ZeroMQ/ZMTP 3.1: `weida-zmq`, complete to the definition of done of
->    [0013](decisions/0013-competitor-libraries.md) §4.7.
+>    [0013](0013-competitor-libraries.md) §4.7.
 > B2 nanomsg/NNG SP: `weida-nng`, the same six slices in the same order.
 > B3 MQTT 5, server side first: sessions, QoS 0/1/2, shared subscriptions, retained messages.
 >    It stays an adapter rather than a library until Phase D, because an MQTT server is a

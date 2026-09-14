@@ -207,7 +207,7 @@ direction that does not.
   > `Publisher::dropped`, with a test that exhausts the pool and observes the drop; a subscriber
   > that parks nothing is reported at subscribe time rather than silently receiving nothing;
   > GUARANTEES §6 gains the local fan-out row and PROTOCOL §2.1 the `reverse` preamble
-  > ([decisions/0012](decisions/0012-local-connection-grouping.md) §4.4).
+  > ([decisions/0012](0012-local-connection-grouping.md) §4.4).
 
 - **B-039 inherits** §4.1-§4.4 with `ImpersonateNamedPipeClient` in place of `SO_PEERCRED`, and
   should need no new decision.

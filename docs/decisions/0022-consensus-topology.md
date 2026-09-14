@@ -174,18 +174,18 @@ alternative.
 
 ### B-229 — Several groups on one connection, and a queue group created by the control group
 kind: code | size: 90 | status: blocked | needs: [B-224, B-227]
-acceptance: `weida-raft` carries **more than one group** over one connection per peer pair — a group identifier in the RPC envelope, one exchange per RPC as B-224 built it, and a test asserting that a stalled RPC in one group does not delay another group's heartbeat ([0022](decisions/0022-consensus-topology.md) §4.5). The broker then creates a queue's group from a committed control-group entry: a three-node cluster where a queue is created, replicated, and its group dissolved when the replication factor drops to 1, with the queue still serving throughout.
-note: this is the item that makes the topology of [0022](decisions/0022-consensus-topology.md) real rather than described; it needs the transport and the log first.
+acceptance: `weida-raft` carries **more than one group** over one connection per peer pair — a group identifier in the RPC envelope, one exchange per RPC as B-224 built it, and a test asserting that a stalled RPC in one group does not delay another group's heartbeat ([0022](0022-consensus-topology.md) §4.5). The broker then creates a queue's group from a committed control-group entry: a three-node cluster where a queue is created, replicated, and its group dissolved when the replication factor drops to 1, with the queue still serving throughout.
+note: this is the item that makes the topology of [0022](0022-consensus-topology.md) real rather than described; it needs the transport and the log first.
 
 ### B-230 — The availability split: administration stops, messaging does not
 kind: code | size: 60 | status: blocked | needs: [B-229]
-acceptance: the property of [0022](decisions/0022-consensus-topology.md) §4.7 proved rather than claimed: with the **control group** below quorum, no queue may be created, deleted or reconfigured — each refused with a message naming the reason — while every existing queue keeps admitting and delivering under its own group's quorum. And the converse: a queue whose own group is below quorum refuses admission and pauses delivery while every other queue on the same nodes is unaffected. Two tests, each killing a different majority.
+acceptance: the property of [0022](0022-consensus-topology.md) §4.7 proved rather than claimed: with the **control group** below quorum, no queue may be created, deleted or reconfigured — each refused with a message naming the reason — while every existing queue keeps admitting and delivering under its own group's quorum. And the converse: a queue whose own group is below quorum refuses admission and pauses delivery while every other queue on the same nodes is unaffected. Two tests, each killing a different majority.
 note: this is the reason the topology has two kinds of group at all, so it is the test that earns the design. Deliberately unlike Kafka's fencing, and the note says why.
 
 ### B-231 — The bounds a cluster adds, each with the failure it prevents
 kind: spec | size: 45 | status: ready | needs: []
-acceptance: the numbers of [0022](decisions/0022-consensus-topology.md) §4.8 written into [PROTOCOL.md](PROTOCOL.md) §10's broker profile with a default and a named failure each: the Raft connection's stream budget (bounds in-flight RPCs across all groups between two nodes), the election and heartbeat ticks (one setting per node, not per queue), the per-group log segment size and retained-segment count, and the refusal of a two-member group or a two-node cluster. Nothing is implemented by this item; what it prevents is a number being invented per slice.
-note: filed because [0022](decisions/0022-consensus-topology.md) §4.8 names which numbers exist and deliberately not what they are, and a number chosen under load is a number chosen badly.
+acceptance: the numbers of [0022](0022-consensus-topology.md) §4.8 written into [PROTOCOL.md](../PROTOCOL.md) §10's broker profile with a default and a named failure each: the Raft connection's stream budget (bounds in-flight RPCs across all groups between two nodes), the election and heartbeat ticks (one setting per node, not per queue), the per-group log segment size and retained-segment count, and the refusal of a two-member group or a two-node cluster. Nothing is implemented by this item; what it prevents is a number being invented per slice.
+note: filed because [0022](0022-consensus-topology.md) §4.8 names which numbers exist and deliberately not what they are, and a number chosen under load is a number chosen badly.
 
 ## 6. What this note does not decide
 
