@@ -6,11 +6,11 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `2a38c47`, 2026-09-14 ~04:55 UTC. Tree clean, gate green on Linux:
-**1794 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+**Snapshot:** main `80928eb`, 2026-09-14 ~06:05 UTC. Tree clean, gate green on Linux:
+**1803 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
 plus `weida --features blocking` at **237**, 1 ignored.
-The Windows 11 VM ran at the **same commit**: **1772 across 136 binaries**, the same 37
+The Windows 11 VM ran at `2a38c47`, nine tests back: **1772 across 136 binaries**, the same 37
 ignored, after two storage faults (`LNK1201`, then `STATUS_IN_PAGE_ERROR`) cleared by a
 `cargo clean` — §6 point 3, not a code problem. Add
 the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
@@ -157,7 +157,7 @@ a multipart refused at hop one, the smaller `max_message_bytes` deciding — are
 
 Every point is a merge into main behind the four-step gate of [LOOP.md](LOOP.md) §6. **The
 chart stops at the two-day stop it was drawn for** (`5ca1329`, 1678 tests); the sessions since
-took it to **1794** without changing its shape, so it is left as the picture of the parallel run
+took it to **1803** without changing its shape, so it is left as the picture of the parallel run
 rather than redrawn per merge. Two things it does not show: three review findings were caught **before** their merge by reading
 the branch (a reassembler counter that drifted on repeated sequence numbers, a runtime-wide
 mutex on the fire-and-forget path that cost 3 % in the header bench, a parked receipt that
@@ -211,7 +211,7 @@ Three things, and only three:
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1794 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  green at **1803 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session.
 - **9 items are `ready`, 14 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
@@ -251,6 +251,15 @@ Three things, and only three:
   three — a `{bytes, interval}` pair in a header *is* a negotiated granularity, which 0023 §4.5
   forbids), B-236's own acceptance (PAIR is one-way transfers both ways) and B-239's
   (`final-only` is not byte-for-byte the classic confirm and cannot be).
+- **A coherence sweep closed the session**, seven parallel read-only audits over code, docs,
+  decision notes, bindings and the five foreign-protocol libraries. Fifteen incoherences, all
+  of the same four kinds: counts that had become false, superseded claims (including
+  `GUARANTEES.md` contradicting itself on whether an acknowledgement level has a wire
+  representation), adapter mappings that still refused a pattern weida now ships, and claims
+  of completeness in the surfaces this plan deliberately left alone. The only code finding was
+  settled by a test rather than an argument: `tests/transports.rs` now runs **all six
+  patterns** over every transport, and `pair_over_unix` is the first thing here that proves
+  the reverse pool of 0012 §4.4 carries an ordinary send rather than a fan-out copy.
 - **What moves the roadmap next** is yours to choose: **Phase D**, the L2 broker, where B-203's
   two parked design questions are now answered — consumer settlement is a cursor, so a delivery
   stays one-way — or **Phase C's Java row**. The two surfaces this session deliberately did not
