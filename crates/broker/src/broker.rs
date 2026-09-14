@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::task::JoinSet;
 use weida::{
-    Acceptor, Acknowledgement, ConsumerId, Error, ErrorCode, Incoming, IncomingMeta,
-    IncomingRequest, IncomingTransfer, Listener, TransferMeta,
+    Acceptor, Acknowledgement, ConsumerId, CursorLevel, Error, ErrorCode, Incoming, IncomingMeta,
+    IncomingRequest, IncomingTransfer, Listener, Reporter, TransferMeta,
 };
 
 use crate::consumers::Consumers;
@@ -378,7 +378,12 @@ async fn admit_exchange(served: &Served, mut request: IncomingRequest) {
         request.refuse(ErrorCode::Rejected).await;
         return;
     }
-    let queued = match read_message(request.take_body(), request.meta(), room).await {
+    let body = request.take_body();
+    // Taken before the payload is consumed: `reporter()` reads the order the
+    // producer put in its DATA header, and `read_message` consumes the
+    // transfer.
+    let reporter = body.reporter();
+    let queued = match read_message(body, request.meta(), room).await {
         Ok(message) => message,
         Err(ReadFailed::TooLarge) => {
             request.refuse(ErrorCode::Rejected).await;
@@ -386,6 +391,7 @@ async fn admit_exchange(served: &Served, mut request: IncomingRequest) {
         }
         Err(ReadFailed::Broken) => return,
     };
+    let admitted_bytes = queued.body.len() as u64;
     // The producer's trace, logged where it is still available: after the
     // exchange ends nothing can reconstruct which trace a queued message
     // belongs to, and a delivery continues it (B-202).
@@ -406,17 +412,31 @@ async fn admit_exchange(served: &Served, mut request: IncomingRequest) {
         .expect("queue mutex poisoned")
         .push(queued);
     match admitted {
-        Ok(()) => confirm(request).await,
+        Ok(()) => {
+            // Both answers, and they say different things. The reply half is
+            // the application's channel and carries the confirm it always
+            // carried (DATA key `8`); the cursor is for a producer that
+            // ordered one, and a producer that ordered none pays nothing.
+            report_accepted(reporter, admitted_bytes).await;
+            confirm(request).await;
+        }
+        // A refusal reports **nothing**: the producer learns from the
+        // refusal, not from a missing cursor.
         Err(Refusal::Full) => request.refuse(ErrorCode::Rejected).await,
     }
 }
 
-/// Admits a one-way transfer: the same admission, no confirm.
+/// Admits a one-way transfer, and reports a cursor if the producer ordered
+/// one.
 ///
-/// A producer that will not wait for a certificate sends a one-way transfer and
-/// gets the transport receipt and nothing more — the honest spelling of
-/// `acks=0` (0018 §4.6). A refusal has nowhere to go on a unidirectional
-/// stream, so a full queue is a `STOP_SENDING(REJECTED)` and no more.
+/// This is the shape [0024](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0024-three-families-one-back-channel.md)
+/// §4.4a exists for: a producer that orders `Accepted` gets a reliable verdict
+/// **on one unidirectional payload stream**, with no exchange and no reply
+/// half. A producer that orders nothing gets the transport receipt and nothing
+/// more — the honest spelling of `acks=0` (0018 §4.6) — and its transfer is
+/// byte-for-byte what it was before cursors existed. A refusal has nowhere to
+/// go on a unidirectional stream, so a full queue is a
+/// `STOP_SENDING(REJECTED)` and no cursor.
 async fn admit_transfer(served: &Served, transfer: IncomingTransfer) {
     let room = room_for(served, transfer.meta());
     let meta = transfer.meta().clone();
@@ -427,10 +447,12 @@ async fn admit_transfer(served: &Served, transfer: IncomingTransfer) {
         drop(transfer);
         return;
     }
+    let reporter = transfer.reporter();
     let queued = match read_message(transfer, &meta, room).await {
         Ok(message) => message,
         Err(_) => return,
     };
+    let admitted_bytes = queued.body.len() as u64;
     if let Err(Refusal::Full) = served
         .queue
         .lock()
@@ -438,6 +460,28 @@ async fn admit_transfer(served: &Served, transfer: IncomingTransfer) {
         .push(queued)
     {
         tracing::debug!("a one-way transfer lost the race for the last bytes of a queue");
+        return;
+    }
+    report_accepted(reporter, admitted_bytes).await;
+}
+
+/// Reports `Accepted` at the admitted body length, once, and FINs.
+///
+/// `Accepted` is a **verdict rather than a prefix** (0023 §4.2): it is true of
+/// the whole message or of none of it, so there is exactly one record even in
+/// `Progress` mode and there is no granularity to configure. A level this
+/// broker cannot reach — `Stored`, with no store — is simply not reported, and
+/// the producer sees it missing rather than failed.
+async fn report_accepted(reporter: Option<Reporter>, bytes: u64) {
+    let Some(mut reporter) = reporter else {
+        return;
+    };
+    let level = CursorLevel::Known(Achieved::Accepted.level());
+    if let Err(e) = reporter.report(level, bytes).await {
+        tracing::debug!(error = %e, "failed to report an accepted cursor");
+    }
+    if let Err(e) = reporter.finish().await {
+        tracing::debug!(error = %e, "failed to finish a cursor report");
     }
 }
 
