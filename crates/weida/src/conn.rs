@@ -1004,51 +1004,123 @@ pub(crate) struct Held {
     path: String,
 }
 
+/// The refusal a stream earns when the path it names cannot serve it —
+/// [PROTOCOL.md](../../../docs/PROTOCOL.md) §9.3's table, as one table.
+///
+/// Both dispatchers used to decide this themselves, each writing out its own
+/// pairing of `ErrorCode` and stop code at the call site, so §9.3 was enforced
+/// in two places. They agreed; what they could not survive is the next
+/// pattern's registration, because a seventh [`Route`] variant added to one
+/// match and not the other is a silent divergence between what a Push sender
+/// and a Req sender learn about the same misroute (B-251).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    /// What an exchange's ERROR frame carries.
+    pub(crate) code: ErrorCode,
+    /// What a one-way stream's `STOP_SENDING` carries.
+    pub(crate) stop: u64,
+}
+
+impl Refusal {
+    /// Nothing is registered at this path — and the same answer for an
+    /// endpoint that went away between the lookup and the hand-over, because
+    /// a sender cannot tell the two apart and does not need to.
+    pub(crate) const UNKNOWN: Refusal = Refusal {
+        code: ErrorCode::UnknownEndpoint,
+        stop: codes::UNKNOWN_ENDPOINT,
+    };
+    /// The path is served, by something that does not take this stream kind:
+    /// a one-way transfer aimed at a replier, an exchange aimed at a puller,
+    /// anything aimed at a publisher. Refusing is the honest answer; the
+    /// alternative is to reinterpret the sender.
+    pub(crate) const WRONG_SHAPE: Refusal = Refusal {
+        code: ErrorCode::Unsupported,
+        stop: codes::UNSUPPORTED,
+    };
+    /// A paired endpoint already has its one peer. A capacity decision rather
+    /// than a routing mistake, which is why it is a third row and not a
+    /// variant of the second
+    /// ([0005](../../../docs/decisions/0005-refusal-race.md)).
+    pub(crate) const PAIR_TAKEN: Refusal = Refusal {
+        code: ErrorCode::Rejected,
+        stop: codes::LIMIT_EXCEEDED,
+    };
+}
+
+/// Which stream kind is asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wanted {
+    /// A unidirectional transfer: Push, Pub/Sub, PAIR, BUS.
+    OneWay,
+    /// The initiating half of an exchange: Req/Rep, SURVEY.
+    Exchange,
+}
+
+/// `None` when the route serves `wanted`, otherwise the refusal it earns.
+pub(crate) fn refusal_for(route: Option<&Route>, wanted: Wanted) -> Option<Refusal> {
+    match (route, wanted) {
+        (None, _) => Some(Refusal::UNKNOWN),
+        (Some(Route::Raw(_)), _) => None,
+        (Some(Route::Transfer(_) | Route::Pair { .. }), Wanted::OneWay) => None,
+        (Some(Route::Request(_)), Wanted::Exchange) => None,
+        // Everything else is the path being served by the wrong shape: a
+        // publisher takes nothing inbound, a replier takes no one-way
+        // transfer, and a pair carries one-way transfers in both directions so
+        // an exchange aimed at one is the same category error as an exchange
+        // aimed at a puller.
+        (Some(Route::Request(_) | Route::Transfer(_) | Route::Pub | Route::Pair { .. }), _) => {
+            Some(Refusal::WRONG_SHAPE)
+        }
+    }
+}
+
 /// Hands one arrived transfer to whatever is bound at `path`.
+///
+/// Every refusal here comes from [`refusal_for`] or a [`Refusal`] constant;
+/// no stop code is written out at a call site (B-251).
 async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
-    match ctx.namespace.lookup(path) {
+    let route = ctx.namespace.lookup(path);
+    if let Some(refusal) = refusal_for(route.as_ref(), Wanted::OneWay) {
+        tracing::debug!(path, ?refusal, "the path does not serve a one-way transfer");
+        transfer.refuse(refusal.stop);
+        return;
+    }
+    match route {
         // Awaiting a queue slot is the backpressure path: it stalls this
         // stream's task, which stalls the peer through QUIC flow control.
         Some(Route::Transfer(queue)) => {
             if let Err(e) = queue.send(transfer).await {
                 tracing::debug!(path, "endpoint went away while dispatching");
-                e.0.refuse(codes::UNKNOWN_ENDPOINT);
+                e.0.refuse(Refusal::UNKNOWN.stop);
             }
         }
         Some(Route::Raw(queue)) => {
             if let Err(e) = queue.send(Incoming::Stream(transfer)).await {
                 tracing::debug!(path, "acceptor went away while dispatching");
                 if let Incoming::Stream(t) = e.0 {
-                    t.refuse(codes::UNKNOWN_ENDPOINT);
+                    t.refuse(Refusal::UNKNOWN.stop);
                 }
             }
         }
         // Exactly one peer, and the **first** one is kept: a stream from any
-        // other connection is refused with `LIMIT_EXCEEDED` while the first
-        // keeps working. ZeroMQ's PAIR drops the newcomer silently; refusing
-        // and saying so is this repository's rule for a capacity decision
+        // other connection is refused while the first keeps working. ZeroMQ's
+        // PAIR drops the newcomer silently; refusing and saying so is this
+        // repository's rule for a capacity decision
         // (`docs/decisions/0005-refusal-race.md`).
         Some(Route::Pair { queue, owner }) => {
             if !owner.claim(ctx) {
                 tracing::debug!(path, "a paired endpoint already has its peer");
-                transfer.refuse(codes::LIMIT_EXCEEDED);
+                transfer.refuse(Refusal::PAIR_TAKEN.stop);
                 return;
             }
             if let Err(e) = queue.send(transfer).await {
                 tracing::debug!(path, "endpoint went away while dispatching");
-                e.0.refuse(codes::UNKNOWN_ENDPOINT);
+                e.0.refuse(Refusal::UNKNOWN.stop);
             }
         }
-        // The path exists but serves a different shape: a one-way transfer
-        // aimed at a replier, or anything aimed at a publisher. Refusing is
-        // the honest answer — the alternative is to reinterpret the sender.
-        Some(Route::Request(_) | Route::Pub) => {
-            tracing::debug!(path, "endpoint does not serve one-way transfers");
-            transfer.refuse(codes::UNSUPPORTED);
-        }
-        None => {
-            tracing::debug!(path, "no endpoint registered");
-            transfer.refuse(codes::UNKNOWN_ENDPOINT);
+        // `refusal_for` above already refused these.
+        Some(Route::Request(_) | Route::Pub) | None => {
+            unreachable!("refusal_for refuses every route that cannot serve a one-way transfer")
         }
     }
 }
@@ -1110,6 +1182,11 @@ async fn handle_bi(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Resu
         send,
         Arc::clone(ctx),
     );
+    if let Some(refusal) = refusal_for(route.as_ref(), Wanted::Exchange) {
+        tracing::debug!(path, ?refusal, "the path does not serve an exchange");
+        request.refuse_coded(refusal.code, refusal.stop).await;
+        return Ok(());
+    }
     match route {
         // Backpressure again: a full accept queue stalls this task, and the
         // peer feels it through flow control. If the endpoint went away, the
@@ -1124,21 +1201,95 @@ async fn handle_bi(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Resu
                 tracing::debug!(path, "acceptor went away while dispatching");
             }
         }
-        // A pair carries one-way transfers in both directions, so an
-        // exchange aimed at one is the same category error as an exchange
-        // aimed at a puller.
-        Some(Route::Transfer(_) | Route::Pub | Route::Pair { .. }) => {
-            tracing::debug!(path, "endpoint does not serve exchanges");
-            request
-                .refuse_coded(ErrorCode::Unsupported, codes::UNSUPPORTED)
-                .await;
-        }
-        None => {
-            tracing::debug!(path, "no endpoint registered");
-            request
-                .refuse_coded(ErrorCode::UnknownEndpoint, codes::UNKNOWN_ENDPOINT)
-                .await;
+        // `refusal_for` above already refused these.
+        Some(Route::Transfer(_) | Route::Pub | Route::Pair { .. }) | None => {
+            unreachable!("refusal_for refuses every route that cannot serve an exchange")
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Refusal, Wanted, refusal_for};
+    use crate::listener::{PairOwner, Route};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn transfer() -> Route {
+        Route::Transfer(mpsc::channel(1).0)
+    }
+
+    fn request() -> Route {
+        Route::Request(mpsc::channel(1).0)
+    }
+
+    fn raw() -> Route {
+        Route::Raw(mpsc::channel(1).0)
+    }
+
+    fn pair() -> Route {
+        Route::Pair {
+            queue: mpsc::channel(1).0,
+            owner: Arc::new(PairOwner::new()),
+        }
+    }
+
+    /// One row per pairing of [`PROTOCOL.md`] §9.3's table, both stream kinds,
+    /// which is the point of having one table: a seventh `Route` variant added
+    /// to one dispatcher and not the other used to be a silent divergence
+    /// between what a Push sender and a Req sender learn about the same
+    /// misroute (B-251).
+    ///
+    /// [`PROTOCOL.md`]: https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/PROTOCOL.md
+    #[test]
+    fn every_route_mismatch_earns_the_refusal_the_protocol_names() {
+        // Nothing registered: the same answer for both kinds.
+        assert_eq!(refusal_for(None, Wanted::OneWay), Some(Refusal::UNKNOWN));
+        assert_eq!(refusal_for(None, Wanted::Exchange), Some(Refusal::UNKNOWN));
+
+        // A raw acceptor takes both kinds, tagged.
+        assert_eq!(refusal_for(Some(&raw()), Wanted::OneWay), None);
+        assert_eq!(refusal_for(Some(&raw()), Wanted::Exchange), None);
+
+        // A puller and a pair take one-way transfers and refuse exchanges.
+        for route in [transfer(), pair()] {
+            assert_eq!(refusal_for(Some(&route), Wanted::OneWay), None);
+            assert_eq!(
+                refusal_for(Some(&route), Wanted::Exchange),
+                Some(Refusal::WRONG_SHAPE)
+            );
+        }
+
+        // A replier is the mirror image.
+        assert_eq!(refusal_for(Some(&request()), Wanted::Exchange), None);
+        assert_eq!(
+            refusal_for(Some(&request()), Wanted::OneWay),
+            Some(Refusal::WRONG_SHAPE)
+        );
+
+        // A publisher takes nothing inbound at all.
+        assert_eq!(
+            refusal_for(Some(&Route::Pub), Wanted::OneWay),
+            Some(Refusal::WRONG_SHAPE)
+        );
+        assert_eq!(
+            refusal_for(Some(&Route::Pub), Wanted::Exchange),
+            Some(Refusal::WRONG_SHAPE)
+        );
+    }
+
+    /// The three rows carry the codes the wire documents name, and the
+    /// capacity row is **not** the routing row: a pair that already has its
+    /// peer is `LIMIT_EXCEEDED`, which a sender can tell apart from a path
+    /// that serves the wrong shape.
+    #[test]
+    fn the_three_refusals_are_distinct_on_the_wire() {
+        use weida_protocol::codes;
+        assert_eq!(Refusal::UNKNOWN.stop, codes::UNKNOWN_ENDPOINT);
+        assert_eq!(Refusal::WRONG_SHAPE.stop, codes::UNSUPPORTED);
+        assert_eq!(Refusal::PAIR_TAKEN.stop, codes::LIMIT_EXCEEDED);
+        assert_ne!(Refusal::UNKNOWN, Refusal::WRONG_SHAPE);
+        assert_ne!(Refusal::WRONG_SHAPE, Refusal::PAIR_TAKEN);
+    }
 }

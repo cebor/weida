@@ -1,0 +1,193 @@
+//! One guard for every crate that allows `unsafe`, and for every crate that
+//! says nothing about it (B-248).
+//!
+//! Most crates here set `unsafe_code = "forbid"` and are done. Seven cannot:
+//! a PyO3 crate's `#[pyclass]`, `#[pymethods]` and `#[pyfunction]` expand to
+//! `unsafe impl`s of PyO3's type-object traits, and the lint does not care
+//! that the code came from a macro. So those manifests set
+//! `unsafe_code = "allow"`, each under a comment asserting that **no `unsafe`
+//! is written by hand in this crate** — and until this file existed, exactly
+//! one of the seven had a test behind that claim
+//! (`crates/py/weida-py-core/tests/no_handwritten_unsafe.rs`, which scanned
+//! its own `src` and nothing else). Six claims with nothing behind them.
+//!
+//! The shape matters more than the coverage. This is **one test that walks the
+//! manifests** rather than seven copies of one test, so a crate that gains the
+//! allowance tomorrow is covered by the fact of having it: nobody has to
+//! remember to copy a file. The same walk catches the other way a guarantee
+//! goes quiet — a crate whose manifest says *nothing*, which permits `unsafe`
+//! by default and claims nothing at all.
+//!
+//! Two deliberate exclusions:
+//!
+//! * **`fuzz/` crates.** Each declares its own `[workspace]`, so no
+//!   workspace-wide build ever compiles them and no workspace lint applies;
+//!   their manifests are `cargo-fuzz`'s shape rather than this repository's.
+//! * **Generated code and dependencies.** The walk reads `src` only.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// What a manifest says about `unsafe`.
+#[derive(Debug, PartialEq, Eq)]
+enum Stance {
+    Forbid,
+    Allow,
+    Silent,
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("the workspace root is two directories up from this crate")
+}
+
+/// Every crate manifest under `crates/`, excluding the self-contained `fuzz`
+/// workspaces.
+fn manifests(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.join("crates")];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("a readable directory") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name == "target" || name == "fuzz" {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.file_name().is_some_and(|name| name == "Cargo.toml") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+fn stance(manifest: &Path) -> Stance {
+    let text = fs::read_to_string(manifest).expect("a readable manifest");
+    if text.contains(r#"unsafe_code = "allow""#) {
+        Stance::Allow
+    } else if text.contains(r#"unsafe_code = "forbid""#) {
+        Stance::Forbid
+    } else {
+        Stance::Silent
+    }
+}
+
+/// Every `.rs` file under `dir`, recursively — which the guard this replaced
+/// did not do: it read one directory level, so a module in a subdirectory was
+/// unchecked.
+fn sources(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Lines that write `unsafe` by hand, as `path:line: text`.
+///
+/// Line comments are skipped because the word appears in prose — this file's
+/// own documentation explains what PyO3's macros expand to, and a doc comment
+/// is not code.
+fn hand_written_unsafe(file: &Path) -> Vec<String> {
+    let source = fs::read_to_string(file).expect("readable Rust source");
+    let mut offenders = Vec::new();
+    for (number, line) in source.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        if code.contains("unsafe ") || code.contains("unsafe{") {
+            offenders.push(format!("{}:{}: {}", file.display(), number + 1, code));
+        }
+    }
+    offenders
+}
+
+/// The claim seven manifests make, tested once for all of them.
+#[test]
+fn no_crate_that_allows_unsafe_writes_any_by_hand() {
+    let root = workspace_root();
+    let allowing: Vec<PathBuf> = manifests(&root)
+        .into_iter()
+        .filter(|manifest| stance(manifest) == Stance::Allow)
+        .collect();
+
+    assert!(
+        allowing.len() >= 7,
+        "the seven PyO3 crates set the allowance; this walk found {}: {allowing:?}",
+        allowing.len()
+    );
+
+    let mut scanned = 0usize;
+    let mut offenders = Vec::new();
+    for manifest in &allowing {
+        let src = manifest
+            .parent()
+            .expect("a manifest has a directory")
+            .join("src");
+        let files = sources(&src);
+        assert!(
+            !files.is_empty(),
+            "{} allows unsafe and has no source to check",
+            manifest.display()
+        );
+        scanned += files.len();
+        for file in files {
+            offenders.extend(hand_written_unsafe(&file));
+        }
+    }
+
+    assert!(
+        scanned > 0,
+        "no Rust source was scanned, so nothing was checked"
+    );
+    assert!(
+        offenders.is_empty(),
+        "unsafe is written by hand in {} crate(s) whose manifests allow it only for PyO3's \
+         macro expansion:\n{}",
+        allowing.len(),
+        offenders.join("\n")
+    );
+}
+
+/// The other way the guarantee goes quiet: a manifest that says nothing.
+///
+/// `unsafe_code` defaults to `allow`, so a crate with no `[lints.rust]` stance
+/// permits hand-written `unsafe` and claims nothing — which is worse than the
+/// seven above, because there is no comment to falsify. Every crate in this
+/// tree takes a position; this is what keeps that true as crates are added.
+#[test]
+fn every_crate_takes_a_position_on_unsafe() {
+    let root = workspace_root();
+    let silent: Vec<PathBuf> = manifests(&root)
+        .into_iter()
+        .filter(|manifest| stance(manifest) == Stance::Silent)
+        .collect();
+    assert!(
+        silent.is_empty(),
+        "these manifests neither forbid nor allow `unsafe_code`, so they permit it by \
+         default and say nothing:\n{}",
+        silent
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
