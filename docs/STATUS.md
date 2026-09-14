@@ -283,21 +283,19 @@ Four things:
    `weida.doodleshnookie.net`, and whether the site goes up before there is something to
    install. Until then the site says so on every page and B-254 holds the work
    ([0025](decisions/0025-the-website.md) §4.6).
-2. **One paste into [LOOP.md](LOOP.md) §6** (B-184 and B-107, now `blocked: needs the owner`).
-   The loop does not edit its own standing instructions, so the replacement text is drafted
-   with **measured** runtimes and waits on you. The choice was made this session — cover the
-   features in the gate rather than declare them out of scope — and the numbers say why it is
-   cheap: the five default-off configurations (`blocking` on `weida`, `weida-zmq`,
-   `weida-mqtt`, `weida-nng`; `cluster` on `weida-broker`) cost **89 s** warm for clippy plus
-   test and cover **850 tests** no `--workspace` command compiles; the ten rustdoc runs — five
-   `--no-default-features`, five `--all-features` — cost **8 s**; and `cargo clean --doc`
-   before the doc step, which is what makes a green doc step a check rather than a cache hit,
-   costs **0.1 s** plus **3.6 s** to re-document everything. The holes are not theoretical and
-   not shrinking: measuring them found the **fourth** `cfg`-gated intra-doc link of the year —
-   `crate::blocking::Cursors::changed` in `crates/weida/src/cursor.rs`, written an hour
-   earlier in B-243, which broke `cargo doc -p weida --no-default-features` while every
-   `--workspace` doc run in the session was green (fixed in `00eff38`). The run that proves
-   the gate needs the command is the run that finds the next one.
+2. **Nothing, since 2026-09-15 — the gate's two blind spots are closed** (B-107 and B-184).
+   [LOOP.md](LOOP.md) §6 now names the five default-off configurations (`blocking` on `weida`,
+   `weida-zmq`, `weida-mqtt`, `weida-nng`; `cluster` on `weida-broker`) and the **850 tests**
+   behind them, the two features excluded with their reason (`nng-interop` and
+   `libzmq-interop` need a C library at run time; `extension-module` is maturin's to set),
+   ten rustdoc runs in the configurations where a `cfg`-gated intra-doc link breaks, and
+   `cargo clean --doc` in front of the doc step so a green doc step is a check rather than a
+   cache hit. The additions cost **89 s** for the feature runs, **8 s** for the doc matrix and
+   **3.7 s** for the clean re-documentation, all measured rather than estimated, and they cost
+   the next plain gate almost nothing because cargo keys a fingerprint per crate *and* feature
+   set. What the hole cost while open: **four** `cfg`-gated links, three of them invisible to
+   every `--workspace` doc run ever made here, the last one an hour old when the measurement
+   found it (`00eff38`).
 3. **The Windows gate is manual.** The VM that unblocked B-039 (`ssh win11-geselle`) is in no
    CI, so `C:\work\gate.ps1` runs beside the Linux one by hand, and B-061's CI is where that
    would stop being true — itself `blocked`, because the Forgejo host has 2 vCPUs, 3 GB of RAM
@@ -337,11 +335,11 @@ Four things:
   the website's own gate run kept its log, the failure named itself
   (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
   a cross-test helper rather than the timing assertion it looked like (B-252).
-- **5 items are `ready`, 21 are `blocked`** (B-061, CI: the Forgejo host cannot run this
-  gate; B-254, serving the site; B-107 and B-184, one paste into LOOP §6; four guide chapters,
-  each on the slice it needs; the rest waiting on an item this session is
+- **5 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
+  gate; B-254, serving the site; four guide chapters, each on the slice it
+  needs; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **258** filed items, **231 are `done`**, and every `ready` one is a
+  tier by 0011 §4.3). Of **258** filed items, **233 are `done`**, and every `ready` one is a
   slice of the **cluster and store phase** (B-219, B-220, B-224, B-226, B-231): nothing else
   in the backlog is actionable without a decision of yours.
   **Every surface of the library is bound**: B-244 and B-243 closed the two this session's

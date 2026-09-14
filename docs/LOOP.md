@@ -117,8 +117,60 @@ removal. Keep the file ordered by priority, ready items first.
 Before any commit that touches Rust, all four, in this order, each with `timeout: 900`:
 `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings` (and again
 `-p weida --no-default-features --all-targets`); `cargo test --workspace --no-fail-fast`;
-`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`. Docs-only commits run none.
+`cargo clean --doc` followed by `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
+Docs-only commits run none.
 Keep the failures block of the test output; a count without names is not a gate result.
+
+**`--workspace` is not the whole workspace.** It builds every crate in its *default*
+configuration, so code behind a default-off feature is compiled by none of the four commands
+above — 850 tests and four synchronous facades, as of this writing. A commit that touches Rust
+therefore also runs, for each crate whose sources it touched:
+
+| crate | feature | commands |
+| --- | --- | --- |
+| `weida` | `blocking` | `clippy -p weida --features blocking --all-targets -- -D warnings`, `test -p weida --features blocking` |
+| `weida-zmq` | `blocking` | the same two with `-p weida-zmq` |
+| `weida-mqtt` | `blocking` | the same two with `-p weida-mqtt` |
+| `weida-nng` | `blocking` | the same two with `-p weida-nng` |
+| `weida-broker` | `cluster` | the same two with `-p weida-broker --features cluster` |
+
+All five, run together, cost **89 s** warm and cover **850 tests** (284, 245, 152, 143, 26).
+A commit that touches the core (`weida`, `weida-protocol`, `weida-runtime`, `weida-core`) runs
+all five, because every facade sits on it.
+
+Two features are **excluded on purpose**, with the reason: `nng-interop` and `libzmq-interop`
+need a foreign C library present at run time, so they belong to the item that touches them and
+to the interop suites that are `#[ignore]`d without it — `clippy -p weida-nng --features
+nng-interop --all-targets` and the `weida-zmq` equivalent still compile in 2 s each and are
+worth running when either bridge changes. `extension-module` on the five `weida-*-py` crates is
+turned on by maturin, never by cargo: a cargo run with it fails to link, and the wheel is proved
+by `develop.sh` and `package.sh` instead.
+
+**The doc step is blind in two directions.** An intra-doc link to a `#[cfg(feature = "…")]`
+item resolves when the feature is on and is a **hard rustdoc error** when it is off, so the
+failing configuration is exactly the one `--workspace` never runs. It has now happened three
+times, most recently `crate::blocking::Cursors::changed` in `crates/weida/src/cursor.rs`, which
+broke `cargo doc -p weida --no-default-features` while every `--workspace` doc run was green.
+So the doc step is ten runs, not one, and they cost **8 s** warm together:
+
+```sh
+export RUSTDOCFLAGS="-D warnings"
+for c in weida weida-mqtt weida-amqp weida-nats weida-nng; do
+  cargo doc -q -p "$c" --no-default-features --no-deps || exit 1
+done
+for c in weida weida-zmq weida-mqtt weida-nng weida-broker; do
+  cargo doc -q -p "$c" --all-features --no-deps || exit 1
+done
+```
+
+The second blindness is the cache: `cargo doc` does not re-document an unchanged crate, so a
+green doc step can be a cache hit rather than a check. `cargo clean --doc` costs **0.1 s** and
+the full re-documentation **3.6 s**, so the guarantee is bought for four seconds and the doc
+step above starts with it.
+
+The feature runs cost the *next* plain gate almost nothing: measured right after them,
+`clippy --workspace` took 3.7 s and `doc --workspace` 9.2 s, because cargo keys a fingerprint
+per crate and feature set and reuses the dependencies both configurations share.
 
 Never weaken a test, widen an `allow`, or add `#[ignore]` to make the gate pass. A test that
 is flaky twice gets a deterministic rewrite or becomes a `blocked` item; it is not retried.
