@@ -6,18 +6,21 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock, Weak};
 
 use quinn::VarInt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use weida_core::{Error, Fingerprint, Limits, validate_endpoint_path};
 use weida_protocol::codes;
 use weida_protocol::header::GuaranteeSet;
 
-use crate::config::ServerTls;
+use crate::config::{ClientTls, ServerTls};
 use crate::conn::ConnCtx;
-use crate::endpoint::{Endpoint, PubState, Publisher, PullState, Puller, RepState, Replier};
+use crate::endpoint::{
+    BusMember, BusState, Endpoint, PairState, Paired, PubState, Publisher, PullState, Puller,
+    RepState, Replier, RespondState, Respondent,
+};
 use crate::inproc;
 use crate::pubsub::SubRegistry;
 use crate::runtime::{Exec, RuntimeInner, Shared};
@@ -38,6 +41,70 @@ pub(crate) enum Route {
     /// so the path is claimed exclusively and so SUBSCRIBE can be answered for
     /// a path that really is served here.
     Pub,
+    /// A paired endpoint: one-way transfers in both directions, from exactly
+    /// **one** peer ([`PairOwner`]).
+    Pair {
+        /// Where an accepted transfer goes.
+        queue: mpsc::Sender<IncomingTransfer>,
+        /// The one connection this endpoint talks to.
+        owner: Arc<PairOwner>,
+    },
+}
+
+/// The single peer of a paired endpoint, and the claim on it.
+///
+/// `id` is `0` until a connection takes the endpoint, then that connection's
+/// `stable_id` **plus one** — `0` is the sentinel, so a stable id of zero
+/// cannot masquerade as "unclaimed". A stream from any other connection is
+/// refused with `LIMIT_EXCEEDED` and the connection survives: ZeroMQ's PAIR
+/// drops the newcomer silently, and refusing while saying so is this
+/// repository's rule for a capacity decision
+/// ([decisions/0005](../../../docs/decisions/0005-refusal-race.md)).
+///
+/// The connection is held **weakly**. A bound endpoint lives in the
+/// listener's namespace and every connection holds that namespace, so a
+/// strong handle here would be a cycle: the connection would keep itself
+/// alive through the route that names it. A peer that went away upgrades to
+/// `None`, which is exactly what the sending side needs to know.
+pub(crate) struct PairOwner {
+    id: AtomicU64,
+    conn: watch::Sender<Option<Weak<ConnCtx>>>,
+}
+
+impl PairOwner {
+    pub(crate) fn new() -> PairOwner {
+        PairOwner {
+            id: AtomicU64::new(0),
+            conn: watch::channel(None).0,
+        }
+    }
+
+    /// Claims this endpoint for `conn`, or reports that another peer holds it.
+    pub(crate) fn claim(&self, conn: &Arc<ConnCtx>) -> bool {
+        let id = conn.conn.stable_id() as u64 + 1;
+        match self
+            .id
+            .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                self.conn.send_replace(Some(Arc::downgrade(conn)));
+                true
+            }
+            // The same connection again: every stream after the first.
+            Err(held) => held == id,
+        }
+    }
+
+    /// The peer, once one has claimed the endpoint and while it is alive.
+    pub(crate) async fn peer(&self) -> Result<Arc<ConnCtx>, Error> {
+        let mut rx = self.conn.subscribe();
+        loop {
+            if let Some(weak) = rx.borrow_and_update().clone() {
+                return weak.upgrade().ok_or(Error::NotConnected);
+            }
+            rx.changed().await.map_err(|_| Error::NotConnected)?;
+        }
+    }
 }
 
 /// Endpoint path to accept-queue map.
@@ -153,6 +220,10 @@ impl Route {
             Route::Request(tx) => Route::Request(tx.clone()),
             Route::Transfer(tx) => Route::Transfer(tx.clone()),
             Route::Raw(tx) => Route::Raw(tx.clone()),
+            Route::Pair { queue, owner } => Route::Pair {
+                queue: queue.clone(),
+                owner: Arc::clone(owner),
+            },
             Route::Pub => Route::Pub,
         }
     }
@@ -406,6 +477,66 @@ impl Listener {
         let (tx, rx) = mpsc::channel(self.inner.runtime.config.endpoint_queue);
         self.inner.namespace.register(path, Route::Raw(tx))?;
         Ok(Acceptor::new(path, rx))
+    }
+
+    /// Registers a bound paired endpoint for `path`.
+    ///
+    /// PAIR is one connection and one peer, carrying one-way transfers in
+    /// both directions ([ARCHITECTURE.md](../../../docs/ARCHITECTURE.md)
+    /// §6b). It adds **no wire vocabulary**: a paired endpoint talks to a
+    /// bare [`crate::Peer`] or [`Acceptor`] on the same path, which is the
+    /// test that proves the pattern layer is API and nothing else.
+    ///
+    /// The one-peer rule is enforced at dispatch: the first connection to
+    /// send here claims the endpoint, and a stream from any other is refused
+    /// with `LIMIT_EXCEEDED` while **the first keeps working**.
+    pub fn pair(&self, path: &str) -> Result<Paired, Error> {
+        validate_endpoint_path(path)?;
+        let (tx, rx) = mpsc::channel(self.inner.runtime.config.endpoint_queue);
+        let owner = Arc::new(PairOwner::new());
+        self.inner.namespace.register(
+            path,
+            Route::Pair {
+                queue: tx,
+                owner: Arc::clone(&owner),
+            },
+        )?;
+        Ok(Endpoint::from_state(PairState::bound(path, owner, rx)))
+    }
+
+    /// Registers a respondent for `path`.
+    ///
+    /// A survey question is an exchange, so a respondent's route is
+    /// **byte-for-byte a replier's**: the same request route, the same accept
+    /// queue, the same backpressure. What makes it a survey is entirely on
+    /// the asking side — the fan-out and the deadline — so this pattern adds
+    /// no routing and no wire vocabulary.
+    pub fn respondent(&self, path: &str) -> Result<Respondent, Error> {
+        validate_endpoint_path(path)?;
+        let (tx, rx) = mpsc::channel(self.inner.runtime.config.endpoint_queue);
+        self.inner.namespace.register(path, Route::Request(tx))?;
+        Ok(Endpoint::from_state(RespondState::new(path, rx)))
+    }
+
+    /// Registers a bus member on `path` that dials the others on `tls`'s
+    /// terms.
+    ///
+    /// The **only** factory that takes both a path and dialling terms,
+    /// because a bus member is the one role that is bound and dialling at
+    /// once ([ARCHITECTURE.md](../../../docs/ARCHITECTURE.md) §6b): it
+    /// accepts on its own path with a puller's route and reaches the others
+    /// with [`crate::BusMember::connect`].
+    pub fn bus(&self, path: &str, tls: impl Into<ClientTls>) -> Result<BusMember, Error> {
+        validate_endpoint_path(path)?;
+        let (tx, rx) = mpsc::channel(self.inner.runtime.config.endpoint_queue);
+        self.inner.namespace.register(path, Route::Transfer(tx))?;
+        Ok(Endpoint::from_state(BusState::new(
+            path,
+            Arc::clone(&self.inner.runtime),
+            Arc::new(tls.into()),
+            rx,
+            self.inner.runtime.config.endpoint_queue,
+        )))
     }
 }
 

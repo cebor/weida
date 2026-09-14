@@ -111,8 +111,8 @@ two entry points, and both layers share the transfer handles they hand out:
 
 ### L1 — patterns
 
-The ZeroMQ/nanomsg pattern family as thin wrappers over L0. Req/Rep, Push/Pull and Pub/Sub
-are implemented; PAIR, BUS and SURVEYOR/RESPONDENT are mapped in §6b and not built;
+The ZeroMQ/nanomsg pattern family as thin wrappers over L0. Req/Rep, Push/Pull, Pub/Sub, PAIR,
+SURVEY and BUS are all implemented;
 DEALER/ROUTER are emergent rather than types of their own (§6a). A pattern contributes a
 selection policy, a queue and vocabulary — never a delivery guarantee, because there is no
 layer beneath L0 from which it could get one.
@@ -1040,8 +1040,7 @@ something to imply from the current behaviour ([GUARANTEES.md](GUARANTEES.md) §
 
 ## 6b. The ZeroMQ pattern family, mapped
 
-Every pattern in the family has a place in this model. Three are built; the rest are mapped,
-so that building them later is composition rather than design.
+Every pattern in the family has a place in this model, and **every one of them is now built**.
 
 | zmq/nanomsg | weida | Status |
 | --- | --- | --- |
@@ -1049,18 +1048,44 @@ so that building them later is composition rather than design.
 | DEALER/ROUTER | emergent: unlimited concurrent exchanges, identity = connection | no separate type |
 | PUSH/PULL | one-way transfer, round-robin out, fan-in on the bound side | implemented |
 | PUB/SUB | one-way fan-out plus SUBSCRIBE/UNSUBSCRIBE, publisher-side prefix filter | implemented |
-| PAIR | one connection, one exchange or one one-way transfer each way | mapped, unimplemented |
-| BUS | n peers, each a `Peer` plus an `Acceptor` on the same path | mapped, unimplemented |
-| SURVEYOR/RESPONDENT | fan-out of exchanges with a deadline | mapped, unimplemented |
+| PAIR | one connection, one peer, one-way transfers in both directions | implemented |
+| BUS | n members, each bound on its own path and dialling the others | implemented |
+| SURVEYOR/RESPONDENT | fan-out of exchanges with a deadline | implemented |
 
 "Mapped, unimplemented" **was** a status rather than a backlog entry, and the question it left
-open — is this vocabulary worth a type? — has since been answered by the owner: **yes, the full
-family**. PAIR, BUS and SURVEYOR/RESPONDENT are filed (B-236, B-237, B-238), which also completes
-the nanomsg set, whose patterns are PAIR, REQREP, PUBSUB, PIPELINE, SURVEY and BUS. Each maps onto
+open — is this vocabulary worth a type? — has been answered twice: by the owner (**yes, the
+full family**) and then by building all three (B-236, B-237, B-238), which completes the
+nanomsg set, whose patterns are PAIR, REQREP, PUBSUB, PIPELINE, SURVEY and BUS. Each maps onto
 stream kinds the wire already carries and primitives §6a already lists, so each is API surface
-rather than protocol.
-PAIR in particular is a Req/Rep or Push/Pull peer with a narrower API, architecturally
-identical to what exists.
+rather than protocol — and building them proved it: **not one byte of wire vocabulary was
+added for any of the three.** A test has a `Paired` talking to a bare `Peer` and `Acceptor` on
+the same path; a respondent's route is byte-for-byte a replier's; a bus member's is a
+puller's.
+
+Four things the table cannot say, each one found by building rather than by mapping.
+
+- **PAIR is one-way transfers in both directions**, not "one exchange or one one-way transfer
+  each way" as this row once read: an exchange's reply half would make one side a replier, and
+  PAIR is symmetric. The one-peer rule is a claim taken at dispatch, and the **first** peer is
+  kept — ZeroMQ drops the newcomer silently, weida refuses it with `LIMIT_EXCEEDED` and says so
+  ([0005](decisions/0005-refusal-race.md)).
+- **A bound side learns its peer only when that peer speaks.** A bound pair's first send
+  therefore waits for the peer rather than buffering; the accepting side of this library has no
+  other way to address a peer it has not heard from, and inventing a queue there would have been
+  a guarantee nobody asked for.
+- **SURVEY needed one primitive, not a pattern's worth.** `Peer::open_bi` picks *one* peer,
+  which is Req/Rep's selection policy; a survey needs the same write against every peer, so the
+  body moved into `stream::open_exchange_on` and the pattern is a fan-out of it plus a deadline.
+  The deadline is the caller's, nothing on the wire carries it, and a late reply is dropped and
+  **counted** where the reply arrives rather than where the caller reads — so the number means
+  "after the deadline" whatever the caller does with its handle.
+- **BUS needs a writer per member**, exactly as the fan-out does. Without one, a member that
+  stops reading stalls the sender: its stream tasks hold streams open, the sender exhausts
+  `max_concurrent_uni_streams`, and `open_uni` blocks. With one, a slow member costs its own
+  copies — counted in `BusMember::dropped`, at the queue when it is full and at the wire when a
+  write fails — and never the sender's time. That is the same rule Pub/Sub states in
+  [GUARANTEES.md](GUARANTEES.md) §6, and BUS is the second pattern to need it, which is what
+  makes it a rule rather than a Pub/Sub detail.
 
 ---
 

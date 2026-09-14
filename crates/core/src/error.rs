@@ -253,6 +253,10 @@ pub enum StopReason {
     UnknownEndpoint,
     /// `UNSUPPORTED`: the endpoint exists but does not serve this stream kind.
     Unsupported,
+    /// `LIMIT_EXCEEDED`: the endpoint is at a capacity bound — a paired
+    /// endpoint that already has its peer, for instance. A refusal of this
+    /// stream, not of the connection.
+    LimitExceeded,
     /// `SHUTDOWN`: the peer's runtime has stopped admitting work — it is
     /// draining or closing, and this stream arrived too late.
     ShuttingDown,
@@ -267,6 +271,7 @@ impl From<StopReason> for Error {
             StopReason::Canceled => Error::Canceled,
             StopReason::UnknownEndpoint => Error::UnknownEndpoint,
             StopReason::Unsupported => Error::Unsupported,
+            StopReason::LimitExceeded => Error::LimitExceeded,
             // A refusal, and a definite one: nothing of this transfer was
             // taken, and the peer will not take it later either. It is
             // `Rejected` rather than a variant of its own because the outcome

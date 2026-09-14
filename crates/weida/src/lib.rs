@@ -78,8 +78,9 @@ pub use config::{ClientTls, Discovery, Identity, Pem, RuntimeConfig, ServerTls, 
 pub use cursor::{CursorSet, Cursors, Reporter};
 pub use drain::Drained;
 pub use endpoint::{
-    Endpoint, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher, Rep, Replier, Req, Requester,
-    Sub, Subscriber,
+    Bus, BusMember, Endpoint, Pair, Paired, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher,
+    Rep, Replier, Req, Requester, Respond, Respondent, Sub, Subscriber, Survey, SurveyRun,
+    Surveyor,
 };
 #[cfg(windows)]
 pub use listener::PipeBinding;

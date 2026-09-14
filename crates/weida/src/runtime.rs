@@ -27,7 +27,10 @@ use weida_protocol::codes;
 use crate::config::{ClientTls, RuntimeConfig};
 use crate::conn::{ConnCtx, ConnHandle};
 use crate::drain::{self, DrainState, Drained};
-use crate::endpoint::{Endpoint, PushState, Pusher, ReqState, Requester, SubState, Subscriber};
+use crate::endpoint::{
+    Endpoint, PairState, Paired, PushState, Pusher, ReqState, Requester, SubState, Subscriber,
+    SurveyState, Surveyor,
+};
 use crate::listener::Listener;
 use crate::pool::ClientPool;
 use crate::stream::Peer;
@@ -302,6 +305,31 @@ impl Runtime {
             Arc::clone(&self.inner),
             Arc::new(tls.into()),
             self.inner.config.endpoint_queue,
+        ))
+    }
+
+    /// Creates a dialling paired endpoint on `tls`'s terms.
+    ///
+    /// The other half is [`crate::Listener::pair`]. PAIR is symmetric above
+    /// the connection — both sides send and receive one-way transfers — so
+    /// the split here is only about who dials, exactly as it is for Sub
+    /// against Pub.
+    pub fn pair(&self, tls: impl Into<ClientTls>) -> Paired {
+        Endpoint::from_state(PairState::dialling(
+            Arc::clone(&self.inner),
+            Arc::new(tls.into()),
+            self.inner.config.endpoint_queue,
+        ))
+    }
+
+    /// Creates a surveyor that dials on `tls`'s terms.
+    ///
+    /// Unlike a requester, a surveyor uses **every** peer it connected to:
+    /// one exchange each, per survey.
+    pub fn surveyor(&self, tls: impl Into<ClientTls>) -> Surveyor {
+        Endpoint::from_state(SurveyState::new(
+            Arc::clone(&self.inner),
+            Arc::new(tls.into()),
         ))
     }
 

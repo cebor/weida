@@ -193,6 +193,11 @@ impl Peer {
         ))
     }
 
+    /// The runtime this peer's tasks run on.
+    pub(crate) fn exec(&self) -> &crate::runtime::Exec {
+        &self.runtime.exec
+    }
+
     /// Dials and records a peer, returning the connection and the path.
     ///
     /// The scheme picks the transport and nothing falls back to anything
@@ -253,6 +258,26 @@ impl Peer {
     pub(crate) fn for_each_live(&self, f: impl FnMut(&ConnHandle, &str)) {
         self.peers.for_each_live(f);
     }
+}
+
+/// Opens one exchange on a **named** connection.
+///
+/// [`Peer::open_bi`] picks one peer, which is the selection policy Req/Rep
+/// wants. A pattern that addresses *every* peer — a survey — needs the same
+/// write against a connection it chose itself, so the body lives here once
+/// rather than twice.
+pub(crate) async fn open_exchange_on(
+    conn: &ConnHandle,
+    path: &str,
+    meta: TransferMeta,
+) -> Result<(OutgoingTransfer, ReplyStream), Error> {
+    let (header, trace, cursors) = outgoing_header(conn, Some(path), &meta, None)?;
+    let (mut send, recv) = conn.open_bi().await?;
+    write_data_preamble(&mut send, &header).await?;
+    Ok((
+        OutgoingTransfer::new(send, trace, ConnHandle::clone(conn), cursors),
+        ReplyStream::new(recv, ConnHandle::clone(conn)),
+    ))
 }
 
 impl std::fmt::Debug for Peer {

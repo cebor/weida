@@ -1013,6 +1013,22 @@ async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
                 }
             }
         }
+        // Exactly one peer, and the **first** one is kept: a stream from any
+        // other connection is refused with `LIMIT_EXCEEDED` while the first
+        // keeps working. ZeroMQ's PAIR drops the newcomer silently; refusing
+        // and saying so is this repository's rule for a capacity decision
+        // (`docs/decisions/0005-refusal-race.md`).
+        Some(Route::Pair { queue, owner }) => {
+            if !owner.claim(ctx) {
+                tracing::debug!(path, "a paired endpoint already has its peer");
+                transfer.refuse(codes::LIMIT_EXCEEDED);
+                return;
+            }
+            if let Err(e) = queue.send(transfer).await {
+                tracing::debug!(path, "endpoint went away while dispatching");
+                e.0.refuse(codes::UNKNOWN_ENDPOINT);
+            }
+        }
         // The path exists but serves a different shape: a one-way transfer
         // aimed at a replier, or anything aimed at a publisher. Refusing is
         // the honest answer — the alternative is to reinterpret the sender.
@@ -1093,7 +1109,10 @@ async fn handle_bi(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Resu
                 tracing::debug!(path, "acceptor went away while dispatching");
             }
         }
-        Some(Route::Transfer(_) | Route::Pub) => {
+        // A pair carries one-way transfers in both directions, so an
+        // exchange aimed at one is the same category error as an exchange
+        // aimed at a puller.
+        Some(Route::Transfer(_) | Route::Pub | Route::Pair { .. }) => {
             tracing::debug!(path, "endpoint does not serve exchanges");
             request
                 .refuse_coded(ErrorCode::Unsupported, codes::UNSUPPORTED)

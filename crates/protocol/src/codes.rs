@@ -51,6 +51,7 @@ pub const fn stop_reason(code: u64) -> StopReason {
         CANCELED => StopReason::Canceled,
         UNKNOWN_ENDPOINT => StopReason::UnknownEndpoint,
         UNSUPPORTED => StopReason::Unsupported,
+        LIMIT_EXCEEDED => StopReason::LimitExceeded,
         SHUTDOWN => StopReason::ShuttingDown,
         other => StopReason::Other(other),
     }
@@ -93,6 +94,10 @@ mod tests {
         assert_eq!(stop_reason(CANCELED), StopReason::Canceled);
         assert_eq!(stop_reason(UNKNOWN_ENDPOINT), StopReason::UnknownEndpoint);
         assert_eq!(stop_reason(UNSUPPORTED), StopReason::Unsupported);
+        // A paired endpoint that already has its peer refuses a newcomer's
+        // stream with this code, so it has to read as a capacity refusal
+        // rather than an unknown number (`docs/PATTERNS.md`, PAIR).
+        assert_eq!(stop_reason(LIMIT_EXCEEDED), StopReason::LimitExceeded);
         // A draining peer stops a stream that arrived too late with this
         // code, so a sender must be able to read it as a refusal rather than
         // as an unknown number (`docs/decisions/0009-drain.md` §4.5).
