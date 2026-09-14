@@ -223,21 +223,24 @@ Four things:
   green at **1827 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session. One caveat worth stating rather than hiding:
-  one full-workspace run out of twenty this session reported a single failure whose output the
-  measuring pipeline consumed, and nineteen runs — including eight at `--test-threads=32` —
-  did not reproduce it. It is recorded here so the next occurrence is captured rather than
-  rediscovered.
-- **16 items are `ready`, 14 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
+  **one full-workspace run in about twenty reports a single failure whose name nobody has
+  seen** — once on Linux, once on Windows, both times through a pipeline that counted the
+  results and discarded the failure block, and not reproduced in twenty-six further Linux runs
+  (eight of them at `--test-threads=32`, three under sixteen busy-loop processes) or four
+  further Windows ones. Filed as B-252 with the capture recipe, because a name is what closes
+  it and a green run is not.
+- **17 items are `ready`, 14 are `blocked`** (B-061, CI: the Forgejo host cannot run this gate;
   B-068, a licence and a publication target; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **247** filed items, **216 are `done`**, and the `ready` ones are four
+  tier by 0011 §4.3). Of **248** filed items, **216 are `done`**, and the `ready` ones are four
   kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231),
   **the surfaces this session's work has not reached yet** (B-243, the cursor API in the two
   Python halves; B-244, the three new patterns in `weida::blocking` and both Python halves),
-  **seven findings the review round filed rather than fixed** (B-245 the `AF_UNIX` reset loss,
+  **eight findings the review round filed rather than fixed** (B-245 the `AF_UNIX` reset loss,
   B-246 the unconditional `traceparent`, B-247 fan-out unpriced, B-248 the `unsafe` guard,
   B-249 the parked-receipt sweep, B-250 the per-message header allocations, B-251 one refusal
-  table), and **two sentences in a file this loop does not write** (§6, B-107 and B-184).
+  table, B-252 the unnamed intermittent failure), and **two sentences in a file this loop does
+  not write** (§6, B-107 and B-184).
   Nothing else is open: every requirement-driven item, every library item and both binding
   slices of weida's own Python surface are closed.
 - **The requirement-driven backlog is closed.** All five requests of
