@@ -563,3 +563,187 @@ which at C8B scale is a certainty rather than a risk.
 - **Nothing here takes responsibility for a message.** Every peer in this chapter forgets
   immediately, which is the next question rather than an omission — a hop that takes
   responsibility is chapter 3, and it needs a queue that survives its consumer.
+
+---
+
+## 4. Depth, and what a chain may claim
+
+The program: `crates/interop/cross-tests/examples/guide_depth.rs`. The test:
+`crates/interop/cross-tests/tests/guide_depth.rs`.
+
+```text
+cargo run -p weida-cross-tests --example guide_depth
+```
+
+**Why chapter 4 before chapter 3.** The chapters are numbered by what a reader needs and
+written in the order of what can be *asserted*. Chapter 3 is a hop that takes responsibility,
+which needs a queue that survives its consumer — filed, not built (B-203). This chapter needs
+two foreign protocols and two bridges, which exist and are tested, so it is written first
+([decisions/0026](decisions/0026-the-guide-and-the-c8b-question.md) §4.4). Nothing in it
+depends on chapter 3.
+
+§0.1 ended with a number that makes this chapter the centre of the whole question: at a
+fan-out width of 10³-10⁴, **two to four hops reach eight billion people**. So a message's fate
+is decided by three or four intermediaries, and the only question that matters at that depth is
+**what each of them is allowed to claim**.
+
+This chapter's chain is deliberately harsher than a weida deployment:
+
+```text
+ZeroMQ peer --ZMTP--> bridge --weida--> bridge --SP--> nng peer
+```
+
+Three protocols, two translations, both foreign ends the real implementations — `zeromq` in
+pure Rust and `nng`'s C library. A chain of weida hops would be the easy case; this is the
+case a reader will actually deploy, because a system that reaches everybody does not get to
+choose everybody's protocol.
+
+### 4.1 A hop is a translation
+
+**Claim §4.1: a hop is a translation, and what crosses is what both protocols can express.**
+
+The topic makes it visible, because all three protocols express it differently:
+
+```text
+ZMTP sent two frames, "sport.football" and "goal"
+SP received one body, "sport.football\0goal" — the frame boundary became a NUL
+```
+
+| Protocol | How a topic exists | Why |
+| --- | --- | --- |
+| ZMTP | its **own frame** | a prefix match "won't cross a frame boundary" ([zmtp](adapters/zmtp.md) §6) |
+| weida | a **segmented field** in the DATA header | a topic is not a path and `*`/`#` match segments ([PROTOCOL.md](PROTOCOL.md) §6.4) |
+| SP | **leading bytes** of the body | SP has no topic field at all ([nng](adapters/nng.md) §6) |
+
+So the chain translates frame → weida topic → leading bytes, and the NUL delimiter is what
+lets the last step be undone by whoever reads it — NUL because it is the one octet a weida
+topic cannot contain. **The frame boundary the sender used does not exist at the far end.** The
+delimiter is a convention the reader has to know, and that convention is in a document rather
+than on the wire.
+
+That is what a translating hop costs, and it is the cheapest example in this repository. The
+expensive ones are in [adapters/zmtp.md](adapters/zmtp.md) §8, which names ten of them — L1
+multipart, L2 byte-prefix subscriptions, L5 ROUTER's silent drop, L10 no application
+acknowledgement — as **named losses** rather than caveats, because a loss with a number can be
+refused at configuration time.
+
+### 4.2 What the chain may claim
+
+**Claim §4.2: the chain's claim is the weakest hop's, and nothing composes upward.**
+
+```text
+the ZeroMQ send succeeded: true; anything arrived at the SP end: false
+```
+
+That pair is the whole chapter in two booleans. The program closes the `nng` receiver
+**before** sending, the ZeroMQ send succeeds anyway, and a fresh receiver on the same address
+proves nothing arrived.
+
+Neither protocol is lying. ZeroMQ's transfer point is `zmq_send` returning and nothing further
+([zmtp](adapters/zmtp.md) §7); SP has **no transfer point at all** — no application
+acknowledgement, no broker receipt, no persistence signal ([nng](adapters/nng.md) §7). weida's
+own `delivered()` proves one hop's transport and says nothing about the application, let alone
+about the next protocol's ([GUARANTEES.md](GUARANTEES.md) §1). Composed:
+
+> **`BestEffort` ∩ `BestEffort` = `BestEffort`**, and the chain's honest end-to-end claim is
+> that a message was accepted somewhere near the beginning.
+
+This is also why the guarantee vocabulary is per hop by construction and not a property of a
+message ([decisions/0006](decisions/0006-guarantee-sets.md)). A hop may promise what it can
+keep. A chain of hops promises the intersection, and no amount of bookkeeping at the edges
+makes the middle stronger.
+
+§0.2 is the reason this is a design constraint rather than a disappointment: at two to four
+hops and 8·10⁹ recipients, an acknowledgement per recipient converging on one root is **1.1 TB
+of acknowledgement traffic for one message**. The tree that makes the fan-out affordable makes
+the end-to-end acknowledgement impossible, so hop-local is not a weakening of a stronger
+design — it is the only design that exists at this scale.
+
+### 4.3 Whose limit decides
+
+**Claim §4.3: the smaller ceiling decides, and it decides at the first hop that sees it.**
+
+```text
+8192 B offered through a 4096 B near cap and a 1 MiB far cap: far end received false
+```
+
+The ZMTP edge holds a 4 KiB ceiling and the SP edge keeps its 1 MiB default. The 8 KiB message
+dies at the first hop, and the second hop **buffers nothing** — which is the part worth a
+program rather than a sentence: a chain does not carry a payload as far as it can and then
+discard it, so a refused message costs the far hop no memory at all. At depth that is the
+difference between one node's bad configuration and a whole tree's.
+
+The general rule, and it is the same rule as §4.2 in a different currency: **a chain's
+capability is the minimum over its hops, per dimension.** A caller sizing a payload has to know
+the smallest ceiling on the path, and there is no protocol mechanism that discovers it — each
+edge is configured, each edge refuses what it cannot hold, and the first refusal is the one you
+get.
+
+### 4.4 A loss that cannot travel
+
+**Claim §4.4: a loss at the first hop is invisible to the sender and total for the chain.**
+
+```text
+2 ZMTP frames in one message: the send succeeded (true), the far end received false
+```
+
+A two-frame ZeroMQ message has no weida counterpart — there is "no message-part concept
+anywhere in v0" ([zmtp](adapters/zmtp.md) §3) — and concatenating the frames would invent an
+application protocol on the application's behalf, so the bridge refuses. That is **L1** of the
+named losses, and the composition is the lesson: **the SP side could have carried those bytes
+perfectly well, and it never sees them.** A chain's capability is an intersection, not a union.
+
+The sender's half is the uncomfortable one, and it follows from §4.2 rather than being a second
+defect: `zmq_send` returned, so by ZeroMQ's own contract the send succeeded — of a message that
+will never exist anywhere else. An application that needs to know otherwise has to ask a
+question instead of making a statement, which is chapter 1 §1.3's rule surviving two protocol
+boundaries unchanged.
+
+### 4.5 The intersection, as arithmetic
+
+**Claim §4.5: the intersection is arithmetic a caller can do, and the runtime's own answer is
+not observable.**
+
+```text
+core ∩ core = BestEffort delivery, TransportReceipt acknowledgement
+core ∩ (AtLeastOnce, Accepted) = BestEffort delivery, TransportReceipt acknowledgement
+can an application ask a live connection what it negotiated? false
+```
+
+The second line is the one that carries the claim, and the first cannot: `core ∩ core` is
+symmetric, so it would read the same if the arithmetic took the **stronger** level. A hop
+offering `AtLeastOnce` delivery and a broker's `Accepted` completion still agrees on core with
+a hop that offers neither, and the chapter's test asserts *that* pair for exactly this reason.
+
+`GuaranteeSet::intersect` is the whole mechanism, and it is a public function: per dimension
+the weaker of the two levels, an exact match required for the dimensions that are not ordered,
+`durability` and `replicas` dropped when the weakened acknowledgement cannot carry them, and a
+connection **refused** with `NEGOTIATION_FAILED` when the result does not reach what a peer
+requires. There is no downgrade path ([GUARANTEES.md](GUARANTEES.md) §4,
+[decisions/0006](decisions/0006-guarantee-sets.md) §4.4). Both sides run it on their own and
+the peer's HELLO, so both reach the same verdict without a round trip.
+
+**And then the honest half.** No public accessor reports the negotiated set of a *live*
+connection: the value is computed, stored and enforced inside the runtime, and `Agreed` is
+`pub(crate)`. An application that wants to know what its connection agreed to has to read the
+adapter's mapping document instead of asking the connection. The chapter's test asserts that
+gap — `observable_on_a_connection` is `false` — so that adding an accessor breaks the test and
+forces this paragraph to be rewritten rather than left quietly wrong.
+
+That is not a large defect, and it is exactly the kind a guide finds: the specification
+documents describe a negotiated set as an observable property of a connection, the API does not
+expose it, and nobody noticed until a chapter tried to print it. Filed as **B-262**.
+
+### 4.6 What this chapter does not tell you
+
+- **Two hops, not four.** Every experiment here is one translation in each direction. The
+  arithmetic of §0.1 needs three or four, and nothing in this repository runs a chain that
+  long.
+- **Both foreign ends are real, and both are on loopback.** No propagation delay between hops,
+  which is exactly the term that makes a deep chain's latency interesting.
+- **A hop that takes responsibility is chapter 3**, and it is the missing half of this chapter:
+  everything here is a hop that forwards. What `Accepted` may mean, and what it may not, needs
+  a queue that survives its consumer (B-203).
+- **Federation between administrations is unbuilt** (§0.4). Two protocols in one process is not
+  two operators, and the question of what a hop across an organisational boundary may claim has
+  a protocol answer and no deployment answer.
