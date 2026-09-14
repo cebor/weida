@@ -1053,7 +1053,7 @@ says so rather than quietly claiming it.
 | 11 | Cancel mid-transfer. | `cancel_mid_transfer` and `reply_abort_when_reply_stream_dropped` in `crates/weida/tests/reqrep.rs`; `canceled_resolves_when_the_requester_walks_away` for the handler-side signal |
 | 12 | Test connection loss. | `crates/weida/tests/hostile.rs`: `a_server_that_never_answers_yields_indeterminate` (closed after FIN) and `a_server_that_disappears_mid_stream_yields_connection_lost` |
 | 13 | Test malformed headers. | `crates/weida/tests/hostile.rs`: garbage preamble and `header_len = 1 MiB` both assert close code `PROTOCOL_VIOLATION`; `weida-protocol` unit tests for duplicate keys, missing required keys (`missing_required_keys_are_rejected`) and oversized lengths |
-| 14 | Fuzz parser. | fuzz targets `preamble`, `data_header`, `hello`, `traceparent`, `roundtrip` and `subscribe` under `crates/protocol/fuzz`, plus the deterministic `fuzz_smoke_*` tests in `crates/protocol/tests/fuzz_smoke.rs` |
+| 14 | Fuzz parser. | fuzz targets `preamble`, `data_header`, `hello`, `traceparent`, `roundtrip`, `subscribe`, `cursor`, `credit` and `error` under `crates/protocol/fuzz`, plus the deterministic `fuzz_smoke_*` tests in `crates/protocol/tests/fuzz_smoke.rs`. The fuzz crate declares its own `[workspace]`, so no workspace-wide build ever compiles it: `roundtrip` was broken by the DATA fields that arrived with keys 8-11 and did not compile again until its generator learned them. The recorded runs below therefore cover the targets that existed at the time of each run, not this list |
 | 15 | Benchmark small and large transfers. | `crates/protocol/benches/codec.rs` (header encode/decode); `crates/weida/benches/echo.rs` (`echo_1kib_rtt`, `echo_1kib_rtt_explicit`, `stream_throughput_64mib`) |
 | 16 | Demonstrate bounded memory with a multi-GB generated stream. | `large_stream_bounded_memory` in `crates/weida/tests/large.rs` (ignored by default; run with `--ignored`), asserting checksum equality and peak RSS below 512 MiB for a 1 GiB echo; example `large_stream` for ad-hoc runs |
 
@@ -1071,7 +1071,7 @@ measures a wire that no longer exists, so its ACK rows are history, not document
 | Two-process prototype | `transform_server` + `printf 'hello weida' \| transform_client --ack` | stdout `HELLO WEIDA`; stderr `outcome=Acked(Accepted)`; the printed trace id appears in the server's request log line |
 | Bounded memory, in process | `cargo test --release -p weida --test large -- --ignored` | 1 GiB echoed each way, checksums equal, 905 MiB/s, peak RSS **24.0 MiB** against a 512 MiB ceiling |
 | Bounded memory, two process | `large_stream --gib 4` against the release server | 4 GiB echoed byte for byte, 908.7 MiB/s both directions, peak RSS **14.4 MiB** |
-| Fuzzing | `cargo +nightly fuzz run <target> -- -runs=200000 -max_len=20000` | all five targets, zero crashes, zero OOMs |
+| Fuzzing | `cargo +nightly fuzz run <target> -- -runs=200000 -max_len=20000` | the five targets that existed then — `preamble`, `data_header`, `hello`, `traceparent`, `roundtrip` — zero crashes, zero OOMs |
 | Header codec | `cargo bench -p weida-protocol` | DataHeader encode 100.2 ns / decode 60.8 ns minimal, 218.5 ns / 146.8 ns fully populated; ACK 32.8 ns / 20.2 ns; preamble parse 6.9 ns |
 | End to end | `cargo bench -p weida` | 1 KiB echo round trip 82.9 us best effort, 113.5 us with an `Accepted` ACK; 64 MiB streaming echo at 1.04 GiB/s counting both directions |
 
@@ -1617,6 +1617,27 @@ than this binding's synchronous surface and 58× faster than its asyncio one, be
 against 45.8 µs — and the Rust library is *faster* than libzmq (32.4 µs against 45.8 µs),
 which is where the implementation actually competes. The binding's overhead is a Python
 problem to solve in the bridge, not a protocol one.
+
+### Verified results — the nine fuzz targets, after the one that had stopped compiling
+
+The fuzz crate declares its own `[workspace]`, so no workspace-wide build ever compiles it
+and the green gate says nothing about it. `roundtrip` had therefore not compiled since DATA
+keys 8-11 arrived: its `DataHeader` literal named eight of the twelve fields with no
+`..Default::default()`, which is a hard `E0063`. Repaired, plus the `credit` and `error`
+targets B-202's acceptance had asked for, and then all nine were run — the first run of the
+set as a set:
+
+| Target | Runs | Result |
+| --- | --- | --- |
+| `preamble`, `data_header`, `hello`, `traceparent`, `subscribe` | 100 000 each | no crash, no OOM, no artifact |
+| `roundtrip` (repaired), `cursor`, `credit` (new), `error` (new) | 100 000 each | no crash, no OOM, no artifact |
+
+`cargo +nightly fuzz run <target> -- -runs=100000 -max_len=20000`, same machine, nightly
+1.100.0; every `fuzz/artifacts/<target>` directory is empty afterwards. The lesson is the
+one the separate workspace hides: a target that does not compile is not a target that finds
+nothing, and only running them says which of the two it is. CI for the fuzz crate stays
+filed (B-061, whose acceptance keeps the fuzz targets out of the push gate deliberately:
+they need nightly and a time budget).
 
 ---
 

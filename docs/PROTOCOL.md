@@ -789,11 +789,12 @@ are the whole scheme:
    rides its own unidirectional stream and QUIC orders no stream against another, so a grant
    that arrives late would otherwise lower a limit the consumer has already raised. Keeping the
    maximum is what makes a *reordered* grant harmless, not just a duplicated one.
-3. **A consumer pauses by restating what it has already been delivered.** That is AMQP 1.0's
-   `link-credit = 0` expressed against an absolute baseline: delivery stops with no stream
-   reset and no connection close, and a later, larger grant resumes it. A fresh subscription's
-   pause is the `0` it starts at. Granting *less* than the delivered count is ignored, which is
-   rule 2 seen from the other side.
+3. **There is no way to lower a standing limit in v0.** Rule 2 is exact: a receiver ignores any
+   grant that is not strictly greater than the limit it holds, so restating the delivered count
+   changes nothing unless the subscription had exhausted its credit anyway. The only pause is
+   the `0` a fresh subscription starts at. AMQP 1.0 can shrink `link-credit` against an absolute
+   baseline; this frame cannot, and a consumer that wants to stay in control therefore grants in
+   increments it is willing to receive rather than expecting to stop a grant it has made.
 
 A large limit is not a hostile number: what a broker holds is bounded by its own `queue_bytes`
 (§10), not by what a consumer promises to take, and a consumer that states `u64::MAX` has said
@@ -938,6 +939,12 @@ SUB    {endpoint:"/md", filter:"ctl.#"}      (rest wildcard, final segment)
 SUB    {endpoint:"/md", filter:""}           (every topic)
        57 03 08  A2 00 63 2F 6D 64 01 60
 
+CREDIT {endpoint:"/jobs", filter:"px.eur", limit:5}
+       57 05 12  A3 00 65 2F 6A 6F 62 73 01 66 70 78 2E 65 75 72 02 05
+
+CREDIT {endpoint:"/jobs", filter:"", limit:0}   (the zero every subscription starts at)
+       57 05 0C  A3 00 65 2F 6A 6F 62 73 01 60 02 00
+
 CURSOR {report_id:1}                         (head frame of a report)
        57 06 03  A1 00 01
 
@@ -1010,6 +1017,15 @@ the pairs are pinned together in `crates/weida/src/pubsub.rs`.
 `header_len = 0x0C` (12 bytes), CBOR map of 2 entries: key `0` `endpoint = "/md"`, key `5`
 `topic = "px.*"`. A **`topic` is never a pattern** (§6.2, §6.4): the `*` here is an ordinary
 byte, and the filter `px.*` selects this topic exactly as it selects `px.eur`.
+
+**CREDIT vectors** — magic `0x57`, kind `0x05` (CREDIT), a CBOR map of 3 entries in both
+cases, because all three keys are required (§6.6). The granting frame is
+`header_len = 0x12` (18 bytes): key `0` `endpoint = "/jobs"`, key `1` `filter = "px.eur"`,
+key `2` `limit = 5`. The second is `header_len = 0x0C` (12 bytes), with the empty filter
+(`0x60`, the whole-queue subscription — present rather than omitted, so absent and empty stay
+distinguishable) and `limit = 0`. That zero is where every subscription begins and the only
+stop the scheme has: a limit is kept only when it is strictly greater than the standing one,
+so restating a number already delivered cannot bring a running subscription back to it.
 
 **CURSOR head vector** — magic `0x57`, kind `0x06` (CURSOR), `header_len = 0x03` (3 bytes),
 CBOR map of 1 entry: key `0` `report_id = 1`. That is the whole head frame: a report names

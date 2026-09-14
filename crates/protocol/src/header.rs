@@ -232,6 +232,14 @@ mod guarantee_key {
 
 /// Declares an enum whose wire form is a small `uint`, with the `core` level
 /// first so that `Default` and "absent means core" agree by construction.
+///
+/// The derived `Ord` ranks by declaration order while `to_wire` reads
+/// explicit literals, and the ladder comparisons rest on the two agreeing —
+/// `GuaranteeSet::intersect` picks the weaker level with `.min()`,
+/// `GuaranteeSet::reaches` compares with `<`, and `CursorLevel`'s derived
+/// order inherits the same coincidence — so the macro asserts the agreement
+/// at compile time rather than letting a variant inserted mid-block with a
+/// higher literal silently rank a stronger guarantee below a weaker one.
 macro_rules! wire_enum {
     ($(#[$meta:meta])* $name:ident { $($(#[$vmeta:meta])* $variant:ident = $value:literal),+ $(,)? }) => {
         $(#[$meta])*
@@ -257,6 +265,26 @@ macro_rules! wire_enum {
                 }
             }
         }
+
+        // The invariant the ladder comparisons depend on. A build failure is
+        // the only acceptable outcome: at run time the mis-ranking is
+        // invisible — every value still encodes and decodes — and shows up
+        // only as a negotiated guarantee weaker than the one reported.
+        const _: () = {
+            let values = [$($value as u64),+];
+            let mut i = 1;
+            while i < values.len() {
+                assert!(
+                    values[i - 1] < values[i],
+                    concat!(
+                        stringify!($name),
+                        ": wire values must ascend with declaration order, ",
+                        "because the derived Ord is the ladder"
+                    )
+                );
+                i += 1;
+            }
+        };
     };
 }
 
@@ -1418,7 +1446,27 @@ impl DataHeader {
     }
 
     /// Encodes the header.
+    ///
+    /// Key `10` goes out in the canonical form §6.2 makes normative —
+    /// strictly ascending by wire value, no repeats — whatever order
+    /// [`DataHeader::report`] happens to hold. That rule is enforced here
+    /// because encoding cannot fail: a vector in any other order would
+    /// otherwise produce bytes that close the connection at every conformant
+    /// peer, and there would be no way to tell the caller so.
+    ///
+    /// The report's other two rules stay the caller's for exactly that
+    /// reason — both need an error, and this function has none to give. At
+    /// most [`limits::MAX_REPORT_LEVELS`] distinct levels, and key `9`
+    /// present exactly when key `10` is: `weida`'s `data_header` refuses an
+    /// oversized order with `Error::LimitExceeded` and allocates the report
+    /// id alongside the order, so no caller reaches this encoder with either
+    /// mistake.
     pub fn encode(&self) -> Vec<u8> {
+        // Sorted and deduplicated by wire value, not by the enum's derived
+        // order, because the wire value is what ascends on the wire.
+        let mut report: Vec<u64> = self.report.iter().map(|level| level.to_wire()).collect();
+        report.sort_unstable();
+        report.dedup();
         let count = u64::from(self.endpoint.is_some())
             + u64::from(self.content_len.is_some())
             + u64::from(self.content_type.is_some())
@@ -1429,7 +1477,7 @@ impl DataHeader {
             + u64::from(self.producer.is_some())
             + u64::from(self.achieved.is_some())
             + u64::from(self.report_id.is_some())
-            + u64::from(!self.report.is_empty())
+            + u64::from(!report.is_empty())
             + u64::from(self.report_mode != ReportMode::default());
         encode_with(|e| {
             e.map(count)?;
@@ -1465,10 +1513,10 @@ impl DataHeader {
             if let Some(report_id) = self.report_id {
                 e.u64(data_key::REPORT_ID)?.u64(report_id)?;
             }
-            if !self.report.is_empty() {
-                e.u64(data_key::REPORT)?.array(self.report.len() as u64)?;
-                for level in &self.report {
-                    e.u64(level.to_wire())?;
+            if !report.is_empty() {
+                e.u64(data_key::REPORT)?.array(report.len() as u64)?;
+                for value in &report {
+                    e.u64(*value)?;
                 }
             }
             // `Progress` is never written: an absent key already says it, so
@@ -1688,10 +1736,15 @@ impl SubscriptionHeader {
 /// nothing and a duplicated one changes nothing. It is also **monotone at the
 /// receiver**: a broker keeps the highest limit it has seen, which is what
 /// makes a reordered frame harmless on a transport that does not order the
-/// streams control frames ride. A consumer therefore pauses by restating the
-/// number it has already been delivered — AMQP 1.0's `link-credit = 0`
-/// against an absolute baseline [amqp10 §5.1] — and a fresh subscription's
-/// pause is the limit `0` it starts at.
+/// streams control frames ride. Monotone is the whole rule: a receiver
+/// ignores any limit that is not strictly greater than the standing one, so
+/// restating a number already delivered changes nothing unless the
+/// subscription had exhausted its credit anyway. **v0 offers no way to lower
+/// a standing limit.** The only pause is the `0` a fresh subscription starts
+/// at, so a consumer that wants to stay in control grants in increments it
+/// is willing to receive. AMQP 1.0 can shrink `link-credit` against an
+/// absolute baseline [amqp10 §5.1]; this frame cannot, and a peer that reads
+/// it as if it could would wait for a stop no broker can deliver.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreditHeader {
     /// Endpoint path of the queue the subscription is on.
@@ -2096,6 +2149,34 @@ mod tests {
             last = Some(key);
             d.skip().unwrap();
         }
+    }
+
+    #[test]
+    fn an_unsorted_report_with_repeats_is_emitted_as_the_canonical_ascending_set() {
+        // A caller hands over the levels in the order it thought of them.
+        // Decoding is the proof: the decoder refuses a non-ascending or
+        // repeated array, so a header that survives its own encoder was
+        // canonicalized on the way out.
+        let h = DataHeader {
+            report_id: Some(1),
+            report: vec![
+                CursorLevel::Application(CursorLevel::APPLICATION_FLOOR),
+                CursorLevel::Known(Acknowledgement::Stored),
+                CursorLevel::Application(CursorLevel::APPLICATION_FLOOR),
+                CursorLevel::Known(Acknowledgement::Accepted),
+                CursorLevel::Known(Acknowledgement::Stored),
+            ],
+            ..DataHeader::reply()
+        };
+        let decoded = DataHeader::decode(&h.encode()).expect("encoder emits the canonical form");
+        assert_eq!(
+            decoded.report,
+            vec![
+                CursorLevel::Known(Acknowledgement::Accepted),
+                CursorLevel::Known(Acknowledgement::Stored),
+                CursorLevel::Application(CursorLevel::APPLICATION_FLOOR),
+            ]
+        );
     }
 
     // --- optional fields --------------------------------------------------
