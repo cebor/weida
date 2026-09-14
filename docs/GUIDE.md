@@ -16,10 +16,13 @@ are in the same chapter as the success case rather than in an appendix.
 **Two rules keep this document honest, and they are enforced rather than promised.**
 
 1. **Every program here is a file in this repository, and a test drives that file.** The
-   chapters do not carry snippets written for the page. `examples/guide_one_transfer.rs` is
-   chapter 1's program and `examples/guide_many_peers.rs` is chapter 2's;
-   `crates/weida/tests/guide.rs` includes each as a module and asserts the claims its chapter
-   makes. A claim added to this document without a program and an assertion fails
+   chapters do not carry snippets written for the page. Chapter 1's program is
+   `crates/weida/examples/guide_one_transfer.rs`, chapter 2's is
+   `crates/weida/examples/guide_many_peers.rs`, and chapter 4's is
+   `crates/interop/cross-tests/examples/guide_depth.rs` — in that crate because its chain needs
+   two foreign protocols, and the two adapters know nothing of each other on purpose. Each is
+   included as a module by a test beside it, which asserts the claims its chapter makes. A
+   claim added to this document without a program and an assertion fails
    `every_claim_the_chapters_make_has_a_program_and_a_test`.
 2. **No number here is an estimate.** Measured figures name the item that measured them
    ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4); arithmetic derived from them says so in the
@@ -30,8 +33,10 @@ Run the chapters before reading them:
 
 ```text
 cargo run -p weida --example guide_one_transfer
-cargo run -p weida --example guide_many_peers   # --release for the timing figures
+cargo run -p weida --example guide_many_peers          # --release for the timing figures
+cargo run -p weida-cross-tests --example guide_depth
 cargo test -p weida --test guide
+cargo test -p weida-cross-tests --test guide_depth
 ```
 
 ---
