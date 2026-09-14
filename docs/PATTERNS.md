@@ -308,6 +308,9 @@ Which answer a pattern needs follows from the pattern, not from the transport:
 | Req/Rep | **reschedule** | a request has a reply half, so the requester learns the outcome and can re-issue; `Indeterminate` is exactly the case where re-issuing must be safe ([FAILURE_MODEL.md](FAILURE_MODEL.md)) |
 | Push/Pull | **reschedule**, and only the sender can | the puller cannot ask: a one-way transfer has no reply half. This is the trade the pattern is |
 | Pub/Sub | **cancel** | the copy is per subscriber and best effort by definition; a dropped copy is counted, not retried ([GUARANTEES.md](GUARANTEES.md) §6) |
+| PAIR | **reschedule** | symmetric, so either side can re-send what it still holds; neither has a reply half to ask with, exactly as Push/Pull |
+| SURVEY | **cancel** | a survey is a partial result by construction: an answer that did not arrive before the deadline is dropped and counted, and re-asking is a new survey |
+| BUS | **cancel** | a copy is per member and best effort, as Pub/Sub's is; a member that could not take one is counted in `dropped()` |
 | a queue (L2) | **cancel on the way in, reschedule on the way out** | an inbound stream that never reached FIN was never a message, so nothing was admitted and nothing was confirmed; a delivery that broke is redelivered, because the queue still holds the message |
 
 That last row is the whole bridge from the stream primitives to the message world: **a message is
@@ -317,6 +320,24 @@ and the message vocabulary adds an assumption — the payload is whole before it
 than a layer ([decisions/0024](decisions/0024-three-families-one-back-channel.md) §4.1). A queue's unit is a completed stream, which is why an interrupted
 admission needs no vocabulary of its own — there is nothing to talk about yet — and why a
 redelivery is an ordinary new stream rather than a continuation.
+
+**Every row of both tables above is a test** (B-242,
+`crates/weida/tests/interrupted.rs`), and so is the rule they follow from: a transfer
+interrupted before FIN is a definite `ConnectionLost` for the sender
+(*`a_transfer_interrupted_before_fin_is_connection_lost_for_the_sender`*); a reader never sees
+an interrupted stream as complete, with `collect` failing `Canceled`, `AsyncRead` failing
+`ConnectionReset` and **never** `Ok(0)`
+(*`a_reader_never_sees_an_interrupted_stream_as_complete`*); a requester learns
+`Indeterminate` and can re-issue (*`a_reqrep_requester_can_reissue_after_an_indeterminate_outcome`*);
+a Push producer is the only side that can (*`a_push_producer_is_the_only_side_that_can_reschedule`*);
+a lost fan-out copy is counted and never re-sent
+(*`a_pubsub_copy_lost_to_a_dead_subscriber_is_counted_not_retried`*); and a cursor reported
+before the break **survives** it
+(*`a_cursor_reported_before_the_break_survives_the_break`*) — which is the whole value of a
+cursor over a verdict: a whole-message verdict tells an interrupted sender nothing, a cursor
+tells it a number. Beside them sits the liveness bound a reliable work chain depends on:
+a bound side observes a dead dialler within `Limits::idle_timeout`
+(*`a_bound_side_observes_a_dead_dialler_within_the_idle_timeout`*).
 
 ---
 
@@ -506,11 +527,96 @@ Two things the patterns cannot express are natural here:
 
 ---
 
-## 6. Mapped, not implemented
+## 6. PAIR, SURVEY and BUS
 
-PAIR, BUS and SURVEYOR/RESPONDENT are mapped onto L0 in [ARCHITECTURE.md](ARCHITECTURE.md)
-and deliberately not shipped until a use case asks. Router/Dealer are emergent (§2). Connecting
-publishers and binding pushers are recorded deferrals.
+The three patterns [ARCHITECTURE.md](ARCHITECTURE.md) §6b mapped and nobody had built. All
+three are built now, and all three added **no wire vocabulary**: a `Paired` talks to a bare
+`Peer` and `Acceptor` on the same path, a `Respondent`'s route is byte-for-byte a replier's, a
+`BusMember`'s is a puller's. Router/Dealer stay emergent (§2); connecting publishers and
+binding pushers stay recorded deferrals.
+
+### 6.1 PAIR
+
+`Runtime::pair` dials, `Listener::pair` binds, and after that the two are the same type with
+the same calls: **one-way transfers in both directions**, one connection, one peer.
+
+| | `Paired`, dialling | `Paired`, bound |
+| --- | --- | --- |
+| Compatible peer | a bound `Paired`, `Acceptor`, `Puller` | a dialling `Paired`, `Peer`, `Pusher` |
+| Send/receive pattern | `connect` once, then `send`/`open` and `recv` concurrently | `send`/`open` and `recv` concurrently |
+| Outgoing routing | the one connection it dialled | the one connection its peer dialled |
+| Action with no peer | a second `connect` is `Error::LimitExceeded` | the first send **waits** for a peer to appear |
+| Second peer | — | refused with `LIMIT_EXCEEDED`, and the first is **kept** |
+
+Two rules a caller can get wrong. **The first peer is kept**: ZeroMQ's PAIR drops the newcomer
+silently, weida refuses it and says so, because a capacity decision is reported
+([decisions/0005](decisions/0005-refusal-race.md)) — the refused sender reads
+`Error::LimitExceeded` and the connection survives. And a **bound** pair cannot address a peer
+it has not heard from, so its first send waits rather than buffering: a queue there would be a
+guarantee nobody asked for.
+
+*`both_directions_carry_transfers_concurrently`,
+`a_second_connection_is_refused_and_the_first_keeps_working`,
+`a_pair_talks_to_a_bare_peer_and_acceptor_on_the_same_path`.*
+
+### 6.2 SURVEY
+
+`Surveyor::survey(body, deadline)` opens **one exchange per connected respondent** — not the
+round-robin pick Req/Rep uses — and `SurveyRun::next(max_bytes)` yields answers as they arrive
+until the deadline. A `Respondent` is a `Replier` with a different name: same route, same
+`accept`, same backpressure.
+
+| | `Surveyor` | `Respondent` |
+| --- | --- | --- |
+| Direction | connects, and **accumulates** peers on purpose | binds |
+| Outgoing routing | every live peer, one exchange each | the exchange that asked |
+| Deadline | the caller's, per survey; nothing on the wire carries it | never learns it |
+| A late answer | dropped and **counted** in `late()` | cannot tell |
+| No respondents | an empty run, not an error | — |
+
+Three rules. The deadline is **not negotiated** and a respondent never learns it, so a survey
+is a local decision about how long to wait. A late answer is counted **where it arrives**
+rather than where the caller reads, so `late()` means "after the deadline" whatever the caller
+does with its handle ([GUARANTEES.md](GUARANTEES.md) §6). And "nobody answered" is an answer:
+a survey with no respondents returns a run whose first `next` is `None`, never
+`Error::NotConnected`.
+
+A respondent that refuses or dies mid-reply is **one `Err` among the answers** and ends
+nothing: the exchanges are independent.
+
+*`every_respondent_answers_within_the_deadline`, `a_late_reply_is_counted_and_not_delivered`,
+`a_respondent_that_refuses_is_one_error_among_replies`,
+`a_respondent_that_dies_mid_reply_does_not_end_the_survey`,
+`a_survey_with_no_respondents_is_empty_not_an_error`.*
+
+### 6.3 BUS
+
+`Listener::bus(path, tls)` is the only factory that takes both a path and dialling terms,
+because a bus member is the one role that is **bound and dialling at once**. Joining is an
+ordinary `connect`, leaving an ordinary disconnect; there is no membership protocol.
+
+| | `BusMember` |
+| --- | --- |
+| Compatible peer | another `BusMember` on the same path |
+| Send/receive pattern | `connect` per member, then `send` → every other member, `recv` |
+| Outgoing routing | every member this one dialled; **never itself** |
+| Backpressure | one writer per member; a full writer queue drops and counts |
+| Ordering | `None` across members, per stream within one |
+| Relay | none: *n* members is *n* × (*n* − 1) deliveries |
+
+A message reaches every **other** member structurally — `send` writes to the peers this member
+dialled, and a member does not dial itself — so nothing filters a copy out, because no copy is
+ever addressed to it. There is **no relay**: weida forwards on nobody's behalf, which is the
+trade nanomsg's BUS makes too. And the fan-out needs a **writer per member** for the same
+reason Pub/Sub's does: without one, a member that stops reading stalls its stream tasks, the
+sender exhausts `max_concurrent_uni_streams` and its next `send` blocks. With one, a slow
+member costs its own copies — counted in `dropped()`, at the queue when it is full and at the
+wire when a write fails — and never the sender's time.
+
+*`every_member_sees_every_other_members_message`,
+`a_sender_never_receives_its_own_message`,
+`a_dead_member_is_dropped_and_the_others_continue`,
+`a_slow_member_is_dropped_and_counted_rather_than_blocking`.*
 
 ---
 
@@ -523,5 +629,10 @@ publishers and binding pushers are recorded deferrals.
 | the newest of a feed, many readers, laggards may lose | Pub/Sub | drops are per subscriber and counted (§4) |
 | ordered messages to one peer | a raw stream | QUIC orders bytes within a stream and nowhere else (§1.7, §5) |
 | a signal larger than `subscriber_buffer_bytes` to many readers | `Publisher::open`, which streams one per subscriber (§4.1) | `publish` takes a whole `Bytes` and refuses it; `open` bounds a chunk instead (B-064) |
-| proof the peer's application acted | Req/Rep, or an L2 broker (Phase 6) | a transport receipt never says that (§1.2); `Accepted`/`Stored`/`Processed` are reserved for a hop that owns the message |
+| proof the peer's application acted | Req/Rep, or an L2 broker (`weida-broker`) | a transport receipt never says that (§1.2); `Accepted`/`Stored`/`Processed` belong to a hop that owns the message, and a broker reports `Accepted` as a cursor (§1.11) |
 | to know whether the receiver accepted it | Req/Rep | a one-way refusal can lose the race with the receipt and then reaches no observer (§1.6, [decisions/0005](decisions/0005-refusal-race.md) §4.3) |
+| exactly one peer, both directions, no selection policy | PAIR | a second peer is refused rather than silently preferred (§6.1) |
+| an answer from everyone who is there, within a deadline | SURVEY | the deadline, the partial result and the late-reply rule are what an application otherwise rebuilds wrongly (§6.2) |
+| every member to hear every other member | BUS | *n* × (*n* − 1) deliveries, no relay, counted drops (§6.3) |
+| a reliable verdict without an exchange | any pattern, plus `TransferMeta::with_report` | a cursor rides a stream of its own, so a Push transfer stays one unidirectional stream and still gets an answer (§1.11, [decisions/0024](decisions/0024-three-families-one-back-channel.md) §4.4a) |
+| how far the far end got, not merely whether it finished | cursors, via `OutgoingTransfer::cursors` | a whole-message verdict tells an interrupted sender nothing; an absolute offset tells it a number (§1.11) |
