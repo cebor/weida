@@ -385,12 +385,23 @@ async fn a_draining_runtime_refuses_a_late_stream_on_an_open_connection() {
     let mut late = within(pusher.open(TransferMeta::default()))
         .await
         .expect("the stream budget is local, so opening still succeeds");
-    let _ = late.write_all(b"too late").await;
-    let err = match late.finish() {
-        Ok(receipt) => within(receipt.delivered())
-            .await
-            .expect_err("a late transfer must be refused"),
+    // **Past the stream window on purpose.** Eight bytes fit in the peer's
+    // window, so their FIN can be acknowledged before the drain's refusal
+    // travels back and the receipt then reports `Ok` — which is
+    // [0005](../../../docs/decisions/0005-refusal-race.md)'s race, not a
+    // defect, and this test lost that coin flip on Windows while passing on
+    // Linux. 0005 states the rule that makes it deterministic: a refusal is
+    // guaranteed beyond the peer's stream window, and `stream_receive_window`
+    // defaults to 1 MiB.
+    let past_the_window = vec![0x7au8; 2 * 1024 * 1024];
+    let err = match within(late.write_all(&past_the_window)).await {
         Err(e) => e,
+        Ok(()) => match late.finish() {
+            Ok(receipt) => within(receipt.delivered())
+                .await
+                .expect_err("a late transfer must be refused"),
+            Err(e) => e,
+        },
     };
     assert!(
         matches!(err, weida::Error::Rejected),
