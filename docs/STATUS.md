@@ -6,30 +6,42 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main, 2026-09-14 ~23:00 UTC. Tree clean, gate green on Linux:
-**1876 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+**Snapshot:** main, 2026-09-15 ~00:20 UTC. Tree clean, gate green on Linux:
+**1878 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
-plus `weida --features blocking` at **282**, 1 ignored, and `weida-py`'s own suite at **25**
-through a freshly built wheel. Seventy-two of those tests arrived in
-the last six rounds: twenty-four regression tests from the review, seventeen that hold the
+plus `weida --features blocking` at **284**, 1 ignored, and `weida-py`'s own suite at **32**
+through a freshly built wheel. Seventy-four of those tests arrived in
+the last seven rounds: twenty-four regression tests from the review, seventeen that hold the
 website to the document set it renders, seventeen that hold **the guide** to the programs
 it teaches with, three that hold the trace decision to the wire, three that hold the
 `AF_UNIX` cancellation guarantee the transport silently did not have, five from the
 review-finding sweep — one refusal table, one `unsafe` guard over seven crates, the framing's
-byte identity and the parked-receipt measurement — and three that hold PAIR, SURVEY and BUS
-to the blocking facade (with six more of them in Python). The intermittent failure
+byte identity and the parked-receipt measurement — three that hold PAIR, SURVEY and BUS
+to the blocking facade, and two that hold the cursor surface to it (with thirteen more of
+them in Python). The intermittent failure
 this snapshot used to
 carry a caveat about is **found and fixed**: it was a port race in the cross-protocol tests,
 not a timing assertion (B-252).
 
-**All six patterns are on all three surfaces.** PAIR, SURVEY and BUS landed in the library
-ahead of its facades; B-244 carried them into `weida::blocking` and both halves of
-`weida-py`, which now register thirteen classes each. The one shape that was a decision
-rather than a translation is a survey's: it is a **value** in Python — `weida.Survey` with
-`replies`, `asked`, `failed`, `late` and `silent()` — because the only channel out of a
-bridged future there is the errno family, so an `async for` over answers would need a second
-error channel invented for `StopAsyncIteration` alone. Answers arrive one at a time on the
-Rust `SurveyRun` and nowhere else.
+**Every surface of the library is now bound.** PAIR, SURVEY and BUS landed in the library
+ahead of its facades and B-244 carried them into `weida::blocking` and both halves of
+`weida-py`; B-243 did the same for the **cursor** surface, so a Python producer orders
+`report=[weida.PROCESSED]` on a send and reads the verdict a one-way transfer has no reply to
+carry. Two shapes were decisions rather than translations, and both came out the same way: a
+survey is a **value** in Python (`weida.Survey`) and a cursor report is a **handle** read in a
+`while (set := await cursors.changed()) is not None:` loop — because the only channel out of a
+bridged future there is the errno family, so `async for` would need a second one invented for
+`StopAsyncIteration` alone. A cursor **level is an integer**, since the level space is open
+above `weida.APPLICATION_FLOOR` and a class would close what the protocol leaves open.
+
+**A synchronous wait without a deadline is a hang, and B-243 found one of ours.** The blocking
+`Cursors::changed(deadline)` is mandatory-deadline for the reason
+[0009](decisions/0009-drain.md) §4.4 gives: a peer that never reports opens no stream, a report
+that never starts never ends, and a connection both sides keep alive never closes, so a parked
+thread would wait forever. The library gained `Cursors::changed_within(deadline)` and
+`Reported::{Changed, Waiting, Ended}` — three outcomes, because a deadline is not an ending —
+and `weida.sync.Cursors.changed(seconds)` raises `TimeoutError`. A mutation test that parked
+for 300 seconds before the change fails in 15 after it.
 
 **A 64-byte message is now twelve bytes of framing.** The guide's own C8B arithmetic found a
 fixed 60-byte `traceparent` on every DATA header of every pattern — 44 % of the wire budget for
@@ -73,13 +85,14 @@ and about 27 messages per second at that width. The width interval in the guide 
 settles how a fan-out fails: a stalled subscriber is refused by the **byte budget** when that
 budget is below the connection's 0.6-1.5 MiB absorption band and by the **queue** when it is
 above it — which is why `dropped_on(topic)` separates the two causes.
-The Windows 11 VM ran at this commit: **1848 across 142
+The Windows 11 VM ran at the previous commit: **1851 across 142
 binaries**, the same 37 ignored, with fmt, clippy in both configurations and rustdoc clean. The
 runs that got there are named in the nightlog rather than counted: the shared local framing
 broke the Windows build in a way no Linux gate can see (`pipe.rs` is `#[cfg(windows)]`), one
 test lost 0005's refusal race on that platform while passing here, and **the VM's storage
-faulted four times in one evening** — `STATUS_IN_PAGE_ERROR` three times and `LNK1201` once,
-each without a source line and each cleared by a `cargo clean`, which is §6 point 3 at a rate
+faulted six times in one evening** — `STATUS_IN_PAGE_ERROR` five times and `LNK1201` once,
+each without a source line and each cleared by a `cargo clean` or by simply running again,
+which is §6 point 3 at a rate
 of minutes rather than hours. Add
 the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
@@ -297,22 +310,23 @@ Four things:
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1876 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  green at **1878 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session. The one caveat this section used to carry — a
   failure in roughly one full-workspace run in twenty that nobody had seen — is **closed**:
   the website's own gate run kept its log, the failure named itself
   (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
   a cross-test helper rather than the timing assertion it looked like (B-252).
-- **8 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
+- **7 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
   gate; B-254, serving the site; four guide chapters, each on the slice it
   needs; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **258** filed items, **230 are `done`**, and the `ready` ones are three
-  kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231),
-  **the one surface this session's work has not reached yet** (B-243, the cursor API in the two
-  Python halves — B-244's three patterns are done),
+  tier by 0011 §4.3). Of **258** filed items, **231 are `done`**, and the `ready` ones are two
+  kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231)
   and **two sentences in a file this loop does not write** (§6, B-107 and B-184).
+  **Every surface of the library is bound**: B-244 and B-243 closed the two this session's
+  plan deliberately left alone, so `weida::blocking` and both `weida-py` halves now carry all
+  six patterns and the cursor surface.
   **All six findings of the review round are closed**, the last two by measurement rather than
   by change: B-250's one-buffer send is inside this machine's spread and kept for the simpler
   code, and B-249's sweep turned out to be unreachable while a peer acknowledges — 20 000
@@ -357,6 +371,7 @@ Four things:
   the reverse pool of 0012 §4.4 carries an ordinary send rather than a fan-out copy.
 - **What moves the roadmap next** is yours to choose: **Phase D**, the L2 broker, where B-203's
   two parked design questions are now answered — consumer settlement is a cursor, so a delivery
-  stays one-way — or **Phase C's Java row**. Of the two surfaces this session deliberately did
-  not reach, **B-244 is closed** (PAIR, SURVEY and BUS in `weida::blocking` and both Python
-  halves) and B-243 remains: the cursor API in `weida-py`.
+  stays one-way — **Phase C's Java row**, or the cluster and store slices that are the only
+  `ready` code items left (B-219, B-220, B-224, B-226, B-231). Both surfaces this session
+  deliberately did not reach are closed: **B-244** (PAIR, SURVEY and BUS) and **B-243** (the
+  cursor API), each on `weida::blocking` and both Python halves.
