@@ -39,7 +39,7 @@ pub(crate) enum Link {
     /// Boxed: a grouped link carries its pools and channels inline and would
     /// otherwise dwarf the other variants.
     #[cfg(unix)]
-    Unix(Box<crate::grouped::Grouped<tokio::net::UnixStream>>),
+    Unix(Box<crate::grouped::Grouped<crate::unix::UnixLocal>>),
     #[cfg(windows)]
     Pipe(Box<crate::grouped::Grouped<crate::pipe::PipeStream>>),
 }
@@ -49,7 +49,7 @@ pub(crate) enum SendHalf {
     Quic(quinn::SendStream),
     Local(LocalSend),
     #[cfg(unix)]
-    Unix(crate::grouped::LocalSend<tokio::net::UnixStream>),
+    Unix(crate::grouped::LocalSend<crate::unix::UnixLocal>),
     #[cfg(windows)]
     Pipe(crate::grouped::LocalSend<crate::pipe::PipeStream>),
 }
@@ -59,7 +59,7 @@ pub(crate) enum RecvHalf {
     Quic(quinn::RecvStream),
     Local(LocalRecv),
     #[cfg(unix)]
-    Unix(crate::grouped::LocalRecv<tokio::net::UnixStream>),
+    Unix(crate::grouped::LocalRecv<crate::unix::UnixLocal>),
     #[cfg(windows)]
     Pipe(crate::grouped::LocalRecv<crate::pipe::PipeStream>),
 }

@@ -771,7 +771,7 @@ impl<S: crate::grouped::Stream> LocalAccept<S> {
 #[cfg(unix)]
 async fn accept_unix(
     listener: tokio::net::UnixListener,
-    serve: LocalAccept<tokio::net::UnixStream>,
+    serve: LocalAccept<crate::unix::UnixLocal>,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -783,6 +783,9 @@ async fn accept_unix(
             // (`docs/decisions/0009-drain.md` §4.5).
             continue;
         }
+        // The accepted socket carries the runtime its halves write their
+        // end-of-payload marker on (B-245), exactly as a pipe instance does.
+        let stream = crate::unix::UnixLocal::accepted(stream, serve.exec.clone());
         serve.exec.spawn(serve.clone_for().serve(stream));
     }
 }

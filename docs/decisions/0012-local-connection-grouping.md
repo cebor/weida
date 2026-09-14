@@ -151,27 +151,25 @@ direction that does not.
    pool is a silent-to-the-publisher, counted-at-the-publisher drop. (d) A client that never
    parks a reverse connection cannot receive Pub/Sub at all — which is a *configuration* a
    subscriber chooses, and must be reported rather than inferred.
-   (e) **On `AF_UNIX` a reset is indistinguishable from a FIN, so a cancelled transfer is read
-   as a complete one.** `crates/weida/src/unix.rs` implements this transport's `finish` and
-   `reset` identically — both `drop(writer)`, the code discarded — and `grouped::LocalRecv`
-   maps a zero-length read to a clean end of stream with no reset check, so
-   `OutgoingTransfer::cancel`, a transfer dropped without `finish()` and a producer that dies
-   mid-payload all reach the reader as `Ok(truncated_bytes)` from `collect` and as EOF on the
-   `AsyncRead`. The cost is the one guarantee a stream-shaped system cannot do without: "half a
-   frame is not a frame" ([PATTERNS.md](../PATTERNS.md) §1.5, §4.1) silently stops holding, and
-   the application takes a truncated payload for a whole one. It is also the only one of these
-   five losses that is **not** inherent to the shape decided in §4 — the other two local
-   transports keep the distinction, in process by checking the writer's reset flag before
-   reporting EOF and on a named pipe by framing every write and carrying the code in a
-   `CHUNK_RESET` chunk — which is why it is filed to be closed (B-245) rather than accepted.
+   (e) **On `AF_UNIX` a reset was indistinguishable from a FIN, so a cancelled transfer read
+   as a complete one — the one named loss of these five that is now closed.**
+   `crates/weida/src/unix.rs` implemented this transport's `finish` and `reset` identically —
+   both `drop(writer)`, the code discarded — so `OutgoingTransfer::cancel`, a transfer dropped
+   without `finish()` and a producer that died mid-payload all reached the reader as
+   `Ok(truncated_bytes)` from `collect` and as EOF on the `AsyncRead`. The cost was the one
+   guarantee a stream-shaped system cannot do without: "half a frame is not a frame"
+   ([PATTERNS.md](../PATTERNS.md) §1.5, §4.1) silently stopped holding, and the application
+   took a truncated payload for a whole one. It was also the only one of these five losses
+   **not** inherent to the shape decided in §4, which is why it was filed to be closed rather
+   than accepted (B-245).
 
    **The constraint is the kernel's, and it was established experimentally.** Linux offers no
    abort for an `AF_UNIX` stream socket: `SO_LINGER` with a zero timeout followed by `close` is
    byte-for-byte what a plain close produces at the reader — the data, then a clean EOF. The
-   distinction can therefore only be carried **in the payload**, and there are exactly two
+   distinction can therefore only be carried **in the payload**, and there were exactly two
    shapes for that:
 
-   - **Per-write framing, as [`pipe.rs`](../../crates/weida/src/pipe.rs) already has it.** Five
+   - **Per-write framing, as [`pipe.rs`](../../crates/weida/src/pipe.rs) already had it.** Five
      bytes per write — a kind byte plus a `u32` length — a FIN chunk, and a RESET chunk
      carrying the code; no lookahead anywhere in the reader. Nothing per byte, and it makes the
      two socket transports one implementation of one framing rather than two conventions, which
@@ -180,13 +178,16 @@ direction that does not.
    - **One end-of-stream marker per transfer.** One byte on a clean end and nine on a reset, so
      the per-write cost disappears — but the reader must hold back the last nine bytes of the
      payload until it sees EOF to know whether they were a marker, and that costs the zero-copy
-     read `AF_UNIX` has today, where `grouped::LocalRecv::read` hands the caller's own buffer
+     read `AF_UNIX` had, where `grouped::LocalRecv::read` hands the caller's own buffer
      straight to the socket. Cheaper on the wire, more expensive in the reader, and a second
      convention beside the pipe's.
 
-   The first is preferred for the same reason the loss exists at all — a convention per
-   transport is how a distinction gets lost — but the choice is B-245's to make, not this
-   note's.
+   **B-245 took the first**, for the reason the loss existed at all — a convention per transport
+   is how a distinction gets lost. The framing moved out of `pipe.rs` into
+   `crates/weida/src/chunked.rs` and both socket transports use it, so there is one framing and
+   one reader; the pipe's behaviour is unchanged byte for byte and the socket gained the RESET
+   chunk it had no kernel equivalent for. What the framing still cannot carry on either socket
+   transport is the reader's refusal, which is loss (b) above and unchanged.
 
 ## 5. Consequences and follow-ups
 

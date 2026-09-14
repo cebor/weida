@@ -220,7 +220,7 @@ No frame cancels anything; cancellation is entirely QUIC stream state.
 
 | Situation | Mechanism | What the peer observes |
 | --- | --- | --- |
-| Sender abandons its own outgoing payload | `RESET_STREAM(CANCELED)` — `OutgoingTransfer::cancel`, or a drop without `finish()` | the transfer is never observable as complete: the read in progress fails — `Error::Canceled` through `read_capped`, `io::ErrorKind::ConnectionReset` on the `AsyncRead` — and never returns EOF. **Over `AF_UNIX` this does not hold**: the reset is indistinguishable from a FIN and a truncated payload is returned as complete (below, and [decisions/0012](decisions/0012-local-connection-grouping.md) §4.7) |
+| Sender abandons its own outgoing payload | `RESET_STREAM(CANCELED)` — `OutgoingTransfer::cancel`, or a drop without `finish()` | the transfer is never observable as complete: the read in progress fails — `Error::Canceled` through `read_capped`, `io::ErrorKind::ConnectionReset` on the `AsyncRead` — and never returns EOF. On **every** transport: QUIC resets the stream, the in-process reader checks the writer's reset flag, and both socket transports carry a RESET chunk with the code, which is what a stream socket cannot express by closing (B-245, [decisions/0012](decisions/0012-local-connection-grouping.md) §4.7(e)) |
 | Receiver refuses an inbound payload | `STOP_SENDING(REJECTED)` — `IncomingTransfer` dropped mid-payload, or a payload past `read_capped`'s cap | `Error::Rejected` from `write_all` or from `delivered()` |
 | Requester abandons the reply | drop `ReplyStream` before `recv()`, which stops the reply half with `CANCELED` | `IncomingRequest::canceled()` resolves; subsequent reply writes fail with `Error::Canceled` |
 | Replier will not answer | ERROR `{NO_REPLY}` + FIN on the reply half — `IncomingRequest` dropped without `reply()` | `ReplyStream::recv()` yields `Error::NoReply` |
@@ -231,16 +231,19 @@ a handler takes it before `reply()` consumes the request, then selects on it bes
 reply writes. A long reply nobody wants otherwise burns the peer's flow-control window, and
 this is how the handler learns to stop.
 
-`cancel()` guarantees an outcome, not a retraction — **on QUIC, in process and over a named
-pipe**. What holds there is that the receiver can never mistake the transfer for a complete
-one: it observes a reset error and never EOF. Over `AF_UNIX` it does not hold at all, and the
-qualifier is not a detail: `crates/weida/src/unix.rs` implements the transport's `finish` and
-`reset` **identically** — both are `drop(writer)` and the code is discarded, because a stream
-socket has no abort — so a cancelled transfer, a transfer dropped without `finish()` and a
-producer that died mid-payload all arrive as a clean end of payload, `collect` returns
-`Ok(truncated_bytes)` and the `AsyncRead` returns EOF. An application over `weida+unix://`
-therefore takes half a message for a whole one with nothing on the wire to warn it
-([decisions/0012](decisions/0012-local-connection-grouping.md) §4.7, B-245). What does
+`cancel()` guarantees an outcome, not a retraction — **on every transport**. What holds is
+that the receiver can never mistake the transfer for a complete one: it observes a reset error
+and never EOF. Two of the four transports get that from the kernel and two had to be given it:
+QUIC has `RESET_STREAM`, the in-process reader checks the writer's reset flag, and both socket
+transports frame their payload and carry a RESET chunk with the code
+(`crates/weida/src/chunked.rs`). That framing was the named pipe's — a pipe has no half-close
+at all — and `AF_UNIX` needed it for the opposite reason: a stream socket has a half-close and
+**no abort**, so `SO_LINGER` with a zero timeout plus `close` is byte-for-byte a plain close at
+the reader and the transport's `finish` and `reset` were the same call. Until B-245 a cancelled
+transfer, a transfer dropped without `finish()` and a producer that died mid-payload therefore
+all arrived over `weida+unix://` as a clean end of payload, and an application took half a
+message for a whole one with nothing on the wire to warn it
+([decisions/0012](decisions/0012-local-connection-grouping.md) §4.7(e)). What does
 **not** hold is that the peer saw fewer bytes. The receiver's assembler is cleared when the
 reset is *processed*, so a reader that gets there first is still served whatever was already
 buffered: `cancel_discards_unread_bytes_and_keeps_read_ones` in

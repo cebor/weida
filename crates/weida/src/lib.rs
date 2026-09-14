@@ -46,6 +46,11 @@
 #[cfg(feature = "blocking")]
 pub mod blocking;
 
+// The chunk framing both socket transports share (B-245): a named pipe has no
+// half-close and a unix socket has no abort, so the end of a payload is a
+// frame rather than a socket state.
+#[cfg(any(unix, windows))]
+mod chunked;
 mod config;
 mod conn;
 mod cursor;

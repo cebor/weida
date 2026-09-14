@@ -7,12 +7,13 @@ at the commit named below, and those files remain the source of truth. The diagr
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
 **Snapshot:** main, 2026-09-14 ~19:00 UTC. Tree clean, gate green on Linux:
-**1865 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+**1868 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
-plus `weida --features blocking` at **270**, 1 ignored. Sixty-one of those tests arrived in
+plus `weida --features blocking` at **270**, 1 ignored. Sixty-four of those tests arrived in
 the last four rounds: twenty-four regression tests from the review, seventeen that hold the
 website to the document set it renders, seventeen that hold **the guide** to the programs
-it teaches with, and three that hold the trace decision to the wire. The intermittent failure
+it teaches with, three that hold the trace decision to the wire, and three that hold the
+`AF_UNIX` cancellation guarantee the transport silently did not have. The intermittent failure
 this snapshot used to
 carry a caveat about is **found and fixed**: it was a port race in the cross-protocol tests,
 not a timing assertion (B-252).
@@ -266,38 +267,38 @@ Four things:
    and a 600 s job limit. The VM's storage also throws `STATUS_IN_PAGE_ERROR` mid-compile
    every few hours; each occurrence is a corrupted artifact cleared by hand, never a code
    problem.
-4. **One decision the review round filed rather than took**, because it changes what a peer
-   observes: which shape closes the `AF_UNIX` reset loss (B-245 — per-write framing as the
-   named-pipe transport has it, or one end-of-stream marker per transfer and a nine-byte
-   lookahead in the reader; the kernel offers no third option, which was measured rather than
-   assumed). The other one is taken: the unconditional `traceparent` is gone, a context is
-   propagated and never minted, and a 64-byte push went from 135 B to **76 B**
-   ([0028](decisions/0028-trace-propagation-is-the-callers.md), B-246).
+4. **Nothing on this list any more, and that is the change.** The two decisions the review
+   round filed rather than took — because each changes what a peer observes — are both taken:
+   the unconditional `traceparent` is gone, a context is propagated and never minted, and a
+   64-byte push went from 135 B to **76 B**
+   ([0028](decisions/0028-trace-propagation-is-the-callers.md), B-246); and the `AF_UNIX` reset
+   loss is closed by the framing the named-pipe transport already had, now shared by both
+   socket transports ([0012](decisions/0012-local-connection-grouping.md) §4.7(e), B-245).
 
 ## 7. Where the loop stands
 
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1865 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  green at **1868 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session. The one caveat this section used to carry — a
   failure in roughly one full-workspace run in twenty that nobody had seen — is **closed**:
   the website's own gate run kept its log, the failure named itself
   (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
   a cross-test helper rather than the timing assertion it looked like (B-252).
-- **14 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
+- **13 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
   gate; B-254, serving the site; four guide chapters, each on the slice it
   needs; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **258** filed items, **224 are `done`**, and the `ready` ones are four
+  tier by 0011 §4.3). Of **258** filed items, **225 are `done`**, and the `ready` ones are four
   kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231),
   **the surfaces this session's work has not reached yet** (B-243, the cursor API in the two
   Python halves; B-244, the three new patterns in `weida::blocking` and both Python halves),
-  **five findings the review round filed rather than fixed** (B-245 the `AF_UNIX` reset loss,
-  B-248 the `unsafe` guard, B-249 the parked-receipt sweep, B-250 the per-message header
-  allocations, B-251 one refusal table — B-247's fan-out measurement and B-246's trace decision
-  are now taken), and
+  **four findings the review round filed rather than fixed** (B-248 the `unsafe` guard,
+  B-249 the parked-receipt sweep, B-250 the per-message header allocations, B-251 one refusal
+  table — B-247's fan-out measurement, B-246's trace decision and B-245's `AF_UNIX` reset loss
+  are now closed), and
   **two sentences in a file this loop does not write** (§6, B-107 and B-184).
   Nothing else is open: every requirement-driven item, every library item, the website itself
   and both binding slices of weida's own Python surface are closed.

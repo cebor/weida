@@ -132,31 +132,31 @@ from — one per dialled path, per §1.3 — and that is the whole mechanism
 connection of the path its subscription names, never at L0 [0003 §4.2, as amended by
 [0011](decisions/0011-answered-where-it-arrived.md) §4.3].
 
-### 1.5 Cancel: not a retraction, and never EOF except over `AF_UNIX`
+### 1.5 Cancel: not a retraction, and never EOF
 
 `OutgoingTransfer::cancel` (and dropping an unfinished transfer) resets the stream. The reader
-never observes the transfer as complete — on every transport but one, and the exception is the
-paragraph after this one: `AsyncRead` fails with `io::ErrorKind::ConnectionReset`,
-`read_capped`/`collect` with `Error::Canceled`, never `Ok(0)`. Bytes the reader already took
-are unaffected. Bytes already buffered at the receiver may still be read before the reset is
-processed: cancellation guarantees the peer cannot mistake the transfer for a whole one, not
-that the peer saw fewer bytes.
+**never** observes the transfer as complete, on every transport: `AsyncRead` fails with
+`io::ErrorKind::ConnectionReset`, `read_capped`/`collect` with `Error::Canceled`, never
+`Ok(0)`. Bytes the reader already took are unaffected. Bytes already buffered at the receiver
+may still be read before the reset is processed: cancellation guarantees the peer cannot
+mistake the transfer for a whole one, not that the peer saw fewer bytes.
 
-**That guarantee holds on QUIC, in process and over a named pipe, and not over `AF_UNIX`.** A
-stream socket has no abort — `SO_LINGER` with a zero timeout followed by `close` is
-byte-for-byte indistinguishable from a plain close at the reader, data then a clean EOF — so
-`crates/weida/src/unix.rs` implements the transport's `finish` and `reset` identically, both
-`drop(writer)` with the code discarded. A cancelled transfer, a transfer dropped without
-`finish()` and a producer that died mid-payload therefore all read as a **complete** transfer
-over `weida+unix://`: `collect` returns `Ok(truncated_bytes)` and the `AsyncRead` returns EOF,
-and the application takes half a message for a whole one. The other two local transports do
-carry the distinction — in process the reader checks the writer's reset flag before reporting
-EOF, and a named pipe frames every write and carries a `CHUNK_RESET` with its code — so
-`AF_UNIX` is the single outlier, and closing it means paying for framing there too
-([decisions/0012](decisions/0012-local-connection-grouping.md) §4.7, B-245).
+**Every transport, and one of them had to be given the ability.** QUIC has `RESET_STREAM`; the
+in-process transport checks the writer's reset flag before reporting EOF; a named pipe frames
+every write and carries a `CHUNK_RESET` with its code. An `AF_UNIX` socket had none of the
+three: a stream socket has no abort — `SO_LINGER` with a zero timeout followed by `close` is
+byte-for-byte indistinguishable from a plain close at the reader, which was measured rather
+than assumed — so `finish` and `reset` were the same call, and a cancelled transfer, a transfer
+dropped without `finish()` and a producer that died mid-payload all read as a **complete**
+transfer. The distinction now lives in the payload, in the framing the named-pipe transport
+already had and both socket transports now share: five bytes per write, a FIN chunk, and a
+RESET chunk carrying the code
+([decisions/0012](decisions/0012-local-connection-grouping.md) §4.7(e), B-245).
 
 *`cancel_discards_unread_bytes_and_keeps_read_ones`, `push_cancel_mid_transfer`,
-`cancel_mid_transfer`.*
+`cancel_mid_transfer`, `an_abandoned_transfer_over_a_socket_is_a_named_cancellation`,
+`a_dropped_transfer_over_a_socket_is_a_cancellation_and_not_a_short_payload`,
+`a_socket_payload_written_in_several_chunks_arrives_whole`.*
 
 ### 1.6 Refusal of a one-way transfer can lose the race to the receipt
 
@@ -243,8 +243,8 @@ cost that answer has, named here rather than discovered.
 ### 1.10 What a local transport changes
 
 Everything above is written against QUIC. Over the three local transports of
-[0010](decisions/0010-local-transport.md) six of those statements mean something else, and the
-first five have the same cause: there is no QUIC connection to share, because one transfer is
+[0010](decisions/0010-local-transport.md) five of those statements mean something else, and
+they have the same cause: there is no QUIC connection to share, because one transfer is
 one channel pair (inproc) or one OS connection (`AF_UNIX`, a named pipe).
 
 - **§1.2's window arithmetic does not apply.** A receipt still means the peer's transport
@@ -278,15 +278,17 @@ one channel pair (inproc) or one OS connection (`AF_UNIX`, a named pipe).
   subscriber byte budget of §4: the copy is dropped, counted in `Publisher::dropped`, and the
   subscription survives. A subscriber that parks nothing is refused at `connect` rather than
   silently receiving nothing.
-- **§1.5's cancellation guarantee is lost over `AF_UNIX`, and only there.** A stream socket
-  cannot abort, so `unix.rs`'s `finish` and `reset` are the same call and a reset arrives as a
-  clean EOF: a cancelled or interrupted transfer is returned to the reader as a complete one,
-  truncated. In process the reader checks the writer's reset flag before reporting EOF, and a
-  named pipe frames its writes and carries the reset code in a `CHUNK_RESET` chunk, so both of
-  those keep the guarantee. Every statement in this document of the form "a reset is never
-  mistaken for a FIN" — §1.5, §1.11, §3's cancellation row, §4's streamed-fan-out rows — is
-  therefore an `AF_UNIX` exception, and it is a **loss** rather than a design choice: 0012 §4.7
-  records it with the two ways out and what each costs, and B-245 is the item that closes it.
+- **§1.5's cancellation guarantee is kept by framing rather than by the kernel.** Neither
+  socket transport gets it for free: a named pipe has no half-close, and a stream socket has a
+  half-close and no abort, which is the same problem from the other side — `SO_LINGER` with a
+  zero timeout plus `close` is byte-for-byte a plain close at the reader. So both frame their
+  payload the same way (`crates/weida/src/chunked.rs`): five bytes per write, a FIN chunk, and
+  a RESET chunk carrying the code, which is what makes a cancelled transfer `Canceled` at the
+  reader instead of a short payload that looks whole. In process the reader checks the writer's
+  reset flag instead, which needs no framing at all. The cost is stated where it was chosen
+  (0012 §4.7(e)): five bytes per write and the zero-copy read. **Until B-245 `AF_UNIX` was the
+  exception**, and every statement of the form "a reset is never mistaken for a FIN" carried an
+  `AF_UNIX` caveat; none does now.
 
 *`crates/weida/tests/transports.rs`: the three pattern bodies over all three transports,
 `a_unix_peer_presents_the_principal_the_kernel_proved`,
@@ -306,13 +308,12 @@ decision over:
 > **Within a connection, QUIC retransmits; when the connection ends, an unfinished stream is
 > gone, and weida does not resend it.**
 
-What the two sides observe is already exact, on every transport but one. The sender gets
+What the two sides observe is already exact, on every transport. The sender gets
 `ConnectionLost` before FIN and `Ok` after it (§1.1, the pattern tables below); the receiver
 never sees an unfinished stream as complete — `AsyncRead` fails with `ConnectionReset`,
-`collect` with `Error::Canceled`, **never** `Ok(0)` (§1.5) — **except over `AF_UNIX`**, where a
-reset is indistinguishable from a FIN and the interrupted stream is handed over as a complete,
-truncated one (§1.10, B-245). "Half a frame is not a frame" (§4.1) is the rule, not a special
-case; over `AF_UNIX` it is a rule the transport cannot enforce.
+`collect` with `Error::Canceled`, **never** `Ok(0)` (§1.5). "Half a frame is not a frame"
+(§4.1) is the rule and not a special case, and since B-245 it is a rule every transport can
+enforce: the one that could not was given the framing to do it.
 
 What happens next is the **application's** choice, and there are exactly three, one of which is
 usually wrong:
@@ -482,7 +483,7 @@ Failure modes:
 | Publisher's connection lost | — | `recv` keeps waiting; filters are remembered and re-sent on the next `connect` |
 | Too many filters on one connection | closes it with `LIMIT_EXCEEDED` | `connect`/`subscribe` fails |
 | Message beyond the budget | `LimitExceeded`, nothing sent | — |
-| Streamed transfer a subscriber cannot keep up with | that subscriber's stream is reset with `CANCELED` and the drop counted; the others keep receiving | a partial payload, ended by a reset rather than a FIN, so it is never mistaken for a whole one — except over `AF_UNIX`, where the reset *is* a FIN (§1.10) |
+| Streamed transfer a subscriber cannot keep up with | that subscriber's stream is reset with `CANCELED` and the drop counted; the others keep receiving | a partial payload, ended by a reset rather than a FIN, so it is never mistaken for a whole one, on every transport (§1.5, B-245) |
 
 This is the one place weida answers overload by discarding, and it is confined to fan-out
 ([GUARANTEES.md](GUARANTEES.md) §6). Today a subscriber cannot detect a drop; **subscriber-side

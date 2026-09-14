@@ -766,6 +766,139 @@ async fn an_abandoned_request_over_a_pipe_is_a_named_cancellation() {
     client.shutdown().await;
     h.shutdown().await;
 }
+/// Claim: over `AF_UNIX` a cancelled transfer is reported as a cancellation,
+/// and **never** as a payload that looks complete (B-245).
+///
+/// This is the shape the transport silently did not have. A unix socket has a
+/// half-close and no abort — `SO_LINGER` with a zero timeout plus `close` is
+/// byte-for-byte a plain close at the reader, which was measured rather than
+/// assumed — so `finish` and `reset` used to be the same call and a reader
+/// took half a message for a whole one. [PATTERNS.md](../../../docs/PATTERNS.md)
+/// §1.5, [GUARANTEES.md](../../../docs/GUARANTEES.md) §6 and
+/// [FAILURE_MODEL.md](../../../docs/FAILURE_MODEL.md) §4 all carried a
+/// qualification for it; this test is what lets them be unqualified.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_abandoned_transfer_over_a_socket_is_a_named_cancellation() {
+    let h = Harness::start(Transport::Unix).await;
+    let replier = h.listener.replier("/slow").expect("replier");
+    let handler = tokio::spawn(async move {
+        let mut request = replier.accept().await.expect("accept");
+        let mut body = request.take_body();
+        body.read_capped(64 * 1024).await
+    });
+
+    let client = h.client();
+    let requester = client.requester(h.trust());
+    within(requester.connect(&h.url("/slow")))
+        .await
+        .expect("connect");
+    let (mut request, _reply) = within(requester.open(TransferMeta::default()))
+        .await
+        .expect("open");
+    within(request.write_all(b"partial")).await.expect("write");
+    request.cancel();
+
+    let seen = within(handler).await.expect("handler");
+    assert!(
+        matches!(seen, Err(Error::Canceled)),
+        "a cancelled transfer must not read as a complete one: {seen:?}"
+    );
+    client.shutdown().await;
+    h.shutdown().await;
+}
+
+/// Claim: over `AF_UNIX` a transfer **dropped** without `finish` is a
+/// cancellation too, which is the case an application hits by accident rather
+/// than on purpose (B-245).
+///
+/// The drop path is the one that matters in production: a task that panics or
+/// a future that is cancelled mid-write leaves exactly this. `Drop` resets the
+/// stream, and before the chunk framing that reset was a clean close.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dropped_transfer_over_a_socket_is_a_cancellation_and_not_a_short_payload() {
+    let h = Harness::start(Transport::Unix).await;
+    let puller = h.listener.puller("/jobs").expect("puller");
+    let drained = tokio::spawn(async move {
+        let transfer = puller.recv().await.expect("recv");
+        transfer.collect(64 * 1024).await
+    });
+
+    let client = h.client();
+    let pusher = client.pusher(h.trust());
+    within(pusher.connect(&h.url("/jobs")))
+        .await
+        .expect("connect");
+    let mut transfer = within(pusher.open(TransferMeta::default()))
+        .await
+        .expect("open");
+    within(transfer.write_all(b"half a message"))
+        .await
+        .expect("write");
+    // No `finish()`: the transfer simply goes out of scope.
+    drop(transfer);
+
+    let seen = within(drained).await.expect("drain task");
+    assert!(
+        seen.is_err(),
+        "a dropped transfer must not arrive as {seen:?}"
+    );
+    assert!(
+        matches!(seen, Err(Error::Canceled)),
+        "and it is a cancellation by name: {seen:?}"
+    );
+    client.shutdown().await;
+    h.shutdown().await;
+}
+
+/// Claim: a finished transfer over `AF_UNIX` still arrives whole, byte for
+/// byte, across more writes than one chunk.
+///
+/// The other half of the framing change, and the regression it could cause:
+/// a reader that mis-parses a chunk boundary would truncate or concatenate.
+/// Three writes of different sizes, one of them larger than the read buffer.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_socket_payload_written_in_several_chunks_arrives_whole() {
+    let h = Harness::start(Transport::Unix).await;
+    let puller = h.listener.puller("/jobs").expect("puller");
+    let reading = tokio::spawn(async move {
+        let transfer = puller.recv().await.expect("recv");
+        transfer.collect(1024 * 1024).await
+    });
+
+    let client = h.client();
+    let pusher = client.pusher(h.trust());
+    within(pusher.connect(&h.url("/jobs")))
+        .await
+        .expect("connect");
+    let mut transfer = within(pusher.open(TransferMeta::default()))
+        .await
+        .expect("open");
+    let big = vec![0x7au8; 96 * 1024];
+    within(transfer.write_all(b"one")).await.expect("write one");
+    within(transfer.write_all(&big)).await.expect("write big");
+    within(transfer.write_all(b"three"))
+        .await
+        .expect("write three");
+    transfer.finish().expect("finish");
+
+    let body = within(reading)
+        .await
+        .expect("read task")
+        .expect("a whole payload");
+    let mut expected = b"one".to_vec();
+    expected.extend_from_slice(&big);
+    expected.extend_from_slice(b"three");
+    assert_eq!(body.len(), expected.len());
+    assert_eq!(
+        body, expected,
+        "the chunk boundaries are not in the payload"
+    );
+    client.shutdown().await;
+    h.shutdown().await;
+}
 
 /// Claim: an unknown-name pipe is a closed peer, and the address rules of
 /// [0010 §4.8] hold for the pipe scheme too.

@@ -113,6 +113,16 @@ async fn a_second_connection_is_refused_and_the_first_keeps_working() {
     // A second peer. Its transfer is refused with `LIMIT_EXCEEDED` — a
     // capacity decision said out loud — and the connection survives the
     // refusal, so the second client learns it rather than hanging.
+    //
+    // **Past the stream window on purpose.** A small push to a claimed path
+    // is [0005](../../../docs/decisions/0005-refusal-race.md)'s race: the FIN
+    // can be acknowledged before the dispatcher's refusal travels back, and
+    // the receipt then reports `Ok`. That race is real and this test hit it
+    // (it pinned one side of a coin flip and lost a run). 0005 states the rule
+    // that makes it deterministic — a refusal is guaranteed *beyond the peer's
+    // stream window* — so this payload is twice `stream_receive_window`'s
+    // 1 MiB default: nobody is reading it, so the write cannot complete until
+    // the refusal arrives.
     let second_client = server.client_runtime();
     let second = second_client.pair(server.trust());
     within(second.connect(&server.url("/link")))
@@ -121,12 +131,15 @@ async fn a_second_connection_is_refused_and_the_first_keeps_working() {
     let mut transfer = within(second.open(TransferMeta::default()))
         .await
         .expect("open");
-    let _ = transfer.write_all(b"me too").await;
-    let refused = match transfer.finish() {
-        Ok(delivery) => within(delivery.delivered())
-            .await
-            .expect_err("the newcomer is refused"),
+    let past_the_window = vec![0x7au8; 2 * 1024 * 1024];
+    let refused = match within(transfer.write_all(&past_the_window)).await {
         Err(e) => e,
+        Ok(()) => match transfer.finish() {
+            Ok(delivery) => within(delivery.delivered())
+                .await
+                .expect_err("the newcomer is refused"),
+            Err(e) => e,
+        },
     };
     assert!(
         matches!(refused, Error::LimitExceeded),

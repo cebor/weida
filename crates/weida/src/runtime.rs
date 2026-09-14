@@ -123,8 +123,11 @@ impl RuntimeInner {
     /// §4.1, §4.2).
     #[cfg(unix)]
     pub(crate) async fn connect_unix(&self, socket: &str) -> Result<ConnHandle, Error> {
-        let link = crate::grouped::dial::<tokio::net::UnixStream>(
-            std::path::PathBuf::from(socket),
+        let link = crate::grouped::dial::<crate::unix::UnixLocal>(
+            crate::unix::UnixEndpoint {
+                path: std::path::PathBuf::from(socket),
+                exec: self.exec.clone(),
+            },
             self.config.limits.max_local_streams,
             self.config.limits.max_parked_reverse,
         )
