@@ -6,13 +6,13 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `08ec2ec`, 2026-09-14 ~16:00 UTC. Tree clean, gate green on Linux:
-**1857 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+**Snapshot:** main `cff962b`, 2026-09-14 ~17:00 UTC. Tree clean, gate green on Linux:
+**1862 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
-plus `weida --features blocking` at **237**, 1 ignored. Fifty-three of those tests arrived in
+plus `weida --features blocking` at **237**, 1 ignored. Fifty-eight of those tests arrived in
 the last three rounds: twenty-four regression tests from the review, seventeen that hold the
-website to the document set it renders, and twelve that hold **the guide** to the programs it
-teaches with. The intermittent failure this snapshot used to
+website to the document set it renders, and seventeen that hold **the guide** to the programs
+it teaches with. The intermittent failure this snapshot used to
 carry a caveat about is **found and fixed**: it was a port race in the cross-protocol tests,
 not a timing assertion (B-252).
 
@@ -23,9 +23,16 @@ C10K, utopian on purpose — and every program in it is a file in the tree that 
 earns the framing: at this repository's own measured numbers, **two to four hops reach
 everybody**, which makes the hard problem at that scale neither throughput nor depth but what
 a hop may claim — and an acknowledgement per recipient converging on one root is 1.1 TB for one
-message. Chapters 1 and 2 are written, ten claims with ten programs; the rest of the arc is
-filed slice by slice, in the order of what can be asserted rather than of the chapter numbers
-(B-256, B-258..B-261).
+message. **Chapters 1, 2 and 4 are written** — fifteen claims, fifteen programs, seventeen
+tests — and the rest of the arc is filed slice by slice, in the order of what can be asserted
+rather than of the chapter numbers (B-258..B-261). Chapter 4 is the cross-protocol chain
+(ZeroMQ → ZMTP bridge → weida → SP bridge → nng, both foreign ends the real implementations),
+and it demonstrates the sentence the whole C8B argument turns on: the ZeroMQ send succeeds,
+nothing arrives at the SP end, neither protocol lied, and
+**`BestEffort` ∩ `BestEffort` = `BestEffort`**. Writing it found one real gap: **no public
+accessor reports what a live connection negotiated** although three documents describe the
+agreed set as a property of a connection (B-262, filed; the chapter's test asserts the gap, so
+closing it fails that test on purpose).
 
 **The fan-out width the whole argument rests on is now measured** (B-247), and it moved the
 argument rather than confirming it. Per subscriber: **396-436 KiB** of transport state at widths
@@ -265,7 +272,7 @@ Four things:
   gate; B-254, serving the site; four guide chapters, each on the slice it
   needs; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **257** filed items, **220 are `done`**, and the `ready` ones are six
+  tier by 0011 §4.3). Of **258** filed items, **221 are `done`**, and the `ready` ones are six
   kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231),
   **the surfaces this session's work has not reached yet** (B-243, the cursor API in the two
   Python halves; B-244, the three new patterns in `weida::blocking` and both Python halves),
@@ -273,8 +280,8 @@ Four things:
   B-246 the unconditional `traceparent`, B-248 the `unsafe` guard,
   B-249 the parked-receipt sweep, B-250 the per-message header allocations, B-251 one refusal
   table — B-247's fan-out measurement is now taken), **the website** (B-253, built; B-254,
-  serving it, blocked on the owner), **the next
-  guide chapter that can be asserted today** (B-256, depth and what a chain may claim), and
+  serving it, blocked on the owner), **the gap writing the guide found** (B-262, a live
+  connection's negotiated guarantee set is not observable), and
   **two sentences in a file this loop does not write** (§6, B-107 and B-184).
   Nothing else is open: every requirement-driven item, every library item and both binding
   slices of weida's own Python surface are closed.
