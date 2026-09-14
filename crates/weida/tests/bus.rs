@@ -14,7 +14,9 @@ mod common;
 
 use std::time::Duration;
 
-use weida::{BusMember, Identity, Listener, Runtime, RuntimeConfig, ServerTls, Trust};
+use weida::{
+    BusMember, Error, Identity, Limits, Listener, Runtime, RuntimeConfig, ServerTls, Trust,
+};
 
 /// Generous ceiling: every assertion below should settle in milliseconds.
 const DEADLINE: Duration = Duration::from_secs(15);
@@ -166,21 +168,30 @@ async fn a_dead_member_is_dropped_and_the_others_continue() {
         "a member that died is dropped from the set"
     );
 
-    // The first send after the death still accepts a copy for the dead
-    // member — its writer has not tried the wire yet — and that copy is
-    // **counted** rather than silently lost.
-    within(bus[0].member.send(b"first after"))
+    // One send after the death. A member's writer now ends on **either** of
+    // two events — its connection closing, or a write failing — so which one
+    // won decides whether a copy was made for the dead member at all. The
+    // invariant that holds across both is what this asserts: a copy is never
+    // silently lost, so a copy accepted for a member that is gone shows up in
+    // `dropped()`, and a member pruned before the send is simply not reached.
+    let reached = within(bus[0].member.send(b"first after"))
         .await
         .expect("send");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while bus[0].member.dropped() == 0 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        bus[0].member.dropped(),
-        1,
-        "the copy the dead member owed is counted"
+    assert!(
+        (1..=2).contains(&reached),
+        "one live member, and at most one copy for the member that died: {reached}"
     );
+    if reached == 2 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while bus[0].member.dropped() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            bus[0].member.dropped(),
+            1,
+            "a copy accepted for the dead member is counted, not lost"
+        );
+    }
 
     // And the survivors continue: the dead member's writer is pruned, so the
     // next send reaches exactly the members that are there.
@@ -243,5 +254,93 @@ async fn a_slow_member_is_dropped_and_counted_rather_than_blocking() {
     assert!(
         dropped > 0,
         "a member that never reads must cost copies rather than the sender"
+    );
+}
+
+#[tokio::test]
+async fn a_body_above_the_fan_out_budget_is_refused_rather_than_dropped_for_everyone() {
+    // The same rule `Publisher::publish` follows: a message that could not be
+    // enqueued for *anybody* is reported to the sender instead of being
+    // dropped once per member, which would look like a delivered send with a
+    // rising drop counter.
+    let bus = members_with(
+        2,
+        RuntimeConfig {
+            limits: Limits {
+                subscriber_buffer_bytes: 64 * 1024,
+                ..Limits::default()
+            },
+            ..RuntimeConfig::default()
+        },
+    )
+    .await;
+    join_all(&bus).await;
+
+    let refused = within(bus[0].member.send(&vec![0x5au8; 64 * 1024 + 1]))
+        .await
+        .expect_err("a body above the budget is refused");
+    assert!(
+        matches!(refused, Error::LimitExceeded),
+        "expected LIMIT_EXCEEDED, got {refused:?}"
+    );
+
+    // The refusal costs the message, not the member: a body inside the
+    // budget still goes out.
+    assert_eq!(
+        within(bus[0].member.send(b"inside the budget"))
+            .await
+            .expect("send"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_slow_member_is_bounded_in_bytes_before_its_message_count() {
+    // A writer queue counted only in messages bounds nothing: a bus send
+    // costs `endpoint_queue × body.len()` per member and multiplies by the
+    // members, and `body.len()` is the application's number. With 256
+    // message slots and a byte budget of four payloads, the byte budget is
+    // what has to stop the fan-out — the same second dimension Pub/Sub
+    // charges per subscriber (`docs/INVARIANTS.md`).
+    let bus = members_with(
+        2,
+        RuntimeConfig {
+            limits: Limits {
+                subscriber_buffer_bytes: 128 * 1024,
+                // Small enough that a member which never reads stalls its
+                // writer after the first copy or two, so the budget is
+                // reached rather than merely configured.
+                stream_receive_window: 16 * 1024,
+                connection_receive_window: 32 * 1024,
+                ..Limits::default()
+            },
+            ..RuntimeConfig::default()
+        },
+    )
+    .await;
+    join_all(&bus).await;
+
+    let payload = vec![0x5au8; 32 * 1024];
+    let mut reached = 0usize;
+    for _ in 0..16u32 {
+        match tokio::time::timeout(Duration::from_secs(2), bus[0].member.send(&payload)).await {
+            Ok(Ok(n)) => reached += n,
+            Ok(Err(e)) => panic!("a bus send failed: {e:?}"),
+            Err(_) => panic!("a slow member blocked the sender"),
+        }
+    }
+
+    let dropped = bus[0].member.dropped();
+    assert_eq!(
+        reached + dropped as usize,
+        16,
+        "every copy is either accepted for delivery or counted: \
+         {reached} reached, {dropped} dropped"
+    );
+    assert!(
+        reached <= 5,
+        "the byte budget holds at most four payloads plus the one in flight, \
+         but {reached} copies were accepted — the message count is bounding this, \
+         not the bytes"
     );
 }

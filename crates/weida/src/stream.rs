@@ -103,14 +103,19 @@ impl PeerSet {
         Err(cause.unwrap_or(Error::ConnectionLost(LossCause::LocallyClosed)))
     }
 
-    /// Runs `f` for every peer whose connection is still open.
-    fn for_each_live(&self, mut f: impl FnMut(&ConnHandle, &str)) {
+    /// Every live peer, collected.
+    ///
+    /// The peer list is a `std` mutex and must not be held across an
+    /// `await`, so a caller that writes to each peer collects first and
+    /// writes after. That rule was written out at four call sites and
+    /// explained at one of them; it lives here now.
+    fn live_peers(&self) -> Vec<(ConnHandle, Arc<str>)> {
         let peers = self.peers.lock().expect("peer list poisoned");
-        for peer in peers.iter() {
-            if peer.conn.conn.close_reason().is_none() {
-                f(&peer.conn, &peer.path);
-            }
-        }
+        peers
+            .iter()
+            .filter(|peer| peer.conn.conn.close_reason().is_none())
+            .map(|peer| (ConnHandle::clone(&peer.conn), Arc::clone(&peer.path)))
+            .collect()
     }
 }
 
@@ -166,11 +171,7 @@ impl Peer {
     /// under `core` it carries none and the sequencer is never touched.
     pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
         let (conn, path) = self.peers.pick()?;
-        let (mut header, trace, cursors) = outgoing_header(&conn, Some(&path), &meta, None)?;
-        header.sequence = conn.sequencer.next(&path);
-        let mut stream = conn.open_uni().await?;
-        write_data_preamble(&mut stream, &header).await?;
-        Ok(OutgoingTransfer::new(stream, trace, conn, cursors))
+        open_transfer_on(&conn, &path, &meta).await
     }
 
     /// Opens a bidirectional stream — an exchange — to the next peer.
@@ -255,8 +256,10 @@ impl Peer {
         Ok((conn, Arc::from(path.as_str())))
     }
 
-    pub(crate) fn for_each_live(&self, f: impl FnMut(&ConnHandle, &str)) {
-        self.peers.for_each_live(f);
+    /// Every live peer, for a caller that has an `await` between the lookup
+    /// and the write.
+    pub(crate) fn live_peers(&self) -> Vec<(ConnHandle, Arc<str>)> {
+        self.peers.live_peers()
     }
 }
 
@@ -277,6 +280,34 @@ pub(crate) async fn open_exchange_on(
     Ok((
         OutgoingTransfer::new(send, trace, ConnHandle::clone(conn), cursors),
         ReplyStream::new(recv, ConnHandle::clone(conn)),
+    ))
+}
+
+/// Opens one **one-way** transfer on a named connection.
+///
+/// The counterpart of [`open_exchange_on`], and for the same reason: three
+/// patterns write this body — [`Peer::open`] for a dialling side, the bound
+/// half of a pair, and each copy a bus member sends — and when each kept its
+/// own copy they drifted. Only one of them assigned the producer sequence,
+/// so a connection that negotiated `PerProducer` carried numbered transfers
+/// in one direction of a pair and unnumbered ones in the other.
+pub(crate) async fn open_transfer_on(
+    conn: &ConnHandle,
+    path: &str,
+    meta: &TransferMeta,
+) -> Result<OutgoingTransfer, Error> {
+    let (mut header, trace, cursors) = outgoing_header(conn, Some(path), meta, None)?;
+    // Under `core` ordering the sequencer is never touched and the key is
+    // omitted; under `PerProducer` this is the number the peer's gap
+    // detector and reassembler read.
+    header.sequence = conn.sequencer.next(path);
+    let mut stream = conn.open_uni().await?;
+    write_data_preamble(&mut stream, &header).await?;
+    Ok(OutgoingTransfer::new(
+        stream,
+        trace,
+        ConnHandle::clone(conn),
+        cursors,
     ))
 }
 
@@ -398,8 +429,12 @@ impl Consumer {
     /// travels in `meta`, so a delivery carries the label the producer gave
     /// the message rather than one this hop invents.
     pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
-        let mut send = self.conn.open_uni().await?;
+        // Header first, like every sibling open: building it can fail, and
+        // on a grouped local transport `open_uni` is a whole OS connect plus
+        // a token preamble, so opening first pays for a connection and a
+        // stream slot that an error the code already knew about then resets.
         let (header, trace, cursors) = outgoing_header(&self.conn, Some(&self.path), &meta, None)?;
+        let mut send = self.conn.open_uni().await?;
         crate::transfer::write_data_preamble(&mut send, &header).await?;
         Ok(OutgoingTransfer::new(
             send,

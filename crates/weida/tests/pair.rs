@@ -13,7 +13,7 @@ mod common;
 use std::time::Duration;
 
 use common::Server;
-use weida::{Error, TransferMeta};
+use weida::{Error, GuaranteeSet, OrderingMode, RuntimeConfig, TransferMeta};
 
 /// Generous ceiling: every assertion below should settle in milliseconds.
 const DEADLINE: Duration = Duration::from_secs(15);
@@ -152,6 +152,144 @@ async fn a_second_connection_is_refused_and_the_first_keeps_working() {
 
     first_client.shutdown().await;
     second_client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_peer_that_goes_away_leaves_the_endpoint_claimable() {
+    // The claim is on a connection, not on eternity. A peer process that
+    // restarts, or a connection that went past the idle timeout, must be
+    // replaceable: holding a bound pair against a connection that no longer
+    // exists would make one peer's shutdown permanent, which is what neither
+    // ZeroMQ's PAIR nor nanomsg's does.
+    let server = Server::start().await;
+    let bound = server.listener.pair("/link").expect("bound pair");
+
+    let first_client = server.client_runtime();
+    let first = first_client.pair(server.trust());
+    within(first.connect(&server.url("/link")))
+        .await
+        .expect("connect");
+    within(first.send(b"before")).await.expect("send");
+    assert_eq!(
+        within(within(bound.recv()).await.expect("recv").collect(64))
+            .await
+            .expect("collect"),
+        b"before"
+    );
+    first_client.shutdown().await;
+
+    // The release happens when this side observes the old connection
+    // closing, which is a network event rather than an instant: the loop
+    // waits for it instead of assuming it, and a refused copy costs a
+    // retry. Without the release every attempt is refused and this times
+    // out.
+    let second_client = server.client_runtime();
+    let second = second_client.pair(server.trust());
+    within(second.connect(&server.url("/link")))
+        .await
+        .expect("connect");
+    let arrived = within(async {
+        loop {
+            second.send(b"after").await.expect("send");
+            if let Ok(transfer) =
+                tokio::time::timeout(Duration::from_millis(50), bound.recv()).await
+            {
+                return transfer.expect("recv");
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        within(arrived.collect(64)).await.expect("collect"),
+        b"after"
+    );
+
+    // And the bound side now addresses the **new** peer: the claim moved
+    // rather than merely being released.
+    within(bound.send(b"and back")).await.expect("send back");
+    assert_eq!(
+        within(within(second.recv()).await.expect("recv").collect(64))
+            .await
+            .expect("collect"),
+        b"and back"
+    );
+
+    second_client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_dropped_pair_releases_its_path_on_a_pooled_connection() {
+    // A dialling pair registers its path in the *client* connection's
+    // namespace, and connections are pooled by authority, trust terms and
+    // path — so the second pair to the same URL reuses the first one's
+    // connection. Without a release the stale route is still there and the
+    // second `connect` fails with `AlreadyRegistered`.
+    let server = Server::start().await;
+    let bound = server.listener.pair("/link").expect("bound pair");
+    let client = server.client_runtime();
+
+    let first = client.pair(server.trust());
+    within(first.connect(&server.url("/link")))
+        .await
+        .expect("connect");
+    drop(first);
+
+    let second = client.pair(server.trust());
+    within(second.connect(&server.url("/link")))
+        .await
+        .expect("the path is free again");
+    within(second.send(b"reused")).await.expect("send");
+    assert_eq!(
+        within(within(bound.recv()).await.expect("recv").collect(64))
+            .await
+            .expect("collect"),
+        b"reused"
+    );
+
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn both_halves_of_a_pair_number_their_transfers() {
+    // One link, one ordering behaviour. Under a negotiated `PerProducer` the
+    // sequence is what the peer's gap detector and reassembler read, and an
+    // unnumbered arrival is passed straight through — so a pair whose bound
+    // half omitted the number would be ordered in one direction and not in
+    // the other, with neither side told. The bound half is a *different send
+    // path* in the code, which is exactly how it came to differ.
+    let ordered = RuntimeConfig {
+        guarantees: GuaranteeSet {
+            ordering: OrderingMode::PerProducerDetect,
+            ..GuaranteeSet::CORE
+        },
+        ..RuntimeConfig::default()
+    };
+    let server = Server::start_with_config(ordered.clone()).await;
+    let bound = server.listener.pair("/link").expect("bound pair");
+
+    let client = server.client_runtime_with_config(ordered);
+    let dialling = client.pair(server.trust());
+    within(dialling.connect(&server.url("/link")))
+        .await
+        .expect("connect");
+
+    within(dialling.send(b"up")).await.expect("send up");
+    let inbound = within(bound.recv()).await.expect("recv");
+    assert_eq!(
+        inbound.meta().sequence,
+        Some(0),
+        "the dialling half numbers its transfers"
+    );
+
+    within(bound.send(b"down")).await.expect("send down");
+    let answer = within(dialling.recv()).await.expect("recv");
+    assert_eq!(
+        answer.meta().sequence,
+        Some(0),
+        "and so does the bound half: one link, one ordering behaviour"
+    );
+
+    client.shutdown().await;
 }
 
 #[tokio::test]

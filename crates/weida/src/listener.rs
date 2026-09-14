@@ -66,6 +66,15 @@ pub(crate) enum Route {
 /// strong handle here would be a cycle: the connection would keep itself
 /// alive through the route that names it. A peer that went away upgrades to
 /// `None`, which is exactly what the sending side needs to know.
+///
+/// **The claim is released when its holder dies.** A pair whose peer
+/// restarts, or whose connection went past the idle timeout, is claimable
+/// again: holding the endpoint against a connection that no longer exists
+/// would make one peer's shutdown permanent, which is neither ZeroMQ's
+/// behaviour nor nanomsg's and is not what "one peer at a time" means. The
+/// release happens inside [`PairOwner::claim`] rather than in a destructor
+/// because the holder is exactly what a newcomer's claim has to compare
+/// itself against.
 pub(crate) struct PairOwner {
     id: AtomicU64,
     conn: watch::Sender<Option<Weak<ConnCtx>>>,
@@ -80,19 +89,54 @@ impl PairOwner {
     }
 
     /// Claims this endpoint for `conn`, or reports that another peer holds it.
+    ///
+    /// The loop runs at most twice: either the claim is free, or a dead
+    /// holder is released and the retry takes it, or a live holder refuses
+    /// it. Two newcomers racing a dead holder both see it gone, exactly one
+    /// wins the `0 -> id` exchange, and the loser refuses against the
+    /// winner.
     pub(crate) fn claim(&self, conn: &Arc<ConnCtx>) -> bool {
         let id = conn.conn.stable_id() as u64 + 1;
-        match self
-            .id
-            .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => {
-                self.conn.send_replace(Some(Arc::downgrade(conn)));
-                true
+        loop {
+            match self
+                .id
+                .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    self.conn.send_replace(Some(Arc::downgrade(conn)));
+                    return true;
+                }
+                // The same connection again: every stream after the first.
+                Err(held) if held == id => return true,
+                Err(held) => {
+                    if self.holder_is_live() {
+                        return false;
+                    }
+                    // Dropping the id back to the sentinel is what makes the
+                    // endpoint claimable; the watch value goes with it so a
+                    // sender waiting in `peer` waits for the next peer
+                    // instead of reading a dead one.
+                    if self
+                        .id
+                        .compare_exchange(held, 0, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        self.conn.send_replace(None);
+                    }
+                }
             }
-            // The same connection again: every stream after the first.
-            Err(held) => held == id,
         }
+    }
+
+    /// Is the connection that holds this endpoint still usable?
+    ///
+    /// A dropped `ConnCtx` fails to upgrade; a *closed* one may still be
+    /// upgradable, because a pool or a drain can outlive the connection it
+    /// holds, and a closed connection can carry nothing for this pair.
+    fn holder_is_live(&self) -> bool {
+        let held = self.conn.borrow().clone();
+        held.and_then(|weak| weak.upgrade())
+            .is_some_and(|ctx| ctx.conn.close_reason().is_none())
     }
 
     /// The peer, once one has claimed the endpoint and while it is alive.
@@ -536,6 +580,7 @@ impl Listener {
             Arc::new(tls.into()),
             rx,
             self.inner.runtime.config.endpoint_queue,
+            self.inner.runtime.config.limits.subscriber_buffer_bytes,
         )))
     }
 }

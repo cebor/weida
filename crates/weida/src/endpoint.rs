@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use weida_core::{Error, TraceContext};
 use weida_protocol::{CreditHeader, FrameKind, SubscriptionHeader};
 
@@ -616,32 +616,28 @@ impl Subscriber {
     /// - **An unmentioned subscription has a limit of zero**: a consumer that
     ///   subscribes and grants nothing receives nothing. That is the only
     ///   default that cannot surprise a consumer with a flood.
-    /// - **To pause, restate what you have already received.** `grant(f, n)`
-    ///   where `n` is the number of deliveries taken so far stops further
-    ///   delivery without resetting a stream or closing the connection; a
-    ///   later, larger grant resumes it. Granting *less* than that is ignored
-    ///   by the broker, which is the same statement as "monotone" above.
+    /// - **A standing limit cannot be lowered.** Monotone means what it
+    ///   says: a grant below the standing limit is ignored, so restating the
+    ///   count already delivered does *not* pause delivery — it changes
+    ///   nothing at all unless that count had already reached the limit.
+    ///   The only pause in v0 is the `0` a fresh subscription starts at, so
+    ///   a consumer that wants to stay in control grants in increments it is
+    ///   willing to receive rather than one large number it means to
+    ///   withdraw later. Lowering a limit would need a wire field that
+    ///   distinguishes a newer statement from an older one, which v0 does
+    ///   not have — and without it a "pause" could be undone by a delayed
+    ///   earlier grant.
     pub async fn grant(&self, filter: &str, limit: u64) -> Result<(), Error> {
         weida_protocol::filter::validate(filter)?;
-        let mut targets = Vec::new();
-        self.state.peer.for_each_live(|conn, path| {
-            targets.push((ConnHandle::clone(conn), path.to_owned()));
-        });
-        for (conn, path) in targets {
-            let header = CreditHeader::new(&path, filter, limit).encode();
+        for (conn, path) in self.state.peer.live_peers() {
+            let header = CreditHeader::new(path.as_ref(), filter, limit).encode();
             write_control(&conn.conn, FrameKind::Credit, &header).await?;
         }
         Ok(())
     }
 
     async fn broadcast(&self, kind: FrameKind, filter: &str) -> Result<(), Error> {
-        // Collect first: the peer lock is a std mutex and must not be held
-        // across an await.
-        let mut targets = Vec::new();
-        self.state.peer.for_each_live(|conn, path| {
-            targets.push((ConnHandle::clone(conn), path.to_owned()));
-        });
-        for (conn, path) in targets {
+        for (conn, path) in self.state.peer.live_peers() {
             send_subscription(&conn, kind, &path, filter).await?;
         }
         Ok(())
@@ -675,11 +671,7 @@ impl Drop for SubState {
             .iter()
             .cloned()
             .collect();
-        let mut targets = Vec::new();
-        self.peer.for_each_live(|conn, path| {
-            targets.push((ConnHandle::clone(conn), Arc::<str>::from(path)));
-        });
-        for (conn, path) in targets {
+        for (conn, path) in self.peer.live_peers() {
             conn.namespace.unregister(&path);
             for filter in &filters {
                 conn.notify(Ctl::SendUnsubscribe {
@@ -824,11 +816,7 @@ impl Paired {
             .as_ref()
             .expect("a pair is either dialling or bound");
         let conn = owner.peer().await?;
-        let (header, trace, cursors) =
-            crate::transfer::outgoing_header(&conn, Some(&self.state.path), &meta, None)?;
-        let mut stream = conn.open_uni().await?;
-        crate::transfer::write_data_preamble(&mut stream, &header).await?;
-        Ok(OutgoingTransfer::new(stream, trace, conn, cursors))
+        crate::stream::open_transfer_on(&conn, &self.state.path, &meta).await
     }
 
     /// Sends `body` as one transfer and returns once the FIN is queued.
@@ -848,6 +836,25 @@ impl Paired {
     pub async fn recv(&self) -> Result<IncomingTransfer, Error> {
         let mut queue = self.state.queue.lock().await;
         queue.recv().await.ok_or(Error::NotConnected)
+    }
+}
+
+impl Drop for PairState {
+    /// Releases the dialled path on a pooled connection.
+    ///
+    /// A dialling pair registers its path in the *client* connection's
+    /// namespace, and connections are pooled by authority, trust terms and
+    /// path — so without this the next `Runtime::pair().connect()` to the
+    /// same URL reuses the connection, finds the dead pair's route still
+    /// there and fails with `LimitExceeded`. This is what
+    /// [`SubState::drop`] does for a subscription, for the same reason.
+    fn drop(&mut self) {
+        let Some(peer) = self.peer.as_ref() else {
+            return;
+        };
+        for (conn, path) in peer.live_peers() {
+            conn.namespace.unregister(&path);
+        }
     }
 }
 
@@ -920,10 +927,7 @@ impl Surveyor {
         body: &[u8],
         deadline: Duration,
     ) -> Result<SurveyRun, Error> {
-        let mut targets = Vec::new();
-        self.state.peer.for_each_live(|conn, path| {
-            targets.push((ConnHandle::clone(conn), Arc::<str>::from(path)));
-        });
+        let targets = self.state.peer.live_peers();
 
         let exec = self.state.peer.exec().clone();
         let late = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -932,31 +936,36 @@ impl Surveyor {
         // reply is never late merely because the caller is slow to read.
         let (tx, rx) = mpsc::channel(targets.len().max(1));
         let mut respondents = 0usize;
+        let mut collecting = Vec::with_capacity(targets.len());
 
         for (conn, path) in targets {
-            let (mut request, reply) =
-                match crate::stream::open_exchange_on(&conn, &path, meta.clone()).await {
-                    Ok(halves) => halves,
-                    // A respondent that cannot even be asked is not an answer
-                    // and not a failure of the survey: the others are still
-                    // being asked.
-                    Err(e) => {
-                        tracing::debug!(error = %e, %path, "a respondent could not be asked");
-                        continue;
-                    }
-                };
-            if let Err(e) = request.write_all(body).await {
-                tracing::debug!(error = %e, %path, "a survey question was not delivered");
-                continue;
-            }
-            if let Err(e) = request.finish() {
-                tracing::debug!(error = %e, %path, "a survey question was not finished");
-                continue;
-            }
+            // The deadline bounds the **asking** too, not just the
+            // collecting. Both of these awaits are the peer's to stall:
+            // `open_exchange_on` waits on its stream budget and `write_all`
+            // on its flow-control window, so without this one respondent
+            // that accepts an exchange and stops reading would hold a
+            // 100 ms survey open forever and every respondent after it
+            // would never be asked at all.
+            let remaining = expires.saturating_duration_since(Instant::now());
+            let asked = exec.within(remaining, ask(&conn, &path, &meta, body)).await;
+            let Some(asked) = asked else {
+                tracing::debug!(%path, "the survey deadline passed before this respondent was asked");
+                break;
+            };
+            let reply = match asked {
+                Ok(reply) => reply,
+                // A respondent that cannot even be asked is not an answer
+                // and not a failure of the survey: the others are still
+                // being asked.
+                Err(e) => {
+                    tracing::debug!(error = %e, %path, "a respondent could not be asked");
+                    continue;
+                }
+            };
             respondents += 1;
             let tx = tx.clone();
             let late = Arc::clone(&late);
-            exec.spawn(async move {
+            collecting.push(exec.spawn(async move {
                 let answer = reply.recv().await;
                 // Counted rather than delivered, and counted **here** so the
                 // number means "after the deadline" whatever the caller does
@@ -964,7 +973,7 @@ impl Surveyor {
                 if Instant::now() >= expires || tx.send(answer).await.is_err() {
                     late.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-            });
+            }));
         }
         drop(tx);
 
@@ -974,9 +983,28 @@ impl Surveyor {
             expires,
             late,
             respondents,
+            collecting,
             done: false,
         })
     }
+}
+
+/// Asks one respondent: the whole question, header to FIN.
+///
+/// Separate from the loop so the deadline can bound all three awaits
+/// together — a question half-written when the deadline passes is abandoned
+/// by dropping the transfer, which resets the stream and is exactly what a
+/// respondent should see for a question nobody waits for any more.
+async fn ask(
+    conn: &ConnHandle,
+    path: &str,
+    meta: &TransferMeta,
+    body: &[u8],
+) -> Result<ReplyStream, Error> {
+    let (mut request, reply) = crate::stream::open_exchange_on(conn, path, meta.clone()).await?;
+    request.write_all(body).await?;
+    request.finish()?;
+    Ok(reply)
 }
 
 /// One survey in progress: the answers, and what the deadline cost.
@@ -986,6 +1014,10 @@ pub struct SurveyRun {
     expires: Instant,
     late: Arc<std::sync::atomic::AtomicU64>,
     respondents: usize,
+    /// One collector per respondent, held so that dropping the run ends
+    /// them: each owns a [`ReplyStream`], and therefore one of this side's
+    /// bidirectional stream slots, until the answer arrives.
+    collecting: Vec<tokio::task::JoinHandle<()>>,
     done: bool,
 }
 
@@ -1001,12 +1033,32 @@ impl SurveyRun {
         if self.done {
             return None;
         }
+        // An answer already in hand is an answer. `within` selects without
+        // bias, so at `remaining == 0` — a caller that reads after its own
+        // deadline, which is the ordinary case — the deadline branch and a
+        // ready `recv` are both ready and the choice is a coin flip. Taking
+        // the buffer first is what keeps an answer that arrived in time from
+        // being lost to that flip, silently and without being counted.
+        match self.rx.try_recv() {
+            Ok(Ok(transfer)) => return Some(transfer.collect(max_bytes).await),
+            Ok(Err(e)) => return Some(Err(e)),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.done = true;
+                return None;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+        }
         let remaining = self.expires.saturating_duration_since(Instant::now());
         match self.exec.within(remaining, self.rx.recv()).await {
-            // The deadline. Answers still in flight are counted, not
-            // delivered.
+            // The deadline. Anything that landed while this call was waiting
+            // is counted here: its collector already succeeded in handing it
+            // over, so it cannot count itself, and a dropped answer that
+            // nothing counts is the one outcome `late` exists to prevent.
             None => {
                 self.done = true;
+                while self.rx.try_recv().is_ok() {
+                    self.late.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 None
             }
             // Every respondent has answered or failed.
@@ -1027,6 +1079,24 @@ impl SurveyRun {
     /// How many respondents were asked.
     pub fn respondents(&self) -> usize {
         self.respondents
+    }
+}
+
+impl Drop for SurveyRun {
+    /// Ends the collectors with the run.
+    ///
+    /// A collector's first await is the answer, so a respondent that accepts
+    /// a question and never answers would keep its task — and the
+    /// bidirectional stream slot its [`ReplyStream`] holds — until the
+    /// connection dies. Surveying such a respondent repeatedly would then
+    /// exhaust this side's stream budget and the *next* survey would block
+    /// in `open_bi`. Dropping the run is the caller saying it wants no more
+    /// answers, so the streams go with it: each abort drops a `ReplyStream`,
+    /// which resets that exchange.
+    fn drop(&mut self) {
+        for handle in &self.collecting {
+            handle.abort();
+        }
     }
 }
 
@@ -1079,17 +1149,33 @@ pub struct BusState {
     dropped: Arc<std::sync::atomic::AtomicU64>,
     /// Messages one member's writer may hold.
     depth: usize,
+    /// Bytes one member's writer may hold, `Limits::subscriber_buffer_bytes`.
+    ///
+    /// The message count alone bounds nothing: a bus send costs
+    /// `depth × body.len()` per member and multiplies by the members, and
+    /// `body.len()` is the application's number. This is the second
+    /// dimension Pub/Sub already charges per subscriber, for the identical
+    /// fan-out (`docs/INVARIANTS.md`).
+    budget: usize,
 }
 
 /// One joined member's writer queue.
 struct BusWriter {
     tx: mpsc::Sender<BusMsg>,
+    /// This member's share of the byte budget, returned by its writer once
+    /// the bytes are on the wire.
+    budget: Arc<Semaphore>,
 }
 
 /// One message on its way to one member.
+///
+/// The payload is a `Bytes`: a bus send makes **one** copy of the body and
+/// every member's queue holds a reference to it, which is what Pub/Sub does
+/// with a published payload and for the same reason — a copy per member is
+/// the one cost a fan-out must not pay per member.
 struct BusMsg {
     meta: TransferMeta,
-    body: Vec<u8>,
+    body: Bytes,
 }
 
 impl BusState {
@@ -1099,6 +1185,7 @@ impl BusState {
         tls: Arc<ClientTls>,
         queue: mpsc::Receiver<IncomingTransfer>,
         depth: usize,
+        budget: usize,
     ) -> BusState {
         BusState {
             peer: Peer::new(runtime, tls),
@@ -1107,6 +1194,7 @@ impl BusState {
             writers: std::sync::Mutex::new(Vec::new()),
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             depth,
+            budget,
         }
     }
 }
@@ -1128,17 +1216,19 @@ impl BusMember {
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
         let (conn, path) = self.state.peer.dial(url).await?;
         let (tx, rx) = mpsc::channel(self.state.depth);
+        let budget = Arc::new(Semaphore::new(self.state.budget));
         conn.exec.spawn(bus_writer(
             conn.clone(),
             path,
             rx,
+            Arc::clone(&budget),
             Arc::clone(&self.state.dropped),
         ));
         self.state
             .writers
             .lock()
             .expect("bus writers poisoned")
-            .push(BusWriter { tx });
+            .push(BusWriter { tx, budget });
         Ok(())
     }
 
@@ -1166,21 +1256,43 @@ impl BusMember {
     ///
     /// "Reached" means accepted for delivery to that member, which is what
     /// [`Publisher::publish`] counts too: the bytes are on their way, and a
-    /// member whose writer queue is full loses **this** copy and is counted
-    /// in [`BusMember::dropped`].
+    /// member whose writer queue is full — in messages or in bytes — loses
+    /// **this** copy and is counted in [`BusMember::dropped`].
+    ///
+    /// Fails with [`Error::LimitExceeded`] for a body above
+    /// `Limits::subscriber_buffer_bytes`, exactly as [`Publisher::publish`]
+    /// does: such a message could never be enqueued for anybody, so
+    /// reporting it beats dropping it for every member.
     pub async fn send_with(&self, meta: TransferMeta, body: &[u8]) -> Result<usize, Error> {
+        if body.len() > self.state.budget {
+            return Err(Error::LimitExceeded);
+        }
+        // One copy for the whole fan-out. Each member's queue then holds a
+        // reference to it rather than a `Vec` of its own.
+        let body = Bytes::copy_from_slice(body);
+        let want = body.len() as u32;
         let mut reached = 0usize;
         let mut dropped = 0u64;
         {
             let mut writers = self.state.writers.lock().expect("bus writers poisoned");
             writers.retain(|writer| !writer.tx.is_closed());
             for writer in writers.iter() {
+                let Ok(permit) = writer.budget.try_acquire_many(want) else {
+                    dropped += 1;
+                    continue;
+                };
                 let msg = BusMsg {
                     meta: meta.clone(),
-                    body: body.to_vec(),
+                    body: body.clone(),
                 };
                 match writer.tx.try_send(msg) {
-                    Ok(()) => reached += 1,
+                    Ok(()) => {
+                        // The writer returns the permits once the bytes are
+                        // gone; dropping one here would return them while
+                        // the copy is still queued.
+                        permit.forget();
+                        reached += 1;
+                    }
                     Err(_) => dropped += 1,
                 }
             }
@@ -1220,10 +1332,31 @@ async fn bus_writer(
     conn: ConnHandle,
     path: Arc<str>,
     mut rx: mpsc::Receiver<BusMsg>,
+    budget: Arc<Semaphore>,
     dropped: Arc<std::sync::atomic::AtomicU64>,
 ) {
-    while let Some(msg) = rx.recv().await {
-        if let Err(e) = send_one(&conn, &path, msg.meta, &msg.body).await {
+    loop {
+        let msg = tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(msg) => msg,
+                None => return,
+            },
+            // The sender holds this writer's channel for the life of the
+            // endpoint, so the channel never closes on its own: without this
+            // arm a member whose connection died would park here forever
+            // holding an `Arc<ConnCtx>`, which is the same reason the
+            // fan-out's writer watches its connection.
+            _ = conn.conn.closed() => {
+                dropped.fetch_add(rx.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
+        let len = msg.body.len();
+        let outcome = send_one(&conn, &path, msg.meta, &msg.body).await;
+        // Returned whatever happened: the copy is no longer queued, so the
+        // bytes it held against this member are free either way.
+        budget.add_permits(len);
+        if let Err(e) = outcome {
             tracing::debug!(error = %e, %path, "a bus write failed; copy dropped");
             // This copy plus whatever was still queued for the member: a
             // member that died is dropped from the set without affecting the
@@ -1241,10 +1374,7 @@ async fn send_one(
     meta: TransferMeta,
     body: &[u8],
 ) -> Result<(), Error> {
-    let (header, trace, cursors) = crate::transfer::outgoing_header(conn, Some(path), &meta, None)?;
-    let mut stream = conn.open_uni().await?;
-    crate::transfer::write_data_preamble(&mut stream, &header).await?;
-    let mut transfer = OutgoingTransfer::new(stream, trace, ConnHandle::clone(conn), cursors);
+    let mut transfer = crate::stream::open_transfer_on(conn, path, &meta).await?;
     transfer.write_all(body).await?;
     transfer.finish()?;
     Ok(())
