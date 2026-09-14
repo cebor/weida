@@ -87,8 +87,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => return Err(e.into()),
     }
 
-    let (mut transfer, reply) = requester.open(TransferMeta::default()).await?;
-    let trace = transfer.trace();
+    // A trace exists because this program asked for one: weida propagates a
+    // context and never mints one
+    // ([0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md)),
+    // so a client that wants its request traced starts the trace itself.
+    let trace = weida::new_trace();
+    let (mut transfer, reply) = requester
+        .open(TransferMeta::default().with_trace(trace))
+        .await?;
     eprintln!(
         "trace_id={} span_id={}",
         trace.trace_id_hex(),

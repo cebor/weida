@@ -318,9 +318,10 @@ fn bench_header_cost(c: &mut Criterion) {
     let rt = tokio_runtime();
     let harness = rt.block_on(harness());
 
-    let (lean_pusher, rich_pusher) = rt.block_on(async {
+    let (lean_pusher, rich_pusher, traced_pusher) = rt.block_on(async {
         drain(harness.listener.puller("/keys0").expect("puller keys0"));
         drain(harness.listener.puller("/keys2").expect("puller keys2"));
+        drain(harness.listener.puller("/traced").expect("puller traced"));
 
         let client = harness.client();
         let lean = client.pusher(harness.trust());
@@ -331,7 +332,12 @@ fn bench_header_cost(c: &mut Criterion) {
         rich.connect(&harness.url("/keys2"))
             .await
             .expect("connect keys2");
-        (lean, rich)
+        let traced = client.pusher(harness.trust());
+        traced
+            .connect(&harness.url("/traced"))
+            .await
+            .expect("connect traced");
+        (lean, rich, traced)
     });
 
     let payload = vec![0x61u8; SMALL];
@@ -339,16 +345,25 @@ fn bench_header_cost(c: &mut Criterion) {
     let rich_meta = TransferMeta::default()
         .with_content_len(SEQUENCE)
         .with_content_type(PRODUCER);
+    // A caller-supplied trace context: what key `3` costs now that the
+    // runtime writes it only on propagation (B-246,
+    // [0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md)).
+    // Until then this was every message's cost, and `lean` below is what a
+    // message costs without it.
+    let traced_meta = TransferMeta::default().with_trace(weida::new_trace());
 
     // Criterion reports messages per second; the bytes per message are
     // deterministic, so they are computed rather than measured.
     let lean_bytes = wire_bytes("/keys0", &lean_meta, SMALL);
     let rich_bytes = wire_bytes("/keys2", &rich_meta, SMALL);
+    let traced_bytes = wire_bytes("/traced", &traced_meta, SMALL);
     eprintln!(
         "header cost: {lean_bytes} B/message minimal, {rich_bytes} B/message with two extra keys \
-         (+{} B, +{:.1} % over a {SMALL}-byte payload)",
+         (+{} B, +{:.1} % over a {SMALL}-byte payload), {traced_bytes} B/message with a \
+         caller-supplied traceparent (+{} B)",
         rich_bytes - lean_bytes,
         (rich_bytes - lean_bytes) as f64 * 100.0 / lean_bytes as f64,
+        traced_bytes - lean_bytes,
     );
 
     let mut group = c.benchmark_group("header");
@@ -357,6 +372,7 @@ fn bench_header_cost(c: &mut Criterion) {
     for (name, meta, pusher) in [
         ("push_64b_keys0", &lean_meta, &lean_pusher),
         ("push_64b_keys2", &rich_meta, &rich_pusher),
+        ("push_64b_traced", &traced_meta, &traced_pusher),
     ] {
         group.bench_function(name, |b| {
             b.to_async(&rt).iter(|| async {
@@ -378,22 +394,26 @@ fn bench_header_cost(c: &mut Criterion) {
 
 /// Bytes one DATA frame puts on the wire: preamble, CBOR header, payload.
 ///
-/// Rebuilds the header the runtime writes for `meta` (`crates/weida/src/transfer.rs`,
-/// `data_header`): the endpoint, whatever `meta` carries, and a generated
-/// `traceparent`.
+/// **The header is the one the runtime writes**, not a reconstruction of it.
+/// The previous version of this function rebuilt a `DataHeader` by hand and
+/// hardcoded a 55-byte `traceparent` — which was right when `data_header`
+/// minted one on every send and became wrong the day it stopped
+/// ([0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md),
+/// B-246). A measurement that can disagree with the code is worse than none,
+/// so this builds the header the same way the send path does: same fields,
+/// same optional keys, and a `traceparent` exactly when `meta` carries a
+/// context.
 fn wire_bytes(endpoint: &str, meta: &TransferMeta, payload: usize) -> usize {
     let header = DataHeader {
         endpoint: Some(endpoint.to_owned()),
         content_len: meta.content_len,
         content_type: meta.content_type.clone(),
-        // Any W3C traceparent: the field is fixed-width, 55 bytes.
-        traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_owned()),
+        traceparent: meta.trace.map(|t| t.to_traceparent()),
         tracestate: None,
         topic: None,
         // B-009 simulated keys 6 and 7 with the existing fields whose wire
         // shape matched; the runtime still writes neither, and key `8` is an
-        // L2 confirm no pattern here sends, so the frame this function
-        // measures is unchanged.
+        // L2 confirm no pattern here sends.
         sequence: None,
         producer: None,
         achieved: meta.achieved,

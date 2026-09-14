@@ -64,8 +64,8 @@ The measured pieces, all from this repository's own runs on one desktop machine
 
 | Measured | Value | Item |
 | --- | --- | --- |
-| Message rate, 64-byte payload, one producer | **179.4 Kmsg/s** | B-009 |
-| Bytes on the wire for that message | **135 B** frame for 64 B of payload | B-009 |
+| Message rate, 64-byte payload, one producer | **192.6-195.9 Kmsg/s** | B-246 |
+| Bytes on the wire for that message | **76 B** frame for 64 B of payload | B-246 |
 | Resident memory per live connection, both ends together | **750-850 KiB** | B-011 |
 | Cold handshake | **1.04-1.10 ms**; a pooled dial 3.8 µs | B-011 |
 | Publish cost at 256 subscribers | **22.94 µs** per message → **88.8 ns per subscriber** | B-247 |
@@ -76,7 +76,7 @@ The measured pieces, all from this repository's own runs on one desktop machine
 
 Everything below is **arithmetic on those numbers**, and says so where it is.
 
-**One sender cannot do it.** 8·10⁹ ÷ 179,400 ≈ **12.4 hours** for one producer to hand out one
+**One sender cannot do it.** 8·10⁹ ÷ 194,000 ≈ **11.4 hours** for one producer to hand out one
 message each. So the shape has to be a tree, and the only question is how wide and how deep.
 
 **How wide can one node be?** Not a memory question, which is the first thing the measurement
@@ -104,7 +104,7 @@ At *d* = 10⁴ that is **8·10⁵ leaf nodes**, 80 above them and one root; the 
 36 ms of its delivery capacity on the message and the whole path is **~0.1 s** of fan-out work.
 
 That single line is why this project's design decisions look the way they do. The scaling
-problem at C8B is not throughput — 8·10⁹ ÷ 179,400 ÷ 10⁶ nodes is microseconds of work per
+problem at C8B is not throughput — 8·10⁹ ÷ 194,000 ÷ 10⁶ nodes is microseconds of work per
 node — and it is not depth. It is **what a hop is allowed to claim**, because there are only
 three or four of them between a publisher and a person, and every one of them is a place where
 responsibility either transfers or is faked.
@@ -115,7 +115,7 @@ Four design decisions in this repository are what they are because of the number
 each one would be defensible without C8B and is *forced* with it.
 
 **No end-to-end acknowledgement.** At *d* = 10³ and four hops, an acknowledgement per recipient
-means 8·10⁹ acknowledgements converging back on one publisher: 8·10⁹ × 135 B ≈ **1.1 TB of
+means 8·10⁹ acknowledgements converging back on one publisher: 8·10⁹ × 76 B ≈ **608 GB of
 acknowledgement traffic for one message**, all of it funnelling into the root. The tree that
 made the fan-out affordable makes the acknowledgement impossible. So a completion is **hop-local
 by construction** ([GUARANTEES.md](GUARANTEES.md) §1): each hop says what it took
@@ -146,17 +146,36 @@ program.
 
 ### 0.3 What the arithmetic says about the bytes
 
-One more line of the same arithmetic, because it changes how a frame reads.
+One more line of the same arithmetic, and it is the one that changed the code.
 
-8·10⁹ × 135 B ≈ **1.08 TB** for one 64-byte message to everybody, at the leaf edge alone. Of
-those 135 bytes, 64 are payload; the largest single item in the rest is a **55-byte W3C
-`traceparent`** that the runtime writes on every DATA header whether anything traces or not.
-That is ≈ **470 GB per message-to-everyone** spent on a trace context nobody asked for — about
-44 % of the total — against ZMTP's one to nine bytes of framing per message and SP's eight.
+A 64-byte message to everybody is 8·10⁹ frames at the leaf edge. When this section was first
+written each of those frames was **135 B**, of which 64 were payload and **60** were a W3C
+`traceparent` the runtime wrote whether anything traced or not — ≈**480 GB per
+message-to-everyone**, 44 % of the total, spent on a trace context nobody asked for. Against
+ZMTP's one to nine bytes of framing per message and SP's eight, that was not a rounding error;
+it was the third-largest line in the budget.
 
-At C10K scale that is a micro-optimisation. At C8B it is the third-largest line in the budget,
-which is why it is filed as a decision rather than a cleanup (B-246), and why the guide states
-it here rather than leaving a reader to discover it with a packet capture.
+It is gone. A context is now **propagated and never minted**
+([decisions/0028](decisions/0028-trace-propagation-is-the-callers.md)), so:
+
+| | Frame | 8·10⁹ of them | Message rate |
+| --- | --- | --- | --- |
+| Before | 135 B | ≈1.08 TB | — |
+| Now, untraced | **76 B** | **≈608 GB** | **192.6-195.9 Kmsg/s** |
+| Now, with a caller's context | 136 B | ≈1.09 TB | 168.9-171.2 Kmsg/s |
+
+**Twelve bytes of framing around 64 bytes of payload**, half of it the endpoint path, and 84 %
+of the wire is now the message. The rate figure is the pair measured in one run, not a
+comparison against B-009's 179.4 Kmsg/s from another day, and both numbers are the bench's
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-246).
+
+Two things worth taking from how that went, because they are the method rather than the result.
+**The arithmetic found it.** Nobody profiled anything: writing down 8·10⁹ × 135 B and asking
+what the bytes were made a fixed 60-byte field indefensible in a way that a 9 % benchmark
+difference never had. And **the decision was about honesty, not bytes**: a minted root is not a
+safe default but a fabricated fact, because a hop that received a context and forgot to pass it
+on used to emit a *new trace* rather than nothing — two unrelated traces in a collector instead
+of one visible gap. The bytes made it urgent; that made it right.
 
 ### 0.4 What is not answered
 
@@ -659,7 +678,7 @@ keep. A chain of hops promises the intersection, and no amount of bookkeeping at
 makes the middle stronger.
 
 §0.2 is the reason this is a design constraint rather than a disappointment: at two to four
-hops and 8·10⁹ recipients, an acknowledgement per recipient converging on one root is **1.1 TB
+hops and 8·10⁹ recipients, an acknowledgement per recipient converging on one root is **608 GB
 of acknowledgement traffic for one message**. The tree that makes the fan-out affordable makes
 the end-to-end acknowledgement impossible, so hop-local is not a weakening of a stronger
 design — it is the only design that exists at this scale.

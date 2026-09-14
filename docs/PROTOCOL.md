@@ -544,6 +544,17 @@ and MUST NOT size an allocation from it.
 `traceparent` and `tracestate` carry W3C Trace Context. `tracestate` is opaque to weida and
 MUST be forwarded unmodified where trace context is propagated.
 
+**Key `3` is optional, and this runtime writes it only on propagation.** A `traceparent` is
+written exactly when the sending application supplied a context — from an inbound transfer's
+metadata, or minted deliberately — and nothing in the library mints one on an application's
+behalf. The reason is stated where it belongs, in
+[decisions/0028](decisions/0028-trace-propagation-is-the-callers.md): a minted root is not a
+safe default but a fabricated fact, and it cost a fixed 60 bytes of every frame of every
+pattern (measured: a 64-byte push is 76 B without it and 136 B with it,
+[IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-246). A peer that writes the key on every frame
+is **conformant**; a peer that treats an absent key as an error is **not**, and a receiver
+reads an absent value exactly as it reads a malformed one — no trace context for this transfer.
+
 **Key `6` is written, and key `7` is not** — a distinction worth stating, because both were
 "coded but unused" in earlier versions of this section and only one still is.
 

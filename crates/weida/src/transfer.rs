@@ -233,7 +233,22 @@ impl IncomingMeta {
 }
 
 /// Generates a fresh root trace context.
-pub(crate) fn new_trace_context() -> TraceContext {
+///
+/// **A caller's call, never the library's.** Nothing in weida mints a context
+/// on an application's behalf: a `traceparent` is propagated exactly where one
+/// was supplied ([0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md)),
+/// because a minted root is not a safe default but a fabricated fact — a hop
+/// that received a context and forgot to pass it on would emit a *new* trace
+/// rather than nothing, and a collector would see two unrelated traces instead
+/// of one broken chain.
+///
+/// So this is how a caller that wants to *start* a trace says so:
+///
+/// ```no_run
+/// # use weida::{TransferMeta, new_trace};
+/// let meta = TransferMeta::default().with_trace(new_trace());
+/// ```
+pub fn new_trace() -> TraceContext {
     use rand::Rng;
     let mut rng = rand::rng();
     loop {
@@ -262,16 +277,21 @@ pub(crate) fn data_header(
     meta: &TransferMeta,
     tracestate: Option<String>,
     report_id: Option<u64>,
-) -> Result<(DataHeader, TraceContext), Error> {
+) -> Result<(DataHeader, Option<TraceContext>), Error> {
     if meta.report.len() > MAX_REPORT_LEVELS {
         return Err(Error::LimitExceeded);
     }
-    let trace = meta.trace.unwrap_or_else(new_trace_context);
+    // Key `3` is written exactly when the caller supplied a context. Minting
+    // one here cost 58 bytes on every frame of every pattern — the largest
+    // single item of a 135-byte frame for a 64-byte push — and fabricated a
+    // root nobody asked for
+    // ([0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md)).
+    let trace = meta.trace;
     let header = DataHeader {
         endpoint: endpoint.map(str::to_owned),
         content_len: meta.content_len,
         content_type: meta.content_type.clone(),
-        traceparent: Some(trace.to_traceparent()),
+        traceparent: trace.map(|t| t.to_traceparent()),
         tracestate,
         topic: meta.topic.clone(),
         // Keys 6 and 7 are specified ahead of code: the codec carries them,
@@ -297,7 +317,7 @@ pub(crate) fn outgoing_header(
     endpoint: Option<&str>,
     meta: &TransferMeta,
     tracestate: Option<String>,
-) -> Result<(DataHeader, TraceContext, Option<Cursors>), Error> {
+) -> Result<(DataHeader, Option<TraceContext>, Option<Cursors>), Error> {
     if meta.report.is_empty() {
         let (header, trace) = data_header(endpoint, meta, tracestate, None)?;
         return Ok((header, trace, None));
@@ -319,7 +339,7 @@ pub(crate) fn outgoing_header(
 /// [`Delivery`] receipt.
 pub struct OutgoingTransfer {
     stream: SendHalf,
-    trace: TraceContext,
+    trace: Option<TraceContext>,
     settled: bool,
     /// The connection this stream belongs to: where an unawaited receipt is
     /// parked so a drain can wait on it
@@ -337,7 +357,7 @@ pub struct OutgoingTransfer {
 impl OutgoingTransfer {
     pub(crate) fn new(
         stream: SendHalf,
-        trace: TraceContext,
+        trace: Option<TraceContext>,
         conn: ConnHandle,
         cursors: Option<Cursors>,
     ) -> OutgoingTransfer {
@@ -350,8 +370,15 @@ impl OutgoingTransfer {
         }
     }
 
-    /// The trace context propagated with this transfer.
-    pub fn trace(&self) -> TraceContext {
+    /// The trace context propagated with this transfer, if the caller supplied
+    /// one.
+    ///
+    /// `None` is the normal case: weida propagates a context and never mints
+    /// one ([0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md)).
+    /// A caller that wants a trace passes it — `TransferMeta::with_trace`,
+    /// from [`crate::new_trace`] or from an inbound
+    /// [`IncomingMeta::trace`] — and reads it back here.
+    pub fn trace(&self) -> Option<TraceContext> {
         self.trace
     }
 
@@ -956,7 +983,7 @@ mod tests {
 
     #[test]
     fn transfer_meta_builders_compose() {
-        let trace = new_trace_context();
+        let trace = new_trace();
         let meta = TransferMeta::default()
             .with_content_type("text/plain")
             .with_content_len(7)
@@ -968,8 +995,8 @@ mod tests {
 
     #[test]
     fn generated_trace_contexts_are_valid_and_distinct() {
-        let a = new_trace_context();
-        let b = new_trace_context();
+        let a = new_trace();
+        let b = new_trace();
         assert_ne!(a.trace_id, b.trace_id);
         assert!(a.is_sampled());
         assert_eq!(
@@ -978,18 +1005,54 @@ mod tests {
         );
     }
 
+    /// [0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md):
+    /// key `3` is written exactly when the caller supplied a context, and the
+    /// 58 bytes it costs are the reason.
     #[test]
-    fn initiating_headers_carry_the_endpoint_and_a_trace_context() {
+    fn a_header_carries_no_trace_context_unless_one_was_supplied() {
         let meta = TransferMeta::default().with_content_len(3);
         let (header, trace) = data_header(Some("/transform"), &meta, None, None).unwrap();
         assert_eq!(header.endpoint.as_deref(), Some("/transform"));
         assert_eq!(header.content_len, Some(3));
+        assert_eq!(trace, None, "nothing mints a context");
+        assert_eq!(header.traceparent, None, "and nothing writes one");
+        assert_eq!(DataHeader::decode(&header.encode()).unwrap(), header);
+
+        let supplied = new_trace();
+        let (header, trace) = data_header(
+            Some("/transform"),
+            &meta.clone().with_trace(supplied),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(trace, Some(supplied));
         assert_eq!(
             header.traceparent.as_deref(),
-            Some(&*trace.to_traceparent())
+            Some(&*supplied.to_traceparent()),
+            "a supplied context is propagated verbatim"
         );
-        // Round-trips through the wire codec unchanged.
         assert_eq!(DataHeader::decode(&header.encode()).unwrap(), header);
+    }
+
+    /// The number the decision turns on, asserted rather than quoted: the
+    /// trace context was the largest single item of a 64-byte push's frame.
+    #[test]
+    fn a_trace_context_costs_fifty_eight_bytes_of_frame() {
+        let meta = TransferMeta::default().with_content_len(64);
+        let (bare, _) = data_header(Some("/t"), &meta, None, None).unwrap();
+        let (traced, _) = data_header(
+            Some("/t"),
+            &meta.clone().with_trace(new_trace()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            traced.encode().len() - bare.encode().len(),
+            58,
+            "1 byte of key, 2 of the tstr prefix, 55 of the value"
+        );
     }
 
     #[test]
@@ -1038,7 +1101,7 @@ mod tests {
         let meta = IncomingMeta::from_header(&header, None);
         assert!(meta.trace.is_none());
 
-        let good = new_trace_context();
+        let good = new_trace();
         header.traceparent = Some(good.to_traceparent());
         assert_eq!(IncomingMeta::from_header(&header, None).trace, Some(good));
     }

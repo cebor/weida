@@ -29,7 +29,6 @@ use crate::runtime::RuntimeInner;
 use crate::stream::Peer;
 use crate::transfer::{
     IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream, TransferMeta,
-    new_trace_context,
 };
 
 mod sealed {
@@ -362,25 +361,32 @@ impl Publisher {
     /// `Limits::subscriber_buffer_bytes`: such a message could never be
     /// enqueued for anyone, so reporting it beats silently dropping it for
     /// every subscriber.
+    ///
+    /// No `traceparent` is written unless one is propagated: see
+    /// [`Publisher::publish_with_trace`] and
+    /// [0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md).
     pub fn publish(&self, topic: &str, payload: impl Into<Bytes>) -> Result<usize, Error> {
-        self.publish_inner(topic, payload.into(), new_trace_context())
+        self.publish_inner(topic, payload.into(), None)
     }
 
     /// Like [`Publisher::publish`], propagating an existing trace context.
+    ///
+    /// The context comes from the caller — an inbound
+    /// [`crate::IncomingMeta::trace`], or [`crate::new_trace`] to start one.
     pub fn publish_with_trace(
         &self,
         topic: &str,
         payload: impl Into<Bytes>,
         trace: TraceContext,
     ) -> Result<usize, Error> {
-        self.publish_inner(topic, payload.into(), trace)
+        self.publish_inner(topic, payload.into(), Some(trace))
     }
 
     fn publish_inner(
         &self,
         topic: &str,
         payload: Bytes,
-        trace: TraceContext,
+        trace: Option<TraceContext>,
     ) -> Result<usize, Error> {
         if payload.len() > self.state.max_payload {
             return Err(Error::LimitExceeded);
@@ -412,14 +418,14 @@ impl Publisher {
     /// Every guarantee of [`Publisher::publish`] holds per subscriber rather
     /// than per publish: see [`FanOut`].
     pub fn open(&self, topic: &str) -> FanOut {
-        self.state
-            .registry
-            .open(&self.state.path, topic, new_trace_context())
+        self.state.registry.open(&self.state.path, topic, None)
     }
 
     /// Like [`Publisher::open`], propagating an existing trace context.
     pub fn open_with_trace(&self, topic: &str, trace: TraceContext) -> FanOut {
-        self.state.registry.open(&self.state.path, topic, trace)
+        self.state
+            .registry
+            .open(&self.state.path, topic, Some(trace))
     }
 
     /// Connections currently subscribed to this publisher.

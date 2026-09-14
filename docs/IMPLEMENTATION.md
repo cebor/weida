@@ -1199,6 +1199,52 @@ producer key is omitted entirely in the default case and the default pays only t
 landed exactly that codec and its golden vectors; the measured frame above is unchanged,
 because the runtime still sets both fields to `None` (§1, fourth increment).
 
+**The baseline these figures sit on is gone.** Every frame above carried an unconditional
+55-byte `traceparent` — 60 B of frame with its key and the length field — which B-246 removed:
+a context is propagated and never minted
+([0028](decisions/0028-trace-propagation-is-the-callers.md)). The minimal frame is now **76 B**
+rather than 135 B, so the two keys' +81 B is now **106 %** of a frame rather than 59 % of one,
+and the conclusion that the cost is the bytes rather than the encoding is unchanged. The
+re-measurement is the next section; these numbers stay because they are what decision 0008 was
+taken from.
+
+### Verified results — what the frame costs once nothing mints a trace (B-246)
+
+`data_header` used to set `traceparent: Some(…)` on **every** DATA header of every pattern and
+mint a fresh root when the caller supplied none, so a 64-byte push paid a fixed 60 bytes of
+frame for a trace context nobody asked for — the largest single item in it, against ZMTP's one
+to nine bytes of framing per message and SP's eight. [GUIDE.md](GUIDE.md) §0.3's C8B arithmetic
+is what made that urgent: ≈480 GB of an ≈1.08 TB message-to-everybody.
+[0028](decisions/0028-trace-propagation-is-the-callers.md) decided the honest half of it — a
+minted root is a fabricated fact, not a safe default — and this is what it measured.
+
+`cargo bench -p weida --bench patterns -- header --warm-up-time 1 --measurement-time 3`, two
+runs, release, loopback, same desktop. The bench's `wire_bytes` helper no longer rebuilds a
+header with a hardcoded `traceparent`; it builds the header the send path builds, and a third
+variant, `push_64b_traced`, measures a caller-supplied context in the same run.
+
+| Variant, 64-byte payload | Frame | Median | Rate |
+| --- | --- | --- | --- |
+| `push_64b_keys0`, no trace context | **76 B** | 5.11-5.19 µs | **192.6-195.9 Kmsg/s** |
+| `push_64b_traced`, caller's context | **136 B** (+60 B) | 5.84-5.92 µs | 168.9-171.2 Kmsg/s |
+| `push_64b_keys2`, the two 0001/0008 keys | 157 B (+81 B) | 5.75-5.83 µs | 171.5-173.8 Kmsg/s |
+
+**A 64-byte message is twelve bytes of framing**, half of it the six-byte endpoint path, so
+84 % of the wire is payload. weida is now in ZMTP's and SP's class on small messages; it used
+to be 71 bytes worse than either.
+
+**A context costs 60 bytes of frame and 13-14 % of the message rate.** Both variants are
+measured in one run, which is the only honest comparison on this machine: B-021 recorded a
+run-to-run spread wider than several of the effects it wanted to see, and the 179.4 Kmsg/s of
+B-009 is from another day. The 58 bytes of that 60 are the header (1 B key, 2 B `tstr` prefix,
+55 B value) and the other 2 are the frame's own length field; a unit test asserts the 58 and
+the bench prints the 60.
+
+**What did not change**: `tracestate` still travels only where a context does, `IncomingMeta`
+still yields `None` for an absent **and** for a malformed value, so no receiver gained a state
+it did not already have, and a peer that writes key `3` on every frame is still conformant
+([PROTOCOL.md](PROTOCOL.md) §6.2).
+
 ### Verified results — what parking a receipt costs the send path (B-032)
 
 The drain of [0009](decisions/0009-drain.md) parks the receipt of every finished transfer

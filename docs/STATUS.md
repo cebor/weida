@@ -6,15 +6,25 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main `cecae03`, 2026-09-14 ~18:00 UTC. Tree clean, gate green on Linux:
-**1862 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
+**Snapshot:** main, 2026-09-14 ~19:00 UTC. Tree clean, gate green on Linux:
+**1865 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
-plus `weida --features blocking` at **237**, 1 ignored. Fifty-eight of those tests arrived in
-the last three rounds: twenty-four regression tests from the review, seventeen that hold the
-website to the document set it renders, and seventeen that hold **the guide** to the programs
-it teaches with. The intermittent failure this snapshot used to
+plus `weida --features blocking` at **270**, 1 ignored. Sixty-one of those tests arrived in
+the last four rounds: twenty-four regression tests from the review, seventeen that hold the
+website to the document set it renders, seventeen that hold **the guide** to the programs
+it teaches with, and three that hold the trace decision to the wire. The intermittent failure
+this snapshot used to
 carry a caveat about is **found and fixed**: it was a port race in the cross-protocol tests,
 not a timing assertion (B-252).
+
+**A 64-byte message is now twelve bytes of framing.** The guide's own C8B arithmetic found a
+fixed 60-byte `traceparent` on every DATA header of every pattern — 44 % of the wire budget for
+a message-to-everybody — and [0028](decisions/0028-trace-propagation-is-the-callers.md) settled
+it on the honest argument rather than the byte count: a minted root is not a safe default but a
+fabricated fact, because a hop that received a context and forgot to propagate it emitted a
+*new trace* rather than nothing. A context is now propagated and never minted, so a 64-byte
+push is **76 B at 192.6-195.9 Kmsg/s** against 135 B before, and weida is in ZMTP's and SP's
+class on small messages instead of 71 bytes worse (B-246).
 
 **There is now a document that teaches.** [GUIDE.md](GUIDE.md) is organised around one
 question — **C8B: how do you scale a software system to eight billion people?**, this project's
@@ -57,7 +67,7 @@ the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
 items, and **every one of the four wheels built and smoke-tested with no Rust toolchain on
-`PATH`**. Twenty-seven decision notes (0001–0027): fourteen `accepted` and thirteen
+`PATH`**. Twenty-eight decision notes (0001–0028): fourteen `accepted` and fourteen
 `provisional` — 0015 (peer authorization), 0016 (conflation) and 0017 (the subscription
 verdict) because each answers an open question with a wire-affecting "no"; 0018 (the minimal
 broker) and 0019 (the JVM binding) because they are the first step of a phase the user
@@ -65,8 +75,9 @@ chooses; 0020–0024 (the cluster, consensus, the store, one control group, the 
 three families) because they are the phase now being built; 0025 (the website) because
 what a site may claim is settled by a release that does not exist yet; 0026 (the guide and
 the C8B question) because the question is a framing the owner set and the arc it implies is
-still being written; and 0027 (the negotiated set is the configured set) because it is
-revisited the day offered and required stop being one setting.
+still being written; 0027 (the negotiated set is the configured set) because it is
+revisited the day offered and required stop being one setting; and 0028 (a trace context is
+propagated, never minted) because the OpenTelemetry phase may want a say in it.
 One binary, `weida` (B-060), beside the library, `weida::blocking` (B-194) beside the async API,
 and **`weida-py`** (B-200, B-204, B-205), the sixth Python binding in the tree, the first of
 weida itself, the only one that reaches every pattern of its library including the streamed
@@ -255,38 +266,38 @@ Four things:
    and a 600 s job limit. The VM's storage also throws `STATUS_IN_PAGE_ERROR` mid-compile
    every few hours; each occurrence is a corrupted artifact cleared by hand, never a code
    problem.
-4. **Two decisions the review round filed rather than took**, because each changes what a peer
-   observes: whether every DATA header keeps paying for an unconditional 55-byte `traceparent`
-   (B-246 — it is the largest single item in a 135-byte frame for a 64-byte push, against
-   ZMTP's one to nine bytes and SP's eight, and no decision note justifies it), and which shape
-   closes the `AF_UNIX` reset loss (B-245 — per-write framing as the named-pipe transport has
-   it, or one end-of-stream marker per transfer and a nine-byte lookahead in the reader; the
-   kernel offers no third option, which was measured rather than assumed).
+4. **One decision the review round filed rather than took**, because it changes what a peer
+   observes: which shape closes the `AF_UNIX` reset loss (B-245 — per-write framing as the
+   named-pipe transport has it, or one end-of-stream marker per transfer and a nine-byte
+   lookahead in the reader; the kernel offers no third option, which was measured rather than
+   assumed). The other one is taken: the unconditional `traceparent` is gone, a context is
+   propagated and never minted, and a 64-byte push went from 135 B to **76 B**
+   ([0028](decisions/0028-trace-propagation-is-the-callers.md), B-246).
 
 ## 7. Where the loop stands
 
 - **Nothing is in flight and every branch is merged.** The four workstreams of
   [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
   commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1852 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
+  green at **1865 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
   any configuration, including the ten rustdoc and three `blocking` runs that are not in the
   gate yet and were run by hand this session. The one caveat this section used to carry — a
   failure in roughly one full-workspace run in twenty that nobody had seen — is **closed**:
   the website's own gate run kept its log, the failure named itself
   (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
   a cross-test helper rather than the timing assertion it looked like (B-252).
-- **15 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
+- **14 items are `ready`, 19 are `blocked`** (B-061, CI: the Forgejo host cannot run this
   gate; B-254, serving the site; four guide chapters, each on the slice it
   needs; the rest waiting on an item this session is
   building or on a toolchain this machine does not have) and **one is `parked`** (A5's control
-  tier by 0011 §4.3). Of **258** filed items, **223 are `done`**, and the `ready` ones are four
+  tier by 0011 §4.3). Of **258** filed items, **224 are `done`**, and the `ready` ones are four
   kinds: **five slices of the cluster and store phase** (B-219, B-220, B-224, B-226, B-231),
   **the surfaces this session's work has not reached yet** (B-243, the cursor API in the two
   Python halves; B-244, the three new patterns in `weida::blocking` and both Python halves),
-  **six findings the review round filed rather than fixed** (B-245 the `AF_UNIX` reset loss,
-  B-246 the unconditional `traceparent`, B-248 the `unsafe` guard,
-  B-249 the parked-receipt sweep, B-250 the per-message header allocations, B-251 one refusal
-  table — B-247's fan-out measurement is now taken), and
+  **five findings the review round filed rather than fixed** (B-245 the `AF_UNIX` reset loss,
+  B-248 the `unsafe` guard, B-249 the parked-receipt sweep, B-250 the per-message header
+  allocations, B-251 one refusal table — B-247's fan-out measurement and B-246's trace decision
+  are now taken), and
   **two sentences in a file this loop does not write** (§6, B-107 and B-184).
   Nothing else is open: every requirement-driven item, every library item, the website itself
   and both binding slices of weida's own Python surface are closed.

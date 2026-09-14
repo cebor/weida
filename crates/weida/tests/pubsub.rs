@@ -387,8 +387,15 @@ async fn slow_subscriber_drops_not_blocks() {
     fast_rt.shutdown().await;
 }
 
+/// A fan-out copy's metadata, including the half that changed with B-246:
+/// a publisher propagates a trace context and never mints one
+/// ([0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md)).
+///
+/// Both directions are asserted on the same subscriber, because the claim is
+/// the difference between the two calls and not either one alone: `publish`
+/// carries no context, `publish_with_trace` carries exactly the caller's.
 #[tokio::test]
-async fn sub_meta_carries_topic_and_trace() {
+async fn sub_meta_carries_topic_and_the_trace_the_publisher_propagated() {
     let server = Server::start().await;
     let publisher = server.listener.publisher("/md").expect("publisher");
 
@@ -407,8 +414,19 @@ async fn sub_meta_carries_topic_and_trace() {
     assert_eq!(meta.endpoint.as_deref(), Some("/md"));
     assert_eq!(meta.content_len, Some(4));
     assert!(
-        meta.trace.is_some(),
-        "fan-out must propagate a trace context"
+        meta.trace.is_none(),
+        "a fan-out mints no trace context: it cost 60 bytes on every copy"
+    );
+
+    let trace = weida::new_trace();
+    publisher
+        .publish_with_trace("px.eur", &b"body"[..], trace)
+        .expect("publish with a trace");
+    let transfer = within(sub.recv()).await.expect("recv the traced copy");
+    assert_eq!(
+        transfer.meta().trace,
+        Some(trace),
+        "a propagated context reaches every subscriber verbatim"
     );
 
     client.shutdown().await;

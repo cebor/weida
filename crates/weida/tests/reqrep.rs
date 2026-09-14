@@ -374,6 +374,61 @@ async fn canceled_resolves_when_the_requester_walks_away() {
     client.shutdown().await;
 }
 
+/// [0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md):
+/// a receiver sees no trace context unless the sender propagated one, on both
+/// halves of an exchange.
+///
+/// The pair with `trace_propagation` below is the claim: the same two peers,
+/// the same calls, and the only difference is whether the caller supplied a
+/// context. A runtime that minted one — as this one did until B-246 — passes
+/// that test and fails this one.
+#[tokio::test]
+async fn a_transfer_carries_no_trace_context_unless_the_sender_supplied_one() {
+    let server = Server::start().await;
+    let replier = server.listener.replier("/untraced").expect("replier");
+
+    let seen = Arc::new(tokio::sync::Mutex::new(Some(())));
+    let server_side = Arc::clone(&seen);
+    let handler = tokio::spawn(async move {
+        let mut request = replier.accept().await.expect("accept");
+        // What the request's metadata says about a trace nobody started.
+        *server_side.lock().await = request.meta().trace.map(|_| ());
+        let _ = request.body().read_capped(64).await.expect("read");
+        let mut reply = request.reply(TransferMeta::default()).await.expect("reply");
+        reply.write_all(b"y").await.expect("write");
+        reply.finish().expect("finish");
+    });
+
+    let client = server.client_runtime();
+    let requester = client.requester(server.trust());
+    requester
+        .connect(&server.url("/untraced"))
+        .await
+        .expect("connect");
+
+    let (mut transfer, reply) = requester.open(TransferMeta::default()).await.expect("open");
+    assert_eq!(
+        transfer.trace(),
+        None,
+        "nothing mints a context on the caller's behalf"
+    );
+    transfer.write_all(b"x").await.expect("write");
+    transfer.finish().expect("finish");
+
+    let body = reply.recv().await.expect("recv reply");
+    assert!(
+        body.meta().trace.is_none(),
+        "and the reply half carries none either"
+    );
+
+    handler.await.expect("handler");
+    assert!(
+        seen.lock().await.is_none(),
+        "the responder saw no trace context on a request that started no trace"
+    );
+    client.shutdown().await;
+}
+
 #[tokio::test]
 async fn trace_propagation() {
     let server = Server::start().await;
@@ -408,7 +463,7 @@ async fn trace_propagation() {
         .open(TransferMeta::default().with_trace(trace))
         .await
         .expect("open");
-    assert_eq!(transfer.trace(), trace);
+    assert_eq!(transfer.trace(), Some(trace));
     transfer.write_all(b"x").await.expect("write");
     transfer.finish().expect("finish");
 

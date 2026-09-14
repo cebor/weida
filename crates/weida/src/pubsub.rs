@@ -42,7 +42,9 @@ const WRITER_QUEUE: usize = 1024;
 struct PubMsg {
     topic: Arc<str>,
     payload: Bytes,
-    trace: TraceContext,
+    /// The trace context the caller propagated, if any: weida mints none
+    /// ([0028](../../../docs/decisions/0028-trace-propagation-is-the-callers.md)).
+    trace: Option<TraceContext>,
     /// The producer's sequence number for this topic, assigned once per
     /// published message. `None` unless `PerProducer` ordering is negotiated.
     sequence: Option<u64>,
@@ -379,7 +381,7 @@ impl SubRegistry {
         path: &str,
         topic: &str,
         payload: Bytes,
-        trace: TraceContext,
+        trace: Option<TraceContext>,
         want: u32,
     ) -> usize {
         let paths = self.paths.read().expect("subscription lock poisoned");
@@ -429,7 +431,7 @@ impl SubRegistry {
     /// The subscriber set is fixed here, at `open`, because a stream is a
     /// stream: a subscriber that arrives mid-payload would receive a fragment
     /// and could not be told where it started. It gets the next message.
-    pub(crate) fn open(&self, path: &str, topic: &str, trace: TraceContext) -> FanOut {
+    pub(crate) fn open(&self, path: &str, topic: &str, trace: Option<TraceContext>) -> FanOut {
         let paths = self.paths.read().expect("subscription lock poisoned");
         let topic: Arc<str> = Arc::from(topic);
         let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
@@ -863,7 +865,7 @@ async fn writer(
 async fn begin_one(ctx: &ConnHandle, path: &str, head: &PubMsg) -> Result<SendHalf, Error> {
     let mut header = DataHeader::addressed(path);
     header.topic = Some(head.topic.to_string());
-    header.traceparent = Some(head.trace.to_traceparent());
+    header.traceparent = head.trace.map(|t| t.to_traceparent());
     header.sequence = head.sequence;
     let mut stream = ctx.open_uni().await?;
     write_data_preamble(&mut stream, &header).await?;
@@ -874,7 +876,7 @@ async fn write_one(ctx: &ConnHandle, path: &str, msg: &PubMsg) -> Result<(), Err
     let mut header = DataHeader::addressed(path);
     header.topic = Some(msg.topic.to_string());
     header.content_len = Some(msg.payload.len() as u64);
-    header.traceparent = Some(msg.trace.to_traceparent());
+    header.traceparent = msg.trace.map(|t| t.to_traceparent());
     // The number the publisher assigned to this *message* (`None` under
     // `core`): every subscriber's copy carries the same one, so a copy this
     // subscriber lost shows up as a hole in its own sequence.

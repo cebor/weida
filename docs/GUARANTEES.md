@@ -275,10 +275,11 @@ the payload, which the core forbids, so the bytes stay in the transport and the 
 as backpressure).
 
 The performance implications of each level MUST be documented. Measured so far: the two DATA
-keys that carry the sequence and the producer identity cost 80 B on a 135 B frame and 9 % of
-the message rate at a 64-byte payload in their worst case, while the default omits the
-producer key entirely and pays the sequence's 6 B
-([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-009; [decisions/0008](decisions/0008-session-identity.md)
+keys that carry the sequence and the producer identity cost **81 B on a 76 B frame** — a
+64-byte message more than doubles — and 12 % of the message rate at a 64-byte payload in their
+worst case, while the default omits the producer key entirely and pays the sequence's 6 B
+([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-009 and B-246;
+[decisions/0008](decisions/0008-session-identity.md)
 §4.4). Reassembly adds no per-message allocation beyond one map entry per held transfer; its
 cost under cross-stream reordering in bytes is the pinned receive windows above.
 

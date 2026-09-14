@@ -182,8 +182,12 @@ before.
   Chapter 2 cannot state a width honestly until that measurement exists, and the guide says so
   in §0.4 rather than rounding. The item is re-pointed at the question.
 - **B-246 gains a second reason.** The unconditional `traceparent` is 44 % of the wire budget
-  for a 64-byte message-to-everybody — ≈470 GB out of 1.08 TB. That is not why it should be
-  decided, but it is why it should be decided *soon*.
+  for a 64-byte message-to-everybody — ≈480 GB out of 1.08 TB. That is not why it should be
+  decided, but it is why it should be decided *soon*. **Both of these landed the same day this
+  note was written**: B-247 measured the width, and B-246 became
+  [0028](0028-trace-propagation-is-the-callers.md) — a context is propagated and never minted,
+  so a 64-byte push is now 76 B of which 12 are framing. The arithmetic of §3 is what found
+  the second one, which is the strongest argument this note can make for having written it.
 - **The remaining chapters are slices**, filed as B-256..B-261 in the order of §4.4's "ready"
   column rather than the chapter numbers.
 - **Named loss: the guide will always lag the ambition.** Option C buys truth at the price of

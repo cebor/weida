@@ -100,7 +100,7 @@ pub use runtime::Runtime;
 pub use stream::{Acceptor, Consumer, ConsumerId, CreditGrant, Incoming, Peer};
 pub use transfer::{
     Delivery, IncomingMeta, IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream,
-    TransferMeta,
+    TransferMeta, new_trace,
 };
 pub use weida_protocol::header::{
     Acknowledgement, Backpressure, CursorLevel, Deduplication, Delivery as DeliveryLevel,
