@@ -10,7 +10,9 @@ at the commit named below, and those files remain the source of truth. The diagr
 **1794 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
 37 ignored — the interop suites that need a library or a broker the machine does not have —
 plus `weida --features blocking` at **237**, 1 ignored.
-The Windows 11 VM last ran at `f8e8051`: **1712 across 128 binaries**, the same 37 ignored. Add
+The Windows 11 VM ran at the **same commit**: **1772 across 136 binaries**, the same 37
+ignored, after two storage faults (`LNK1201`, then `STATUS_IN_PAGE_ERROR`) cleared by a
+`cargo clean` — §6 point 3, not a code problem. Add
 the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
 `blocking` and `nng-interop`) and the four bindings' Python suites: **45**
 (MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
