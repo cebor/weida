@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::varint::{self, VarintError, decode_varint, encode_varint};
+use crate::varint::{self, VarintError, decode_varint};
 
 /// First byte of every weida stream: ASCII `W`.
 pub const MAGIC: u8 = 0x57;
@@ -178,11 +178,28 @@ pub fn parse_preamble(
     Ok((Preamble { kind, header_len }, 2 + used))
 }
 
+/// A preamble for `header_len` bytes of header, and how many of the returned
+/// bytes are it.
+///
+/// Returned in a fixed array rather than pushed into a `Vec`, so a send path
+/// that already owns a buffer allocates nothing to write one: the frame's
+/// length field precedes the header it measures, so the header has to be
+/// encoded first, and a caller that encodes it at `MAX_PREAMBLE_LEN` can then
+/// right-align this preamble against it and write **one** contiguous slice
+/// (B-250).
+pub fn preamble_bytes(kind: FrameKind, header_len: u64) -> ([u8; MAX_PREAMBLE_LEN], usize) {
+    let mut bytes = [0u8; MAX_PREAMBLE_LEN];
+    bytes[0] = MAGIC;
+    bytes[1] = kind.to_u8();
+    let len = crate::varint::write_varint(header_len, &mut bytes[2..])
+        .expect("header lengths are bounded far below 2^62");
+    (bytes, 2 + len)
+}
+
 /// Appends a preamble for `header_len` bytes of header to `out`.
 pub fn encode_preamble(kind: FrameKind, header_len: u64, out: &mut Vec<u8>) {
-    out.push(MAGIC);
-    out.push(kind.to_u8());
-    encode_varint(header_len, out).expect("header lengths are bounded far below 2^62");
+    let (bytes, len) = preamble_bytes(kind, header_len);
+    out.extend_from_slice(&bytes[..len]);
 }
 
 /// Builds a complete header-only frame: preamble followed by `header`.
@@ -307,7 +324,7 @@ mod tests {
     fn oversized_header_is_rejected_before_allocation() {
         // 1 MiB advertised against a 16 KiB cap.
         let mut buf = vec![MAGIC, FrameKind::Data.to_u8()];
-        encode_varint(1024 * 1024, &mut buf).unwrap();
+        crate::varint::encode_varint(1024 * 1024, &mut buf).unwrap();
         let err = parse_preamble(&buf, CAP).unwrap_err();
         assert_eq!(
             err,
@@ -322,7 +339,7 @@ mod tests {
     #[test]
     fn a_header_exactly_at_the_cap_is_accepted() {
         let mut buf = vec![MAGIC, FrameKind::Hello.to_u8()];
-        encode_varint(CAP, &mut buf).unwrap();
+        crate::varint::encode_varint(CAP, &mut buf).unwrap();
         assert_eq!(parse_preamble(&buf, CAP).unwrap().0.header_len, CAP);
     }
 

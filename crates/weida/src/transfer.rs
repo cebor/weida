@@ -24,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use weida_core::{Error, ErrorCode, PeerIdentity, TraceContext};
 use weida_protocol::header::limits::MAX_REPORT_LEVELS;
 use weida_protocol::header::{Acknowledgement, CursorLevel, ReportMode};
-use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes, encode_preamble};
+use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes};
 
 use crate::conn::{ConnHandle, Ctl, read_frame, write_error_frame};
 use crate::cursor::{Cursors, Reporter, order_report};
@@ -883,16 +883,47 @@ impl std::fmt::Debug for IncomingRequest {
     }
 }
 
+/// Builds the preamble and DATA header of an outgoing transfer in **one**
+/// buffer, and reports where the frame starts in it.
+///
+/// The frame's length field precedes the header it measures, so the header has
+/// to be encoded first. The previous shape encoded it into a fresh `Vec` —
+/// paying the 8/16/32/64/128 growth chain for a ~70-byte header — then
+/// allocated a second exact-capacity `Vec` and copied the whole thing into it
+/// (B-250).
+///
+/// Instead the header is encoded **after** a reserved `MAX_PREAMBLE_LEN`, and
+/// the preamble is right-aligned against it: one allocation whose capacity is
+/// right the first time, no copy of the header, and one contiguous slice to
+/// write. The bytes are identical to the two-buffer form, which
+/// `a_data_frame_is_built_in_one_buffer_and_is_byte_identical` asserts —
+/// getting the alignment wrong is the one regression this shape can cause.
+fn data_frame(header: &DataHeader) -> (Vec<u8>, usize) {
+    /// Room for a typical DATA header after the reserved preamble: an
+    /// endpoint path, a `content_len`, and a caller's trace context if there
+    /// is one. A header past this grows the `Vec` once, which is the case
+    /// this constant exists to make rare rather than impossible.
+    const HEADER_HINT: usize = 160;
+
+    let pre = weida_protocol::MAX_PREAMBLE_LEN;
+    let mut buf = Vec::with_capacity(pre + HEADER_HINT);
+    buf.resize(pre, 0);
+    header.encode_into(&mut buf);
+    let header_len = buf.len() - pre;
+
+    let (bytes, len) = weida_protocol::preamble_bytes(FrameKind::Data, header_len as u64);
+    let start = pre - len;
+    buf[start..pre].copy_from_slice(&bytes[..len]);
+    (buf, start)
+}
+
 /// Writes the preamble and DATA header of an outgoing transfer.
 pub(crate) async fn write_data_preamble(
     stream: &mut SendHalf,
     header: &DataHeader,
 ) -> Result<(), Error> {
-    let encoded = header.encode();
-    let mut buf = Vec::with_capacity(weida_protocol::MAX_PREAMBLE_LEN + encoded.len());
-    encode_preamble(FrameKind::Data, encoded.len() as u64, &mut buf);
-    buf.extend_from_slice(&encoded);
-    stream.write_all(&buf).await
+    let (buf, start) = data_frame(header);
+    stream.write_all(&buf[start..]).await
 }
 
 /// The reply half of an exchange the requester is waiting on.
@@ -1067,6 +1098,44 @@ mod tests {
         assert_eq!(header.endpoint, None);
         assert_eq!(header.tracestate.as_deref(), Some("vendor=x"));
         assert_eq!(DataHeader::decode(&header.encode()).unwrap(), header);
+    }
+
+    /// The one regression the one-buffer construction can cause: a preamble
+    /// aligned by one byte too many or too few (B-250).
+    ///
+    /// Asserted against the shape it replaced — encode the header, then build
+    /// `preamble ++ header` — over headers whose length crosses the varint's
+    /// own boundary, because that is where the alignment changes width.
+    #[test]
+    fn a_data_frame_is_built_in_one_buffer_and_is_byte_identical() {
+        use weida_protocol::{encode_frame, header::limits::MAX_ENDPOINT_BYTES};
+
+        for path_len in [1usize, 60, 61, 62, 200, MAX_ENDPOINT_BYTES] {
+            let path = format!("/{}", "a".repeat(path_len - 1));
+            let meta = TransferMeta::default()
+                .with_content_len(1 << 20)
+                .with_trace(new_trace());
+            let (header, _) = data_header(Some(&path), &meta, None, None).unwrap();
+
+            let (buf, start) = data_frame(&header);
+            let want = encode_frame(FrameKind::Data, &header.encode());
+            assert_eq!(
+                &buf[start..],
+                want.as_slice(),
+                "a {path_len}-byte path frames differently in one buffer"
+            );
+            // And the peer can read it back: the preamble's length field has
+            // to agree with what follows it, which a mis-aligned write would
+            // break without changing the byte count.
+            let (preamble, used) =
+                weida_protocol::parse_preamble(&buf[start..], 64 * 1024).expect("a preamble");
+            assert_eq!(preamble.kind, FrameKind::Data);
+            assert_eq!(
+                DataHeader::decode(&buf[start + used..]).unwrap(),
+                header,
+                "the header the length field points at"
+            );
+        }
     }
 
     #[test]

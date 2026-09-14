@@ -18,7 +18,7 @@ pub mod varint;
 
 pub use frame::{
     FrameKind, MAGIC, MAX_PREAMBLE_LEN, Preamble, PreambleError, encode_frame, encode_preamble,
-    parse_preamble,
+    parse_preamble, preamble_bytes,
 };
 pub use header::{
     CreditHeader, CursorHeader, CursorLevel, DataHeader, ErrorHeader, HeaderError, Hello,

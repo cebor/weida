@@ -51,17 +51,43 @@ pub const fn varint_len(value: u64) -> usize {
     }
 }
 
-/// Appends `value` to `out` in its shortest QUIC varint form.
-pub fn encode_varint(value: u64, out: &mut Vec<u8>) -> Result<(), VarintError> {
+/// Writes `value` into the front of `out` in its shortest QUIC varint form,
+/// and reports how many bytes it took.
+///
+/// The `Vec`-appending form below delegates to this one. A caller with a fixed
+/// buffer — a send path building a preamble it will right-align against an
+/// already-encoded header — allocates nothing (B-250).
+///
+/// # Errors
+///
+/// [`VarintError::OutOfRange`] above 2^62 − 1, and when `out` is shorter than
+/// the form `value` needs.
+pub fn write_varint(value: u64, out: &mut [u8]) -> Result<usize, VarintError> {
     if value > MAX {
         return Err(VarintError::OutOfRange);
     }
-    match varint_len(value) {
-        1 => out.push(value as u8),
-        2 => out.extend_from_slice(&((value as u16) | 0x4000).to_be_bytes()),
-        4 => out.extend_from_slice(&((value as u32) | 0x8000_0000).to_be_bytes()),
-        _ => out.extend_from_slice(&(value | 0xc000_0000_0000_0000).to_be_bytes()),
+    let len = varint_len(value);
+    if out.len() < len {
+        return Err(VarintError::OutOfRange);
     }
+    match len {
+        1 => out[0] = value as u8,
+        2 => out[..2].copy_from_slice(&((value as u16) | 0x4000).to_be_bytes()),
+        4 => out[..4].copy_from_slice(&((value as u32) | 0x8000_0000).to_be_bytes()),
+        _ => out[..8].copy_from_slice(&(value | 0xc000_0000_0000_0000).to_be_bytes()),
+    }
+    Ok(len)
+}
+
+/// Appends `value` to `out` in its shortest QUIC varint form.
+///
+/// # Errors
+///
+/// [`VarintError::OutOfRange`] above 2^62 − 1.
+pub fn encode_varint(value: u64, out: &mut Vec<u8>) -> Result<(), VarintError> {
+    let mut bytes = [0u8; 8];
+    let len = write_varint(value, &mut bytes)?;
+    out.extend_from_slice(&bytes[..len]);
     Ok(())
 }
 

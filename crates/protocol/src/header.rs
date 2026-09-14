@@ -894,13 +894,23 @@ impl From<HeaderError> for Error {
     }
 }
 
-/// Encoding into a `Vec` cannot fail, so the encoders return bytes directly.
-fn encode_with(
+/// Appends an encoded header to a buffer the caller owns.
+///
+/// Every `encode` in this file is a thin wrapper over an `encode_into` that
+/// goes through here, so a hot send path can reuse one buffer and the
+/// canonical form has exactly one implementation — the property that matters,
+/// because two encoders that can disagree about key order would be a wire
+/// divergence rather than an optimisation (B-250).
+fn encode_into_with(
+    out: &mut Vec<u8>,
     f: impl FnOnce(&mut Encoder<Vec<u8>>) -> Result<(), minicbor::encode::Error<Infallible>>,
-) -> Vec<u8> {
-    let mut e = Encoder::new(Vec::new());
+) {
+    // `Encoder` owns its writer, so the buffer is handed over and taken back.
+    // `std::mem::take` keeps the caller's allocation: the `Vec` that comes
+    // back is the same one, grown at most by this header.
+    let mut e = Encoder::new(std::mem::take(out));
     f(&mut e).expect("encoding into a Vec is infallible");
-    e.into_writer()
+    *out = e.into_writer();
 }
 
 /// Skips one CBOR value iteratively, refusing to recurse and refusing to nest
@@ -1247,7 +1257,16 @@ impl Hello {
 
     /// Encodes the header.
     pub fn encode(&self) -> Vec<u8> {
-        encode_with(|e| {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Appends the encoded header to `out`, for a send path that reuses a
+    /// buffer (B-250). The canonical form has one implementation and this is
+    /// it; [`Self::encode`] is a wrapper.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        encode_into_with(out, |e| {
             // A `core` declaration is never written: an absent key already
             // says it, and a v0 HELLO must stay byte-identical (§6.1).
             let offered = self.guarantees_offered.filter(|s| !s.is_core());
@@ -1462,6 +1481,15 @@ impl DataHeader {
     /// id alongside the order, so no caller reaches this encoder with either
     /// mistake.
     pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Appends the encoded header to `out`, for a send path that reuses a
+    /// buffer (B-250). The canonical form has one implementation and this is
+    /// it; [`Self::encode`] is a wrapper.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
         // Sorted and deduplicated by wire value, not by the enum's derived
         // order, because the wire value is what ascends on the wire.
         let mut report: Vec<u64> = self.report.iter().map(|level| level.to_wire()).collect();
@@ -1479,7 +1507,7 @@ impl DataHeader {
             + u64::from(self.report_id.is_some())
             + u64::from(!report.is_empty())
             + u64::from(self.report_mode != ReportMode::default());
-        encode_with(|e| {
+        encode_into_with(out, |e| {
             e.map(count)?;
             if let Some(endpoint) = &self.endpoint {
                 e.u64(data_key::ENDPOINT)?.str(endpoint)?;
@@ -1618,8 +1646,17 @@ impl ErrorHeader {
 
     /// Encodes the header.
     pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Appends the encoded header to `out`, for a send path that reuses a
+    /// buffer (B-250). The canonical form has one implementation and this is
+    /// it; [`Self::encode`] is a wrapper.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
         let count = 1 + u64::from(self.message.is_some());
-        encode_with(|e| {
+        encode_into_with(out, |e| {
             e.map(count)?;
             e.u64(error_key::CODE)?.u64(self.code)?;
             if let Some(msg) = &self.message {
@@ -1676,10 +1713,19 @@ impl SubscriptionHeader {
 
     /// Encodes the header.
     pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Appends the encoded header to `out`, for a send path that reuses a
+    /// buffer (B-250). The canonical form has one implementation and this is
+    /// it; [`Self::encode`] is a wrapper.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
         // Both keys are required, so neither is elided: an absent filter and an
         // empty filter would otherwise be indistinguishable on the wire, and
         // the empty filter is the "everything" subscription.
-        encode_with(|e| {
+        encode_into_with(out, |e| {
             e.map(2)?;
             e.u64(subscription_key::ENDPOINT)?.str(&self.endpoint)?;
             e.u64(subscription_key::FILTER)?.str(&self.filter)?;
@@ -1769,7 +1815,16 @@ impl CreditHeader {
 
     /// Encodes the header.
     pub fn encode(&self) -> Vec<u8> {
-        encode_with(|e| {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Appends the encoded header to `out`, for a send path that reuses a
+    /// buffer (B-250). The canonical form has one implementation and this is
+    /// it; [`Self::encode`] is a wrapper.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        encode_into_with(out, |e| {
             e.map(3)?;
             e.u64(credit_key::ENDPOINT)?.str(&self.endpoint)?;
             e.u64(credit_key::FILTER)?.str(&self.filter)?;
@@ -1829,7 +1884,16 @@ pub struct CursorHeader {
 impl CursorHeader {
     /// Encodes the header.
     pub fn encode(&self) -> Vec<u8> {
-        encode_with(|e| {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Appends the encoded header to `out`, for a send path that reuses a
+    /// buffer (B-250). The canonical form has one implementation and this is
+    /// it; [`Self::encode`] is a wrapper.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        encode_into_with(out, |e| {
             e.map(1)?;
             e.u64(cursor_key::REPORT_ID)?.u64(self.report_id)?;
             Ok(())
@@ -1903,6 +1967,18 @@ pub fn decode_cursor_record(
 
 #[cfg(test)]
 mod tests {
+    /// The tests build headers by hand; production code goes through each
+    /// type's `encode_into`.
+    fn encode_with(
+        f: impl FnOnce(
+            &mut minicbor::Encoder<Vec<u8>>,
+        ) -> Result<(), minicbor::encode::Error<std::convert::Infallible>>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        super::encode_into_with(&mut out, f);
+        out
+    }
+
     use super::*;
     use weida_core::ErrorCode;
 
