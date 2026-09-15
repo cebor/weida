@@ -125,10 +125,15 @@ reads: a 2 MiB + 64 KiB message comes to rest in a 4 MiB allocation, so charging
 would let a queue hold close to twice `queue_bytes` of resident payload, with the factor
 chosen by the producer's message size. One further bound belongs to that config rather than
 to `Limits`, because a queue outlives every connection that touches it: `max_queues`,
-checked before any path is claimed. `max_unacked` is **not** a bound today — no code reads
-it, and it could not be enforced against a *cumulative* credit limit without capping a
-subscription's lifetime delivery count rather than its outstanding one; it becomes live with
-the acknowledgement of B-203. The payload is read under the queue's *remaining* budget,
+checked before any path is claimed. `max_unsettled` bounds, **per subscription**, the
+deliveries a queue has handed out and not seen reported — live since B-203, and enforced in
+the delivery scan, which is the one place it can be: a subscription at its bound is not
+eligible. It could not be enforced against a *cumulative* credit limit without capping a
+subscription's lifetime delivery count rather than its outstanding one, which is why it is a
+separate number rather than a clamp on credit. An unsettled delivery **keeps its charge**
+against `queue_bytes`, so the two bounds compose: a consumer that stops reporting costs its
+own slots and the queue's budget, and nothing else. The payload is read under the queue's
+*remaining* budget,
 never under the producer's advisory `content_len`, so an over-budget message is refused
 rather than buffered and then rejected (B-201,
 [decisions/0018](decisions/0018-minimal-broker.md) §4.8).

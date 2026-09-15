@@ -824,9 +824,12 @@ are the whole scheme:
 A large limit is not a hostile number: what a broker holds is bounded by its own `queue_bytes`
 (§10), not by what a consumer promises to take, and a consumer that states `u64::MAX` has said
 "send me everything" rather than "allocate something". What a broker *does* cap is the number
-of deliveries it lets go **unsettled** at once — `weida-broker`'s `max_unacked` — and that cap
-becomes observable only once a delivery has an outcome to wait for, which is the consumer
-acknowledgement of [decisions/0018](decisions/0018-minimal-broker.md) §4.3. A receiver MUST NOT
+of deliveries it lets go **unsettled** at once — `weida-broker`'s `max_unsettled` — and that
+cap became binding with the consumer settlement of
+[decisions/0018](decisions/0018-minimal-broker.md) §4.3 and
+[decisions/0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) §4.7 (B-203):
+a delivery is outstanding until its consumer reports `Processed` on the cursor stream the
+delivery ordered, and its bytes stay charged to the queue until then. A receiver MUST NOT
 deliver beyond the limit it has accepted, and a limit it declines to honour in full is not an
 error to report: the consumer observes it as delivery stopping, which is exactly what credit
 means.
@@ -1351,7 +1354,7 @@ Per broker (`weida_broker::BrokerConfig`), for a process that runs the L2 layer:
 | --- | --- | --- |
 | `queue_bytes` | 8 MiB | bytes one queue holds, charged as the payload plus the retained labels plus a fixed `PER_MESSAGE_OVERHEAD` (256 B) per message. A queue at the bound refuses admission — ERROR `{REJECTED}` on an exchange's reply half, `STOP_SENDING(REJECTED)` on a one-way stream — and never discards a message it has already confirmed ([decisions/0018](decisions/0018-minimal-broker.md) §4.8) |
 | `max_queues` | `64` | queues one broker registers; a configuration naming more is refused before any path is claimed |
-| `max_unacked` | `256` | deliveries one subscription may have **unsettled** at once. A consumer's credit limit is cumulative and is honoured in full (§6.6); this bounds what may be in flight without an outcome, so it becomes binding with the consumer acknowledgement of B-203 |
+| `max_unsettled` | `256` | deliveries **one subscription** may have unsettled at once, live since B-203. A consumer's credit limit is cumulative and is honoured in full (§6.6); this bounds what may be in flight without an outcome, and an unsettled delivery keeps its bytes charged against `queue_bytes`. Named `max_unacked` until [decisions/0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) §4.7: a consumer reports, it does not acknowledge |
 
 These are a **third** profile rather than fields on `Limits`, because a queue is not a
 per-connection object: it outlives every connection that touches it, which is the whole point

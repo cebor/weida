@@ -205,10 +205,18 @@ impl Consumers {
     /// consumer does not swallow the messages the others could have had.
     /// Returns the handle to deliver with; [`Consumers::undo`] gives the
     /// credit back if the write fails.
+    ///
+    /// `has_room` is asked of every candidate that passes the rest, and it is
+    /// how `max_unsettled` reaches this decision without this module knowing
+    /// what an unsettled delivery is: the queue owns that table, so the queue
+    /// answers the question. A subscription that fails it is not eligible
+    /// *this round* and is not otherwise penalised — one settlement makes it
+    /// eligible again with no bookkeeping here.
     pub(crate) fn take_turn(
         &mut self,
         topic: &str,
         skip: &[(ConsumerId, String)],
+        has_room: &dyn Fn(ConsumerId, &str) -> bool,
     ) -> Option<(ConsumerId, String, Consumer)> {
         let mut eligible: Vec<(ConsumerId, &str)> = self
             .subs
@@ -218,6 +226,7 @@ impl Consumers {
                 sub.has_credit()
                     && !skipped(skip, id, filter)
                     && weida::filter::matches(topic, filter)
+                    && has_room(id, filter)
             })
             .map(|(id, filter, _)| (id, filter.as_str()))
             .collect();

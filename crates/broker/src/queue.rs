@@ -1,4 +1,5 @@
-//! One queue: messages held in memory, under one byte budget.
+//! One queue: messages held in memory, under one byte budget — and the
+//! deliveries it has handed out and not yet seen settled.
 //!
 //! Nothing here talks to a peer. The queue answers two questions — is there
 //! room, and what is held — and the broker turns those answers into a confirm
@@ -6,8 +7,16 @@
 //! `Stored` is not expressible anywhere in this crate
 //! ([0018](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0018-minimal-broker.md)
 //! §4.2).
+//!
+//! **A delivered message is still this queue's.** Until a consumer reports
+//! `Processed`, a message that has gone out lives in the `unsettled` table
+//! and **keeps its charge** against the budget: it may come back, so it is
+//! memory the queue still owes. That is the whole difference between this
+//! queue and the one before B-203, where a delivery was a deletion and a
+//! consumer that died took the message with it — RabbitMQ's `no-ack` mode,
+//! which its own documentation calls unsafe.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use weida::{IncomingMeta, TraceContext};
 
@@ -28,10 +37,10 @@ pub const PER_MESSAGE_OVERHEAD: usize = 256;
 
 /// One message a queue holds.
 ///
-/// The payload, plus what a delivery will need when B-202 adds one: the topic
-/// a consumer's filter selects on, the content type the producer labelled it
-/// with, and the trace context, so that a delivery continues the producer's
-/// trace instead of starting a new one.
+/// The payload, plus what a delivery needs: the topic a consumer's filter
+/// selects on, the content type the producer labelled it with, and the trace
+/// context, so that a delivery continues the producer's trace instead of
+/// starting a new one.
 #[derive(Debug)]
 pub struct QueuedMessage {
     /// The payload, as read.
@@ -42,6 +51,14 @@ pub struct QueuedMessage {
     pub content_type: Option<String>,
     /// The producer's trace context, so a delivery is the same trace.
     pub trace: Option<TraceContext>,
+    /// How often this message has been handed to a consumer, the current
+    /// attempt included once it goes out.
+    ///
+    /// `0` until the first delivery. It counts **attempts**, not failures:
+    /// the queue does not know why an earlier one went unsettled, only that
+    /// it did. The wire form is DATA key `12` and is B-267's slice; this
+    /// field is what it will read.
+    pub attempts: u64,
 }
 
 impl QueuedMessage {
@@ -79,24 +96,52 @@ pub enum Refusal {
     Full,
 }
 
+/// A delivery this queue has handed out and not seen settled.
+///
+/// The id is the queue's own and is never on the wire: settlement arrives as a
+/// cursor on the delivery's own report, so the broker needs no correlation
+/// field of its own — the id names the entry to drop or requeue when that
+/// report resolves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeliveryId(pub u64);
+
 /// What a queue holds right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueueStats {
-    /// Messages held.
+    /// Messages held and deliverable.
     pub messages: usize,
+    /// Deliveries handed out and not yet settled. Still charged.
+    pub unsettled: usize,
     /// Bytes charged against `queue_bytes`, including the per-message
-    /// overhead of [`PER_MESSAGE_OVERHEAD`].
+    /// overhead of [`PER_MESSAGE_OVERHEAD`] — **held and unsettled
+    /// together**, because an unsettled delivery may come back.
     pub bytes: usize,
 }
 
-/// A queue: a FIFO of messages and the budget they are charged against.
+/// A queue: a FIFO of messages, the deliveries owed on them, and the budget
+/// both are charged against.
 #[derive(Debug)]
 pub struct Queue {
     messages: VecDeque<QueuedMessage>,
-    /// Sum of [`QueuedMessage::charge`] over `messages`, maintained on both
-    /// sides rather than recomputed: admission asks for it per message.
+    /// Handed out, not settled. Keyed by this queue's own delivery id, with
+    /// the subscription that holds it recorded so a bound can be per
+    /// subscription and a lost subscription can be swept.
+    unsettled: HashMap<DeliveryId, Unsettled>,
+    next_delivery: u64,
+    /// Sum of [`QueuedMessage::charge`] over `messages` **and** `unsettled`,
+    /// maintained on every move rather than recomputed: admission asks for it
+    /// per message, and an unsettled delivery is memory this queue still
+    /// owes.
     charged: usize,
     budget: usize,
+}
+
+/// One outstanding delivery: the message to give back, and who holds it.
+#[derive(Debug)]
+struct Unsettled {
+    message: QueuedMessage,
+    consumer: weida::ConsumerId,
+    filter: String,
 }
 
 impl Queue {
@@ -104,6 +149,8 @@ impl Queue {
     pub fn new(budget: usize) -> Queue {
         Queue {
             messages: VecDeque::new(),
+            unsettled: HashMap::new(),
+            next_delivery: 1,
             charged: 0,
             budget,
         }
@@ -194,10 +241,110 @@ impl Queue {
         self.messages.push_front(message);
     }
 
+    /// Takes the message at `index` back into this queue as an **unsettled
+    /// delivery**, returning the id that will settle it.
+    ///
+    /// The message arrives here owned, because the broker wrote it with no
+    /// lock held — [`Queue::take`] handed it out and this hands it back — so
+    /// nothing is copied for a delivery. Its bytes are charged again, and
+    /// they are charged **until a consumer reports**: a delivery that may
+    /// come back is memory this queue still owes, which is the one accounting
+    /// rule of this slice. [`Queue::stats`] reports held and unsettled
+    /// separately so an operator can see which it is.
+    ///
+    /// It cannot be refused, for [`Queue::push_front`]'s reason: this is the
+    /// same bytes changing state, and the loop that took them admits nothing
+    /// in between.
+    pub fn hold(
+        &mut self,
+        message: QueuedMessage,
+        consumer: weida::ConsumerId,
+        filter: &str,
+    ) -> DeliveryId {
+        let id = DeliveryId(self.next_delivery);
+        self.next_delivery += 1;
+        self.charged += message.charge();
+        self.unsettled.insert(
+            id,
+            Unsettled {
+                message,
+                consumer,
+                filter: filter.to_owned(),
+            },
+        );
+        id
+    }
+
+    /// Drops a settled delivery and releases its charge.
+    ///
+    /// `false` when the id is unknown, which is not a failure: a settlement
+    /// and a requeue race on a connection that dies as its consumer reports,
+    /// and whichever arrives second finds nothing to do.
+    pub fn settle(&mut self, id: DeliveryId) -> bool {
+        match self.unsettled.remove(&id) {
+            Some(entry) => {
+                self.charged -= entry.message.charge();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Puts an unsettled delivery back at the head of the queue.
+    ///
+    /// The charge does not move, because it never left: this is the same
+    /// bytes changing state, which is why it cannot be refused. `false` when
+    /// the id is unknown, for [`Queue::settle`]'s reason.
+    pub fn requeue(&mut self, id: DeliveryId) -> bool {
+        match self.unsettled.remove(&id) {
+            Some(entry) => {
+                self.messages.push_front(entry.message);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Requeues every delivery one subscription holds, and says how many.
+    ///
+    /// What a lost subscription means: its outstanding deliveries are nobody's
+    /// until they are somebody else's. Order is the queue's own again — the
+    /// entries go back to the head in no particular order among themselves,
+    /// which is the honest statement, because a queue that promised the
+    /// original order across a consumer's death would be promising something
+    /// it never had (the deliveries were concurrent).
+    pub fn requeue_all(&mut self, consumer: weida::ConsumerId, filter: Option<&str>) -> usize {
+        let lost: Vec<DeliveryId> = self
+            .unsettled
+            .iter()
+            .filter(|(_, entry)| {
+                entry.consumer == consumer && filter.is_none_or(|f| entry.filter == f)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &lost {
+            self.requeue(*id);
+        }
+        lost.len()
+    }
+
+    /// How many deliveries one subscription holds unsettled.
+    ///
+    /// The number `max_unsettled` bounds, and it is per subscription because
+    /// that is what the name has always meant: one slow consumer costs its own
+    /// slots and nobody else's.
+    pub fn unsettled_for(&self, consumer: weida::ConsumerId, filter: &str) -> usize {
+        self.unsettled
+            .values()
+            .filter(|entry| entry.consumer == consumer && entry.filter == filter)
+            .count()
+    }
+
     /// What the queue holds.
     pub fn stats(&self) -> QueueStats {
         QueueStats {
             messages: self.messages.len(),
+            unsettled: self.unsettled.len(),
             bytes: self.charged,
         }
     }
@@ -212,6 +359,7 @@ mod tests {
             body: vec![0u8; body],
             topic: None,
             content_type: None,
+            attempts: 0,
             trace: None,
         }
     }
@@ -247,6 +395,7 @@ mod tests {
             queue.stats(),
             QueueStats {
                 messages: 3,
+                unsettled: 0,
                 bytes: PER_MESSAGE_OVERHEAD * 3
             }
         );
@@ -295,6 +444,7 @@ mod tests {
                 body,
                 topic: None,
                 content_type: None,
+                attempts: 0,
                 trace: None,
             }
         }
@@ -314,6 +464,7 @@ mod tests {
             queue.stats(),
             QueueStats {
                 messages: 0,
+                unsettled: 0,
                 bytes: 0
             }
         );
@@ -328,6 +479,7 @@ mod tests {
             body: Vec::new(),
             topic: Some("x".repeat(11)),
             content_type: None,
+            attempts: 0,
             trace: None,
         };
         assert_eq!(queue.push(labelled), Err(Refusal::Full));

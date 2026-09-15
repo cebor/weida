@@ -297,12 +297,14 @@ counts, performed in that order.
 **4.8 The persistence boundary, as a list, so that Phase 5 is not pre-empted.** *What the first
 slice keeps, all in memory, every item bounded before it is allocated* [INVARIANTS]: the queue
 registry, each queue's message bodies up to a per-queue byte budget, each subscription's granted
-delivery limit and delivery count, and each subscription's unacknowledged deliveries up to a cap.
+delivery limit and delivery count, and each subscription's unsettled deliveries up to a cap.
 Those bounds are new numbers and they belong on the broker's own configuration rather than on
 `weida-core::Limits`, because a queue is not a per-connection object and "Numbers that belong to
 a runtime rather than to a connection live on `RuntimeConfig`" [PROTOCOL §10]: `queue_bytes` per
-queue, `max_queues` per broker, `max_unacked` per subscription as the ceiling on any credit the
-broker will honour. A queue at `queue_bytes` refuses admission — `Reject`, "a cap refused before
+queue, `max_queues` per broker, `max_unsettled` per subscription as the ceiling on deliveries a
+subscription may hold without reporting — named `max_unacked` here until
+[0029](0029-a-report-is-relayed-a-certificate-is-not.md) §4.7 observed that nothing in it is an
+ack. A queue at `queue_bytes` refuses admission — `Reject`, "a cap refused before
 buffering" [GUARANTEES §6] — and never discards a message it has already confirmed, because a
 confirmed message is one whose responsibility it took [GUARANTEES §1].
 
@@ -395,6 +397,11 @@ note: the roadmap gated Phase D on this frame having "a consumer on both ends" (
 kind: code | size: 90 | status: ready | needs: [B-202]
 acceptance: the outcome half of [0018](0018-minimal-broker.md) §4.3 and §4.7. A delivery is answered by the consumer with `Processed` or a refusal on the reply half of the delivery exchange; an acknowledged message leaves the queue and frees one unit of `max_unacked`; a refused or unanswered delivery is requeued and redelivered to any consumer with credit, and a redelivery is observable as one by the consumer. Unacknowledged deliveries of a connection that closes are requeued, the shape [rabbitmq-amqp091.md](../research/rabbitmq-amqp091.md) §6 documents. `Broker::drain(Duration)` implements the four steps of §4.7 — stop admitting, keep delivering under granted credit, requeue what is outstanding at the deadline, return a count of acknowledged, requeued and undelivered — with a mandatory finite deadline and no infinite variant ([0009](0009-drain.md) §4.3), and its documentation states in one sentence that it is **not** the L0 drain and certifies nothing about a peer. Tests assert: a consumer that drops a delivery without answering sees it again; a queue drain with a silent consumer terminates at its deadline and reports the requeue; and the producer's certificate stays `Accepted` however the consumer answers, which is hop-locality ([GUARANTEES.md](../GUARANTEES.md) §2).
 note: this is the slice that makes the broker worth its hop. Without a consumer acknowledgement the queue is RabbitMQ's `no-ack` mode, which its own documentation calls unsafe.
+note: **this snapshot is what the note proposed, not what was built.** B-203 was executed under
+[0029](0029-a-report-is-relayed-a-certificate-is-not.md): settlement is a **cursor** the delivery
+orders, not an answer on a reply half — a delivery stayed one-way — the bound is `max_unsettled`,
+and the drain is `retire(deadline)` returning `Retired { settled, unsettled, requeued }`. The
+wording above is kept as written so that what the note asked for stays readable.
 
 ## 6. What this note does not decide
 
