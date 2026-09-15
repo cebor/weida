@@ -272,7 +272,7 @@ other end.
 
 ## 6. What needs a human
 
-Two open questions, then four entries that record how the others were closed or why they stay
+One open question, then five entries that record how the others were closed or why they stay
 manual.
 
 1. **The broker's design, and the names of the components that are missing** (B-203,
@@ -284,18 +284,21 @@ manual.
    cursor is already cumulative. What is open is what the owner stopped it for: the design
    changes they have in mind and the component names that do not exist yet. Guide chapter 3
    (B-258) and all of Phase D wait behind it.
-2. **Which language Phase C binds next, which is a question about reach and not about
-   mechanism.** [LOOP.md](LOOP.md) §9 says "Python first, then Java, then Node" and **no
-   document says why** — the ordering is an assertion from the first week, and
-   [0019](decisions/0019-jvm-binding.md) answered only *how* a JVM binding would be built
-   (JNI, not Panama, against an LTS floor), never whether the JVM is the next row worth its
-   cost. Since then the Python row has proved the shape five bindings wide and two facts have
-   moved: an N-API addon reaches Node, Bun and Deno as **one** artifact, and there is no JDK on
-   this machine at all. The answer belongs in a decision note with the C8B framing of
-   [0026](decisions/0026-the-guide-and-the-c8b-question.md) §0 as its yardstick, because
-   "reaches eight billion people" is a statement about how many runtimes can call this and
-   through what substrate — a C ABI is the thing ZeroMQ's own reach was built on and this
-   workspace does not have one.
+2. **Answered in conversation on 2026-09-15 and filed, not yet written up.** The order is the
+   owner's: **Python, Node, Erlang, C, Java** (B-264). Python is finished and five bindings
+   wide; Node is **one** row because an N-API addon serves Node, Bun and Deno from one
+   artifact; Erlang is third and is the cheapest bridge of any target, because `rustler`'s
+   `enif_send` puts completions into a process mailbox and replaces the loop-wakeup machinery
+   every other binding needs; a **C ABI** is fourth, since it is the substrate only for the
+   targets with no Rust-native path (Go, .NET, C, Zig, Lua) and every binding here is written
+   by this project; Java is **last rather than dropped**, with the reason recorded — the reach
+   is real, the maintenance is not, and a binding nobody here can read is worse than none.
+   Two items came out of the same conversation: Erlang **distribution** over weida as a
+   research sheet before any adapter (B-265, and the claim it would prove is already written
+   in [0022](decisions/0022-consensus-topology.md) §4.5), and whether PyPy deserves a `cffi`
+   client over that C ABI (B-266, likely no: the measured cost is one event-loop wakeup per
+   await, not bytecode). The toolchains now exist here — Erlang/OTP 29, Elixir, rebar3 3.27,
+   Bun 1.4.0, Deno 2.9.6, Node 26.8 — installed on the owner's authority this session.
 3. **Closed by parking, not by answering (2026-09-15).** The website exists in the tree and
    renders on demand — `cargo run -p weida-site`, 56 pages, a link checker that fails the
    build on a dangling link — and goes **nowhere** while the library is unpublished, because a
@@ -354,13 +357,15 @@ manual.
   the website's own gate run kept its log, the failure named itself
   (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
   a cross-test helper rather than the timing assertion it looked like (B-252).
-- **5 items are `ready`, 17 are `blocked`, 3 are `parked`** (B-254, the site, and B-061, CI,
+- **9 items are `ready`, 17 are `blocked`, 3 are `parked`** (B-254, the site, and B-061, CI,
   both parked by the owner this session; A5's control tier by 0011 §4.3; the blocked ones are
   four guide chapters, each on the slice it needs, and the rest waiting on an item this
-  session is building or on a toolchain this machine does not have). Of **258** filed items,
-  **233 are `done`**, and every `ready` one is a slice of the **cluster and store phase**
-  (B-219, B-220, B-224, B-226, B-231): nothing else in the backlog is actionable without a
-  decision of yours.
+  session is building or on a toolchain this machine does not have). Of **262** filed items,
+  **233 are `done`**, and the `ready` ones are two kinds: **five slices of the cluster and
+  store phase** (B-219, B-220, B-224, B-226, B-231) and **four questions the session's last
+  conversation filed** — the acknowledgement vocabulary and the broker's relay (B-263, which
+  now blocks B-203), Phase C's order (B-264), Erlang distribution's sheet (B-265) and PyPy
+  (B-266).
   **Every surface of the library is bound**: B-244 and B-243 closed the two this session's
   plan deliberately left alone, so `weida::blocking` and both `weida-py` halves now carry all
   six patterns and the cursor surface.
