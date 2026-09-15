@@ -5,110 +5,54 @@ first, then the numbers, then the chronology.
 
 ## Review needed
 
-**All four workstreams are finished and merged, and that is the change you are looking at**
-([0014](decisions/0014-parallel-libraries.md), accepted at your decision). **Sixty-six filed
-items, sixty-eight merges, one night**: W1 nine (`weida-py-core` and `weida-zmq-py`, B-111 +
-B-058 + B-112..B-118), W2 twenty (`weida-nng`, the forwarder rebuilt on it, both Python
-surfaces, B-119..B-138), W3 sixteen (the MQTT 5 **client** `weida-mqtt`, two interop runs
-against two real brokers, both Python surfaces, B-062 + B-139..B-153), W4 twenty-one
-(`weida-amqp` and `weida-nats` with their codecs, their interop and four Python surfaces,
-B-154..B-174). main `cc04d6b`, tree clean, gate green here: **1678 tests**, 0 failed, 37
-ignored, fmt, clippy in every configuration the tree has, rustdoc with `-D warnings`. Each
-workstream owned its worktree and its `CARGO_TARGET_DIR` and none ran cargo in this tree; the
-gate ran here, once per merge, and every Python proof was re-run here rather than accepted on
-report.
+**Nothing is red, nothing is in flight, and one thing wants your eye: sixteen decision notes
+are `provisional`.** State at main `1599584`+ (2026-09-15, ~03:00Z), tree clean, gate green
+here: **1878 tests**, 0 failed, 37 ignored, plus the five default-off feature configurations at
+**850** and `weida-py`'s own suite at **32** through a freshly built wheel. Windows 11 green at
+`d26da7e`: 1853 across 142 binaries. `cargo clean` ran this session, so the first build after
+you read this is cold.
 
-**The repository now ships five protocol libraries and four Python bindings**, none of which
-has weida in its picture: ZeroMQ (`weida-zmtp` + `weida-zmq` + `weida-zmq-py`), the nanomsg SP
-protocols (`weida-sp` + `weida-nng` + `weida-nng-py`), MQTT 5 (`weida-mqtt-codec` +
-`weida-mqtt` + `weida-mqtt-py`), AMQP 1.0 (`weida-amqp-codec` + `weida-amqp` +
-`weida-amqp-py`) and Core NATS (`weida-nats-codec` + `weida-nats` + `weida-nats-py`) — with a
-parity document per library and one shared PyO3 foundation, `weida-py-core`, under every
-binding.
+**Provisional decisions, 16 of 30** — 0015 through 0030, the whole run since the libraries
+landed. They are provisional because each was taken by the loop under [LOOP.md](LOOP.md) §3
+rather than by you, and two of tonight's are the ones to read first:
 
-**Six things are left standing, all filed, none of them hidden.** **B-186 is the tree's only
-known red**: two intra-doc links in `weida-nats` name `#[cfg(feature = "tls")]` items, so
-`cargo doc -p weida-nats --no-default-features` fails — broken since B-165 and invisible to
-every `--workspace` run. It is two lines, and it is the second sighting of the class **B-184**
-exists to close: the gate's doc step runs neither the per-crate `--no-default-features`
-configuration nor against a target that cannot be stale. **B-187**: `weida-nats-py` is the one
-binding of four whose wheel has never been built and run with the toolchain off `PATH`.
-**B-183 and B-185**: `weida-nng-py` and `weida-mqtt-py` have no parity document while the
-index's "Planned:" line names both. **B-182**: an NNG survey test asserts an exact count it
-only waited for approximately — a real flake, filed with both honest fixes named, and its
-workstream is gone, so it has no owner.
+- **[0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md)** amends two earlier
+  notes and a normative document, which no other provisional note here does. It says a queue
+  **relays its consumer's report** to the producer while its own certificate stays `Accepted`,
+  and it corrects [0018](decisions/0018-minimal-broker.md) §4.3's "MUST NOT relay" to the rule
+  it meant. Your framing, my earlier objection was wrong, and the distinction it rests on —
+  a guarantee is negotiated and hop-local, a cursor is a report and may be carried — was
+  already in [0023](decisions/0023-completion-is-a-cursor.md) §4.5. It unblocks B-203.
+- **[0030](decisions/0030-which-runtimes-and-in-which-order.md)** records Phase C's order as
+  **Python, Node, Erlang, C, Java** with a cost per position, and therefore supersedes the
+  ordering clause of [LOOP.md](LOOP.md) §9 — **your file, so that line is yours to change.**
+  0019 keeps its JVM design and gains a status line saying it answers *how* and never
+  *whether*.
 
-**The ZeroMQ library, which the other four were measured against**, closed at main `742d905`
-with all twenty-six items of [decision 0013](decisions/0013-competitor-libraries.md) —
-B-070..B-095 — merged, so its definition of done is closed. Its numbers at that anchor:
-**764 tests** with one ignored, plus **228** under `weida-zmq`'s non-default `blocking` feature,
-**18** in the libzmq interop matrix run for real against this machine's 4.3.5, and the interop
-bench Success on all four cases. The evidence below is that library's; the four that followed
-it are summarised per item in the chronology.
+**Two rules of LOOP.md were broken tonight, both on your explicit instruction, and they are
+here because that is what this section is for.** §2 says "no `sudo`, no package installation":
+you authorised it for this project, so Erlang/OTP 29, Elixir 1.20.2, rebar3 3.27, Bun 1.4.0
+and Deno 2.9.6 are installed. And §6's gate text is now **yours**: you pasted the measured
+replacement, so the gate covers the five feature configurations and ten rustdoc runs that were
+invisible to it (B-107, B-184, open since B-087 and B-152).
 
-**The evidence behind that sentence, one line each.** Every claim below is a test or a document
-in the tree, not a summary of intent:
+**Four items are `parked`, three of them by you this session** — B-254 (no site while the
+library is unpublished), B-061 (your own CI), B-265 (the Erlang-distribution sheet, not now) —
+plus B-045, A5's control tier by 0011 §4.3. **Sixteen are `blocked`**, none on anything I can
+do: four guide chapters each wait on the slice they teach, the JVM row waits on 0030's last
+position, and the rest wait on the store and consensus phase.
 
-- **Socket types:** all twenty rows of `zmq_socket(3)`'s table decided — eleven of the twelve
-  stable types implemented with their mute action, routing and alternation, `ZMQ_STREAM` absent
-  with what is missing named, the eight draft types absent as a family with their RFC numbers.
-- **Transports:** `tcp://`, `inproc://` and `ipc://`, each with its own length budget and its own
-  test file; the eight libzmq names we do not implement are refused by name at parse.
-- **Security:** NULL, PLAIN and CURVE with the ZAP dialog over `inproc://zeromq.zap.01`, 200/300/
-  400/500, and `ZapUserId` deliberately unconnected to any weida identity.
-- **Interop, both roles:** **13** tests against `zeromq` 0.6 in the ordinary suite and **18**
-  against libzmq 4.3.5 behind `--ignored`, every pairing with our socket bound *and* connecting.
-  CURVE opens in both directions: our boxes in libsodium, libsodium's in ours.
-- **The zguide:** **9** recipes — the three pirates, Majordomo, Freelance, Clone, Binary Star,
-  Espresso, the last-value cache — each asserting the guide's own claim, with the test files
-  *including* the examples so the recipe under test is the one a reader runs.
-- **The parity table:** `docs/libraries/zmq.md`, every row carrying its evidence, no aggregate
-  verdicts, and a 98-row option table generated from the code rather than transcribed.
+**What is `ready`, in the order the loop will take it.** Of **262** filed items, **236 are
+`done`** and six are `ready`: **B-203**, the broker's outcome half — settlement, the relay of
+0029, `max_unsettled`, `retire(deadline)` — which is the biggest thing open and the one that
+makes the queue a queue rather than RabbitMQ's `no-ack` mode; then the five cluster and store
+slices, **B-231, B-226, B-219, B-220, B-224**. Nothing among them needs a decision of yours.
 
-**One thing needs you, and it is the same one as this morning.** **B-039, named pipes**, is
-`blocked: needs a Windows runner` by my judgement rather than by a missing design — 0012 §4.6
-leaves nothing to decide and the slice is writable today, but every line of it is
-`#[cfg(windows)]`, so this tree's gate cannot compile it, cannot run it and cannot fail on it,
-and the details are exactly the hostile kind (a DACL that must not grant Everyone, two
-accept-loop races, `RevertToSelf` on every exit from an impersonation, the 1-255 instance cap).
-The `AF_UNIX` slice found a design hole no amount of reading had found; the pipe slice would find
-its own and nobody would see them. Overrule me if you want it written blind. **B-058, the Python
-binding, is no longer parked** — 0014 un-parked it as W1's first binding item — so the only
-`parked` item left is **B-045, the per-peer control connection**, by 0011 §4.3 with a written
-revival condition.
-
-**Five small items are ready and would cost under two hours together**, each one a loose end I
-would rather you saw named than tidied away: **B-104** (write the pipe-pairing diagnosis where
-somebody would try that harness again — already diagnosed, nothing is broken), **B-106** (a
-regression test for the `Queue` lost wakeup that landed without one), **B-107** (one sentence so
-LOOP §6's gate compiles the non-default `blocking` feature, which it currently never does),
-**B-109** (the codec's public `CurveCommand::encode()` still frames a `MESSAGE` as a command, the
-one form libzmq closes the connection on, and a golden vector pins it) and **B-110** (the zmq.rs
-interop helper probes a port, drops the listener and hands the number over, so the parallel suite
-can take it first — it failed once today and passed on re-run).
-
-**Two standing caveats, so a red gate is read correctly rather than panicked over.** B-102's
-compile-fail harness carries **384 lines of `rustc 1.98.0` diagnostics** committed to the tree, so
-a toolchain upgrade can redden it for a wording change: regenerate with `TRYBUILD=overwrite` and
-*read the diff*, because the pass case and the `Enumerated` guard are the halves that cannot break
-that way. And B-110 above is the only flake of the day — it arrived **with a name, a file and a
-line**, which is what your one-sentence change to LOOP §6 bought; a month ago it would have been
-"one test failed of 75" with nothing to chase.
-
-**Decisions 0001-0014 are all `accepted`; nothing is provisional.** The four worktrees of 0014
-— `../weida-w1` … `../weida-w4`, created detached at main `184e439`, each workstream branching
-inside its own — have all been drained; nothing of any workstream is unmerged, checked branch
-by branch rather than taken on report. **No stash and no dirty tree.** There was one for about
-ten minutes early on and it is worth knowing why, because it is the failure mode the worktree
-rule exists to prevent: two workers resolved an edit against *this* tree instead of their own
-(W1 the workspace member and `pyo3` entry, W3 the adapters-index row), I stashed both rather
-than merge from a dirty tree, held B-062 `in_progress` rather than count an uncommitted file as
-done, and dropped the stash only after checking the re-landed branch text against the stashed
-text. Of **187 items filed**, **160 are `done`**, 25 `ready`, **none `in_progress`**, 1
-`blocked` (B-039) and 1 `parked` (B-045). The twenty-five `ready` items are the whole of what
-is left: the six named above, the older loose ends and the requirement-driven work (B-060,
-B-061, B-064..B-068, B-096, B-099, B-104, B-106, B-107, B-109, B-110, B-175..B-179), and
-nothing among them blocks anything else.
+**One standing hardware note, and it is not the tree's.** The `/mnt/win` NVMe (980 PRO 2 TB,
+100 % full) reports 630 media and data integrity errors, 86 % spare and three self-tests that
+ended in failed segments. The Windows VM's `STATUS_IN_PAGE_ERROR` storm was a *different*
+disk and is fixed (btrfs checksums against `cache=none`, now `chattr +C`), but this one has
+real errors — back it up.
 
 ## Numbers
 
@@ -458,3 +402,4 @@ IMPLEMENTATION.md §4.
 2026-09-15T01:40Z | B-254 B-061 | parked | **Two owner questions closed by parking them, which is the honest answer to both.** The site (B-254) goes nowhere while the library is unpublished: a site is a promise of something to install and the workspace is `0.1.0`, untagged — which is the acceptance's own precondition, so parking it changes nothing about the work and everything about the claim. Nothing is lost, because `cargo run -p weida-site` renders the 56 pages from the tree on demand and its link checker fails the build on a dangling link, so the site stays correct while it stays local. CI (B-061) is the owner's own project now, so this loop stops designing one; what it hands over is better than a workflow file anyway — the gate is fully written down in LOOP §6 as of an hour ago, with the measured load beside it: 150 s warm for the four workspace commands on 16 cores, 89 s for the five feature configurations, 8 s for the doc matrix, and a `target/` that had reached **197 GiB** before this round deleted it (362 250 files, `/` from 86 % to 77 %). That last number is the one a runner's disk budget has to answer for, and it is why a second build tree on this machine was never the free option it looked like.
 2026-09-15T02:10Z | B-263 B-264 B-265 B-266 | filed | **A design conversation with the owner settled four things, and the sharpest of them corrects a rule I had quoted at them.** **(1) The acknowledgement vocabulary is the user's** — which is already true on the wire, `CursorLevel::Application(u64)` above the floor, "carried and ordered, never interpreted"; the numbering stays and turning numbers into labels is each binding's API problem, not the header's. **(2) The broker relays the consumer's report to the producer, and [0018](decisions/0018-minimal-broker.md) §4.3's "MUST NOT relay" is what needs amending, not the plan.** I had quoted hop-locality against it; the owner's framing is better and the text supports them: a cursor is a **report**, a guarantee is the negotiated `acknowledgement` dimension of HELLO, and 0023 §4.5 already separates the two. So the broker's *certificate* to the producer stays `Accepted` while the consumer's report travels end to end **as the consumer's** — the broker is the durable middle of one pattern rather than a third party with opinions, which is the whole point of extending the zmq patterns with a persistent queue. Three mechanical consequences go in the note (B-263): a message is two transfers, so the broker translates the producer's order into its own order on the delivery; relay re-emits the `(level, offset)` pair under the report id the **producer** allocated, because an id is per connection and per allocating side; and relay stays honest only while the body is byte-identical across the hop. An ordered level nobody reports stays silence — the owner's "shrug", which is the honest-absence rule already implemented and tested. **(3) Phase C's order is recorded at last: Python, Node, Erlang, C, Java** (B-264). Java is **last, not dropped**, with its reason written down — the reach is real and the maintenance is not. Node is one row for three runtimes, Erlang is the cheapest bridge of all of them because `enif_send` makes a mailbox the completion mechanism, and the **C ABI is fourth** because it is the substrate only for the targets with no Rust-native path; with every binding written here, Rust-native wins wherever it exists. **(4) Two questions came out of it**: Erlang **distribution** over weida as a research sheet before any code (B-265 — and the claim it would prove is already in [0022](decisions/0022-consensus-topology.md) §4.5, where this repository argues against distribution's single TCP stream), and whether PyPy earns a `cffi` client over that C ABI (B-266, likely no: `abi3` is CPython's and the measured cost is one event-loop wakeup per await, not bytecode). Toolchains installed on the owner's authority, so none of these is blocked on this machine any more: **Erlang/OTP 29** (erts 17.0.6, JIT), Elixir, rebar3 3.27, Bun 1.4.0, Deno 2.9.6 beside Node 26.8. Backlog: 262 items, 233 done, 9 ready.
 2026-09-15T02:40Z | B-263 | done, 0029 | **The contradiction was three decisions old and the sentence that resolves it was already in the tree.** [0023](decisions/0023-completion-is-a-cursor.md) §4.4 had `Processed` "lose its end-to-end reading", [0018](decisions/0018-minimal-broker.md) §4.3 said the broker "MUST NOT relay it", and [GUARANTEES.md](GUARANTEES.md) §2 forbids presenting a hop-local acknowledgement as an end-to-end result — so the completion mechanism the cursor stream exists for was unavailable through exactly the topology a persistent queue is, and the owner's objection to that was right. The resolution is 0023 §4.5, which already separates a **guarantee** (the negotiated `acknowledgement` dimension of HELLO, failed at negotiation, hop-local) from a **cursor** ("never load-bearing", an observation somebody made). GUARANTEES §2's invariant is about the first only. So: a queue **re-emits** its consumer's report toward the producer as the consumer's, its own certificate stays `Accepted`, and two prohibitions keep a claim from drifting — a hop may not emit a level it did not receive for that message, and may not re-emit a report that reached it as a re-emission, so a report travels at most one queue from its observer. Chains are refused in writing rather than left to code. **Two alternatives refused with their reasons**: attribution bytes on the record, because a record is 16 bytes and `Processed`'s own definition ("the next hop's application-level consumer has explicitly reported successful processing") already names whose statement it is — and a broker-specific restatement level, because a producer would then have to know it is talking to a queue, and order a private number, to learn a standard thing. The note also settles what B-203 would otherwise have decided in code, all of it the owner's call: **no visibility timeout**, because there are three failure modes with three answers — packet loss is QUIC's retransmission, a dead consumer is the requeue on subscription loss, a consumer that holds a delivery is bounded by `max_unsettled` — and a timeout would add a fourth answer whose cost is duplicates *weida invented*; plus the names `Unsettled`/`max_unsettled` (there is no ack here, there is a report), `delivery_attempt` as a **count** rather than a flag on DATA key `12` with "absent means `1`", and `retire(deadline)` for the queue drain because [0009](decisions/0009-drain.md) §4.7 forbids presenting it as the L0 drain. Amended: 0018 §4.3, 0023 §4.4, GUARANTEES §2, PROTOCOL §6.2 (key `12` and the rule that a relayed record rides the **reader's own** `report_id`). B-203 goes from `blocked` to `ready` with §4.6 and §4.7 as acceptance rather than as choices. Site 57 pages, link checker clean, 17 site tests green; docs-only, so LOOP §6 runs none.
+2026-09-15T02:55Z | B-264 B-266 | done, 0030 | **Phase C's order has a reason at last, and the small item found the bigger fact.** [0030](decisions/0030-which-runtimes-and-in-which-order.md): **Python, Node, Erlang, C, Java**, each position with its cost rather than its popularity, and it supersedes the ordering clause of LOOP §9 — the owner's line to change. Two things the writing sharpened. **Erlang would be second on cost alone**: `enif_send` delivers a completion into a process mailbox, so the loop-wakeup machinery that costs the Python row its measured ~78 µs per operation is not needed, `ResourceArc` replaces the generation-tagged handle table 0019 designs for the JVM, and refcounted binaries beat CPython's forced outbound copy — it is third only because Node's reach is wider. And **"Node" is one row for three runtimes**, because N-API is a stable ABI that Bun and Deno implement, with the caveat written down rather than assumed: each runtime gets its own smoke test, the way `package.sh` proves the wheel instead of trusting maturin. B-266 (PyPy) is answered **no** on the number that already existed — the cost is one event-loop wakeup per `await`, not bytecode — but **it found something sharper than its own question**, read out of PyO3 0.29.2's selector rather than assumed (`pyo3-build-config-0.29.2/src/impl_.rs:96-132`): `applicable_stable_abi` returns `None` for a **free-threaded** interpreter below 3.15, so this wheel's headline claim — "one `abi3` wheel for CPython 3.9 and up" — holds for GIL-enabled CPython and **not** for 3.13t or 3.14t. `weida-py.md` §2 said it unconditionally and now says it conditionally; §10 carries the PyPy answer. Docs-only, so LOOP §6 runs none; site 57 pages, link checker clean, 17 site tests green | next review pass, then B-203

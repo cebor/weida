@@ -1,6 +1,10 @@
 # 0019: How a JVM binding reaches these libraries
 
-Status: provisional
+Status: provisional, and **last in the order**
+([0030](0030-which-runtimes-and-in-which-order.md) §3.5): this note answers *how* a JVM binding
+would be built and never whether the JVM is the next row worth its cost. 0030 answers that with
+the reason recorded — the reach is real, the maintenance is not, and nobody on this project
+reads Java — so the design below stands unbuilt until that changes.
 Date: 2026-09-14
 Relates to: B-199; [0013](0013-competitor-libraries.md) §4.2, §4.4, §4.6, §4.7;
 [0014](0014-parallel-libraries.md) §2, §3; [LOOP.md](../LOOP.md) §2, §5, §9 Phase C;
