@@ -494,6 +494,7 @@ configuration error, not a negotiation position.
 | `9` | `uint` | `report_id` | no | — | identifier of the CURSOR stream that will report on this transfer (§6.7) |
 | `10` | `array` of `uint` | `report` | no | 16 items, strictly ascending | levels the sender **orders** a report for; an order, not a guarantee |
 | `11` | `uint` | `report_mode` | no | one of §6.2's `report_mode` values | `0` `progress` (default, never written), `1` `final-only` |
+| `12` | `uint` | `delivery_attempt` | no | — | how often an L2 queue has handed this message out, first attempt included; **absent means `1`**. A count rather than a flag: a repeat is visible, and a poison message is countable. Written by a queue redelivering, by no other sender |
 
 **Every key is optional at the decoder, and that is deliberate.** A decoder sees a byte
 slice, not a stream: it cannot tell an initiating half from a reply half, so it cannot
@@ -625,6 +626,19 @@ without an exchange ([0024](decisions/0024-three-families-one-back-channel.md) �
 - The reply half of an exchange may order its own report. That is how the **reply
   direction** is reported without a second header field: the responder orders levels in its
   own reply header, on its own id.
+- **`delivery_attempt` is written only by a queue, and only from `2` upwards.** Absent means
+  the first attempt, so a first delivery costs zero bytes for it. It counts what an L2 queue
+  has handed out for one message — a consumer that died after processing and before reporting
+  is the case that makes it non-zero — and it carries **no** claim that the earlier attempts
+  failed, because the queue does not know that either. A consumer MUST treat any value above
+  `1` as "this may be a duplicate" and nothing more
+  ([decisions/0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) §4.6).
+- **A relayed report reuses the reader's own `report_id`.** A queue that re-emits a consumer's
+  `(level, offset)` toward the producer writes it on the producer's cursor stream, under the id
+  **the producer** allocated — a record is copied, never forwarded, because an id is scoped to
+  the connection and the allocating side. The pair itself is unchanged, which is honest only
+  while the body is byte-identical across the hop
+  ([decisions/0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) §4.3).
 
 ### 6.3 ERROR (kind 2)
 

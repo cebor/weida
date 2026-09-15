@@ -184,8 +184,14 @@ request/reply, and [0018 §4.3] already refused the relay: guarantees are hop-lo
 [GUARANTEES §2], so the producer's certificate stays what its own hop gave it however the
 consumer later answers. What `Processed` remains is the **settlement cursor toward the queue** —
 "you may forget up to *N*" — which is the thing that defines redelivery and, for a stream, is the
-difference between resuming at *N* and redelivering a gigabyte. The level keeps its code point and
-loses its end-to-end reading.
+difference between resuming at *N* and redelivering a gigabyte. The level keeps its code point.
+**Amended by [0029](0029-a-report-is-relayed-a-certificate-is-not.md) §4.1:** it also keeps its
+definition, and a queue hop may **re-emit** a consumer's `Processed` toward the producer as the
+consumer's report — never as the broker's certificate, which stays `Accepted`, never fabricated,
+and never relayed a second time. What this paragraph got right is the half that survives: a
+report is not a guarantee, and no hop certifies a hop it does not own. What it got wrong is
+treating "not a guarantee" as "not transportable", which would make the mechanism this note
+built unavailable through exactly the topology a queue is.
 
 **4.5 Whether cursors are reported is negotiated; how often is local.** The `acknowledgement`
 dimension of [PROTOCOL §6.5] already expresses whether: a peer that negotiates `Stored` promises

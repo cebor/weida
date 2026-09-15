@@ -123,6 +123,21 @@ In v0 there is exactly one hop — a direct QUIC connection between requester an
 responder — so hop-local and end-to-end coincide. This coincidence is an accident of the
 brokerless topology and MUST NOT be relied on by API design or documentation wording.
 
+**A guarantee is hop-local; a report may be carried.** The two are different objects and only
+the first is bound by the rule above. A *guarantee* is what a peer promised at negotiation —
+the `acknowledgement` dimension of the HELLO set — and it is always about the immediate next
+hop. A *report* is a cursor: an observation somebody made, on a stream of its own, never
+load-bearing
+([0023](decisions/0023-completion-is-a-cursor.md) §4.5). A hop MAY re-emit a report it received
+toward the peer that ordered it, and MUST NOT present such a report as **its own** guarantee.
+A queue is the case this exists for: a producer orders `Processed`, the queue's consumer
+reports it, and the queue re-emits that report while its own certificate to the producer stays
+`Accepted`
+([0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) §4.1). Two prohibitions
+keep it honest and are normative: a hop MUST NOT emit a level it did not receive for that
+message, and MUST NOT re-emit a report that reached it as a re-emission — so a report travels
+at most one hop past its observer, and no claim can drift away from what somebody saw.
+
 ---
 
 ## 3. Independent guarantee dimensions

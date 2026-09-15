@@ -173,11 +173,17 @@ redeliver it, and is option C. The level that fits is already defined: "the next
 application-level consumer has explicitly reported successful processing" [GUARANTEES §1] — the
 consumer's statement about its own hop, the same thing AMQP 1.0's `disposition(accepted)`
 certifies and which [0004 §5] maps to `Processed` rather than `Stored` because it "says nothing
-about disk" [amqp10 §6.5]. The broker MUST NOT relay it: guarantees are hop-local
-[GUARANTEES §2], the producer's certificate stays `Accepted` however the consumer later answers,
-and the two transfer points are "entirely orthogonal and unaware of each other… Neither is
-end-to-end" [rabbitmq-amqp091 §6]. A producer that needs to know a consumer processed its
-message uses an application reply, which is what every sheet says too [SYNTHESIS §2 D3].
+about disk" [amqp10 §6.5]. **Amended by [0029](0029-a-report-is-relayed-a-certificate-is-not.md)
+§4.1:** this paragraph said "the broker MUST NOT relay it", and the rule it meant is that a hop
+MUST NOT present another hop's report as **its own guarantee**. A cursor is a report and the
+negotiated `acknowledgement` dimension is the guarantee [0023 §4.5], so the broker's certificate
+to the producer stays `Accepted` however the consumer later answers — unchanged, and the part
+this paragraph was protecting — while the consumer's report may be re-emitted toward the
+producer **as the consumer's**, bounded to one queue and never fabricated [0029 §4.3, §4.4].
+What remains true as written: the two transfer points are "entirely orthogonal and unaware of
+each other… Neither is end-to-end" [rabbitmq-amqp091 §6] in the sense that neither *certifies*
+the other. A producer that needs a consumer's own answer rather than its report still uses an
+application reply, which is what every sheet says too [SYNTHESIS §2 D3].
 
 **4.4 The credit frame is *in* the first slice, and it is frame kind `5`.** Kind `5` is the
 number PROTOCOL reserves [PROTOCOL §4], [PROTOCOL §11], and the slice spends it rather than

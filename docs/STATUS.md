@@ -272,18 +272,25 @@ other end.
 
 ## 6. What needs a human
 
-One open question, then five entries that record how the others were closed or why they stay
-manual.
+No open question on this list, and six entries that record how each was closed or why it stays
+manual. The next decision is a choice of direction rather than an answer this loop is waiting
+for.
 
-1. **The broker's design, and the names of the components that are missing** (B-203,
-   `blocked`). Both reversible choices the item was stopped for are **answered** and neither
-   needs the owner any more: consumer settlement is a cursor on a cursor stream, so a delivery
-   keeps the one-way topology a queue delivery has, and the alternative
-   [0018](decisions/0018-minimal-broker.md) §6 named — a frame kind `6` carrying batched acks
-   in RabbitMQ's `multiple` shape — is spent, because kind `6` is the cursor stream and a
-   cursor is already cumulative. What is open is what the owner stopped it for: the design
-   changes they have in mind and the component names that do not exist yet. Guide chapter 3
-   (B-258) and all of Phase D wait behind it.
+1. **Nothing — the last open question was answered in conversation and written up
+   (2026-09-15).** B-203 was `blocked` on the broker's design and on names that did not exist;
+   both are settled and it is `ready`.
+   [0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) is where the substance
+   went, and it corrects three decisions that had quietly contradicted each other: a
+   **guarantee** is the negotiated `acknowledgement` dimension and is hop-local, a **cursor is
+   a report** and may be carried, and only the first is what
+   [GUARANTEES.md](GUARANTEES.md) §2 forbids passing off as somebody else's. So a queue
+   re-emits its consumer's report toward the producer **as the consumer's** while its own
+   certificate stays `Accepted`, bounded by two prohibitions — never a level it did not
+   receive, never a re-emission of a re-emission — so a report travels at most one queue from
+   its observer. The rest of B-203's open choices are answered in the same note: **no
+   visibility timeout** (three failure modes, three answers: QUIC's retransmission, the
+   requeue on subscription loss, and `max_unsettled`), and the names `Unsettled`,
+   `delivery_attempt` as a count on DATA key `12`, and `retire(deadline)` for the queue drain.
 2. **Answered in conversation on 2026-09-15 and filed, not yet written up.** The order is the
    owner's: **Python, Node, Erlang, C, Java** (B-264). Python is finished and five bindings
    wide; Node is **one** row because an N-API addon serves Node, Bun and Deno from one
@@ -357,15 +364,14 @@ manual.
   the website's own gate run kept its log, the failure named itself
   (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
   a cross-test helper rather than the timing assertion it looked like (B-252).
-- **9 items are `ready`, 17 are `blocked`, 3 are `parked`** (B-254, the site, and B-061, CI,
-  both parked by the owner this session; A5's control tier by 0011 §4.3; the blocked ones are
-  four guide chapters, each on the slice it needs, and the rest waiting on an item this
-  session is building or on a toolchain this machine does not have). Of **262** filed items,
-  **233 are `done`**, and the `ready` ones are two kinds: **five slices of the cluster and
-  store phase** (B-219, B-220, B-224, B-226, B-231) and **four questions the session's last
-  conversation filed** — the acknowledgement vocabulary and the broker's relay (B-263, which
-  now blocks B-203), Phase C's order (B-264), Erlang distribution's sheet (B-265) and PyPy
-  (B-266).
+- **8 items are `ready`, 16 are `blocked`, 4 are `parked`** (B-254, the site, B-061, CI, and
+  B-265, the Erlang-distribution sheet, all parked by the owner this session; A5's control
+  tier by 0011 §4.3; the blocked ones are four guide chapters, each on the slice it needs, and
+  the rest waiting on an item this session is building). Of **262** filed items,
+  **234 are `done`**, and the `ready` ones are three kinds: **the broker's outcome half**
+  (B-203, unblocked by [0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) and
+  the biggest thing open), **five slices of the cluster and store phase** (B-219, B-220,
+  B-224, B-226, B-231), and **two write-ups** — Phase C's order (B-264) and PyPy (B-266).
   **Every surface of the library is bound**: B-244 and B-243 closed the two this session's
   plan deliberately left alone, so `weida::blocking` and both `weida-py` halves now carry all
   six patterns and the cursor surface.
