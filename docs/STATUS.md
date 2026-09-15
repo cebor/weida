@@ -6,22 +6,16 @@ the project before reading the detail; every number and status here is taken fro
 at the commit named below, and those files remain the source of truth. The diagrams live in
 `docs/status/` and are plain SVG; regenerate them by hand when the picture changes.
 
-**Snapshot:** main, 2026-09-15 ~00:20 UTC. Tree clean, gate green on Linux:
-**1878 tests** (218 at the start of the session, 764 before the four parallel workstreams) with
-37 ignored — the interop suites that need a library or a broker the machine does not have —
-plus `weida --features blocking` at **284**, 1 ignored, and `weida-py`'s own suite at **32**
-through a freshly built wheel. Seventy-four of those tests arrived in
-the last seven rounds: twenty-four regression tests from the review, seventeen that hold the
-website to the document set it renders, seventeen that hold **the guide** to the programs
-it teaches with, three that hold the trace decision to the wire, three that hold the
-`AF_UNIX` cancellation guarantee the transport silently did not have, five from the
-review-finding sweep — one refusal table, one `unsafe` guard over seven crates, the framing's
-byte identity and the parked-receipt measurement — three that hold PAIR, SURVEY and BUS
-to the blocking facade, and two that hold the cursor surface to it (with thirteen more of
-them in Python). The intermittent failure
-this snapshot used to
-carry a caveat about is **found and fixed**: it was a port race in the cross-protocol tests,
-not a timing assertion (B-252).
+**Snapshot:** `main` at `fa13dbb`, 2026-09-15 16:22 UTC. Tree clean; the
+[LOOP.md](LOOP.md) §6 gate is green on Linux: **1882 passed, 0 failed, 37
+ignored** across the workspace, plus **854 passed** across the five default-off feature
+configurations (`284 + 245 + 152 + 143 + 30`), both required clippy configurations, and the
+workspace plus all ten explicit rustdoc configurations after `cargo clean --doc`.
+`weida-py` adds **32** tests through a freshly built wheel. The four tests since the previous
+snapshot are B-203's settlement proofs: a reported delivery leaves, a report lost with its
+subscription requeues, `max_unsettled` stops and resumes one subscription, and an unsettled
+message keeps its charge. Mutations that removed the requeue, the bound or the charge each made
+the corresponding claim fail.
 
 **Every surface of the library is now bound.** PAIR, SURVEY and BUS landed in the library
 ahead of its facades and B-244 carried them into `weida::blocking` and both halves of
@@ -85,47 +79,33 @@ and about 27 messages per second at that width. The width interval in the guide 
 settles how a fan-out fails: a stalled subscriber is refused by the **byte budget** when that
 budget is below the connection's 0.6-1.5 MiB absorption band and by the **queue** when it is
 above it — which is why `dropped_on(topic)` separates the two causes.
-The Windows 11 VM ran at this commit: **1853 across 142
-binaries**, the same 37 ignored, with fmt, clippy in both configurations and rustdoc clean. The
-runs that got there are named in the nightlog rather than counted: the shared local framing
-broke the Windows build in a way no Linux gate can see (`pipe.rs` is `#[cfg(windows)]`), one
-test lost 0005's refusal race on that platform while passing here, and **the VM's storage
-faulted twelve times in one evening** — `STATUS_IN_PAGE_ERROR` eleven times and `LNK1201`
-once, each without a source line and each cleared by a `cargo clean` or by simply running
-again, the last attempt taking six faults in 78 seconds across five crates. **That cause is
-now found and fixed on the host, and it was never the disk**: §6 point 3. Add
-the non-default feature runs (`weida-zmq` and `weida-mqtt`'s `blocking`, `weida-nng`'s
-`blocking` and `nng-interop`) and the four bindings' Python suites: **45**
-(MQTT), **36** (NATS) and **17** (AMQP) re-run here on merge, ZeroMQ's and SP's in their own
-items, and **every one of the four wheels built and smoke-tested with no Rust toolchain on
-`PATH`**. Twenty-eight decision notes (0001–0028): fourteen `accepted` and fourteen
-`provisional` — 0015 (peer authorization), 0016 (conflation) and 0017 (the subscription
-verdict) because each answers an open question with a wire-affecting "no"; 0018 (the minimal
-broker) and 0019 (the JVM binding) because they are the first step of a phase the user
-chooses; 0020–0024 (the cluster, consensus, the store, one control group, the cursor and the
-three families) because they are the phase now being built; 0025 (the website) because
-what a site may claim is settled by a release that does not exist yet; 0026 (the guide and
-the C8B question) because the question is a framing the owner set and the arc it implies is
-still being written; 0027 (the negotiated set is the configured set) because it is
-revisited the day offered and required stop being one setting; and 0028 (a trace context is
-propagated, never minted) because the OpenTelemetry phase may want a say in it.
-One binary, `weida` (B-060), beside the library, `weida::blocking` (B-194) beside the async API,
-and **`weida-py`** (B-200, B-204, B-205), the sixth Python binding in the tree, the first of
-weida itself, the only one that reaches every pattern of its library including the streamed
-fan-out, and — like the other five — with an asyncio surface and a `sync` one. **Twenty-eight
-`[workspace] members`**, one directory per protocol family, read off `cargo metadata` rather
-than a hand-kept list: `weida-core`, `weida-protocol`, `weida-runtime`, `weida-winpipe`,
-`weida`, `weida-broker`, `crates/raft/weida-raft`, `crates/py/{weida-py-core, weida-py}`,
-then
+The latest successful Windows proof remains `d26da7e`: **1853 passed across 142 binaries**,
+0 failed and 37 ignored, with fmt, both clippy configurations and rustdoc clean. It is not a
+proof of this snapshot: the VM was rebuilt after the btrfs/QEMU cache fault was fixed and the
+fresh guest currently has no cargo, rustc, git or MSVC, so the manual gate cannot run until its
+toolchain is restored. The old result and its twelve storage-shaped failures stay in the
+nightlog rather than being presented as current evidence.
+
+There are **six Python bindings**: the five competitor libraries plus `weida-py`, each with an
+asyncio and a synchronous surface on the shared `weida-py-core` foundation. The newest one is
+the first that reaches every weida pattern and its cursor surface. **Thirty decision notes
+(0001–0030): fourteen `accepted` and sixteen `provisional`.** The newest two are
+[0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md), which separates a relayed
+report from a hop-local certificate, and
+[0030](decisions/0030-which-runtimes-and-in-which-order.md), which fixes Phase C's order as
+Python, Node, Erlang, C, Java.
+
+One binary, `weida` (B-060), sits beside the library, and `weida::blocking` (B-194) beside the
+async API. **Twenty-eight `[workspace] members`**, read from `cargo metadata`: `weida-core`,
+`weida-protocol`, `weida-runtime`, `weida-winpipe`, `weida`, `weida-broker`,
+`crates/raft/weida-raft`, `crates/py/{weida-py-core, weida-py}`, then
 `crates/zmq/{weida-zmtp, weida-zmq, weida-zmq-bridge, weida-zmq-py}`,
 `crates/nng/{weida-sp, weida-nng, weida-nng-bridge, weida-nng-py}`,
 `crates/mqtt/{weida-mqtt-codec, weida-mqtt, weida-mqtt-py}`,
 `crates/amqp/{weida-amqp-codec, weida-amqp, weida-amqp-py}`,
-`crates/nats/{weida-nats-codec, weida-nats, weida-nats-py}`, `crates/interop/cross-tests`
-and `crates/site` — the last of which is the website at
-[weida.doodleshnookie.net](https://weida.doodleshnookie.net), rendered from the documents in
-this directory rather than written beside them
-([0025](decisions/0025-the-website.md)), and the one member that is `publish = false`.
+`crates/nats/{weida-nats-codec, weida-nats, weida-nats-py}`,
+`crates/interop/cross-tests` and `crates/site`. The site renders this document set rather than
+maintaining a second one and remains unpublished while the workspace has no release form.
 
 ![Product line](status/product-line.svg)
 
@@ -147,11 +127,10 @@ or reserved frame is peer-scoped. The last open question in it, what a local `op
 its ceiling, is answered: it **waits for a slot**, so `Block` means the same thing on every
 transport (B-059).
 
-**Phase B is complete across all four slices, and Phase C's Python row with it** — sixty-six
-items of [0014](decisions/0014-parallel-libraries.md) in four parallel workstreams, each
-library the definition of done of
-[0013](decisions/0013-competitor-libraries.md) §4.7 and each binding following its own
-library, asyncio first and synchronous second:
+**Phase B is complete across all four slices, and Phase C's Python row is complete across all
+six bindings.** The sixty-six items of
+[0014](decisions/0014-parallel-libraries.md) built the five competitor libraries and their
+bindings, each binding following its own library, asyncio first and synchronous second:
 
 - **B1 ZeroMQ** — `weida-zmq` and `weida-zmq-py`: eleven socket types against
   `zmq_socket(3)`'s twenty rows, three transports, NULL/PLAIN/CURVE with the ZAP dialog, a
@@ -173,22 +152,24 @@ library, asyncio first and synchronous second:
   `nats-server` was reachable, which its parity table records as a clause **not met** rather
   than rounding up.
 
-What that leaves: **Phase C's Java and Node rows**, untouched and unfiled; **Phase D**, the L2
-broker, which is also where MQTT's and AMQP's server halves live; and the five parity
-documents' own open questions, each named in its document rather than here.
-AMQP 0-9-1 (RabbitMQ) is deliberately not a Phase B adapter: its clients come with the broker (D2), and B4's AMQP 1.0 client already reaches RabbitMQ 4.x.
+What that leaves in Phase C is the order fixed by
+[0030](decisions/0030-which-runtimes-and-in-which-order.md): **Node, Erlang, C, Java**. Phase D
+is no longer untouched: the in-memory broker admits and confirms, delivers under cumulative
+credit, and settles or requeues a delivery. DATA key `12`, report relay and `retire(deadline)`
+are the three ready continuations; stores, replication, MQTT's and AMQP's server halves and
+AMQP 0-9-1 clients remain later Phase D work.
 
 ## 2. What exists, layer by layer
 
 ![Architecture](status/architecture.svg)
 
 The load-bearing line is the **transport boundary**: `Link`, `SendHalf`, `RecvHalf` as enums in
-`crates/weida/src/transport.rs`. Everything above it — frames, HELLO, negotiation, the three
-patterns, ordering, dedup, drain — is transport-blind, and `tests/transports.rs` proves that by
-running one Req/Rep, one Push/Pull and one Pub/Sub body over QUIC, inproc, `AF_UNIX` and, on
-Windows, named pipes unchanged. Below it the two kernel-mediated transports share one
-implementation of the 0012 grouping, generic over what a socket and a pipe differ in; the
-pipe's one addition is a chunk framing, because a pipe has no half-close.
+`crates/weida/src/transport.rs`. Everything above it is transport-blind, and
+`tests/transports.rs` now runs **all six patterns** over QUIC, inproc, `AF_UNIX` and, on
+Windows, named pipes. Below it the two kernel-mediated transports share one implementation of
+the 0012 grouping and the same per-write framing, generic over what a socket and a pipe differ
+in; that shared framing is what made an interrupted `AF_UNIX` stream distinguishable from FIN
+(B-245).
 
 The **reactor is its own crate** now: `weida-runtime` holds `Exec`, the three reactor-ownership
 constructors, the capped resolver, the `AF_UNIX` and named-pipe hygiene and the name
@@ -222,6 +203,15 @@ exchange's publisher confirm stays the DATA key `8` reply it always was. A level
 cannot reach — `Stored`, with no store — is absent from the report rather than failed, which is
 `GUARANTEES.md` §1's prohibition seen from the reporting side.
 
+**The broker now owns a delivery until somebody reports it processed.** B-201 admits and
+confirms at `Accepted`; B-202 registers ordinary subscribers and delivers under their
+cumulative credit; B-203 moves each delivery into an `unsettled` table **without releasing its
+`queue_bytes` charge**. The consumer's `Processed` cursor settles it, while a report that ends
+without one requeues it at the head. `max_unsettled` is a live per-subscription bound, not a
+clamp on lifetime credit. What is not built is kept separate and named: B-267 exposes the
+attempt count on DATA key `12`, B-268 relays a consumer report toward the producer under the
+producer's report id, and B-269 adds `retire(deadline)`.
+
 **The pattern family is complete.** Req/Rep, Push/Pull and Pub/Sub were already there; PAIR,
 SURVEY and BUS (B-236, B-237, B-238) close
 [ARCHITECTURE.md](ARCHITECTURE.md) §6b's table and with it the nanomsg set — and they cost
@@ -246,15 +236,13 @@ a multipart refused at hop one, the smaller `max_message_bytes` deciding — are
 
 ![Tests over time](status/tests-over-time.svg)
 
-Every point is a merge into main behind the four-step gate of [LOOP.md](LOOP.md) §6. **The
-chart stops at the two-day stop it was drawn for** (`5ca1329`, 1678 tests); the sessions since
-took it to **1803** without changing its shape, so it is left as the picture of the parallel run
-rather than redrawn per merge. Two things it does not show: three review findings were caught **before** their merge by reading
-the branch (a reassembler counter that drifted on repeated sequence numbers, a runtime-wide
-mutex on the fire-and-forget path that cost 3 % in the header bench, a parked receipt that
-held an OS descriptor), and three of the four findings of the ZMTP interop run were mistakes in
-our own code that no unit test could have seen without an independent implementation on the
-other end.
+Every plotted point in the two panels is a merge into `main` behind the gate that existed when
+the parallel run was made. The detailed curve deliberately stops at that run's two-day stop
+(`5ca1329`, 1678 passed); the diagram now carries a separate, explicitly non-time-scaled current
+badge instead of pretending the intervening three days fit the old axis. That badge is the
+snapshot above: **1882 passed at `fa13dbb`, 37 ignored**. The two dips in the historical curve
+are real deletions: B-098 replaced four weaker tests with one, and B-094 removed the bridge's
+second wire implementation together with its suite.
 
 ## 5. The measurements that decided something
 
@@ -272,115 +260,55 @@ other end.
 
 ## 6. What needs a human
 
-No open question on this list, and six entries that record how each was closed or why it stays
-manual. The next decision is a choice of direction rather than an answer this loop is waiting
-for.
+No unresolved design question gates the next ready item. Six entries record what was decided,
+what remains deliberately manual and which machine fact currently limits a second-platform
+proof.
 
-1. **Nothing — the last open question was answered in conversation and written up
-   (2026-09-15).** B-203 was `blocked` on the broker's design and on names that did not exist;
-   both are settled and it is `ready`.
-   [0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) is where the substance
-   went, and it corrects three decisions that had quietly contradicted each other: a
-   **guarantee** is the negotiated `acknowledgement` dimension and is hop-local, a **cursor is
-   a report** and may be carried, and only the first is what
-   [GUARANTEES.md](GUARANTEES.md) §2 forbids passing off as somebody else's. So a queue
-   re-emits its consumer's report toward the producer **as the consumer's** while its own
-   certificate stays `Accepted`, bounded by two prohibitions — never a level it did not
-   receive, never a re-emission of a re-emission — so a report travels at most one queue from
-   its observer. The rest of B-203's open choices are answered in the same note: **no
-   visibility timeout** (three failure modes, three answers: QUIC's retransmission, the
-   requeue on subscription loss, and `max_unsettled`), and the names `Unsettled`,
-   `delivery_attempt` as a count on DATA key `12`, and `retire(deadline)` for the queue drain.
-2. **Answered in conversation on 2026-09-15 and filed, not yet written up.** The order is the
-   owner's: **Python, Node, Erlang, C, Java** (B-264). Python is finished and five bindings
-   wide; Node is **one** row because an N-API addon serves Node, Bun and Deno from one
-   artifact; Erlang is third and is the cheapest bridge of any target, because `rustler`'s
-   `enif_send` puts completions into a process mailbox and replaces the loop-wakeup machinery
-   every other binding needs; a **C ABI** is fourth, since it is the substrate only for the
-   targets with no Rust-native path (Go, .NET, C, Zig, Lua) and every binding here is written
-   by this project; Java is **last rather than dropped**, with the reason recorded — the reach
-   is real, the maintenance is not, and a binding nobody here can read is worse than none.
-   Two items came out of the same conversation: Erlang **distribution** over weida as a
-   research sheet before any adapter (B-265, and the claim it would prove is already written
-   in [0022](decisions/0022-consensus-topology.md) §4.5), and whether PyPy deserves a `cffi`
-   client over that C ABI (B-266, likely no: the measured cost is one event-loop wakeup per
-   await, not bytecode). The toolchains now exist here — Erlang/OTP 29, Elixir, rebar3 3.27,
-   Bun 1.4.0, Deno 2.9.6, Node 26.8 — installed on the owner's authority this session.
-3. **Closed by parking, not by answering (2026-09-15).** The website exists in the tree and
-   renders on demand — `cargo run -p weida-site`, 56 pages, a link checker that fails the
-   build on a dangling link — and goes **nowhere** while the library is unpublished, because a
-   site is a promise of something to install and the workspace is `0.1.0`, untagged (B-254,
-   `parked`). CI is the owner's own project now, so this loop does not design one (B-061,
-   `parked`); what it leaves behind is a gate written down rather than practised.
-4. **Closed by a paste: the gate's two blind spots** (B-107 and B-184, both `done`).
-   [LOOP.md](LOOP.md) §6 now names the five default-off configurations (`blocking` on `weida`,
-   `weida-zmq`, `weida-mqtt`, `weida-nng`; `cluster` on `weida-broker`) and the **850 tests**
-   behind them, the two features excluded with their reason (`nng-interop` and
-   `libzmq-interop` need a C library at run time; `extension-module` is maturin's to set),
-   ten rustdoc runs in the configurations where a `cfg`-gated intra-doc link breaks, and
-   `cargo clean --doc` in front of the doc step so a green doc step is a check rather than a
-   cache hit. The additions cost **89 s** for the feature runs, **8 s** for the doc matrix and
-   **3.7 s** for the clean re-documentation, all measured rather than estimated, and they cost
-   the next plain gate almost nothing because cargo keys a fingerprint per crate *and* feature
-   set. What the hole cost while open: **four** `cfg`-gated links, three of them invisible to
-   every `--workspace` doc run ever made here, the last one an hour old when the measurement
-   found it (`00eff38`).
-5. **The Windows gate stays manual, and one disk still wants attention.** The VM that
-   unblocked B-039 (`ssh win11-geselle`) is in no CI — B-061 is `parked` on the owner's own CI
-   work — so `C:\work\gate.ps1` runs beside the Linux one by hand.
-   The `STATUS_IN_PAGE_ERROR`/`LNK1201` faults that turned every
-   Windows pass into two to four runs are **found and fixed, and the disk was innocent**: the
-   images (`/var/lib/geselle/vm/win11/{base,run}.qcow2`) live on btrfs, which checksums every
-   data write, and `vm.sh` gave them to QEMU as `cache=none,aio=native`, so the guest can
-   change a page after btrfs has taken its checksum of it. The block then reads back `EIO`
-   while the drive reports nothing — **2145 `corruption_errs` against 0 read, write and flush
-   errors** in `btrfs device stats /`, all of them on the two image inodes, up from 76 two
-   days earlier, on an NVMe with **0 media and data integrity errors and 3 % wear** whose
-   `base.qcow2` re-reads its 8.67 GiB clean today. It is also why `cargo clean` always
-   "fixed" it: a rewritten block gets a checksum that matches it again. `vm.sh` now sets
-   `chattr +C` on the image directory before creating an image, so every new overlay is
-   `No_COW` and unchecksummed; it applies at the next `vm.sh run`, and a VM started before
-   that change still runs on the old overlay. Two things stay human: this gate is still
-   manual, and the *other* NVMe (980 PRO 2 TB, `/mnt/win`, 100 % full) reports 630 media and
-   data integrity errors, 86 % spare left and three self-tests that ended in failed segments
-   — back that one up.
-6. **Nothing else, and that is the change.** The two decisions the review
-   round filed rather than took — because each changes what a peer observes — are both taken:
-   the unconditional `traceparent` is gone, a context is propagated and never minted, and a
-   64-byte push went from 135 B to **76 B**
-   ([0028](decisions/0028-trace-propagation-is-the-callers.md), B-246); and the `AF_UNIX` reset
-   loss is closed by the framing the named-pipe transport already had, now shared by both
-   socket transports ([0012](decisions/0012-local-connection-grouping.md) §4.7(e), B-245).
+1. **B-203 is built, not waiting on the conversation any more.**
+   [0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) supplied the rule; B-203
+   supplied settlement and requeue. A queue's own certificate remains `Accepted`, while the
+   consumer's `Processed` is a report that may be relayed as the consumer's — never invented,
+   never re-relayed. No visibility timer was added: QUIC retransmits lost packets, a lost
+   subscription requeues, and a live but silent consumer is bounded by `max_unsettled`.
+   The three consequences intentionally split out are ready as B-267, B-268 and B-269.
+2. **Phase C's order and the PyPy answer are written down.**
+   [0030](decisions/0030-which-runtimes-and-in-which-order.md) records **Python, Node, Erlang,
+   C, Java**: one N-API artifact targets Node, Bun and Deno; Rustler can send completions into a
+   BEAM mailbox; the C ABI serves runtimes without a Rust-native bridge; Java stays last rather
+   than being dropped. B-266 answered **no** to a second PyPy client: the measured cost is one
+   event-loop wakeup per `await`, not bytecode. B-265, the separate Erlang-distribution sheet,
+   is parked until the Erlang row.
+3. **The website and CI are parked by the owner, not blocked on code.** The site renders **58
+   pages** from this tree and fails its build on a dangling link, but remains local while the
+   workspace is unpublished and untagged (B-254). CI is the owner's separate project (B-061);
+   this tree supplies a reproducible gate rather than a workflow file.
+4. **The gate's blind spots are closed.** LOOP §6 names all five default-off configurations and
+   ten explicit rustdoc configurations, with `cargo clean --doc` first. The feature matrix had
+   850 tests when the rule was measured and has **854 now**, because B-203 added four broker
+   tests that also run with `cluster`.
+5. **Windows stays manual and its toolchain currently needs rebuilding.** The btrfs/QEMU
+   `cache=none` failure was fixed by creating the VM images with `No_COW`; the replacement guest
+   is reachable but has no Rust, git or MSVC yet, so `C:\work\gate.ps1` is not presently
+   runnable. The unrelated 980 PRO mounted at `/mnt/win` still reports 630 media/data-integrity
+   errors and still needs the owner's backup.
+6. **The two peer-visible review decisions are closed.** A trace context is propagated and
+   never minted ([0028](decisions/0028-trace-propagation-is-the-callers.md), B-246), taking a
+   64-byte push from 135 B to **76 B**; and the named-pipe chunk framing is now shared with
+   `AF_UNIX`, so cancellation cannot read as successful FIN (B-245).
 
 ## 7. Where the loop stands
 
-- **Nothing is in flight and every branch is merged.** The four workstreams of
-  [0014](decisions/0014-parallel-libraries.md) are drained — sixty-six filed items, **68 merge
-  commits** since `184e439`, checked branch by branch rather than taken on report — the gate is
-  green at **1878 tests** with 37 ignored on Linux, and the tree is clean. **No known red**, in
-  any configuration, including the ten rustdoc and three `blocking` runs that are not in the
-  gate yet and were run by hand this session. The one caveat this section used to carry — a
-  failure in roughly one full-workspace run in twenty that nobody had seen — is **closed**:
-  the website's own gate run kept its log, the failure named itself
-  (`an_nng_push_reaches_a_zmq_pull`, `AddrInUse`), and it was a probe-then-bind port race in
-  a cross-test helper rather than the timing assertion it looked like (B-252).
-- **8 items are `ready`, 16 are `blocked`, 4 are `parked`** (B-254, the site, B-061, CI, and
-  B-265, the Erlang-distribution sheet, all parked by the owner this session; A5's control
-  tier by 0011 §4.3; the blocked ones are four guide chapters, each on the slice it needs, and
-  the rest waiting on an item this session is building). Of **262** filed items,
-  **234 are `done`**, and the `ready` ones are three kinds: **the broker's outcome half**
-  (B-203, unblocked by [0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) and
-  the biggest thing open), **five slices of the cluster and store phase** (B-219, B-220,
-  B-224, B-226, B-231), and **two write-ups** — Phase C's order (B-264) and PyPy (B-266).
-  **Every surface of the library is bound**: B-244 and B-243 closed the two this session's
-  plan deliberately left alone, so `weida::blocking` and both `weida-py` halves now carry all
-  six patterns and the cursor surface.
-  **All six findings of the review round are closed**, the last two by measurement rather than
-  by change: B-250's one-buffer send is inside this machine's spread and kept for the simpler
-  code, and B-249's sweep turned out to be unreachable while a peer acknowledges — 20 000
-  fire-and-forget sends evict zero receipts against a cap of 3 072.
-  Nothing else is open: every requirement-driven item, every library item, the website itself
-  and both binding slices of weida's own Python surface are closed.
+- **Nothing is in flight and the tree is clean at `fa13dbb`.** The required Linux gate is green
+  at **1882 passed, 0 failed, 37 ignored**, the five default-off configurations add **854
+  passed**, and all ten rustdoc configurations are clean after the doc cache is removed. The
+  only unrun cross-check is Windows, for the missing guest toolchain named above; no LOOP §6
+  configuration is red.
+- **8 items are `ready`, 16 are `blocked`, 4 are `parked`; of 265 filed items, 237 are
+  `done`.** The ready list is exact: B-267, B-268 and B-269 finish the broker outcome sequence,
+  then B-231, B-226, B-219, B-220 and B-224 are the five cluster/store slices. The first three
+  are independent cuts rather than one hidden mega-item: wire-visible attempt count, report
+  relay across two connections, and finite queue retirement. Every surface already built in
+  Rust is bound in `weida::blocking` and both `weida-py` halves.
 - **The requirement-driven backlog is closed.** All five requests of
   [requirements/zeughaus-video.md](requirements/zeughaus-video.md) are answered where they were
   filed: streaming fan-out **built** (B-064, `Publisher::open`), conflation **answered without a
@@ -396,18 +324,16 @@ for.
   replenish the backlog (B-191..B-200) and a review pass was logged at `db5c144`: 0 new
   findings, and the allocation sweep's best answer is that the pipe transport's chunk header
   declares a `u32` length and allocates **nothing** from it.
-- **What this session closed**: the acknowledgement model and the pattern family. **B-233**
-  (frame kind `6`, the cursor stream, with four golden vectors and a fuzz target), **B-239** and
-  **B-240** (the cursor API in `weida`, two report modes and a granularity that is the
-  reporter's own), the broker reporting `Accepted` as a cursor so a Push producer gets a
-  reliable verdict on one unidirectional stream (0024 §4.4a), **B-236**, **B-237** and **B-238**
-  (PAIR, SURVEY and BUS, which complete `ARCHITECTURE.md` §6b's table and the nanomsg set), and
-  **B-242** (the failure matrix `PATTERNS.md` §1.11 claimed and nothing tested). Four decision
-  notes were **corrected by building them**: 0024 §4.4 (the head frame names a `report_id`, not
-  QUIC's `StreamId`, which exists on one of four transports), 0024 §4.3 (two wire modes, not
-  three — a `{bytes, interval}` pair in a header *is* a negotiated granularity, which 0023 §4.5
-  forbids), B-236's own acceptance (PAIR is one-way transfers both ways) and B-239's
-  (`final-only` is not byte-for-byte the classic confirm and cannot be).
+- **What this session closed:** the acknowledgement model, the complete pattern family and the
+  first useful outcome half of the broker. B-233/B-239/B-240 built frame kind `6`, cursors,
+  report modes and reporter-owned granularity; B-236/B-237/B-238 built PAIR, SURVEY and BUS;
+  B-242 proved the failure matrix; B-243 and B-244 carried every new surface into blocking Rust
+  and Python. B-203 then made a delivery a retained responsibility rather than a deletion:
+  settle on `Processed`, requeue when the report disappears, and retain the byte charge while
+  unsettled. [0029](decisions/0029-a-report-is-relayed-a-certificate-is-not.md) records why a
+  report may travel where a certificate may not, and
+  [0030](decisions/0030-which-runtimes-and-in-which-order.md) records the runtime order instead
+  of leaving it as an assertion in the roadmap.
 - **A coherence sweep closed the session**, seven parallel read-only audits over code, docs,
   decision notes, bindings and the five foreign-protocol libraries. Fifteen incoherences, all
   of the same four kinds: counts that had become false, superseded claims (including
@@ -417,9 +343,8 @@ for.
   settled by a test rather than an argument: `tests/transports.rs` now runs **all six
   patterns** over every transport, and `pair_over_unix` is the first thing here that proves
   the reverse pool of 0012 §4.4 carries an ordinary send rather than a fan-out copy.
-- **What moves the roadmap next** is yours to choose: **Phase D**, the L2 broker, where B-203's
-  two parked design questions are now answered — consumer settlement is a cursor, so a delivery
-  stays one-way — **Phase C's Java row**, or the cluster and store slices that are the only
-  `ready` code items left (B-219, B-220, B-224, B-226, B-231). Both surfaces this session
-  deliberately did not reach are closed: **B-244** (PAIR, SURVEY and BUS) and **B-243** (the
-  cursor API), each on `weida::blocking` and both Python halves.
+- **What moves next is no longer a human choice:** B-267 is the first ready item. It puts
+  `delivery_attempt` on DATA key `12` without mixing that wire change into B-203's behavior
+  slice; B-268 and B-269 follow. The five ready cluster/store slices stay behind those three in
+  backlog order. Node is the next Phase C row by 0030, but no binding item has been filed or
+  started.
