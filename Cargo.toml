@@ -40,6 +40,10 @@ members = [
     # than written a second time beside them
     # ([decisions/0025](docs/decisions/0025-the-website.md)).
     "crates/site",
+    # The OpenBao client and the identity sources it drives, in its own
+    # crate because of the two dependencies below
+    # ([decisions/0032](docs/decisions/0032-identity-sources-and-the-handoff.md) §4.3).
+    "crates/openbao/weida-openbao",
 ]
 
 [workspace.package]
@@ -84,6 +88,19 @@ weida-amqp-py = { path = "crates/amqp/weida-amqp-py", version = "0.1.0" }
 weida-nats-codec = { path = "crates/nats/weida-nats-codec", version = "0.1.0" }
 weida-nats = { path = "crates/nats/weida-nats", version = "0.1.0" }
 weida-nats-py = { path = "crates/nats/weida-nats-py", version = "0.1.0" }
+weida-openbao = { path = "crates/openbao/weida-openbao", version = "0.1.0" }
+# The two dependencies `weida-openbao` alone carries, and the reason the
+# OpenBao client is its own crate ([decisions/0032](docs/decisions/0032-identity-sources-and-the-handoff.md)
+# §3): the OpenBao API is JSON over HTTPS, and nothing else in the workspace
+# speaks either. `reqwest` with rustls and no default features — the TLS
+# configuration is handed in, built on the same `ring` provider as weida's
+# own, so no process-wide provider is ever installed; `serde_json` for the
+# JSON, `Value` only, no derive.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-no-provider", "json", "charset"] }
+serde_json = "1"
+# Public roots for an OpenBao behind a public certificate, when no CA is
+# configured: the Mozilla set as rustls-pki-types, nothing platform-specific.
+webpki-roots = "1"
 
 quinn = "0.11"
 # The consensus engine of the L2 broker, and a dependency rather than a

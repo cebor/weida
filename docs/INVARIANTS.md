@@ -78,6 +78,19 @@ events per endpoint; a reader that falls behind is told `Missed(n)` and the even
 never queued. A slot's redial task holds the endpoint weakly and ends at the endpoint's
 drop, so an application that connects and forgets holds one task per address and no more.
 
+**An identity source of [0032](decisions/0032-identity-sources-and-the-handoff.md) holds one
+identity and a 64-event stream, and reads nothing on a timer.** A `files` source checks two
+modification times at most once per `FilesOptions::poll` (10 s), and only when the identity
+is used — no task, no reactor, no inotify; the parse of a changed file happens then, once,
+and a file that does not parse leaves the previous identity in service with `RenewalFailed`
+on the stream. A rustls resolver caches one certified key per source generation, so an
+unchanged source costs a handshake one atomic load. What `weida-openbao` adds runs as tasks
+that hold the source and the client and end with them: one renewal per `PkiSign`, one
+refresh per `PkiAnchor` and `Kv`, one token renewal per client; each sleeps between
+rounds and none queues. A response from OpenBao is bounded by `reqwest`'s body read into a
+`serde_json::Value`, which is the one place this crate trusts a server it authenticated to
+with a token — the same trust the `bao` CLI extends.
+
 **The cursor stream is inside this invariant, and the shape that keeps it there is worth
 naming.** A report is the first thing a peer sends that is *about* a transfer rather than part
 of one, so the tempting implementation is a table keyed by whatever the peer says. It is not

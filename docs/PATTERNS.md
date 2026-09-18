@@ -252,7 +252,29 @@ lives no longer than the connection it was given on, and a *subscription* cannot
 token at all, because SUBSCRIBE has no reply half ([PROTOCOL.md](PROTOCOL.md) §6.4) — the one
 cost that answer has, named here rather than discovered.
 
-*`crates/weida/tests/identity.rs`, all ten.*
+**Where the identity comes from is a source, not a value**
+([decisions/0032](decisions/0032-identity-sources-and-the-handoff.md)). `ServerTls` and
+`ClientTls` take an `IdentitySource` and a `TrustSource`; a plain `Identity` or `Trust`
+converts into the source that never changes. A binding serves whatever its source holds at
+each handshake, so a certificate renewed under it reaches the next peer with no re-bind, and
+a dialling endpoint presents the identity of the moment on each connection. Three sources
+ship in `weida`: `ephemeral` (generated per process, the default and what pinning by address
+needs), `files` (a directory bootstrapped owner-only on first use and reloaded when an agent
+rewrites it — Vault Agent, cert-manager, certbot, SPIRE all end here), and a static value.
+`weida-openbao` adds a certificate signed by a PKI role over the local key (`PkiSign`), trust
+anchored on the mount's CA (`PkiAnchor`), material read from KV (`Kv`), and the three ways to
+authenticate to the store, the wrapped hand-off among them. **What rotation does to the
+fingerprint is the one thing to know:** the fingerprint is the key's, so a certificate renewed
+under the same key is invisible to every pinning peer and to the redial of §1.8, while a new
+key is a new peer — `IdentityEvent::Renewed` against `KeyChanged` on the source's event stream,
+and `PeerEvent::GaveUp { PeerChanged }` on the peers that pinned the old one. Revocation is
+not checked, on any path; a short TTL under a renewing source is the answer weida has.
+
+*`crates/weida/tests/identity.rs`, all ten; `crates/weida/tests/identity_source.rs`: a
+certificate replaced under a live binding is served to the next handshake, a replaced key is
+`KeyChanged` and `PeerChanged`, a bootstrapped directory is owner-only and yields the same key
+twice; `crates/openbao/weida-openbao/tests/scripted.rs`, and `tests/bao_dev.rs` against the
+real server.*
 
 ### 1.10 What a local transport changes
 

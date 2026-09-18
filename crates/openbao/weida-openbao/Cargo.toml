@@ -1,0 +1,40 @@
+[package]
+name = "weida-openbao"
+description = "OpenBao/Vault for weida: token, AppRole and wrapped hand-off authentication, and identity sources signed by a PKI mount, anchored on its CA, or read from KV"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# The sources this crate drives: `IdentitySource::external`,
+# `TrustSource::external`, and the `Identity`/`Trust` values it feeds them
+# ([decisions/0032](../../../docs/decisions/0032-identity-sources-and-the-handoff.md)
+# §4.3).
+weida.workspace = true
+weida-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# The two dependencies that make this its own crate: the OpenBao API is JSON
+# over HTTPS, and nothing else in the workspace speaks either. The TLS
+# configuration is built here on the same `ring` provider weida uses and
+# handed to `reqwest`, so no process-wide provider is installed.
+reqwest.workspace = true
+serde_json.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+# The CSR a `PkiSign` source sends: built over the key it already holds, so
+# the fingerprint survives every renewal.
+rcgen.workspace = true
+
+[dev-dependencies]
+# The scripted HTTP server the tests answer from.
+tokio = { workspace = true, features = ["io-util", "net"] }
+
+[lints.rust]
+unsafe_code = "forbid"
