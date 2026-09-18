@@ -1156,12 +1156,17 @@ async fn a_local_address_is_checked_before_it_is_dialled() {
 /// links it registered, and the dialling side sees the same
 /// `ConnectionLost` a QUIC peer's close produces
 /// ([decisions/0010](../../docs/decisions/0010-local-transport.md) §4.2,
-/// B-028's `LossCause`).
+/// B-028's `LossCause`). Under `ReconnectPolicy::never()`, so that the loss
+/// reaches the caller; with the default policy the runtime would wait for
+/// the bus to be bound again instead (`tests/reconnect.rs`).
 #[tokio::test]
 async fn a_local_peer_that_goes_away_is_reported_as_connection_loss() {
     let h = Harness::start(Transport::Inproc).await;
     let _puller = h.listener.puller("/jobs").expect("puller");
-    let client = h.client();
+    let client = h.client_with(RuntimeConfig {
+        reconnect: weida::ReconnectPolicy::never(),
+        ..RuntimeConfig::default()
+    });
     let pusher = client.pusher(h.trust());
     within(pusher.connect(&h.url("/jobs")))
         .await

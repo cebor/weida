@@ -238,9 +238,9 @@ with the connection's close reason instead of waiting out the 10 s HELLO deadlin
 whose identity a binding refuses learns it at once rather than hanging for `hello_timeout_ms`.
 `conn_error` maps `TimedOut` (idle timeout) and `Reset` (stateless reset) to
 `Error::ConnectionLost` — definite, where it used to be `Error::Transport("timed out")` — and
-a peer close carrying a TLS alert code to `Error::Tls`. `PeerSet::add` reaps entries whose
-connection has closed, so a process that reconnects after every loss no longer accumulates
-dead peers for the life of the process.
+a peer close carrying a TLS alert code to `Error::Tls`. Dead peers used to be reaped by
+`PeerSet::add` on the next `connect`; since 0031 a dead peer is a slot the runtime redials,
+and nothing accumulates either way.
 
 The increment is pinned by 10 tests in `crates/weida/tests/identity.rs` (an address pin under
 an empty trust; a wrong pin refused with `Untrusted(what answered)` and no peer added; an
@@ -1017,8 +1017,8 @@ is noted where the two differ.
 | The connection window is the shared resource | `a_stalled_stream_does_not_block_its_siblings` | 32 KiB payloads, 64 KiB stream window, 256 KiB connection window: siblings of an unread stream arrive and read back correctly, and the stall lands at **7 unread streams = 229376 of 262144 bytes**; reading one stream's 32 KiB releases the stalled writer. The test asserts the bound `1 + blocked_at <= connection_window / payload` and the unblocking, not the index |
 | The stream budget is backpressure, and `open` is where it lands | `the_stream_budget_is_backpressure_not_an_error`, `a_deeper_endpoint_queue_does_not_raise_the_stream_budget` | with `max_concurrent_uni_streams = 2` the third transfer blocks in `Pusher::open` — not in `write_all`, not in the receipt — and never errors; reading one transfer to EOF releases it. `endpoint_queue = 8` changes nothing, because a transfer parked in the queue still owns its stream |
 | Cancellation | `cancel_discards_unread_bytes_and_keeps_read_ones` | the 4 KiB already read still compares equal; after `cancel()` the reader is served the whole 4 KiB buffered remainder and only then fails, as `io::ErrorKind::ConnectionReset` on the `AsyncRead` and as `Error::Canceled` through `read_capped` — never EOF |
-| Idle timeout is connection loss | `idle_timeout_reports_loss_within_the_window` | a 500 ms server idle timeout against the client's default 10 s keep-alive (asserted to be the longer of the two): after 1.5 s of silence the next request fails with `Error::ConnectionLost(LossCause::IdleTimeout)` — the cause, not only the outcome, since B-028 |
-| No automatic reconnect | `after_the_server_restarts_the_pusher_must_reconnect` | the **first** send after the server closed fails with `ConnectionLost` and `peer_count()` drops to 0; nothing reconnects, and after `connect` to a replacement server carrying the same identity a send succeeds and `peer_count()` is 1 — the dead entry was reaped |
+| Idle timeout is connection loss | `idle_timeout_reports_loss_within_the_window` | a 500 ms server idle timeout against the client's default 10 s keep-alive (asserted to be the longer of the two): after 1.5 s of silence the endpoint reports `PeerEvent::Lost { cause: IdleTimeout }` — the cause, not only the outcome, since B-028 — and, since 0031, the next request rides the redialled connection |
+| A lost peer is reported, and the redial is the runtime's | `a_server_that_goes_away_is_reported_as_connection_lost`; `crates/weida/tests/reconnect.rs` | under `ReconnectPolicy::never()` the **first** send after the server closed fails with `ConnectionLost(PeerClosed)` and `peer_count()` drops to 0. Under the default policy (B-270 to B-273): a server restarted on the same address is redialled with `Lost`, `Retrying`, `Connected` on the event stream, over QUIC, `AF_UNIX` and inproc alike; a body sent during the outage arrives after it, 100 of them in order; `open` waits through the outage and `send_timeout` bounds the wait with the loss cause; a subscriber's filters — including one added during the outage — are on the new connection; a replacement server with a new key is refused as `GaveUp { PeerChanged }`; the outbox bound blocks or drops as `outbox_full` says and a body over `outbox_bytes` is `LimitExceeded` |
 | Hot paths unchanged | `cargo bench -p weida` (3 s measurement, both trees on the same idle machine) | `echo_1kib_rtt` 63.5-67.3 µs over four runs of this tree against 62.9 µs for the tree before it; `push_1kib_best_effort` 7.9 µs against 7.9; `pub_1kib_8_subscribers` 71.7 µs against 70.3. All within the run-to-run spread of this machine: the verifier runs once per handshake and the per-stream path gained one `Option<[u8; 32]>` copy |
 
 The two probes that resisted determinism are recorded as observations only: the buffered tail
@@ -1742,9 +1742,10 @@ Recorded deliberately, not discovered later.
   would be worse.
 - **Publisher direction is fixed.** Pub and Pull bind; Sub and Push connect. The reverse
   directions wait for a use case that demands them.
-- **No automatic reconnect.** A dead peer is never redialled by the library; the application
-  calls `connect` again, and dead entries are reaped at that moment (`PeerSet::add`), not
-  before.
+- **A redial restores a transport, not a registration.** Since 0031 a lost address is
+  redialled by the runtime and a subscriber's own filters are re-sent; nothing server-side
+  survives the connection, and a stream that was in flight is the application's to reopen
+  (`docs/PATTERNS.md` §1.8, §1.11).
 - **Authorization hooks are not implemented.** Master doc §46's authorization surface does not
   exist. What ships is authentication plus the identity: applications decide on
   `IncomingMeta::peer`, and the only built-in allow list is a `Trust` pin list on a binding,

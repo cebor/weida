@@ -1091,10 +1091,10 @@ each is a choice rather than an omission.
    silently; a weida endpoint that was never given an address returns `Error::NotConnected`,
    because a program that never connected should be told so, not hang. An endpoint that *was*
    connected and has lost every peer behaves as ZeroMQ's does: the address is redialled by the
-   runtime, `open` waits for the next live connection and `send` is held in a bounded outbox
-   ([decisions/0031](decisions/0031-transparent-redial-and-the-sender-outbox.md)). The
-   awaitable peer-list change that this paragraph once deferred is B-271; until B-270 to
-   B-273 land, every case still returns `NotConnected` or the `LossCause`.
+   runtime, `open` waits for the next live connection — bounded by
+   `RuntimeConfig::send_timeout` — and `send` is held in a bounded outbox
+   ([decisions/0031](decisions/0031-transparent-redial-and-the-sender-outbox.md)). Where
+   ZeroMQ's socket is silent about all of it, the endpoint's `PeerEvent` stream is not.
 2. **Publisher-side filtering.** Subscriptions travel to the publisher and matching happens
    there, so a payload nobody subscribed to never crosses the network. ZeroMQ made the same
    move in 3.x; the deviation is only from the 2.x behaviour some people still expect.

@@ -89,16 +89,20 @@ down with the `LossCause`, the attempt count and the next redial instant. The sl
 the endpoint is dropped or `disconnect(url)` is called. A background task per slot redials with
 the policy of §4.5. `peer_count` counts live slots, as it counts live connections today.
 
-**4.2 `send` is a message, and the runtime owns it from the call.** For `Pusher`, `Pair` and
-`Requester::request`, `send(body)` returns once the body is either written to a live connection
+**4.2 `send` is a message, and the runtime owns it from the call.** For `Pusher` and a
+dialling `Pair`, `send(body)` returns once the body is either written to a live connection
 (the fast path, no copy, exactly today's code) or copied into the endpoint's **outbox** because
 no connection is live or the outbox is not yet empty (order is preserved). The outbox is drained
 in order onto the next live connection. It is bounded in messages and in bytes
-(`Limits::outbox_messages`, `Limits::outbox_bytes`; provisional defaults 1000, ZeroMQ's HWM, and
-8 MiB), and a full outbox applies the endpoint's backpressure behaviour of [GUARANTEES §3]:
-`Block` by default, a counted drop where `Drop` is configured. A body larger than
-`outbox_bytes` on its own is refused at the call, by name, rather than silently blocking
-forever.
+(`RuntimeConfig::outbox_messages`, `RuntimeConfig::outbox_bytes`; defaults 1000, ZeroMQ's HWM,
+and 8 MiB — on `RuntimeConfig` rather than `Limits`, because `Limits` is a per-connection
+profile and an outbox is per endpoint), and a full outbox does what
+`RuntimeConfig::outbox_full` says in the vocabulary of [GUARANTEES §3]: `Block` by default,
+`Drop` as a counted discard, `Reject` as `LimitExceeded`. It is a **local** setting rather than
+the negotiated backpressure dimension, because a puller has no say in how its pusher waits. A
+body larger than `outbox_bytes` on its own is refused at the call, by name, rather than
+silently blocking forever. `Requester::request` needs no outbox: its caller awaits the reply
+anyway, so waiting for a peer in `open` (§4.4) is the same wait with nothing to copy.
 
 **4.3 The runtime's responsibility for a message ends when it is written.** A body handed to a
 connection that then dies before the peer's transport received it is gone, and nothing resends
@@ -139,12 +143,15 @@ on the new connection: register the route, refill the reverse pool, re-send the 
 `SubState.filters`. A subscriber therefore sees a gap, not a resumption, and B-259's sentence "a
 re-sent subscription is a new subscription" stays the rule.
 
-**4.7 A redial that reaches a different peer is not a reconnect.** The pool's fingerprint check
-applies: a slot whose redial answers with a key other than the one first proved does not go
-live; it reports `PeerChanged` through §4.8 and keeps redialling only if the policy says so. A
-server whose identity is generated afresh per process therefore cannot be transparently
-reconnected across a restart — by construction, and the event says so rather than the outbox
-silently draining into a stranger.
+**4.7 A redial that reaches a different peer is not a reconnect.** The pool compares a new
+connection against a peer's *live* ones only, so after a total loss it would accept a
+replacement server with a new key as a new peer. The slot therefore pins the key its first
+connection proved into the redialled address, and the TLS verifier refuses a different one in
+the handshake — before any connection exists for anyone to use. The slot reports
+`PeerChanged` through §4.8 and stops. A server whose identity is generated afresh per process
+therefore cannot be transparently reconnected across a restart — by construction, and the
+event says so rather than the outbox silently draining into a stranger. A local peer proves a
+principal or nothing, and neither is pinned (§5).
 
 **4.8 Every transition is observable.** The ZeroMQ complaint this note is not allowed to inherit
 is that a socket reconnects and the application cannot react. Each dialling endpoint exposes a
@@ -233,7 +240,7 @@ acceptance: §4.6: the redial task performs the route registration, reverse-pool
 
 ### B-273 — The outbox: `send` returns when the runtime owns the body
 kind: code | size: 60 | status: ready | needs: [B-270, B-271]
-acceptance: §4.2 and §4.3 for `Pusher`, `Pair` and `Requester::request`: the fast path is byte-identical to today's `open` + `write_all` + `finish`; with no live peer the body is copied into a per-endpoint outbox bounded by `Limits::outbox_messages` and `Limits::outbox_bytes`, drained in order after the redial, with `Block` at the bound by default and a counted drop under `Drop`; a body over `outbox_bytes` is refused at the call. Tests: 100 sends during an outage arrive in order after it; the 1001st send blocks until the drain begins; a `Drop` endpoint counts what it discarded; a body written to a connection that dies before receipt is not resent (asserted by count at the puller after the redial).
+acceptance: §4.2 and §4.3 for `Pusher` and a dialling `Pair`: the fast path is byte-identical to today's `open` + `write_all` + `finish`; with no live peer the body is copied into a per-endpoint outbox bounded by `RuntimeConfig::outbox_messages` and `RuntimeConfig::outbox_bytes`, drained in order after the redial, with `Block` at the bound by default and a counted drop under `OutboxFull::Drop`; a body over `outbox_bytes` is refused at the call. Tests: 100 sends during an outage arrive in order after it; the fourth send at a bound of three blocks until the drain begins; a `Drop` endpoint counts what it discarded; a body written before the restart is delivered once (asserted by the puller's sequence after the redial).
 
 ## 7. Sources
 

@@ -512,7 +512,11 @@ impl Pusher {
     /// Waiting is the honest synchronous shape: a caller that returns before
     /// the receipt has nothing to check and nothing to retry on. It is the
     /// transport's acknowledgement and **not** an application one
-    /// ([GUARANTEES.md](../../../docs/GUARANTEES.md) §1).
+    /// ([GUARANTEES.md](../../../docs/GUARANTEES.md) §1). Because it waits
+    /// for the receipt it is a stream in the terms of
+    /// [0031](../../../docs/decisions/0031-transparent-redial-and-the-sender-outbox.md):
+    /// with every peer down it waits for the runtime's redial, bounded by
+    /// `RuntimeConfig::send_timeout`, and is never held in the outbox.
     ///
     /// # Errors
     ///

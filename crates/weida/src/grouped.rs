@@ -608,7 +608,20 @@ impl<S: Stream> Grouped<S> {
             Side::Accept { .. } => return Err(Error::Unsupported),
         };
         let slot = self.slot().await?;
-        let mut stream = S::connect(endpoint).await?;
+        let mut stream = match S::connect(endpoint).await {
+            Ok(stream) => stream,
+            // Nobody answers on the address any more: the peer is gone, and
+            // the group with it. Learned here, at the next open, because a
+            // local transport has no idle timeout and carries nothing on the
+            // control connection after the HELLOs to learn it from earlier
+            // (`docs/PATTERNS.md` §1.10). Marking the link closed is what
+            // lets a redial start [0031 §4.10].
+            Err(e @ Error::ConnectionLost(_)) => {
+                self.close(codes::SHUTDOWN, "nobody answers on the address");
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         let mut preamble = [0u8; 1 + TOKEN_LEN];
         preamble[0] = KIND_TRANSFER;
         preamble[1..].copy_from_slice(token);

@@ -13,6 +13,7 @@
 //! yet (`docs/GUARANTEES.md`).
 
 use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,8 +26,9 @@ use crate::config::ClientTls;
 use crate::conn::{ConnHandle, Ctl, write_control};
 use crate::listener::{PairOwner, Route};
 use crate::pubsub::{FanOut, SubRegistry};
+use crate::reconnect::PeerEvents;
 use crate::runtime::RuntimeInner;
-use crate::stream::Peer;
+use crate::stream::{Attach, Peer};
 use crate::transfer::{
     IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream, TransferMeta,
 };
@@ -159,13 +161,27 @@ impl ReqState {
 
 impl Requester {
     /// Connects to `weida://host:port/path`.
+    ///
+    /// The address is kept: a lost connection is redialled by the runtime
+    /// under [`crate::RuntimeConfig::reconnect`], and [`Requester::events`]
+    /// reports it.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
         self.state.peer.connect(url).await
+    }
+
+    /// Forgets a dialled address; see [`Peer::disconnect`].
+    pub fn disconnect(&self, url: &str) -> bool {
+        self.state.peer.disconnect(url)
     }
 
     /// Number of connected peers.
     pub fn peer_count(&self) -> usize {
         self.state.peer.peer_count()
+    }
+
+    /// The event stream of this requester's addresses; see [`Peer::events`].
+    pub fn events(&self) -> PeerEvents {
+        self.state.peer.events()
     }
 
     /// Opens one exchange: a request stream and its reply half.
@@ -251,10 +267,16 @@ impl PushState {
 impl Pusher {
     /// Connects to `weida://host:port/path`.
     ///
-    /// Like a requester, a pusher accumulates peers and pools connections per
-    /// `host:port`.
+    /// The address is kept: a lost connection is redialled by the runtime
+    /// under [`crate::RuntimeConfig::reconnect`], and [`Pusher::events`]
+    /// reports it.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
         self.state.peer.connect(url).await
+    }
+
+    /// Forgets a dialled address; see [`Peer::disconnect`].
+    pub fn disconnect(&self, url: &str) -> bool {
+        self.state.peer.disconnect(url)
     }
 
     /// Number of connected peers.
@@ -262,21 +284,36 @@ impl Pusher {
         self.state.peer.peer_count()
     }
 
+    /// The event stream of this pusher's addresses; see [`Peer::events`].
+    pub fn events(&self) -> PeerEvents {
+        self.state.peer.events()
+    }
+
+    /// Bodies the outbox discarded; see [`Peer::dropped`].
+    pub fn dropped(&self) -> u64 {
+        self.state.peer.dropped()
+    }
+
     /// Opens a one-way transfer to the next peer, round-robin.
     ///
     /// Use this rather than [`Pusher::send`] when the transport receipt
     /// matters: [`OutgoingTransfer::finish`] hands back a
     /// [`crate::Delivery`] that resolves once the peer's transport holds every
-    /// byte.
+    /// byte. The stream is the application's: with every peer down this
+    /// waits for the redial, and a stream on a connection that dies fails
+    /// with `ConnectionLost` and is not reopened by anyone but the caller.
     pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
         self.state.peer.open(meta).await
     }
 
-    /// Sends `body` as one transfer and returns once the FIN is queued.
+    /// Sends `body` as one message: the runtime owns it from this call.
     ///
     /// Pipeline semantics: the delivery receipt is discarded, so a push costs
     /// no round trip and reports only failures the local side already knows
-    /// about. Callers who want the receipt use [`Pusher::open`] and await
+    /// about. With a live peer the body is written at once; with none it is
+    /// held in the outbox and written once a peer is back, in order, and a
+    /// full outbox applies the configured backpressure ([`Peer::send`]).
+    /// Callers who want the receipt use [`Pusher::open`] and await
     /// [`crate::Delivery::delivered`] themselves.
     pub async fn send(&self, body: &[u8]) -> Result<(), Error> {
         self.send_with(TransferMeta::default(), body).await
@@ -284,10 +321,7 @@ impl Pusher {
 
     /// Like [`Pusher::send`], with explicit metadata.
     pub async fn send_with(&self, meta: TransferMeta, body: &[u8]) -> Result<(), Error> {
-        let mut transfer = self.open(meta).await?;
-        transfer.write_all(body).await?;
-        transfer.finish()?;
-        Ok(())
+        self.state.peer.send(meta, body).await
     }
 }
 
@@ -461,23 +495,69 @@ impl Publisher {
     }
 }
 
+/// What a subscriber does on every connection it gets, first dial and
+/// redial alike: claim the path as its route, fill the reverse pool where
+/// the transport needs one, and send the filters it holds
+/// ([0031](../../../docs/decisions/0031-transparent-redial-and-the-sender-outbox.md)
+/// §4.6). The publisher kept nothing, so nothing else is restored.
+struct SubAttach {
+    filters: Arc<std::sync::Mutex<HashSet<String>>>,
+    queue_tx: mpsc::Sender<IncomingTransfer>,
+}
+
+impl Attach for SubAttach {
+    fn attach<'a>(
+        &'a self,
+        conn: &'a ConnHandle,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async move {
+            if conn.conn.needs_reverse_pool() && conn.conn.park_reverse().await? == 0 {
+                return Err(Error::Unsupported);
+            }
+            conn.namespace
+                .register(path, Route::Transfer(self.queue_tx.clone()))?;
+            if conn.conn.needs_reverse_pool() {
+                let maintaining = Arc::clone(conn);
+                conn.exec
+                    .spawn(async move { maintaining.conn.maintain_reverse().await });
+            }
+            let filters: Vec<String> = self
+                .filters
+                .lock()
+                .expect("filter set poisoned")
+                .iter()
+                .cloned()
+                .collect();
+            for filter in filters {
+                send_subscription(conn, FrameKind::Subscribe, path, &filter).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
 /// State of a subscriber.
 pub struct SubState {
     peer: Peer,
-    /// Filters this subscriber wants, remembered so a peer connected later
-    /// receives the same subscriptions.
-    filters: std::sync::Mutex<HashSet<String>>,
-    queue_tx: mpsc::Sender<IncomingTransfer>,
+    /// Filters this subscriber wants, remembered so a peer connected — or
+    /// redialled — later receives the same subscriptions. Shared with the
+    /// attachment the peer runs on every connection.
+    filters: Arc<std::sync::Mutex<HashSet<String>>>,
     queue: Mutex<mpsc::Receiver<IncomingTransfer>>,
 }
 
 impl SubState {
     pub(crate) fn new(runtime: Arc<RuntimeInner>, tls: Arc<ClientTls>, depth: usize) -> SubState {
         let (queue_tx, queue) = mpsc::channel(depth);
-        SubState {
-            peer: Peer::new(runtime, tls),
-            filters: std::sync::Mutex::new(HashSet::new()),
+        let filters = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let attach = SubAttach {
+            filters: Arc::clone(&filters),
             queue_tx,
+        };
+        SubState {
+            peer: Peer::with_attach(runtime, tls, Some(Arc::new(attach))),
+            filters,
             queue: Mutex::new(queue),
         }
     }
@@ -502,36 +582,29 @@ impl Subscriber {
     /// §4.4). A subscriber that parks nothing - because the limit is zero,
     /// or because the peer refused every attempt - cannot receive fan-out at
     /// all, and learns that here rather than by waiting forever.
+    ///
+    /// The address is kept: when the connection is lost the runtime redials
+    /// it and does all of the above again on the new connection, filters
+    /// included. What was published in between is gone — the publisher
+    /// keeps no subscription across connections — and
+    /// [`Subscriber::events`] says when the gap began and ended.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
-        let (conn, path) = self.state.peer.dial(url).await?;
-        if conn.conn.needs_reverse_pool() && conn.conn.park_reverse().await? == 0 {
-            return Err(Error::Unsupported);
-        }
-        conn.namespace
-            .register(&path, Route::Transfer(self.state.queue_tx.clone()))?;
-        if conn.conn.needs_reverse_pool() {
-            let maintaining = Arc::clone(&conn);
-            conn.exec
-                .spawn(async move { maintaining.conn.maintain_reverse().await });
-        }
+        self.state.peer.connect(url).await
+    }
 
-        let filters: Vec<String> = self
-            .state
-            .filters
-            .lock()
-            .expect("filter set poisoned")
-            .iter()
-            .cloned()
-            .collect();
-        for filter in filters {
-            send_subscription(&conn, FrameKind::Subscribe, &path, &filter).await?;
-        }
-        Ok(())
+    /// Forgets a dialled address; see [`Peer::disconnect`].
+    pub fn disconnect(&self, url: &str) -> bool {
+        self.state.peer.disconnect(url)
     }
 
     /// Number of connected peers.
     pub fn peer_count(&self) -> usize {
         self.state.peer.peer_count()
+    }
+
+    /// The event stream of this subscriber's addresses; see [`Peer::events`].
+    pub fn events(&self) -> PeerEvents {
+        self.state.peer.events()
     }
 
     /// Registers interest in every topic `filter` matches.
@@ -707,11 +780,41 @@ pub struct PairState {
     /// The bound path; empty on a dialling pair, whose path is the one it
     /// dialled and is already recorded in its [`Peer`].
     path: Arc<str>,
-    /// Where inbound transfers are delivered. The dialling side registers
-    /// this in the connection's namespace; the bound side's copy lives in the
-    /// listener's route instead, so it is `None` there.
-    queue_tx: Option<mpsc::Sender<IncomingTransfer>>,
     queue: Mutex<mpsc::Receiver<IncomingTransfer>>,
+}
+
+/// What a dialling pair does on every connection it gets: claim the path as
+/// its route and fill the reverse pool where the transport needs one — on
+/// the redialled connection as on the first (0031 §4.6).
+struct PairAttach {
+    queue_tx: mpsc::Sender<IncomingTransfer>,
+}
+
+impl Attach for PairAttach {
+    fn attach<'a>(
+        &'a self,
+        conn: &'a ConnHandle,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async move {
+            if conn.conn.needs_reverse_pool() && conn.conn.park_reverse().await? == 0 {
+                return Err(Error::Unsupported);
+            }
+            conn.namespace.register(
+                path,
+                Route::Pair {
+                    queue: self.queue_tx.clone(),
+                    owner: Arc::new(PairOwner::new()),
+                },
+            )?;
+            if conn.conn.needs_reverse_pool() {
+                let maintaining = ConnHandle::clone(conn);
+                conn.exec
+                    .spawn(async move { maintaining.conn.maintain_reverse().await });
+            }
+            Ok(())
+        })
+    }
 }
 
 impl PairState {
@@ -724,7 +827,6 @@ impl PairState {
             peer: None,
             owner: Some(owner),
             path: Arc::from(path),
-            queue_tx: None,
             queue: Mutex::new(queue),
         }
     }
@@ -735,11 +837,11 @@ impl PairState {
         depth: usize,
     ) -> PairState {
         let (queue_tx, queue) = mpsc::channel(depth);
+        let attach = PairAttach { queue_tx };
         PairState {
-            peer: Some(Peer::new(runtime, tls)),
+            peer: Some(Peer::with_attach(runtime, tls, Some(Arc::new(attach)))),
             owner: None,
             path: Arc::from(""),
-            queue_tx: Some(queue_tx),
             queue: Mutex::new(queue),
         }
     }
@@ -771,36 +873,28 @@ impl Paired {
         let Some(peer) = self.state.peer.as_ref() else {
             return Err(Error::Unsupported);
         };
-        if peer.peer_count() > 0 {
+        // One address, live or being redialled: a second one would be a
+        // second peer.
+        if peer.slot_count() > 0 {
             return Err(Error::LimitExceeded);
         }
-        let (conn, path) = peer.dial(url).await?;
-        if conn.conn.needs_reverse_pool() && conn.conn.park_reverse().await? == 0 {
-            return Err(Error::Unsupported);
-        }
-        let queue = self
-            .state
-            .queue_tx
-            .clone()
-            .expect("a dialling pair has a queue");
-        conn.namespace.register(
-            &path,
-            Route::Pair {
-                queue,
-                owner: Arc::new(PairOwner::new()),
-            },
-        )?;
-        if conn.conn.needs_reverse_pool() {
-            let maintaining = ConnHandle::clone(&conn);
-            conn.exec
-                .spawn(async move { maintaining.conn.maintain_reverse().await });
-        }
-        Ok(())
+        peer.connect(url).await
     }
 
     /// Number of connected peers: `0` or `1`.
     pub fn peer_count(&self) -> usize {
         self.state.peer.as_ref().map_or(0, Peer::peer_count)
+    }
+
+    /// The event stream of a dialling pair's address; see [`Peer::events`].
+    /// A bound pair dials nothing and reports nothing: `None`.
+    pub fn events(&self) -> Option<PeerEvents> {
+        self.state.peer.as_ref().map(Peer::events)
+    }
+
+    /// Bodies a dialling pair's outbox discarded; see [`Peer::dropped`].
+    pub fn dropped(&self) -> u64 {
+        self.state.peer.as_ref().map_or(0, Peer::dropped)
     }
 
     /// Opens one outgoing transfer to the peer.
@@ -825,13 +919,21 @@ impl Paired {
         crate::stream::open_transfer_on(&conn, &self.state.path, &meta).await
     }
 
-    /// Sends `body` as one transfer and returns once the FIN is queued.
+    /// Sends `body` as one message.
+    ///
+    /// On a dialling pair the runtime owns the body from this call: written
+    /// at once while the peer is live, held in the outbox and written after
+    /// the redial otherwise ([`Peer::send`]). On a bound pair it is written
+    /// once the peer has appeared, as [`Paired::open`] describes.
     pub async fn send(&self, body: &[u8]) -> Result<(), Error> {
         self.send_with(TransferMeta::default(), body).await
     }
 
     /// Like [`Paired::send`], with explicit metadata.
     pub async fn send_with(&self, meta: TransferMeta, body: &[u8]) -> Result<(), Error> {
+        if let Some(peer) = self.state.peer.as_ref() {
+            return peer.send(meta, body).await;
+        }
         let mut transfer = self.open(meta).await?;
         transfer.write_all(body).await?;
         transfer.finish()?;

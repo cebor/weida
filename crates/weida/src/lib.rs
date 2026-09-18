@@ -66,6 +66,7 @@ mod ordering;
 mod pipe;
 mod pool;
 mod pubsub;
+mod reconnect;
 mod runtime;
 mod stream;
 mod tls;
@@ -101,6 +102,7 @@ pub use pubsub::{FanOut, TopicDrops};
 // `Delivery` keeps its transfer-receipt meaning at this level, so the
 // dimension of the same name is re-exported under the name the guarantee
 // documents use for it.
+pub use reconnect::{GiveUp, OutboxFull, PeerEvent, PeerEvents, ReconnectPolicy};
 pub use runtime::Runtime;
 pub use stream::{Acceptor, Consumer, ConsumerId, CreditGrant, Incoming, Peer};
 pub use transfer::{

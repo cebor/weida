@@ -217,9 +217,12 @@ is why it is negotiated rather than default ([GUARANTEES.md](GUARANTEES.md) §3)
   never told an address still fails at once with `Error::NotConnected`.
 
 *`idle_timeout_reports_loss_within_the_window` (server idle timeout 500 ms, client
-keep-alive 10 s, `ConnectionLost(IdleTimeout)` after 1.5 s of silence). The redial itself is
-B-270 to B-272; until they land, "nothing reconnects" is still what the code does and
-`after_the_server_restarts_the_pusher_must_reconnect` still asserts it.*
+keep-alive 10 s, `PeerEvent::Lost { cause: IdleTimeout }` after 1.5 s of silence, and the
+next request on the redialled connection); `crates/weida/tests/reconnect.rs`, all ten:
+restart on the same address over QUIC, `AF_UNIX` and inproc with the same `Lost`, `Retrying`,
+`Connected` order, `never()`, a replacement server with a new key refused as `PeerChanged`,
+`open` waiting through the outage, `send_timeout`, re-subscription, and the outbox of
+§1.11.*
 
 ### 1.9 Identity: who is on the other side
 
@@ -277,11 +280,18 @@ one channel pair (inproc) or one OS connection (`AF_UNIX`, a named pipe).
   which locally means when both ends are done with it — so a consumer that stops reading
   slows its producer down instead of failing it. What `LimitExceeded` still means locally is
   a refusal somebody decided on, the reverse pool of §4 below, and never a busy transport.
-- **§1.8's liveness is the kernel's.** There is no idle timeout and no keep-alive locally: a
-  peer that goes away closes its socket or drops its channel, which arrives as
-  `ConnectionLost(PeerClosed)` on the next operation. That is a *better* signal than a timer,
-  and it is why the two timers are not simulated — an invented local heartbeat would only be
-  able to say what the kernel already said.
+- **§1.8's liveness is the kernel's, and the loss is learned at the next open.** There is no
+  idle timeout and no keep-alive locally: a peer that goes away closes its socket or drops its
+  channel. In process both ends share one closed-state cell, so the dialling side learns it
+  at once. On a socket transport nothing travels on the control connection after the HELLOs,
+  so the first `open` that finds nobody answering on the address is what reports
+  `ConnectionLost(PeerClosed)` and marks the peer gone — and it is also what starts the
+  redial of §1.8; a body handed to `send` at that moment is held in the outbox like any
+  other. That is a *better* signal than a timer, and it is why the two timers are not
+  simulated — an invented local heartbeat would only be able to say what the kernel already
+  said. The redial itself waits on the clock for a socket and on the name registry for a
+  bus, which is back exactly when its name is bound again
+  ([decisions/0031](decisions/0031-transparent-redial-and-the-sender-outbox.md) §4.10).
 - **§4's fan-out needs a parked connection.** A publisher on a socket transport writes each
   copy on a reverse connection the subscriber parked in advance
   ([0012](decisions/0012-local-connection-grouping.md) §4.4), bounded by

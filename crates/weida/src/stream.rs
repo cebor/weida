@@ -15,218 +15,275 @@
 //! broker semantics (queues, publisher confirms, consumer acks) belong to a
 //! layer that does not exist yet.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
-use tokio::sync::{Mutex, mpsc};
-use weida_core::{Address, Error, LossCause};
+use bytes::Bytes;
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
+use weida_core::{Address, Error, LossCause, PeerIdentity};
 
 use crate::config::ClientTls;
 use crate::conn::ConnHandle;
+use crate::reconnect::{EVENT_QUEUE, GiveUp, OutboxFull, PeerEvent, PeerEvents, ReconnectPolicy};
 use crate::runtime::RuntimeInner;
 use crate::transfer::{
     IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream, TransferMeta,
     outgoing_header, write_data_preamble,
 };
 
-/// One connected peer: the connection and the path that was dialled on it.
-struct PeerEntry {
-    conn: ConnHandle,
+/// What a pattern does on every connection its peer establishes, first dial
+/// and redial alike.
+///
+/// A subscriber registers its route and re-sends its filters; a dialling
+/// pair registers its route. Both used to do it inline in `connect`, which
+/// left a redialled connection with no route and no filters. One
+/// implementation, called from one place
+/// ([0031](../../../docs/decisions/0031-transparent-redial-and-the-sender-outbox.md)
+/// §4.6).
+pub(crate) trait Attach: Send + Sync {
+    fn attach<'a>(
+        &'a self,
+        conn: &'a ConnHandle,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+}
+
+/// Where one dialled address currently stands.
+enum SlotState {
+    Live(ConnHandle),
+    /// Lost, and the redial task is working on it.
+    Down(LossCause),
+    /// Lost, and nothing will redial it: the policy ran out, the peer
+    /// changed, or this side closed it.
+    Gone(LossCause),
+}
+
+/// One dialled address: the slot that outlives its connection (0031 §4.1).
+struct Slot {
+    id: u64,
+    url: Arc<str>,
     path: Arc<str>,
+    state: SlotState,
+    /// Ends the slot's redial task when the slot is disconnected.
+    stop: Arc<Notify>,
 }
 
-/// A dialling endpoint's peers plus its selection policy (primitive P3).
+/// One `send` body the runtime owns until it is written (0031 §4.2).
+struct Queued {
+    meta: TransferMeta,
+    body: Bytes,
+}
+
+/// The sender outbox: bounded in messages and bytes by `RuntimeConfig`.
+struct Outbox {
+    queue: std::sync::Mutex<VecDeque<Queued>>,
+    bytes: AtomicUsize,
+    /// Woken when the queue shrinks, for a sender blocked at the bound.
+    room: Notify,
+    /// Woken when the queue grows, for the drain task.
+    filled: Notify,
+    draining: AtomicBool,
+    dropped: AtomicU64,
+}
+
+/// Everything a dialling endpoint's tasks share with it.
 ///
-/// Peers accumulate: connecting again adds a peer rather than replacing one
-/// (master doc §5). Shared by every dialling pattern — the policy differs (Req
-/// and Push pick one, Sub addresses all of them), the set does not.
-///
-/// Dead peers are reaped whenever a live one is added, so a process that
-/// reconnects after every loss holds at most one dead entry per loss until
-/// its next `connect` — bounded by the application's own reconnect rate,
-/// never growing with uptime.
-pub(crate) struct PeerSet {
-    peers: std::sync::Mutex<Vec<PeerEntry>>,
+/// Tasks hold this weakly: the endpoint owns the only strong reference
+/// through [`Peer`], so dropping the endpoint ends every task at its next
+/// wake, and the `alive` channel in [`Peer`] wakes them for exactly that.
+pub(crate) struct PeerShared {
+    runtime: Arc<RuntimeInner>,
+    tls: Arc<ClientTls>,
+    slots: std::sync::Mutex<Vec<Slot>>,
     cursor: AtomicUsize,
+    next_slot: AtomicU64,
+    /// Woken whenever a slot changes state, for a `pick` waiting on one.
+    changed: Notify,
+    events: broadcast::Sender<PeerEvent>,
+    attach: Option<Arc<dyn Attach>>,
+    outbox: Outbox,
 }
 
-impl PeerSet {
-    fn new() -> PeerSet {
-        PeerSet {
-            peers: std::sync::Mutex::new(Vec::new()),
-            cursor: AtomicUsize::new(0),
-        }
-    }
-
-    fn add(&self, conn: ConnHandle, path: &str) {
-        let mut peers = self.peers.lock().expect("peer list poisoned");
-        peers.retain(|p| p.conn.conn.close_reason().is_none());
-        peers.push(PeerEntry {
-            conn,
-            path: Arc::from(path),
-        });
-    }
-
-    /// Number of peers whose connection is still open.
-    fn len(&self) -> usize {
-        self.peers
-            .lock()
-            .expect("peer list poisoned")
-            .iter()
-            .filter(|p| p.conn.conn.close_reason().is_none())
-            .count()
-    }
-
-    /// Picks the next live peer, round-robin.
+impl PeerShared {
+    /// The next live slot, round-robin, without waiting.
     ///
-    /// When every peer is closed, the error says **why** the last one
-    /// examined died rather than flattening all of them into a bare
-    /// `ConnectionLost`: an application deciding whether to redial needs to
-    /// tell an idle timeout from a peer that closed deliberately, and this is
-    /// the only place that knowledge was being thrown away.
-    fn pick(&self) -> Result<(ConnHandle, Arc<str>), Error> {
-        let peers = self.peers.lock().expect("peer list poisoned");
-        if peers.is_empty() {
+    /// `Ok(None)` is a slot that is down and being redialled — worth
+    /// waiting for. `Err` is either an endpoint that was never connected or
+    /// one whose every slot has been given up, with the cause of the last
+    /// one examined: an application deciding what to do next needs to tell
+    /// an idle timeout from a peer that closed deliberately.
+    fn try_pick(&self) -> Result<Option<(ConnHandle, Arc<str>)>, Error> {
+        let slots = self.slots.lock().expect("peer list poisoned");
+        if slots.is_empty() {
             return Err(Error::NotConnected);
         }
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
         let mut cause = None;
-        for offset in 0..peers.len() {
-            let peer = &peers[(start + offset) % peers.len()];
-            match peer.conn.conn.close_reason() {
-                None => return Ok((Arc::clone(&peer.conn), Arc::clone(&peer.path))),
-                Some(reason) => cause = Some(reason),
+        let mut pending = false;
+        for offset in 0..slots.len() {
+            let slot = &slots[(start + offset) % slots.len()];
+            match &slot.state {
+                // A connection may have closed before its task noticed. What
+                // the task will decide is decided here the same way, so a
+                // close that will not be redialled never looks like a wait.
+                SlotState::Live(conn) => match conn.conn.close_reason() {
+                    None => return Ok(Some((ConnHandle::clone(conn), Arc::clone(&slot.path)))),
+                    Some(reason) => {
+                        let c = loss_cause(&reason);
+                        if self.runtime.config.reconnect.redials_after(c) {
+                            pending = true;
+                        }
+                        cause = Some(c);
+                    }
+                },
+                SlotState::Down(c) => {
+                    pending = true;
+                    cause = Some(*c);
+                }
+                SlotState::Gone(c) => cause = Some(*c),
             }
         }
-        // A closed connection always has a reason, so the fallback is
-        // unreachable in practice and exists to keep the mapping total.
-        Err(cause.unwrap_or(Error::ConnectionLost(LossCause::LocallyClosed)))
-    }
-
-    /// Every live peer, collected.
-    ///
-    /// The peer list is a `std` mutex and must not be held across an
-    /// `await`, so a caller that writes to each peer collects first and
-    /// writes after. That rule was written out at four call sites and
-    /// explained at one of them; it lives here now.
-    fn live_peers(&self) -> Vec<(ConnHandle, Arc<str>)> {
-        let peers = self.peers.lock().expect("peer list poisoned");
-        peers
-            .iter()
-            .filter(|peer| peer.conn.conn.close_reason().is_none())
-            .map(|peer| (ConnHandle::clone(&peer.conn), Arc::clone(&peer.path)))
-            .collect()
-    }
-}
-
-/// The dialling side of the stream core.
-///
-/// A `Peer` owns a set of connections and the trust anchors they were
-/// authenticated against, and opens streams on them. Every dialling pattern —
-/// Req, Push, Sub — is this plus a selection policy and a bit of vocabulary.
-pub struct Peer {
-    runtime: Arc<RuntimeInner>,
-    tls: Arc<ClientTls>,
-    peers: PeerSet,
-}
-
-impl Peer {
-    pub(crate) fn new(runtime: Arc<RuntimeInner>, tls: Arc<ClientTls>) -> Peer {
-        Peer {
-            runtime,
-            tls,
-            peers: PeerSet::new(),
+        if pending {
+            return Ok(None);
         }
-    }
-
-    /// Connects to `weida://[fingerprint@]host:port/path`.
-    ///
-    /// Connections are pooled per `host:port`, trust configuration and the
-    /// fingerprint the address names, so several endpoints addressing the
-    /// same peer on the same terms share one QUIC connection while two
-    /// different sets of terms never do. Returns once the HELLO exchange has
-    /// been negotiated, so the first stream cannot race negotiation.
-    ///
-    /// A peer that answers with an identity the terms do not cover fails with
-    /// [`Error::Untrusted`] carrying the fingerprint it presented.
-    pub async fn connect(&self, url: &str) -> Result<(), Error> {
-        self.dial(url).await.map(|_| ())
-    }
-
-    /// Number of peers whose connection is still open.
-    ///
-    /// A peer that went away no longer counts; nothing reconnects it, so the
-    /// number drops until the application calls [`Peer::connect`] again.
-    pub fn peer_count(&self) -> usize {
-        self.peers.len()
-    }
-
-    /// Opens a unidirectional stream to the next peer, round-robin.
-    ///
-    /// The DATA header is written before this returns, so the caller gets a
-    /// handle that is already addressed and can only carry payload.
-    ///
-    /// Under a negotiated `PerProducer` ordering the header also carries this
-    /// producer's next sequence number for the dialled path (DATA key `6`);
-    /// under `core` it carries none and the sequencer is never touched.
-    pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
-        let (conn, path) = self.peers.pick()?;
-        open_transfer_on(&conn, &path, &meta).await
-    }
-
-    /// Opens a bidirectional stream — an exchange — to the next peer.
-    ///
-    /// The returned [`ReplyStream`] is the return half. It needs no correlation
-    /// identifier: it *is* the correlation, and dropping it cancels the reply.
-    pub async fn open_bi(
-        &self,
-        meta: TransferMeta,
-    ) -> Result<(OutgoingTransfer, ReplyStream), Error> {
-        let (conn, path) = self.peers.pick()?;
-        let (header, trace, cursors) = outgoing_header(&conn, Some(&path), &meta, None)?;
-        let (mut send, recv) = conn.open_bi().await?;
-        // The peer learns of the stream with this write, so it never sees a
-        // bidirectional stream it cannot classify.
-        write_data_preamble(&mut send, &header).await?;
-        Ok((
-            OutgoingTransfer::new(send, trace, Arc::clone(&conn), cursors),
-            ReplyStream::new(recv, conn),
+        Err(Error::ConnectionLost(
+            cause.unwrap_or(LossCause::LocallyClosed),
         ))
     }
 
-    /// The runtime this peer's tasks run on.
-    pub(crate) fn exec(&self) -> &crate::runtime::Exec {
-        &self.runtime.exec
+    /// The next live slot, waiting for a redial when every slot is down
+    /// (0031 §4.4), bounded by `RuntimeConfig::send_timeout`.
+    async fn pick(&self) -> Result<(ConnHandle, Arc<str>), Error> {
+        let wait = self.wait_live();
+        match self.runtime.config.send_timeout {
+            None => wait.await,
+            Some(limit) => match self.runtime.exec.within(limit, wait).await {
+                Some(picked) => picked,
+                // The cause the waiter would have seen, not a new outcome.
+                None => Err(match self.try_pick() {
+                    Ok(Some(picked)) => return Ok(picked),
+                    Ok(None) => Error::ConnectionLost(self.last_cause()),
+                    Err(e) => e,
+                }),
+            },
+        }
     }
 
-    /// Dials and records a peer, returning the connection and the path.
+    /// Waits until a slot is live, with no bound.
+    async fn wait_live(&self) -> Result<(ConnHandle, Arc<str>), Error> {
+        loop {
+            // Registered before the check, so a change between the check and
+            // the await is not missed.
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.try_pick()? {
+                Some(picked) => return Ok(picked),
+                None => notified.await,
+            }
+        }
+    }
+
+    /// The cause of the most recently examined down or gone slot.
+    fn last_cause(&self) -> LossCause {
+        let slots = self.slots.lock().expect("peer list poisoned");
+        slots
+            .iter()
+            .rev()
+            .find_map(|slot| match &slot.state {
+                SlotState::Down(c) | SlotState::Gone(c) => Some(*c),
+                SlotState::Live(_) => None,
+            })
+            .unwrap_or(LossCause::LocallyClosed)
+    }
+
+    /// Number of slots whose connection is open.
+    fn live_count(&self) -> usize {
+        self.slots
+            .lock()
+            .expect("peer list poisoned")
+            .iter()
+            .filter(
+                |slot| matches!(&slot.state, SlotState::Live(c) if c.conn.close_reason().is_none()),
+            )
+            .count()
+    }
+
+    /// Every live connection, collected.
     ///
-    /// The scheme picks the transport and nothing falls back to anything
-    /// else: `weida://` dials QUIC on `tls`'s terms, `weida+inproc://`
-    /// reaches a bus in this process with no TLS at all
-    /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
-    /// §4.6, §4.8). The trust configuration is simply unused on a local
-    /// address — there is no key to check.
+    /// The slot list is a `std` mutex and must not be held across an
+    /// `await`, so a caller that writes to each peer collects first and
+    /// writes after.
+    fn live_peers(&self) -> Vec<(ConnHandle, Arc<str>)> {
+        self.slots
+            .lock()
+            .expect("peer list poisoned")
+            .iter()
+            .filter_map(|slot| match &slot.state {
+                SlotState::Live(conn) if conn.conn.close_reason().is_none() => {
+                    Some((ConnHandle::clone(conn), Arc::clone(&slot.path)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn set_state(&self, id: u64, state: SlotState) {
+        let mut slots = self.slots.lock().expect("peer list poisoned");
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+            slot.state = state;
+        }
+        drop(slots);
+        self.changed.notify_waiters();
+    }
+
+    fn emit(&self, event: PeerEvent) {
+        // No reader is not an error: an endpoint nobody watches pays nothing.
+        let _ = self.events.send(event);
+    }
+
+    /// Dials `url` and runs the pattern's attachment on the new connection.
     ///
-    /// Crate-internal because a `Sub` needs the connection handle itself: it
-    /// registers its path in that connection's namespace so fanned-out copies
-    /// have somewhere to land.
-    pub(crate) async fn dial(&self, url: &str) -> Result<(ConnHandle, Arc<str>), Error> {
-        let (conn, path) = match Address::parse(url)? {
+    /// `proved` is what the slot's first connection proved: a redial over
+    /// QUIC pins that key into the address, so a replacement server with a
+    /// different key is refused **in the handshake**, before any connection
+    /// exists for anyone to use (0031 §4.7). A local peer proves a principal
+    /// or nothing, and neither is pinned: the address names a socket path
+    /// or a bus, and whoever binds it is the peer.
+    async fn dial_address(
+        &self,
+        address: &Address,
+        proved: Option<&PeerIdentity>,
+    ) -> Result<(ConnHandle, Arc<str>), Error> {
+        let (conn, path) = match address {
             Address::Quic(addr) => {
                 // B-017: the pool keys on the dialled path as well as the
                 // authority, and checks the fingerprint it gets back.
-                let conn = self.runtime.connect(&addr, &self.tls).await?;
-                (conn, addr.path)
+                let path = addr.path.as_str();
+                let pinned;
+                let addr = match proved {
+                    Some(PeerIdentity::Key(fp)) if addr.peer.is_none() => {
+                        pinned = weida_core::EndpointAddr {
+                            peer: Some(*fp),
+                            ..addr.clone()
+                        };
+                        &pinned
+                    }
+                    _ => addr,
+                };
+                let conn = self.runtime.connect(addr, &self.tls).await?;
+                (conn, path)
             }
             Address::Inproc(addr) => {
                 let conn = self.runtime.connect_local(&addr.bus).await?;
-                (conn, addr.path)
+                (conn, addr.path.as_str())
             }
             #[cfg(unix)]
             Address::Unix(addr) => {
                 let conn = self.runtime.connect_unix(&addr.socket).await?;
-                (conn, addr.path)
+                (conn, addr.path.as_str())
             }
             #[cfg(not(unix))]
             Address::Unix(addr) => {
@@ -241,8 +298,8 @@ impl Peer {
             }
             #[cfg(windows)]
             Address::Pipe(addr) => {
-                let conn = self.runtime.connect_pipe(&addr).await?;
-                (conn, addr.path)
+                let conn = self.runtime.connect_pipe(addr).await?;
+                (conn, addr.path.as_str())
             }
             #[cfg(not(windows))]
             Address::Pipe(addr) => {
@@ -252,14 +309,556 @@ impl Peer {
                 )));
             }
         };
-        self.peers.add(ConnHandle::clone(&conn), &path);
-        Ok((conn, Arc::from(path.as_str())))
+        if let Some(attach) = &self.attach {
+            attach.attach(&conn, path).await?;
+        }
+        Ok((conn, Arc::from(path)))
+    }
+}
+
+/// The dialling side of the stream core.
+///
+/// A `Peer` owns a set of dialled addresses and the trust anchors they are
+/// authenticated against, and opens streams on their connections. Every
+/// dialling pattern — Req, Push, Sub — is this plus a selection policy and a
+/// bit of vocabulary.
+///
+/// An address, once dialled, is kept: when its connection is lost the
+/// runtime redials it under [`ReconnectPolicy`], and the transitions are
+/// reported on [`Peer::events`]
+/// ([0031](../../../docs/decisions/0031-transparent-redial-and-the-sender-outbox.md)).
+pub struct Peer {
+    shared: Arc<PeerShared>,
+    /// Dropped with the peer; every task of this peer watches it.
+    alive: watch::Sender<()>,
+}
+
+impl Peer {
+    pub(crate) fn new(runtime: Arc<RuntimeInner>, tls: Arc<ClientTls>) -> Peer {
+        Peer::with_attach(runtime, tls, None)
+    }
+
+    pub(crate) fn with_attach(
+        runtime: Arc<RuntimeInner>,
+        tls: Arc<ClientTls>,
+        attach: Option<Arc<dyn Attach>>,
+    ) -> Peer {
+        let (events, _) = broadcast::channel(EVENT_QUEUE);
+        let (alive, _) = watch::channel(());
+        Peer {
+            shared: Arc::new(PeerShared {
+                runtime,
+                tls,
+                slots: std::sync::Mutex::new(Vec::new()),
+                cursor: AtomicUsize::new(0),
+                next_slot: AtomicU64::new(0),
+                changed: Notify::new(),
+                events,
+                attach,
+                outbox: Outbox {
+                    queue: std::sync::Mutex::new(VecDeque::new()),
+                    bytes: AtomicUsize::new(0),
+                    room: Notify::new(),
+                    filled: Notify::new(),
+                    draining: AtomicBool::new(false),
+                    dropped: AtomicU64::new(0),
+                },
+            }),
+            alive,
+        }
+    }
+
+    /// Connects to `weida://[fingerprint@]host:port/path`.
+    ///
+    /// Connections are pooled per `host:port`, trust configuration and the
+    /// fingerprint the address names, so several endpoints addressing the
+    /// same peer on the same terms share one QUIC connection while two
+    /// different sets of terms never do. Returns once the HELLO exchange has
+    /// been negotiated, so the first stream cannot race negotiation.
+    ///
+    /// A peer that answers with an identity the terms do not cover fails with
+    /// [`Error::Untrusted`] carrying the fingerprint it presented.
+    ///
+    /// The address is kept after this returns: a lost connection is redialled
+    /// by the runtime under [`crate::RuntimeConfig::reconnect`], and nothing
+    /// here needs calling again.
+    pub async fn connect(&self, url: &str) -> Result<(), Error> {
+        self.dial(url).await.map(|_| ())
+    }
+
+    /// Forgets `url`: the slot is removed and its redial task ends.
+    ///
+    /// The connection itself is pooled and may be serving another endpoint,
+    /// so it is not closed here; an idle one goes when the pool reaps it.
+    /// Returns whether the address was known.
+    pub fn disconnect(&self, url: &str) -> bool {
+        let mut slots = self.shared.slots.lock().expect("peer list poisoned");
+        let before = slots.len();
+        slots.retain(|slot| {
+            let keep = &*slot.url != url;
+            if !keep {
+                slot.stop.notify_one();
+            }
+            keep
+        });
+        let removed = slots.len() != before;
+        drop(slots);
+        if removed {
+            self.shared.changed.notify_waiters();
+        }
+        removed
+    }
+
+    /// Number of peers whose connection is open.
+    ///
+    /// A peer that went away no longer counts while it is being redialled,
+    /// and counts again once the redial succeeds.
+    pub fn peer_count(&self) -> usize {
+        self.shared.live_count()
+    }
+
+    /// Number of addresses this peer holds, live or not.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.shared.slots.lock().expect("peer list poisoned").len()
+    }
+
+    /// The event stream of this peer's addresses.
+    pub fn events(&self) -> PeerEvents {
+        PeerEvents::new(self.shared.events.subscribe())
+    }
+
+    /// Messages the outbox discarded: at the bound under a `Drop`
+    /// backpressure policy, or refused by the peer once written.
+    pub fn dropped(&self) -> u64 {
+        self.shared.outbox.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Opens a unidirectional stream to the next peer, round-robin.
+    ///
+    /// With every peer down, waits for the redial — bounded by
+    /// [`crate::RuntimeConfig::send_timeout`] — rather than failing; a peer
+    /// that was never connected fails at once with [`Error::NotConnected`].
+    ///
+    /// The DATA header is written before this returns, so the caller gets a
+    /// handle that is already addressed and can only carry payload.
+    ///
+    /// Under a negotiated `PerProducer` ordering the header also carries this
+    /// producer's next sequence number for the dialled path (DATA key `6`);
+    /// under `core` it carries none and the sequencer is never touched.
+    pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error> {
+        let (conn, path) = self.shared.pick().await?;
+        open_transfer_on(&conn, &path, &meta).await
+    }
+
+    /// Opens a bidirectional stream — an exchange — to the next peer.
+    ///
+    /// The returned [`ReplyStream`] is the return half. It needs no correlation
+    /// identifier: it *is* the correlation, and dropping it cancels the reply.
+    /// Waits for a peer exactly as [`Peer::open`] does.
+    pub async fn open_bi(
+        &self,
+        meta: TransferMeta,
+    ) -> Result<(OutgoingTransfer, ReplyStream), Error> {
+        let (conn, path) = self.shared.pick().await?;
+        let (header, trace, cursors) = outgoing_header(&conn, Some(&path), &meta, None)?;
+        let (mut send, recv) = conn.open_bi().await?;
+        // The peer learns of the stream with this write, so it never sees a
+        // bidirectional stream it cannot classify.
+        write_data_preamble(&mut send, &header).await?;
+        Ok((
+            OutgoingTransfer::new(send, trace, Arc::clone(&conn), cursors),
+            ReplyStream::new(recv, conn),
+        ))
+    }
+
+    /// Sends `body` as one whole one-way transfer, and owns it from here.
+    ///
+    /// With a live peer and an empty outbox this is [`Peer::open`], a write
+    /// and a FIN, with no copy. Otherwise the body is copied into the
+    /// outbox and written, in order, once a peer is live — the runtime's
+    /// responsibility from this call until the write, and not after it: a
+    /// body written to a connection that then dies is gone, as in ZeroMQ
+    /// (0031 §4.2, §4.3). A full outbox applies the configured backpressure:
+    /// `Block` waits for room, `Drop` discards and counts, `Reject` fails
+    /// with [`Error::LimitExceeded`]. A body larger than the outbox is
+    /// refused with [`Error::LimitExceeded`] rather than blocking forever.
+    pub async fn send(&self, meta: TransferMeta, body: &[u8]) -> Result<(), Error> {
+        let shared = &self.shared;
+        if shared.outbox_is_empty()
+            && let Some((conn, path)) = shared.try_pick()?
+        {
+            match open_transfer_on(&conn, &path, &meta).await {
+                Ok(mut transfer) => {
+                    transfer.write_all(body).await?;
+                    transfer.finish()?;
+                    return Ok(());
+                }
+                // Nothing was written: the connection died under the open.
+                // The body is still whole and still ours.
+                Err(Error::ConnectionLost(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        shared.enqueue(meta, body).await?;
+        self.ensure_draining();
+        Ok(())
+    }
+
+    /// Starts the outbox drain task unless it is running.
+    fn ensure_draining(&self) {
+        if self.shared.outbox.draining.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.shared);
+        let alive = self.alive.subscribe();
+        self.shared.runtime.exec.spawn(drain_outbox(weak, alive));
+    }
+
+    /// The runtime this peer's tasks run on.
+    pub(crate) fn exec(&self) -> &crate::runtime::Exec {
+        &self.shared.runtime.exec
+    }
+
+    /// Dials and records a peer, returning the connection and the path.
+    ///
+    /// The scheme picks the transport and nothing falls back to anything
+    /// else: `weida://` dials QUIC on `tls`'s terms, `weida+inproc://`
+    /// reaches a bus in this process with no TLS at all
+    /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
+    /// §4.6, §4.8). The trust configuration is simply unused on a local
+    /// address — there is no key to check.
+    ///
+    /// The first dial reports its failure to the caller: an address that is
+    /// wrong, refused or untrusted is not something a redial fixes. Once it
+    /// has succeeded, the address is a slot the runtime keeps live.
+    pub(crate) async fn dial(&self, url: &str) -> Result<(ConnHandle, Arc<str>), Error> {
+        let address = Address::parse(url)?;
+        let (conn, path) = self.shared.dial_address(&address, None).await?;
+        let url: Arc<str> = Arc::from(url);
+        let id = self.shared.next_slot.fetch_add(1, Ordering::Relaxed);
+        let stop = Arc::new(Notify::new());
+        {
+            let mut slots = self.shared.slots.lock().expect("peer list poisoned");
+            slots.push(Slot {
+                id,
+                url: Arc::clone(&url),
+                path: Arc::clone(&path),
+                state: SlotState::Live(ConnHandle::clone(&conn)),
+                stop: Arc::clone(&stop),
+            });
+        }
+        self.shared.changed.notify_waiters();
+        self.shared.emit(PeerEvent::Connected {
+            url: Arc::clone(&url),
+            peer: conn.peer.clone(),
+        });
+        self.shared.runtime.exec.spawn(watch_slot(
+            Arc::downgrade(&self.shared),
+            self.alive.subscribe(),
+            stop,
+            id,
+            url,
+            address,
+            ConnHandle::clone(&conn),
+        ));
+        Ok((conn, path))
     }
 
     /// Every live peer, for a caller that has an `await` between the lookup
     /// and the write.
     pub(crate) fn live_peers(&self) -> Vec<(ConnHandle, Arc<str>)> {
-        self.peers.live_peers()
+        self.shared.live_peers()
+    }
+}
+
+/// Maps the error a closed connection reports onto the loss vocabulary.
+///
+/// A deliberate close with a code this side maps to a protocol outcome —
+/// negotiation, violation, limit — is still the peer closing: whether to
+/// redial after it is the policy's `stop_on_peer_closed`.
+fn loss_cause(reason: &Error) -> LossCause {
+    match reason {
+        Error::ConnectionLost(cause) => *cause,
+        Error::Negotiation(_) | Error::Protocol(_) | Error::LimitExceeded => LossCause::PeerClosed,
+        _ => LossCause::TransportError,
+    }
+}
+
+/// One slot's life after its first connection: notices the loss, redials
+/// under the policy, and reports every step (0031 §4.1, §4.5, §4.8).
+async fn watch_slot(
+    weak: Weak<PeerShared>,
+    mut alive: watch::Receiver<()>,
+    stop: Arc<Notify>,
+    id: u64,
+    url: Arc<str>,
+    address: Address,
+    mut conn: ConnHandle,
+) {
+    let policy: ReconnectPolicy = match weak.upgrade() {
+        Some(shared) => shared.runtime.config.reconnect.clone(),
+        None => return,
+    };
+    let proved = conn.peer.clone();
+    loop {
+        let reason = tokio::select! {
+            reason = conn.conn.closed() => reason,
+            _ = alive.changed() => return,
+            _ = stop.notified() => return,
+        };
+        let Some(shared) = weak.upgrade() else { return };
+        let cause = loss_cause(&reason);
+        shared.set_state(id, SlotState::Down(cause));
+        shared.emit(PeerEvent::Lost {
+            url: Arc::clone(&url),
+            cause,
+        });
+        // This side closed it: the application already decided, and a
+        // runtime that is shutting down must not dial anything.
+        let stopped = !policy.redials_after(cause);
+        if stopped {
+            give_up(&shared, id, cause, &url, GiveUp::Policy { attempts: 0 });
+            return;
+        }
+        drop(shared);
+
+        let mut attempt = 0u32;
+        conn = loop {
+            attempt += 1;
+            let Some(shared) = weak.upgrade() else { return };
+            if !policy.allows(attempt) {
+                give_up(
+                    &shared,
+                    id,
+                    cause,
+                    &url,
+                    GiveUp::Policy {
+                        attempts: attempt - 1,
+                    },
+                );
+                return;
+            }
+            let delay = policy.delay(attempt);
+            shared.emit(PeerEvent::Retrying {
+                url: Arc::clone(&url),
+                attempt,
+                delay,
+            });
+            let sleep = shared.runtime.exec.sleep(delay);
+            drop(shared);
+            // In process a bus is back exactly when its name is bound again,
+            // so the wait is on the registry rather than on the clock
+            // (0031 §4.10). Everything else has a network to wait out.
+            let waited = match &address {
+                Address::Inproc(addr) => tokio::select! {
+                    _ = crate::inproc::wait_bound(&addr.bus) => true,
+                    _ = alive.changed() => false,
+                    _ = stop.notified() => false,
+                },
+                _ => tokio::select! {
+                    _ = sleep => true,
+                    _ = alive.changed() => false,
+                    _ = stop.notified() => false,
+                },
+            };
+            if !waited {
+                return;
+            }
+            let Some(shared) = weak.upgrade() else { return };
+            match shared.dial_address(&address, proved.as_ref()).await {
+                Ok((conn, _)) => break conn,
+                // The pinned key was not the one that answered: a different
+                // server behind the address. Not a reconnect (0031 §4.7).
+                Err(Error::Untrusted(presented)) => {
+                    give_up(
+                        &shared,
+                        id,
+                        cause,
+                        &url,
+                        GiveUp::PeerChanged {
+                            presented: Some(presented),
+                        },
+                    );
+                    return;
+                }
+                Err(Error::Tls(m)) if proved.is_some() => {
+                    give_up(
+                        &shared,
+                        id,
+                        cause,
+                        &url,
+                        GiveUp::PeerChanged { presented: None },
+                    );
+                    tracing::debug!(%url, reason = %m, "redial reached a peer that proved nothing");
+                    return;
+                }
+                Err(
+                    e @ (Error::Tls(_)
+                    | Error::Negotiation(_)
+                    | Error::AlreadyRegistered
+                    | Error::Unsupported
+                    | Error::InvalidAddress(_)),
+                ) => {
+                    give_up(&shared, id, cause, &url, GiveUp::Failed(e.to_string()));
+                    return;
+                }
+                Err(e) => {
+                    tracing::debug!(%url, attempt, error = %e, "redial failed");
+                }
+            }
+        };
+        let Some(shared) = weak.upgrade() else { return };
+        shared.set_state(id, SlotState::Live(ConnHandle::clone(&conn)));
+        shared.emit(PeerEvent::Connected {
+            url: Arc::clone(&url),
+            peer: conn.peer.clone(),
+        });
+        // Whatever waited for a peer — the outbox drain among them.
+        shared.outbox.filled.notify_waiters();
+    }
+}
+
+fn give_up(shared: &PeerShared, id: u64, cause: LossCause, url: &Arc<str>, why: GiveUp) {
+    shared.set_state(id, SlotState::Gone(cause));
+    shared.emit(PeerEvent::GaveUp {
+        url: Arc::clone(url),
+        why,
+    });
+}
+
+impl PeerShared {
+    fn outbox_is_empty(&self) -> bool {
+        self.outbox
+            .queue
+            .lock()
+            .expect("outbox poisoned")
+            .is_empty()
+    }
+
+    /// Copies `body` into the outbox, applying the bound and the configured
+    /// backpressure behaviour at it.
+    async fn enqueue(&self, meta: TransferMeta, body: &[u8]) -> Result<(), Error> {
+        let config = &self.runtime.config;
+        if body.len() > config.outbox_bytes {
+            return Err(Error::LimitExceeded);
+        }
+        loop {
+            let room = self.outbox.room.notified();
+            tokio::pin!(room);
+            room.as_mut().enable();
+            {
+                let mut queue = self.outbox.queue.lock().expect("outbox poisoned");
+                let bytes = self.outbox.bytes.load(Ordering::Relaxed);
+                if queue.len() < config.outbox_messages && bytes + body.len() <= config.outbox_bytes
+                {
+                    queue.push_back(Queued {
+                        meta,
+                        body: Bytes::copy_from_slice(body),
+                    });
+                    self.outbox.bytes.fetch_add(body.len(), Ordering::Relaxed);
+                    drop(queue);
+                    self.outbox.filled.notify_waiters();
+                    return Ok(());
+                }
+            }
+            match config.outbox_full {
+                OutboxFull::Drop => {
+                    self.outbox.dropped.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                OutboxFull::Reject => return Err(Error::LimitExceeded),
+                OutboxFull::Block => room.await,
+            }
+        }
+    }
+
+    /// The oldest queued body, cloned out for the write.
+    fn peek_outbox(&self) -> Option<(TransferMeta, Bytes)> {
+        self.outbox
+            .queue
+            .lock()
+            .expect("outbox poisoned")
+            .front()
+            .map(|q| (q.meta.clone(), q.body.clone()))
+    }
+
+    fn pop_outbox(&self) {
+        let mut queue = self.outbox.queue.lock().expect("outbox poisoned");
+        if let Some(queued) = queue.pop_front() {
+            self.outbox
+                .bytes
+                .fetch_sub(queued.body.len(), Ordering::Relaxed);
+        }
+        drop(queue);
+        self.outbox.room.notify_waiters();
+    }
+}
+
+/// Writes the outbox, in order, onto whichever peer is live.
+///
+/// A body the connection refuses, or that a connection dies under once it
+/// has started, is dropped and counted: the runtime's responsibility ended
+/// at the write (0031 §4.3). A body no connection would take yet stays at
+/// the front until one is live.
+async fn drain_outbox(weak: Weak<PeerShared>, mut alive: watch::Receiver<()>) {
+    loop {
+        let Some(shared) = weak.upgrade() else { return };
+        let Some((meta, body)) = shared.peek_outbox() else {
+            // Empty. Hand the flag back, then look once more: a sender that
+            // enqueued between the peek and the flag would otherwise wait
+            // for a task that has left.
+            shared.outbox.draining.store(false, Ordering::Release);
+            if shared.outbox_is_empty() || shared.outbox.draining.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            continue;
+        };
+        let filled = shared.outbox.filled.notified();
+        tokio::pin!(filled);
+        filled.as_mut().enable();
+        let picked = match shared.try_pick() {
+            Ok(Some(picked)) => picked,
+            // Down and being redialled, or every address gone: wait for the
+            // next change. A new `connect` wakes this too.
+            Ok(None) | Err(_) => {
+                // The strong reference is held across the wait; a dropped
+                // endpoint wakes `alive` and the task leaves at once.
+                let changed = shared.changed.notified();
+                tokio::select! {
+                    _ = filled => {}
+                    _ = changed => {}
+                    _ = alive.changed() => return,
+                }
+                continue;
+            }
+        };
+        let (conn, path) = picked;
+        let mut transfer = match open_transfer_on(&conn, &path, &meta).await {
+            Ok(transfer) => transfer,
+            // Nothing was opened, so nothing was handed over: the body stays
+            // at the front and the next pick finds a different, or a
+            // redialled, connection.
+            Err(Error::ConnectionLost(_)) => continue,
+            Err(e) => {
+                tracing::debug!(error = %e, "outbox body refused at the open");
+                shared.outbox.dropped.fetch_add(1, Ordering::Relaxed);
+                shared.pop_outbox();
+                continue;
+            }
+        };
+        let written = async {
+            transfer.write_all(&body).await?;
+            transfer.finish()
+        }
+        .await;
+        // Written means handed to a connection, and the responsibility ended
+        // there: a body the connection died under, or the peer refused, is
+        // gone and counted, never resent (0031 §4.3).
+        if let Err(e) = written {
+            tracing::debug!(error = %e, "outbox body discarded");
+            shared.outbox.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        shared.pop_outbox();
     }
 }
 

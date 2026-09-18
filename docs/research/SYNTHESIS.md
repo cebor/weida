@@ -561,10 +561,12 @@ is Phase 6 [GUARANTEES §6], [ARCHITECTURE §1].
 - **P2 — liveness.** Idle timeout (`RuntimeConfig::idle_timeout`, 30 s default, the smaller of
   the two peers' values governing both) plus keep-alives sent by the **dialling** side only
   (`RuntimeConfig::keep_alive`, 10 s default) [PATTERNS §1.8]. Loss surfaces as
-  `Error::ConnectionLost` from the next operation, without the cause: an idle timeout, a peer
-  SHUTDOWN and a transport failure are indistinguishable at the API [FAILURE_MODEL §4]. No
-  session, no last will, no peer state to preserve: **nothing reconnects**, the application
-  calls `connect` again, and a `Subscriber` re-sends its filters on `connect` [PATTERNS §1.8].
+  `Error::ConnectionLost(cause)` with the cause kept — idle timeout, peer close, local close,
+  reset, transport error — and as `PeerEvent::Lost` on the endpoint's event stream
+  [PATTERNS §1.8]. No session, no last will, no peer state to preserve: what reconnects is the
+  **address**, redialled by the runtime under `ReconnectPolicy`, and a `Subscriber` re-sends
+  its own filters on the new connection
+  ([0031](../decisions/0031-transparent-redial-and-the-sender-outbox.md)).
 - **P3 — capacity spreading.** Round-robin over live peers, one message or one exchange per
   pick, with a peer skipped only once its connection is closed; "a peer that is merely slow
   keeps receiving its share and eventually stalls the pusher through its windows". Spreading
@@ -589,11 +591,12 @@ is Phase 6 [GUARANTEES §6], [ARCHITECTURE §1].
 - **P5 — late joiner.** Nothing is retained: `publish` returns `0` with no subscribers and
   "nothing is queued for a subscriber that does not exist yet" [PATTERNS §4]. No last-value
   cache, snapshot or replay mechanism is stated in any weida document.
-- **P6 — failover.** Not stated as a mechanism, and the absence is deliberate: nothing
-  reconnects, and the application re-dials with the same or a new address, the dead entry being
-  reaped then [PATTERNS §1.8]. `after_the_server_restarts_the_pusher_must_reconnect` is the
-  named test [PATTERNS §1.8]. "client reconnects through another broker" is listed out of scope
-  until Phase 6 [FAILURE_MODEL §3].
+- **P6 — failover.** Not stated as a mechanism, and the absence is deliberate: the runtime
+  redials the **same** address ([0031](../decisions/0031-transparent-redial-and-the-sender-outbox.md)
+  §4.1, ZeroMQ's shape), and a redial that reaches a peer with a different key is refused as
+  `PeerChanged` rather than treated as a failover [0031 §4.7]. Failover to a *different*
+  address is the application's `connect`, as it is in every ZeroMQ recipe. "client reconnects
+  through another broker" is listed out of scope until Phase 6 [FAILURE_MODEL §3].
 - **P7 — restart survival.** Nothing is persisted; there is no persistence subsystem. The
   scenarios that need one — "producer crashes after local persistence before sending",
   "receiver persists transfer but ACK is lost", "disk becomes full during stream persistence",
@@ -1256,3 +1259,23 @@ namespace, whose filters become segmented patterns — separator `.`, `*` for ex
 segment, trailing `#` for zero or more — and a ZeroMQ byte-prefix subscription maps to a
 segment boundary as a named loss. The note carries the mapping table for MQTT `+`/`#`,
 NATS `*`/`>` and AMQP 0-9-1 `*`/`#`.
+
+**8.10 Does the runtime reconnect, and what does a `send` own while it does?** ZeroMQ's
+socket redials its endpoints with `ZMQ_RECONNECT_IVL` and queues messages in the endpoint's pipe
+while it does [zeromq §12/P6]; NNG's dialer reconnects pipes [nanomsg-nng §12/P2]; NATS and
+RabbitMQ libraries reconnect by their own policy [nats §12/P6], [rabbitmq-amqp091 §12/P6]. weida
+had none of it — "nothing reconnects, the application calls `connect` again" — and its own
+ZeroMQ implementation had all of it (`weida-zmq`, B-073). The decision is whether the core
+redials, what it restores when it does, and where the application's responsibility for a
+payload ends.
+
+**Closed by [0031](../decisions/0031-transparent-redial-and-the-sender-outbox.md):** the
+address outlives its connection and the runtime redials it under a `ReconnectPolicy`
+(exponential with jitter by default, `never()` for the old behaviour), re-sending a subscriber's
+own filters and reporting every transition on a bounded `PeerEvent` stream; a redial that
+reaches a different key is refused. Responsibility moves at the API boundary rather than at a
+size: `send(body)` is a message the runtime owns from the call, held in a bounded outbox until
+written to a live connection and never resent after that — at-most-once, ZeroMQ's contract —
+while `open` is a stream that waits for a live peer and otherwise stays the application's. No
+session state, no counter across the reconnect, no resend of a stream:
+[0008](../decisions/0008-session-identity.md) §4.5 and D8 hold.

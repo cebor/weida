@@ -70,6 +70,13 @@ pub(crate) fn unbind(bus: &str) {
     BUSES.unbind(bus);
 }
 
+/// Resolves once `bus` is bound, at once if it already is: what a redial
+/// waits on in process, where a bus is back exactly when its name is
+/// registered again (0031 §4.10).
+pub(crate) async fn wait_bound(bus: &str) {
+    BUSES.wait_bound(bus).await;
+}
+
 /// Dials `bus`, handing the far half to whoever bound it.
 pub(crate) fn dial(bus: &str, max_streams: usize, buffer: usize) -> Result<LocalConn, Error> {
     validate_bus(bus)?;
@@ -107,41 +114,51 @@ pub(crate) struct LocalConn {
     buffer: usize,
 }
 
-/// Shared by both ends of one connection: whether it is closed and why.
+/// Shared by both ends of one connection: whether it is closed, why, and by
+/// which end.
 struct LinkState {
     code: AtomicU64,
     reason: StdMutex<String>,
+    /// The `id` of the end that closed: on QUIC a local close and a peer's
+    /// close are two different errors, and the redial policy tells them
+    /// apart, so the one shared cell has to remember who wrote it.
+    closed_by: AtomicUsize,
     closed: Notify,
 }
 
 impl LinkState {
-    fn close(&self, code: u64, reason: &str) {
+    fn close(&self, code: u64, reason: &str, by: usize) {
         if self
             .code
             .compare_exchange(NO_CODE, code, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            self.closed_by.store(by, Ordering::Release);
             *self.reason.lock().expect("close reason poisoned") = reason.to_owned();
             self.closed.notify_waiters();
         }
     }
 
-    fn close_reason(&self) -> Option<Error> {
+    fn close_reason(&self, me: usize) -> Option<Error> {
         let code = self.code.load(Ordering::Acquire);
-        (code != NO_CODE).then(|| closed_error(code))
+        (code != NO_CODE).then(|| {
+            let local = self.closed_by.load(Ordering::Acquire) == me;
+            closed_error(code, local)
+        })
     }
 }
 
 /// Maps a local close code onto the outcome vocabulary, the same way
-/// `conn_error` maps an application close on QUIC.
-fn closed_error(code: u64) -> Error {
+/// `conn_error` maps an application close on QUIC — including its
+/// distinction between this side's close and the peer's.
+fn closed_error(code: u64, local: bool) -> Error {
     match code {
         codes::NEGOTIATION_FAILED => {
             Error::Negotiation("peer closed the connection: negotiation failed".into())
         }
-        codes::SHUTDOWN => Error::ConnectionLost(LossCause::PeerClosed),
         codes::LIMIT_EXCEEDED => Error::LimitExceeded,
         codes::PROTOCOL_VIOLATION => Error::Protocol("peer reported a protocol violation".into()),
+        _ if local => Error::ConnectionLost(LossCause::LocallyClosed),
         _ => Error::ConnectionLost(LossCause::PeerClosed),
     }
 }
@@ -158,6 +175,7 @@ impl LocalConn {
         let state = Arc::new(LinkState {
             code: AtomicU64::new(NO_CODE),
             reason: StdMutex::new(String::new()),
+            closed_by: AtomicUsize::new(usize::MAX),
             closed: Notify::new(),
         });
         // One budget per connection, shared by both directions: what the cap
@@ -193,17 +211,17 @@ impl LocalConn {
     }
 
     pub(crate) fn close_reason(&self) -> Option<Error> {
-        self.state.close_reason()
+        self.state.close_reason(self.id)
     }
 
     pub(crate) fn close(&self, code: u64, reason: &str) {
-        self.state.close(code, reason);
+        self.state.close(code, reason, self.id);
     }
 
     /// Resolves when either side closes, with the reason.
     pub(crate) async fn closed(&self) -> Error {
         loop {
-            if let Some(reason) = self.state.close_reason() {
+            if let Some(reason) = self.state.close_reason(self.id) {
                 return reason;
             }
             self.state.closed.notified().await;
@@ -238,7 +256,7 @@ impl LocalConn {
     }
 
     pub(crate) async fn open_uni(&self) -> Result<LocalSend, Error> {
-        if let Some(closed) = self.state.close_reason() {
+        if let Some(closed) = self.close_reason() {
             return Err(closed);
         }
         let slot = self.slot().await?;
@@ -250,7 +268,7 @@ impl LocalConn {
     }
 
     pub(crate) async fn open_bi(&self) -> Result<(LocalSend, LocalRecv), Error> {
-        if let Some(closed) = self.state.close_reason() {
+        if let Some(closed) = self.close_reason() {
             return Err(closed);
         }
         // One transfer, one slot, as on the socket transports where an

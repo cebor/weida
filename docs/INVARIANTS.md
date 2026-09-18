@@ -65,6 +65,19 @@ table: the topics are the local application's, not a peer's, but a table nobody 
 table that grows for the life of the process, and at the cap a topic's drops count in the
 aggregate only.
 
+**The sender outbox and the event stream of
+[0031](decisions/0031-transparent-redial-and-the-sender-outbox.md) are inside it too, and
+neither is remote input.** An outbox holds bodies the local application handed to `send`
+while no peer was live, bounded in count by `RuntimeConfig::outbox_messages` (1000, ZeroMQ's
+`ZMQ_SNDHWM`) and in bytes by `RuntimeConfig::outbox_bytes` (8 MiB — the bound ZeroMQ lacks),
+with `outbox_full` deciding what a `send` does at either: block, drop and count, or fail. A
+body larger than the byte bound is refused at the call rather than blocking forever. A peer
+influences none of it: the numbers are the sender's, and what the peer's absence changes is
+only *whether* the bound is reached. The `PeerEvent` stream is a broadcast channel of 64
+events per endpoint; a reader that falls behind is told `Missed(n)` and the events are gone,
+never queued. A slot's redial task holds the endpoint weakly and ends at the endpoint's
+drop, so an application that connects and forgets holds one task per address and no more.
+
 **The cursor stream is inside this invariant, and the shape that keeps it there is worth
 naming.** A report is the first thing a peer sends that is *about* a transfer rather than part
 of one, so the tempting implementation is a table keyed by whatever the peer says. It is not

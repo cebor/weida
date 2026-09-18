@@ -14,6 +14,8 @@ use weida_core::{Error, Fingerprint, Limits};
 use weida_protocol::header::GuaranteeSet;
 use weida_runtime::SharedResolver;
 
+use crate::reconnect::{OutboxFull, ReconnectPolicy};
+
 /// Whether a dialled authority may name a **set** of nodes.
 ///
 /// The configuration knob of
@@ -140,6 +142,28 @@ pub struct RuntimeConfig {
     /// nothing at all and QUIC has no refusal to observe, so without a bound
     /// the second address is reached only after a handshake timeout.
     pub connect_attempt_timeout: Duration,
+    /// How a dialling endpoint redials an address whose connection it lost
+    /// ([decisions/0031](../../../docs/decisions/0031-transparent-redial-and-the-sender-outbox.md)
+    /// §4.5). The default doubles from 100 ms to 30 s with jitter and never
+    /// gives up; [`ReconnectPolicy::never`] is the behaviour before 0031.
+    pub reconnect: ReconnectPolicy,
+    /// How long an `open` on a dialling endpoint waits for a peer to come
+    /// back before it fails with the loss cause; `None` waits as long as the
+    /// redial does (0031 §4.4). ZeroMQ's `ZMQ_SNDTIMEO`, with its default.
+    pub send_timeout: Option<Duration>,
+    /// Bodies a dialling endpoint's outbox holds while no peer is live, and
+    /// the bytes they may sum to (0031 §4.2). At either bound
+    /// [`RuntimeConfig::outbox_full`] decides. ZeroMQ's `ZMQ_SNDHWM` of 1000
+    /// for the count; the byte bound is what ZeroMQ lacks and
+    /// `docs/INVARIANTS.md` needs.
+    pub outbox_messages: usize,
+    /// See [`RuntimeConfig::outbox_messages`].
+    pub outbox_bytes: usize,
+    /// What a `send` does at the outbox bound: wait, drop and count, or
+    /// fail. Local to the sender, unlike the negotiated
+    /// [`GuaranteeSet::backpressure`], because a puller has no say in how
+    /// its pusher waits.
+    pub outbox_full: OutboxFull,
 }
 
 impl Default for RuntimeConfig {
@@ -156,6 +180,11 @@ impl Default for RuntimeConfig {
             connect_attempt_timeout: Duration::from_millis(250),
             discovery: Discovery::default(),
             resolver: SharedResolver::default(),
+            reconnect: ReconnectPolicy::default(),
+            send_timeout: None,
+            outbox_messages: 1000,
+            outbox_full: OutboxFull::default(),
+            outbox_bytes: 8 * 1024 * 1024,
         }
     }
 }

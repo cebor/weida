@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use weida_core::Error;
 
 /// A namespace of names that can be bound, dialled and unbound, generic over
@@ -34,6 +34,8 @@ use weida_core::Error;
 pub struct NameRegistry<T> {
     max_name_bytes: usize,
     entries: Mutex<HashMap<String, mpsc::UnboundedSender<T>>>,
+    /// Woken on every bind, for a dialler waiting for a name to appear.
+    bound: Notify,
 }
 
 impl<T> NameRegistry<T> {
@@ -42,6 +44,7 @@ impl<T> NameRegistry<T> {
         NameRegistry {
             max_name_bytes,
             entries: Mutex::new(HashMap::new()),
+            bound: Notify::new(),
         }
     }
 
@@ -85,6 +88,8 @@ impl<T> NameRegistry<T> {
         }
         let (tx, rx) = mpsc::unbounded_channel();
         entries.insert(name.to_owned(), tx);
+        drop(entries);
+        self.bound.notify_waiters();
         Ok(rx)
     }
 
@@ -108,6 +113,24 @@ impl<T> NameRegistry<T> {
             .expect("name registry poisoned")
             .get(name)
             .cloned()
+    }
+
+    /// Resolves once `name` is bound, at once if it already is.
+    ///
+    /// The in-process counterpart of redialling a socket: a bus is back
+    /// exactly when its name is registered again, so a dialler waits on the
+    /// registry rather than on a clock. Registered before the check, so a
+    /// bind between the check and the wait is not missed.
+    pub async fn wait_bound(&self, name: &str) {
+        loop {
+            let bound = self.bound.notified();
+            tokio::pin!(bound);
+            bound.as_mut().enable();
+            if self.lookup(name).is_some() {
+                return;
+            }
+            bound.await;
+        }
     }
 }
 

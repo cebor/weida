@@ -106,10 +106,15 @@ Notes on the covered ones:
   connection after reading part of the request; the sender observes `ConnectionLost` while
   still pre-FIN, and `is_definite_failure()` is true. Two tests in
   `crates/weida/tests/streams.rs` cover the variants that carry no close frame at all:
-  `idle_timeout_reports_loss_within_the_window`, where a silent connection simply expires,
-  and `after_the_server_restarts_the_pusher_must_reconnect`, where the first send after the
-  peer went away fails and the application has to `connect` again — v0 never reconnects by
-  itself.
+  `idle_timeout_reports_loss_within_the_window`, where a silent connection simply expires and
+  the endpoint reports `PeerEvent::Lost { cause: IdleTimeout }`, and
+  `a_server_that_goes_away_is_reported_as_connection_lost`, where under
+  `ReconnectPolicy::never()` the first send after the peer went away fails with the cause.
+  Under the default policy the runtime redials the address and a `send` during the outage is
+  held in the outbox; what is **not** repaired by that is the stream that was in flight, which
+  stays lost exactly as above
+  ([decisions/0031](decisions/0031-transparent-redial-and-the-sender-outbox.md) §4.3, §4.4;
+  `crates/weida/tests/reconnect.rs`).
 - **receiver crashes during stream** — indistinguishable at the wire from the previous case;
   same rule, same outcome, and the same two `streams.rs` tests apply unchanged.
 - **receiver gets the entire transfer but crashes before answering** — exercised by

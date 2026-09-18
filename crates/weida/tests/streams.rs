@@ -705,22 +705,24 @@ async fn cancel_discards_unread_bytes_and_keeps_read_ones() {
     client.shutdown().await;
 }
 
-// --- 6. no reconnect in v0 ------------------------------------------------
+// --- 6. a lost peer is reported, and a redial is the runtime's -------------
 
-/// Claim: v0 does not reconnect. When a server goes away, sends fail with
-/// `ConnectionLost`, `peer_count` no longer counts the dead peer, and the
-/// application must call `connect` again.
-///
-/// The setup runs two servers with the *same* identity on different ports, so
-/// the second is a restart as far as trust is concerned. Both the failure and
-/// the recovery are observed on one pusher.
+/// Claim: when a server goes away the loss is definite and named —
+/// `ConnectionLost(PeerClosed)` — and `peer_count` stops counting the dead
+/// peer. What happens next is the redial of `tests/reconnect.rs`; here the
+/// policy is `never`, so the first send after the close is the one that
+/// reports it, exactly as before 0031.
 #[tokio::test]
-async fn after_the_server_restarts_the_pusher_must_reconnect() {
+async fn a_server_that_goes_away_is_reported_as_connection_lost() {
     let certs = Certs::generate();
     let first = ManualServer::start(&certs, RuntimeConfig::default()).await;
     let puller = first.listener.puller("/jobs").expect("puller");
 
-    let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+    let client = Runtime::new(RuntimeConfig {
+        reconnect: weida::ReconnectPolicy::never(),
+        ..RuntimeConfig::default()
+    })
+    .expect("client runtime");
     let pusher = client.pusher(certs.client_tls());
     within(pusher.connect(&first.url("/jobs")))
         .await
@@ -757,21 +759,20 @@ async fn after_the_server_restarts_the_pusher_must_reconnect() {
     assert_eq!(attempts, 1, "the first send after the close already fails");
     assert_eq!(pusher.peer_count(), 0, "a dead peer does not count");
 
-    // A new server, same identity, new port. Nothing reconnects on its own.
+    // A new server, same identity, new port: a new address is a new slot,
+    // and the dead one no longer counts.
     let second = ManualServer::start(&certs, RuntimeConfig::default()).await;
     let puller = second.listener.puller("/jobs").expect("puller");
     within(pusher.connect(&second.url("/jobs")))
         .await
-        .expect("reconnect");
+        .expect("connect again");
     within(pusher.send(b"after")).await.expect("send after");
     let inbound = within(puller.recv()).await.expect("recv after");
     assert_eq!(
         within(inbound.collect(64)).await.expect("collect"),
         b"after"
     );
-
-    // Reconnecting reaped the dead entry: the set holds the live peer only.
-    assert_eq!(pusher.peer_count(), 1, "only the live peer remains");
+    assert_eq!(pusher.peer_count(), 1, "only the live peer counts");
 
     client.shutdown().await;
 }
@@ -803,6 +804,57 @@ async fn idle_timeout_reports_loss_within_the_window() {
     )
     .await;
     let replier = server.listener.replier("/rpc").expect("replier");
+    let replier = std::sync::Arc::new(replier);
+    let handler = tokio::spawn({
+        let replier = std::sync::Arc::clone(&replier);
+        async move {
+            let request = replier.accept().await.expect("accept");
+            let mut out = request
+                .reply(TransferMeta::default())
+                .await
+                .expect("open reply");
+            out.write_all(b"pong").await.expect("write reply");
+            out.finish().expect("finish reply");
+        }
+    });
+
+    let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
+    assert!(
+        client.config().limits.keep_alive > Duration::from_millis(500),
+        "the client's keep-alive must be too slow to save this connection"
+    );
+    let requester = client.requester(certs.client_tls());
+    let mut events = requester.events();
+    within(requester.connect(&server.url("/rpc")))
+        .await
+        .expect("connect");
+    assert!(matches!(
+        within(events.recv()).await,
+        Some(weida::PeerEvent::Connected { .. })
+    ));
+    let reply = within(requester.request(b"ping")).await.expect("request");
+    assert_eq!(within(reply.collect(64)).await.expect("collect"), b"pong");
+    within(handler).await.expect("handler");
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // The cause, not merely the outcome: an application deciding what an
+    // outage means must be able to tell an idle timeout from a peer that
+    // closed deliberately, and peer selection used to flatten both into one
+    // error. Since 0031 the cause is on the event stream, and the loss
+    // itself is the runtime's to repair: the server is still there, so the
+    // next request rides the redialled connection.
+    let lost = within(events.recv()).await;
+    assert!(
+        matches!(
+            lost,
+            Some(weida::PeerEvent::Lost {
+                cause: LossCause::IdleTimeout,
+                ..
+            })
+        ),
+        "a timed-out peer must surface as an idle timeout, got {lost:?}"
+    );
     let handler = tokio::spawn(async move {
         let request = replier.accept().await.expect("accept");
         let mut out = request
@@ -812,32 +864,11 @@ async fn idle_timeout_reports_loss_within_the_window() {
         out.write_all(b"pong").await.expect("write reply");
         out.finish().expect("finish reply");
     });
-
-    let client = Runtime::new(RuntimeConfig::default()).expect("client runtime");
-    assert!(
-        client.config().limits.keep_alive > Duration::from_millis(500),
-        "the client's keep-alive must be too slow to save this connection"
-    );
-    let requester = client.requester(certs.client_tls());
-    within(requester.connect(&server.url("/rpc")))
+    let reply = within(requester.request(b"ping again"))
         .await
-        .expect("connect");
-    let reply = within(requester.request(b"ping")).await.expect("request");
+        .expect("the redialled connection serves the request");
     assert_eq!(within(reply.collect(64)).await.expect("collect"), b"pong");
     within(handler).await.expect("handler");
-
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-
-    let err = within(requester.request(b"x"))
-        .await
-        .expect_err("an idled-out connection must not serve a request");
-    // The cause, not merely the outcome: an application deciding whether to
-    // redial must be able to tell an idle timeout from a peer that closed
-    // deliberately, and peer selection used to flatten both into one error.
-    assert!(
-        matches!(err, Error::ConnectionLost(LossCause::IdleTimeout)),
-        "a timed-out peer must surface as an idle timeout, got {err:?}"
-    );
 
     client.shutdown().await;
 }
