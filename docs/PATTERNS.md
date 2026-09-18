@@ -192,23 +192,34 @@ N − 1 of the transfers in flight, and 84 of 256 were held with no adversarial 
 ([IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-010). Ordering is not free at the receiver, which
 is why it is negotiated rather than default ([GUARANTEES.md](GUARANTEES.md) §3).
 
-### 1.8 Liveness: idle timeout, keep-alive, no reconnect
+### 1.8 Liveness: idle timeout, keep-alive, redial
 
 - A connection with no traffic is declared dead after `RuntimeConfig::idle_timeout` (30 s
   default), the smaller of the two peers' values governing both.
 - Only the **dialling** side sends keep-alives (`RuntimeConfig::keep_alive`, 10 s default). A
   binding with an idle timeout shorter than its clients' keep-alive interval drops them.
-- Loss surfaces as `Error::ConnectionLost(cause)` from the next operation, and the cause is
-  kept rather than flattened: `IdleTimeout`, `PeerClosed`, `LocallyClosed`, `Reset` or
-  `TransportError`. It is not a second outcome — the failure is definite whichever it is —
-  but it is what tells an application whether redialling makes sense. `Peer::peer_count`
-  stops counting the dead peer.
-- **Nothing reconnects.** The application calls `connect` again, with the same or a new
-  address; the dead entry is reaped then. A `Subscriber` re-sends its filters on `connect`.
+- Loss surfaces as `Error::ConnectionLost(cause)` from an operation that was on the dead
+  connection, and the cause is kept rather than flattened: `IdleTimeout`, `PeerClosed`,
+  `LocallyClosed`, `Reset` or `TransportError`. It is not a second outcome — the failure is
+  definite whichever it is — but it is what a `PeerEvent::Lost` carries and what decides
+  whether the redial policy continues. `Peer::peer_count` stops counting the dead peer.
+- **The address reconnects; the connection does not.** `connect` records a slot the runtime
+  redials under `ReconnectPolicy` (100 ms doubling to 30 s with jitter by default;
+  `ReconnectPolicy::never()` for the old behaviour) until the endpoint is dropped or the address
+  is disconnected. A redial that reaches a peer with a different key does not go live. A
+  `Subscriber` re-registers its route and re-sends its filters on the new connection; nothing
+  else is restored — the peer kept nothing ([decisions/0008](decisions/0008-session-identity.md)
+  §4.5), and what was published during the gap is gone. Every transition is reported on the
+  endpoint's `PeerEvent` stream ([decisions/0031](decisions/0031-transparent-redial-and-the-sender-outbox.md)
+  §4.8).
+- **`open` waits, `NotConnected` means never connected.** With every slot down, `open` waits
+  for the next live connection, bounded by `RuntimeConfig::send_timeout`; an endpoint that was
+  never told an address still fails at once with `Error::NotConnected`.
 
 *`idle_timeout_reports_loss_within_the_window` (server idle timeout 500 ms, client
-keep-alive 10 s, `ConnectionLost(IdleTimeout)` after 1.5 s of silence);
-`after_the_server_restarts_the_pusher_must_reconnect`.*
+keep-alive 10 s, `ConnectionLost(IdleTimeout)` after 1.5 s of silence). The redial itself is
+B-270 to B-272; until they land, "nothing reconnects" is still what the code does and
+`after_the_server_restarts_the_pusher_must_reconnect` still asserts it.*
 
 ### 1.9 Identity: who is on the other side
 
@@ -326,10 +337,13 @@ usually wrong:
 
 The third is the one that needs the cursors of
 [decisions/0023](decisions/0023-completion-is-a-cursor.md): a receiver that reports "durable up to
-*N*" is telling the sender what it may skip, and the sender decides. weida does **not** decide,
-does not remember a payload, and does not re-open a stream on anyone's behalf — a library that
-did would be rebuilding retries, which are Phase 4 and, in every system this repository surveyed,
-application-level (ZeroMQ's Lazy Pirate and Titanic are recipes, not features).
+*N*" is telling the sender what it may skip, and the sender decides. weida does **not** decide
+and does not re-open a stream on anyone's behalf — a library that did would be rebuilding
+retries, which are Phase 4 and, in every system this repository surveyed, application-level
+(ZeroMQ's Lazy Pirate and Titanic are recipes, not features). The one payload it does remember
+is not a stream: a body handed to `send` is a **message**, owned by the runtime from the call,
+held in a bounded outbox until it is written to a live connection and never resent after that
+([decisions/0031](decisions/0031-transparent-redial-and-the-sender-outbox.md) §4.2-§4.3).
 
 Which answer a pattern needs follows from the pattern, not from the transport:
 

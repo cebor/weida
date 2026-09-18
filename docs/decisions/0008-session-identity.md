@@ -177,6 +177,11 @@ Clean Start 1" [SYNTHESIS §7.2].
    the catalogue that genuinely resumes application state owns storage
    [SYNTHESIS §2 D8], storage is the L2 layer's job [ARCHITECTURE §1], and a retained session
    is remote-controlled state that the stream core has no owner for [INVARIANTS].
+   **Amended by [0031](0031-transparent-redial-and-the-sender-outbox.md):** "no reconnect
+   logic enters the runtime" is withdrawn for the *transport* half — the runtime redials a
+   dialled address and the subscriber re-sends its own filters on the new connection. The
+   session half stands unchanged: nothing server-side is retained, the counter restarts, and
+   the outbox 0031 adds is sender-local state with a sender-local owner and bound.
 6. **Subscription and sequence resumption are L2 work, and this note assigns them there
    rather than leaving them unowned.** The broker hop of Phase 6 is where a subscription
    outlives its connection, because the broker already holds the per-subscription credit that

@@ -1087,11 +1087,14 @@ Four things the table cannot say, each one found by building rather than by mapp
 weida is ZeroMQ's idea on QUIC, not ZeroMQ's behaviour. Five differences are deliberate, and
 each is a choice rather than an omission.
 
-1. **No mute state.** A ZeroMQ socket with no peer blocks silently; weida returns
-   `Error::NotConnected`. Explicitness over a silent stall — a program that never connected
-   should be told so, not hang. This is worth revisiting together with reconnect logic:
-   blocking-until-peer would live in `PeerSet::pick` behind an awaitable peer-list change,
-   and is deliberately not built now.
+1. **No mute state for an endpoint that never connected.** A ZeroMQ socket with no peer blocks
+   silently; a weida endpoint that was never given an address returns `Error::NotConnected`,
+   because a program that never connected should be told so, not hang. An endpoint that *was*
+   connected and has lost every peer behaves as ZeroMQ's does: the address is redialled by the
+   runtime, `open` waits for the next live connection and `send` is held in a bounded outbox
+   ([decisions/0031](decisions/0031-transparent-redial-and-the-sender-outbox.md)). The
+   awaitable peer-list change that this paragraph once deferred is B-271; until B-270 to
+   B-273 land, every case still returns `NotConnected` or the `LossCause`.
 2. **Publisher-side filtering.** Subscriptions travel to the publisher and matching happens
    there, so a payload nobody subscribed to never crosses the network. ZeroMQ made the same
    move in 3.x; the deviation is only from the 2.x behaviour some people still expect.
