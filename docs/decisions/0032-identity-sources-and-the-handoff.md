@@ -64,9 +64,15 @@ revokes the child token by its accessor and everything leased under it dies with
 same revocation runs at every process exit. What the flow proves is the hand-off; what it
 cannot protect is the running process's memory against the same uid, which is systemd
 hardening's job (`ProtectProc`, `NoNewPrivileges`, `ptrace_scope`). This is OpenBao's own
-response-wrapping mechanism, delivered through systemd's credentials directory
-(`LoadCredential`/`SetCredential`: a tmpfs only the service's uid can read, gone with the
-process), minted in `ExecStartPre=` and revoked in `ExecStopPost=`.
+response-wrapping mechanism, minted in `ExecStartPre=` and revoked in `ExecStopPost=`.
+**Delivery, as found by B-277:** the credentials directory (`LoadCredential`/`SetCredential`)
+is the natural place, and it is the place the *controller's* token rides — but it is mounted
+read-only for `ExecStartPre=` as for the service, so a pre-start cannot leave a freshly
+minted wrapping token there. The wrapping token travels through `RuntimeDirectory=` instead:
+`0700`, the unit's uid, removed with the unit, unlinked by the service once redeemed. Same
+uid, same tmpfs semantics, one more line in the unit. And the controller keeps the child's
+accessor from the minting answer (`wrapped_accessor`), so a theft — where the service never
+gets far enough to report anything — still ends with the thief's token revoked.
 
 ```mermaid
 sequenceDiagram
@@ -75,7 +81,7 @@ sequenceDiagram
     participant S as service (uid svc)
     C->>B: token/create role=svc, meta{unit}, wrap_ttl=5s
     B-->>C: wrapping token (single use, 5 s)
-    C->>S: start; wrapping token in $CREDENTIALS_DIRECTORY
+    C->>S: start; wrapping token in $RUNTIME_DIRECTORY, accessor kept
     S->>B: sys/wrapping/unwrap (first action)
     alt nobody redeemed it first
         B-->>S: service token (renewable, periodic)
@@ -164,23 +170,23 @@ affordable.
   library documents have.
 
 ### B-274 — Identity and trust as sources: ephemeral, static, files with reload, live rotation
-kind: code | size: 90 | status: ready | needs: []
+kind: code | size: 90 | status: done 3e6828b | needs: []
 acceptance: §4.1, §4.2, §4.4 in `crates/weida`: `IdentitySource`/`TrustSource` traits with a current value and a change signal; `Static`, `Ephemeral` (feature `generate`) and `Files` (bootstrap `0700`/`0600`, mtime reload at an interval) sources; `ServerTls::from_source` and `ClientTls::with_identity_source` alongside the value constructors, which become the static source; a rustls resolver on the binding that serves the rotated certificate to the next handshake with no re-bind; `IdentityEvent` on a bounded stream. Tests: a binding whose files are replaced under it serves the new certificate to the next connection and the old connection is unaffected; a key replaced on disk yields `KeyChanged` and a pinning client's redial reports `PeerChanged`; the bootstrap writes owner-only files and a second start loads them with the same fingerprint.
 
 ### B-275 — `weida-openbao`: the client and the three auths, hand-off included
-kind: code | size: 90 | status: ready | needs: [B-274]
+kind: code | size: 90 | status: done 9e24256 | needs: [B-274]
 acceptance: §4.3 first half: `crates/openbao/weida-openbao` with `reqwest` (rustls, no default features) and `serde_json`, both justified in the manifest; `Auth::Token`, `Auth::AppRole { role_id, secret_id }` and `Auth::Handoff { wrapping_token: Source }` where the source is a path or `$CREDENTIALS_DIRECTORY/<name>`; unwrap before any other request; a renewal task on `auth/token/renew-self` at half the TTL; a failed unwrap is `IdentityEvent::HandoffStolen` and an error. Tests against a scripted HTTP server in the crate for every auth and for the stolen hand-off (unwrap answers 400 "wrapping token is not valid or does not exist"), and one `#[ignore]`d test against `bao server -dev` on the local binary that mints a wrapped token, unwraps it, and sees the second unwrap fail.
 
 ### B-276 — `PkiSign`, `PkiAnchor`, `Kv`
-kind: code | size: 60 | status: ready | needs: [B-275]
+kind: code | size: 60 | status: done 9e24256 | needs: [B-275]
 acceptance: §4.3 second half: `PkiSign` builds a CSR from a `Files` key (rcgen), calls `pki/sign/<role>` with `use_csr_sans`, installs the chain, and renews at a configured fraction of the TTL with `Renewed`/`RenewalFailed`; `PkiAnchor` is a `TrustSource` from `pki/cert/ca` (or `ca_chain`) reloaded at an interval; `Kv` reads chain and key from a KV v2 secret. The role settings of §2 are checked where they can be (`key_type` mismatch is an error naming the role), and stated in the crate's README where they cannot. Tests: scripted server for all three; the `#[ignore]`d `bao -dev` test enables a PKI mount, a role, signs weida's CSR, and a client trusting `pki/cert/ca` connects to a binding whose identity came from `PkiSign`, then the binding rotates and the client's next connection verifies against the new chain with the same fingerprint.
 
 ### B-277 — The systemd hand-off, end to end
-kind: code | size: 45 | status: ready | needs: [B-275]
+kind: code | size: 45 | status: done 9e24256 | needs: [B-275]
 acceptance: `crates/openbao/weida-openbao/examples/handoff/`: a unit file with `ExecStartPre=` minting the wrapped child token (`bao token create -role … -wrap-ttl=5s`) into `SetCredential`, `ExecStopPost=` revoking by accessor, `ProtectProc`, `NoNewPrivileges`, `Restart=on-failure`; a service binary that unwraps, signs its identity and binds; a README that states the policy the controller token needs and the role the service token has. Proved on this workstation by running the unit under a user manager against `bao server -dev`, once cleanly and once with the wrapping token consumed by a second `bao unwrap` first.
 
 ### B-278 — Documents
-kind: docs | size: 30 | status: ready | needs: [B-274]
+kind: docs | size: 30 | status: done 9e24256 | needs: [B-274]
 acceptance: §6's four edits, plus `docs/libraries/weida-openbao.md` once B-275 exists.
 
 ## 7. Sources
@@ -197,5 +203,6 @@ OpenBao 2.6: `sys/wrapping/wrap`, `sys/wrapping/unwrap`, `sys/wrapping/lookup`,
 `auth/token/create`, `auth/token/renew-self`, `auth/token/revoke-accessor`,
 `auth/approle/login`, `pki/sign/:role`, `pki/cert/ca`, `pki/ca_chain`, KV v2 `data/:path`.
 systemd: `systemd.exec(5)` `LoadCredential=`/`SetCredential=`, `$CREDENTIALS_DIRECTORY`,
-`ExecStartPre=`/`ExecStopPost=`, `ProtectProc=`, `NoNewPrivileges=`; `Yama` `ptrace_scope`.
+`RuntimeDirectory=`, `ExecStartPre=`/`ExecStopPost=`, `ProtectProc=`, `NoNewPrivileges=`;
+`Yama` `ptrace_scope`.
 rustls: `ResolvesServerCert`, `ResolvesClientCert`, `sign::CertifiedKey`.
