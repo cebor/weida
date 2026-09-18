@@ -227,19 +227,19 @@ should be a refusal is left to the item that finds a reason for it.
   program that watches `PeerEvent` rather than one that loops on `connect`.
 
 ### B-270 — A dialled address outlives its connection: slots, redial policy, events
-kind: code | size: 90 | status: ready | needs: []
+kind: code | size: 90 | status: done 76cbb28 | needs: []
 acceptance: §4.1, §4.5, §4.7, §4.8 and §4.10 in `crates/weida`: `PeerSet` holds slots keyed by URL and trust, a per-slot task redials with `ReconnectPolicy` (backoff with jitter, `stop` causes, `give_up`), `ReconnectPolicy::never()` reproduces today's tests unchanged, a redial answering with a different fingerprint does not go live and reports `PeerChanged`, and every transition is delivered on a bounded, lag-counting `PeerEvent` stream per endpoint. On `weida+inproc://` the redial is a wait on the name registry rather than a timer; on `AF_UNIX` and named pipes it is the same policy as QUIC. Tests: a pusher whose QUIC server restarts delivers again with no second `connect`; the same over `AF_UNIX` with the listener re-bound on the same path, and over inproc with the bus dropped and re-registered under the same name, each asserting the same `Lost`, `Retrying`, `Connected` event order; a policy of `never` reports `ConnectionLost` as before; a QUIC server that comes back with a new key yields `GaveUp { PeerChanged }`.
 
 ### B-271 — `open` waits for a live peer; `NotConnected` means never connected
-kind: code | size: 45 | status: ready | needs: [B-270]
+kind: code | size: 45 | status: done 76cbb28 | needs: [B-270]
 acceptance: §4.4: `PeerSet::pick` awaits a peer-list change when every slot is down, bounded by `RuntimeConfig::send_timeout`, and returns `NotConnected` only for an endpoint with no slot. The `after_the_server_restarts_the_pusher_must_reconnect` test is replaced by one that opens a transfer during the outage and sees it complete on the redialled connection; a `send_timeout` test sees the timeout error with the last `LossCause` in it.
 
 ### B-272 — Re-subscribe on the redialled connection
-kind: code | size: 30 | status: ready | needs: [B-270]
+kind: code | size: 30 | status: done 76cbb28 | needs: [B-270]
 acceptance: §4.6: the redial task performs the route registration, reverse-pool fill and filter re-send that `Subscriber::connect` performs today, factored so there is one implementation of that sequence. Test: a subscriber whose publisher restarts receives the next publish after the restart with no application call; a filter subscribed *during* the outage is present after it.
 
 ### B-273 — The outbox: `send` returns when the runtime owns the body
-kind: code | size: 60 | status: ready | needs: [B-270, B-271]
+kind: code | size: 60 | status: done 76cbb28 | needs: [B-270, B-271]
 acceptance: §4.2 and §4.3 for `Pusher` and a dialling `Pair`: the fast path is byte-identical to today's `open` + `write_all` + `finish`; with no live peer the body is copied into a per-endpoint outbox bounded by `RuntimeConfig::outbox_messages` and `RuntimeConfig::outbox_bytes`, drained in order after the redial, with `Block` at the bound by default and a counted drop under `OutboxFull::Drop`; a body over `outbox_bytes` is refused at the call. Tests: 100 sends during an outage arrive in order after it; the fourth send at a bound of three blocks until the drain begins; a `Drop` endpoint counts what it discarded; a body written before the restart is delivered once (asserted by the puller's sequence after the redial).
 
 ## 7. Sources
