@@ -59,6 +59,7 @@ mod drain;
 mod endpoint;
 #[cfg(any(unix, windows))]
 mod grouped;
+mod identity;
 mod inproc;
 mod listener;
 mod ordering;
@@ -75,15 +76,6 @@ mod transport;
 #[cfg(unix)]
 mod unix;
 
-pub use weida_core::DEFAULT_PORT;
-pub use weida_core::{
-    Address, EndpointAddr, Error, ErrorCode, Fingerprint, InprocAddr, Limits, LocalPrincipal,
-    LossCause, PeerIdentity, PipeAddr, Result, StopReason, TraceContext, UnixAddr,
-    WindowsPrincipal,
-};
-pub use weida_protocol::{ALPN, VERSION, codes, filter};
-pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
-
 pub use config::{ClientTls, Discovery, Identity, Pem, RuntimeConfig, ServerTls, Trust};
 pub use cursor::{CursorSet, Cursors, Reported, Reporter};
 pub use drain::Drained;
@@ -92,6 +84,7 @@ pub use endpoint::{
     Rep, Replier, Req, Requester, Respond, Respondent, Sub, Subscriber, Survey, SurveyRun,
     Surveyor,
 };
+pub use identity::{FilesOptions, IdentityEvent, IdentityEvents, IdentitySource, TrustSource};
 #[cfg(windows)]
 pub use listener::PipeBinding;
 #[cfg(unix)]
@@ -99,6 +92,14 @@ pub use listener::UnixBinding;
 pub use listener::{Binding, Listener, LocalBinding};
 pub use ordering::Gap;
 pub use pubsub::{FanOut, TopicDrops};
+pub use weida_core::DEFAULT_PORT;
+pub use weida_core::{
+    Address, EndpointAddr, Error, ErrorCode, Fingerprint, InprocAddr, Limits, LocalPrincipal,
+    LossCause, PeerIdentity, PipeAddr, Result, StopReason, TraceContext, UnixAddr,
+    WindowsPrincipal,
+};
+pub use weida_protocol::{ALPN, VERSION, codes, filter};
+pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
 // `Delivery` keeps its transfer-receipt meaning at this level, so the
 // dimension of the same name is re-exported under the name the guarantee
 // documents use for it.

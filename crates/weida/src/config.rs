@@ -14,6 +14,7 @@ use weida_core::{Error, Fingerprint, Limits};
 use weida_protocol::header::GuaranteeSet;
 use weida_runtime::SharedResolver;
 
+use crate::identity::{IdentitySource, TrustSource};
 use crate::reconnect::{OutboxFull, ReconnectPolicy};
 
 /// Whether a dialled authority may name a **set** of nodes.
@@ -414,31 +415,38 @@ impl Trust {
 /// TLS configuration of a dialling endpoint: what it trusts and, optionally,
 /// who it is.
 ///
-/// Equality is by content, and the connection pool keys on it: two endpoints
-/// dialling the same authority under different trust or identity must never
-/// share a connection, or one would be using a peer authenticated on the
-/// other's terms.
+/// Both are sources ([`TrustSource`], [`IdentitySource`]): a value converts
+/// into a source that never changes, and a source that does — a directory
+/// an agent rewrites, an authority that renews — is read again on every
+/// connection this endpoint builds
+/// ([decisions/0032](../../../docs/decisions/0032-identity-sources-and-the-handoff.md)).
+///
+/// Equality is by content for static sources and by identity for the rest,
+/// and the connection pool keys on it: two endpoints dialling the same
+/// authority under different trust or identity must never share a
+/// connection, or one would be using a peer authenticated on the other's
+/// terms — while two configured alike do share one.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ClientTls {
     /// Whom to accept as the peer.
-    pub trust: Trust,
+    pub trust: TrustSource,
     /// The identity to present. `None` dials anonymously, which a binding
     /// that requires client trust ([`ServerTls::require_client`]) refuses.
-    pub identity: Option<Identity>,
+    pub identity: Option<IdentitySource>,
 }
 
 impl ClientTls {
     /// Dials anonymously under `trust`.
-    pub fn new(trust: Trust) -> ClientTls {
+    pub fn new(trust: impl Into<TrustSource>) -> ClientTls {
         ClientTls {
-            trust,
+            trust: trust.into(),
             identity: None,
         }
     }
 
-    /// Presents `identity` to every peer.
-    pub fn with_identity(mut self, identity: Identity) -> ClientTls {
-        self.identity = Some(identity);
+    /// Presents `identity` — a value or a source — to every peer.
+    pub fn with_identity(mut self, identity: impl Into<IdentitySource>) -> ClientTls {
+        self.identity = Some(identity.into());
         self
     }
 }
@@ -449,35 +457,55 @@ impl From<Trust> for ClientTls {
     }
 }
 
+impl From<TrustSource> for ClientTls {
+    fn from(trust: TrustSource) -> ClientTls {
+        ClientTls::new(trust)
+    }
+}
+
 /// TLS configuration of a binding: who it is and, optionally, whom it lets in.
+///
+/// The identity is a source: a binding serves whatever the source holds at
+/// each handshake, so a certificate renewed under it — by a file the agent
+/// rewrote, by an authority the process asked — reaches the next peer
+/// without a re-bind
+/// ([decisions/0032](../../../docs/decisions/0032-identity-sources-and-the-handoff.md)
+/// §4.1).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ServerTls {
     /// The identity presented to every dialling peer.
-    pub identity: Identity,
+    pub identity: IdentitySource,
     /// When set, every peer must present an identity this trusts; anonymous
     /// peers and untrusted identities fail the handshake. When `None`, peers
     /// are anonymous and [`crate::IncomingMeta::peer`] is `None`.
-    pub client_trust: Option<Trust>,
+    pub client_trust: Option<TrustSource>,
 }
 
 impl ServerTls {
-    /// Serves as `identity`, accepting anonymous peers.
-    pub fn new(identity: Identity) -> ServerTls {
+    /// Serves as `identity` — a value or a source — accepting anonymous
+    /// peers.
+    pub fn new(identity: impl Into<IdentitySource>) -> ServerTls {
         ServerTls {
-            identity,
+            identity: identity.into(),
             client_trust: None,
         }
     }
 
     /// Requires every peer to present an identity that `trust` accepts.
-    pub fn require_client(mut self, trust: Trust) -> ServerTls {
-        self.client_trust = Some(trust);
+    pub fn require_client(mut self, trust: impl Into<TrustSource>) -> ServerTls {
+        self.client_trust = Some(trust.into());
         self
     }
 }
 
 impl From<Identity> for ServerTls {
     fn from(identity: Identity) -> ServerTls {
+        ServerTls::new(identity)
+    }
+}
+
+impl From<IdentitySource> for ServerTls {
+    fn from(identity: IdentitySource) -> ServerTls {
         ServerTls::new(identity)
     }
 }

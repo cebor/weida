@@ -18,6 +18,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use quinn::rustls::client::ResolvesClientCert;
 use quinn::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
@@ -25,6 +26,8 @@ use quinn::rustls::crypto::CryptoProvider;
 use quinn::rustls::pki_types::pem::PemObject;
 use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use quinn::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use quinn::rustls::server::{ClientHello, ResolvesServerCert};
+use quinn::rustls::sign::CertifiedKey;
 use quinn::rustls::{
     CertificateError, DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme,
 };
@@ -32,6 +35,7 @@ use quinn::{TransportConfig, VarInt};
 use weida_core::{Error, Fingerprint, Limits};
 
 use crate::config::{ClientTls, Identity, Pem, ServerTls, Trust};
+use crate::identity::{IdentitySource, TrustSource};
 
 /// Reads a certificate chain from either PEM source.
 pub(crate) fn certs_from(pem: &Pem) -> Result<Vec<CertificateDer<'static>>, Error> {
@@ -282,12 +286,70 @@ impl ServerCertVerifier for PeerVerifier {
     }
 }
 
-/// Verifies the client a binding accepted.
+/// Verifies the client a binding accepted, against the trust of the moment.
+///
+/// The binding lives longer than its trust: an anchor an authority rotates
+/// is a new root store, and a pin an operator adds is a new policy. Both are
+/// rebuilt when the source's generation moved and cached otherwise.
 #[derive(Debug)]
 struct ClientVerifier {
+    trust: TrustSource,
+    provider: Arc<CryptoProvider>,
+    cached: Mutex<(u64, Arc<ClientTrust>)>,
+}
+
+/// One generation of a binding's client trust.
+#[derive(Debug)]
+struct ClientTrust {
     policy: Policy,
     chain: Option<Arc<dyn ClientCertVerifier>>,
-    provider: Arc<CryptoProvider>,
+}
+
+impl ClientVerifier {
+    fn new(trust: TrustSource, provider: Arc<CryptoProvider>) -> Result<ClientVerifier, Error> {
+        let generation = trust.generation();
+        let built = ClientTrust::build(&trust.current(), &provider)?;
+        Ok(ClientVerifier {
+            trust,
+            provider,
+            cached: Mutex::new((generation, Arc::new(built))),
+        })
+    }
+
+    fn current(&self) -> Arc<ClientTrust> {
+        let generation = self.trust.generation();
+        let mut cached = self.cached.lock().expect("trust cache poisoned");
+        if cached.0 != generation {
+            match ClientTrust::build(&self.trust.current(), &self.provider) {
+                Ok(built) => *cached = (generation, Arc::new(built)),
+                // Unreadable anchors: the previous trust stays in force and
+                // the source reported it.
+                Err(e) => self.trust.report_failure(e.to_string()),
+            }
+        }
+        Arc::clone(&cached.1)
+    }
+}
+
+impl ClientTrust {
+    fn build(trust: &Trust, provider: &Arc<CryptoProvider>) -> Result<ClientTrust, Error> {
+        let chain = match root_store(trust)? {
+            Some(roots) => Some(
+                quinn::rustls::server::WebPkiClientVerifier::builder_with_provider(
+                    roots,
+                    Arc::clone(provider),
+                )
+                .build()
+                .map(|v| v as Arc<dyn ClientCertVerifier>)
+                .map_err(|e| tls_err("building the client verifier", e))?,
+            ),
+            None => None,
+        };
+        Ok(ClientTrust {
+            policy: Policy::new(None, trust),
+            chain,
+        })
+    }
 }
 
 impl ClientCertVerifier for ClientVerifier {
@@ -304,13 +366,14 @@ impl ClientCertVerifier for ClientVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, quinn::rustls::Error> {
-        match self.policy.judge(end_entity)? {
+        let trust = self.current();
+        match trust.policy.judge(end_entity)? {
             Verdict::Accept => Ok(ClientCertVerified::assertion()),
-            Verdict::Chain(presented) => match &self.chain {
+            Verdict::Chain(presented) => match &trust.chain {
                 Some(chain) => chain
                     .verify_client_cert(end_entity, intermediates, now)
-                    .map_err(|_| self.policy.refuse(presented)),
-                None => Err(self.policy.refuse(presented)),
+                    .map_err(|_| trust.policy.refuse(presented)),
+                None => Err(trust.policy.refuse(presented)),
             },
         }
     }
@@ -388,14 +451,99 @@ fn load_identity(
     Ok((certs_from(&identity.cert_chain)?, key_from(&identity.key)?))
 }
 
+/// Builds the key rustls signs handshakes with from a loaded identity.
+fn certified_key(
+    provider: &CryptoProvider,
+    identity: &Identity,
+) -> Result<Arc<CertifiedKey>, Error> {
+    let (chain, key) = load_identity(identity)?;
+    let key = provider
+        .key_provider
+        .load_private_key(key)
+        .map_err(|e| tls_err("loading the private key", e))?;
+    let certified = CertifiedKey::new(chain, key);
+    certified
+        .keys_match()
+        .map_err(|e| tls_err("the certificate does not match its key", e))?;
+    Ok(Arc::new(certified))
+}
+
+/// Serves the identity a source holds **now** to every handshake.
+///
+/// The certified key is rebuilt when the source's generation moved and
+/// cached otherwise, so a rotation costs one parse and an unchanged source
+/// costs an atomic load per handshake. A connection already established
+/// keeps the key it was made with; only the next handshake sees the new
+/// one, which is what "rotation without re-binding" means (0032 §4.1).
+#[derive(Debug)]
+struct LiveKey {
+    source: IdentitySource,
+    provider: Arc<CryptoProvider>,
+    cached: Mutex<(u64, Arc<CertifiedKey>)>,
+}
+
+impl LiveKey {
+    fn new(source: IdentitySource, provider: Arc<CryptoProvider>) -> Result<LiveKey, Error> {
+        let generation = source.generation();
+        let key = certified_key(&provider, &source.loaded().identity)?;
+        Ok(LiveKey {
+            source,
+            provider,
+            cached: Mutex::new((generation, key)),
+        })
+    }
+
+    fn current(&self) -> Option<Arc<CertifiedKey>> {
+        // `loaded()` is also where a file source's due check runs.
+        let loaded = self.source.loaded();
+        let generation = self.source.generation();
+        let mut cached = self.cached.lock().expect("key cache poisoned");
+        if cached.0 == generation {
+            return Some(Arc::clone(&cached.1));
+        }
+        match certified_key(&self.provider, &loaded.identity) {
+            Ok(key) => {
+                *cached = (generation, Arc::clone(&key));
+                Some(key)
+            }
+            // The source accepted material rustls cannot use; the previous
+            // key stays in service and the source reported the failure.
+            Err(e) => {
+                self.source.report_failure(e.to_string());
+                Some(Arc::clone(&cached.1))
+            }
+        }
+    }
+}
+
+impl ResolvesServerCert for LiveKey {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.current()
+    }
+}
+
+impl ResolvesClientCert for LiveKey {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        self.current()
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
 /// Builds a QUIC server configuration from the binding's identity and, when
 /// it requires one, the trust it holds clients to.
 pub(crate) fn server_config(
     tls: &ServerTls,
     limits: &Limits,
 ) -> Result<quinn::ServerConfig, Error> {
-    let (chain, key) = load_identity(&tls.identity)?;
     let provider = provider();
+    let key = LiveKey::new(tls.identity.clone(), Arc::clone(&provider))?;
 
     let builder = quinn::rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&quinn::rustls::version::TLS13])
@@ -409,28 +557,13 @@ pub(crate) fn server_config(
                         .into(),
                 ));
             }
-            let chain_verifier = match root_store(trust)? {
-                Some(roots) => Some(
-                    quinn::rustls::server::WebPkiClientVerifier::builder_with_provider(
-                        roots,
-                        Arc::clone(&provider),
-                    )
-                    .build()
-                    .map(|v| v as Arc<dyn ClientCertVerifier>)
-                    .map_err(|e| tls_err("building the client verifier", e))?,
-                ),
-                None => None,
-            };
-            builder.with_client_cert_verifier(Arc::new(ClientVerifier {
-                policy: Policy::new(None, trust),
-                chain: chain_verifier,
-                provider: Arc::clone(&provider),
-            }))
+            builder.with_client_cert_verifier(Arc::new(ClientVerifier::new(
+                trust.clone(),
+                Arc::clone(&provider),
+            )?))
         }
     };
-    let mut crypto = builder
-        .with_single_cert(chain, key)
-        .map_err(|e| tls_err("installing the server certificate", e))?;
+    let mut crypto = builder.with_cert_resolver(Arc::new(key));
     crypto.alpn_protocols = vec![weida_protocol::ALPN.to_vec()];
 
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
@@ -445,18 +578,22 @@ pub(crate) fn server_config(
 /// `expected` is the fingerprint the address named, if any. The returned
 /// [`Refused`] is where the verifier records a peer it turned away, so the
 /// caller can report [`Error::Untrusted`] with the identity that showed up.
+///
+/// Built per dial, so the trust and the identity are whatever their sources
+/// hold at that moment.
 pub(crate) fn client_config(
     tls: &ClientTls,
     expected: Option<Fingerprint>,
     limits: &Limits,
 ) -> Result<(quinn::ClientConfig, Refused), Error> {
-    if expected.is_none() && tls.trust.is_empty() {
+    let trust = tls.trust.current();
+    if expected.is_none() && trust.is_empty() {
         return Err(Error::Tls(
             "nothing to trust: the address names no fingerprint and the trust set is empty".into(),
         ));
     }
     let provider = provider();
-    let chain_verifier = match root_store(&tls.trust)? {
+    let chain_verifier = match root_store(&trust)? {
         Some(roots) => Some(
             quinn::rustls::client::WebPkiServerVerifier::builder_with_provider(
                 roots,
@@ -468,7 +605,7 @@ pub(crate) fn client_config(
         ),
         None => None,
     };
-    let policy = Policy::new(expected, &tls.trust);
+    let policy = Policy::new(expected, &trust);
     let refused = Arc::clone(&policy.refused);
     let verifier = Arc::new(PeerVerifier {
         policy,
@@ -476,7 +613,7 @@ pub(crate) fn client_config(
         provider: Arc::clone(&provider),
     });
 
-    let builder = quinn::rustls::ClientConfig::builder_with_provider(provider)
+    let builder = quinn::rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&quinn::rustls::version::TLS13])
         .map_err(|e| tls_err("selecting TLS 1.3", e))?
         .dangerous()
@@ -484,10 +621,8 @@ pub(crate) fn client_config(
     let mut crypto = match &tls.identity {
         None => builder.with_no_client_auth(),
         Some(identity) => {
-            let (chain, key) = load_identity(identity)?;
-            builder
-                .with_client_auth_cert(chain, key)
-                .map_err(|e| tls_err("installing the client certificate", e))?
+            let key = LiveKey::new(identity.clone(), provider)?;
+            builder.with_client_cert_resolver(Arc::new(key))
         }
     };
     crypto.alpn_protocols = vec![weida_protocol::ALPN.to_vec()];
