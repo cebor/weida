@@ -37,11 +37,10 @@ as emergent rather than implemented, see [ARCHITECTURE.md](ARCHITECTURE.md) §6a
 and later remain out of scope; Phase 6 gained the acknowledgement vocabulary that used to
 sit in the core.
 
-Phase 9 is open out of order, deliberately and narrowly: the ZMTP codec
-(`crates/zmq/weida-zmtp`, [adapters/zmtp.md](adapters/zmtp.md) §10.1) is a self-contained
-foreign-protocol codec with no weida dependency, so it needs nothing from phases 4-8 and
-building it now is what turns the adapter mapping document from a design into a checked
-claim. The bridge slices, which do need the patterns, wait for their place in the order.
+Phase 9 is open out of order for standalone foreign-protocol libraries. Their dependency-free
+codecs and `weida-runtime`-based implementations need none of the later weida phases and keep
+their own protocol semantics. They do not introduce general bridges or mappings onto weida
+patterns ([0013](decisions/0013-competitor-libraries.md)).
 
 One increment belongs to no phase: **`weida-runtime` is extracted** (B-070,
 `crates/runtime`). It holds `Exec` — `spawn`, `sleep`, `within`, `enter` and the capped
@@ -695,8 +694,7 @@ header stacks — and rejects from the declared value alone, before anything is 
 
 **Four places where the specification, the research sheet and NNG disagree.** Each is a
 decision here rather than a comment in the code, because each one changes what a real peer
-will accept ([docs/adapters/nng.md](adapters/nng.md) §11 carries them as open questions the
-interop bench settles):
+will accept and the interop suite must settle it:
 
 1. **Endpoint type numbers are the implementation's.** The SP RFCs assign the 12-bit
    protocol IDs and delegate the 4-bit endpoint role to the per-protocol RFCs, which never
@@ -710,9 +708,8 @@ interop bench settles):
    `0` on a cooked send and increments on receipt (`src/sp/protocol/pair1/pair.c`).
    **Decision:** encode NNG's `0`, decode both without complaint — the difference is a
    count, not a format — and name the disagreement in the module documentation, in
-   `pair::INITIAL_HOPS` and in the mapping document. A test against a real NNG peer is what
-   would close it; until then this codec is interoperable with the implementation rather
-   than with the prose.
+   `pair::INITIAL_HOPS` and in the crate documentation. A test against a real NNG peer closes
+   the question; until then the codec follows the implementation rather than the prose.
 3. **The hop ceiling has two values.** The sheet documents `MAXTTL` as 1-255 with 8 the
    common default (§11); NNG's `NNI_MAX_MAX_TTL` is **15** (`src/core/defs.h`), and its own
    comment says the buffer sizing is why. **Decision:** ship all three as named constants
@@ -728,160 +725,14 @@ interop bench settles):
    has the socket. The same reasoning already applies to `weida-zmtp`'s `BodyTooLarge`, for
    a different upstream reason (libzmq disconnects).
 
-**What the golden vectors are for.** `docs/adapters/nng.md` §10.1 publishes 20 accept
-vectors and 6 rejection vectors; `tests/golden_vectors.rs` asserts every accept vector in
-**both** directions and every rejection vector on the decoder. Encoding alone would not
-catch a decoder wrong in the same way, which is the failure mode that matters when the peer
-is NNG and not us — and it is what B-043 showed pays, since the ZMTP vectors were what made
-a foreign peer's disagreements interpretable rather than mysterious.
+**What the golden vectors are for.** `crates/nng/weida-sp/tests/golden_vectors.rs` asserts
+every accepted vector in both directions and every rejected vector on the decoder. Encoding
+alone would not catch a decoder wrong in the same way, which is the failure mode that matters
+when the peer is NNG and not us.
 
-**Not in this slice:** no bridge, no I/O, no weida types, and no PUB/SUB topic handling —
-SP has no topic field, only the leading bytes of a body, so the split is adapter
-configuration and belongs to the bridge slice ([adapters/nng.md](adapters/nng.md) §6).
+**Not in this slice:** no I/O and no weida types. SP socket state, topic conventions and
+transport policy belong to the standalone `weida-nng` library above the codec.
 
-**Delivered in the fourteenth increment — the SP inbound bridge (B-052):**
-
-`crates/nng/weida-nng-bridge`, the mirror of B-041 for SP: one `Inbound` terminates the
-SP TCP mapping with `weida-sp` and speaks weida onward. `REP` in front of a weida
-`Replier`, `PULL` in front of a `Puller`, `PUB` fed by a `Subscriber`. Ten integration
-tests against an SP peer built on our own codec — no C library, nothing `#[ignore]`d — plus
-the unit test that pins the endpoint-type table.
-
-**Two things are structurally unlike the ZMTP bridge, and both come from the protocol.**
-
-1. **Requests are concurrent, and the tag stack is what pairs them.** ZMTP's REQ is
-   lockstep, so B-041's REP loop is too. A cooked SP REQ holds one outstanding request per
-   *context* and a socket may own many
-   ([research/nanomsg-nng.md](research/nanomsg-nng.md) §2), so the bridge splits the socket,
-   serves each request in its own task and writes replies through one writer task. Order is
-   not the correlation — the 32-bit tag stack is [rfc-reqrep §5] — and
-   `several_requests_in_flight_are_answered_by_tag_not_by_order` proves it by making the
-   weida replier answer four held requests in reverse: a sequential bridge deadlocks on that
-   test rather than failing it slowly.
-2. **The `PUB` side subscribes to everything.** SP filters at the *subscriber* and a SUB
-   socket has no send operation at all (§4), so no subscription ever reaches the bridge and
-   there is nothing to translate. It takes the empty-subscription row of
-   [adapters/nng.md](adapters/nng.md) §6, and L1 stops being a sentence: the test observes a
-   topic the peer would have filtered out arriving anyway. The topic is written as the
-   leading bytes of the body with no separator, because SP has no topic field.
-
-**Every bound is a factor of one stated product**, which is the B-043 arithmetic applied
-before the review pass could find it rather than after. `max_message_bytes` defaults to
-1 MiB — `stream_receive_window`, the same number and the same reason as the ZMTP bridge —
-and the worst case one bridge holds is
-`max_message_bytes × 2 × max_in_flight × max_connections` = 1 MiB × 2 × 4 × 64 = **512 MiB**,
-twice `max_in_flight` because a request payload is held while its exchange runs and its
-reply while it waits for the writer. `max_connections` exists because the listener would
-otherwise accept without a ceiling; `max_hops` bounds the tag stack a peer can make the
-bridge allocate. All four are configuration, and zero in any of them is refused at
-`bind` — which is also where a guarantee set above `core` is refused (§9.2, §9.3).
-
-**A refusal here carries no reason, and that is now L10 of the mapping document.** SP has
-no error frame: the TCP mapping's only remedy is "the connection MUST be closed
-immediately" [rfc-tcp §2]. A mismatched endpoint type, a malformed protocol header, an
-oversized declaration and a too-deep tag stack are therefore all the same observation from
-the peer's side — the bridge's header, then EOF — which two tests assert and which makes
-the bridge's own log the only place the reason exists. The contrast with the ZMTP bridge,
-where a refusal carries a printable reason, is the sharpest thing this slice learned.
-
-**What is not here:** the outbound direction (slice 3) and the interop bench against a real
-`nng` peer (slice 5), which is what would settle §11's PAIR v1 hop-count disagreement and
-L10's "is a close really all a peer learns".
-
-**Delivered in the fifteenth increment — the SP outbound bridge (B-063):**
-
-The other direction of the same crate: `Outbound` binds the weida side and dials one
-foreign SP peer — `REQ` toward a `REP`, `PUSH` toward a `PULL`, `SUB` toward a `PUB`. Nine
-integration tests against a peer built on `weida-sp` over a plain TCP listener, plus five
-unit tests for the topic split and the request-id sequence.
-
-**The decision this slice existed to make: the bridge does not retransmit.** A cooked REQ
-socket resends on its timer, on disconnect, or when a peer becomes available
-([research/nanomsg-nng.md](research/nanomsg-nng.md) §4). Doing that here would manufacture
-at-least-once for a weida requester that asked for one attempt, which is the adapter
-inventing a guarantee its source protocol does not give *in the direction nobody asked for*
-— L3 and L4 of [adapters/nng.md](adapters/nng.md) §8 arriving from the wrong side. So the
-bridge speaks the **raw** REQ header shape: a 31-bit id per exchange, written once with the
-terminal bit [rfc-reqrep §5], matched on the way back. The test asserts the absence —
-exactly one request on the wire and nothing after it — which is the only way an
-un-retransmission can be observed.
-
-**How a weida requester learns that an SP peer will not answer**, the question the loop
-asked for judgement on. SP has no error frame and no way to decline, so silence is the
-whole vocabulary (§4, §6, [rfc-tcp §2]). Two answers rather than one:
-
-1. **A per-exchange deadline**, B-042's answer for ZMTP, reused because the shape is the
-   same even though the cause is not: there a ROUTER *dropped* an unroutable request, here
-   the peer may be deliberately silent. On expiry the requester gets `ERROR{NO_REPLY}`.
-2. **A close ends every pending exchange at once**, which B-042 did not have. A closed
-   connection is the only statement SP can make, so waiting out the deadline after it would
-   be inventing patience: the test parks an exchange behind a 600-second deadline, drops the
-   peer, and expects `Error::NoReply` immediately. This is the slice's one deviation from
-   the ZMTP answer, recorded here because it is a deviation.
-
-**A wrong peer type is told to nobody and reported to everybody.** The dialled peer gets a
-close — L10 again — but the weida side is already bound, so for `refusal_grace` the bridge
-answers every exchange with `ERROR{UNSUPPORTED}`, which reaches a requester as
-`Error::Unsupported` rather than as an endpoint that never existed. A `Puller` has no coded
-refusal, so an arriving transfer is dropped, which resets its stream: weida's own
-per-stream refusal.
-
-**Bounds, again stated as a product.** `max_pending_exchanges × max_message_bytes` =
-64 × 1 MiB = **64 MiB**, and each waiting exchange holds a weida request *and* its body,
-which is why the ceiling is checked **before** the body is read — the cheaper refusal, and
-the shape B-053 had to add to the ZMTP bridge after the fact.
-
-**The topic split became configuration in both directions.** SP has no topic field, so
-`TopicSplit` says what the leading bytes mean — a delimiter, a fixed width, or a constant —
-and the inbound direction gained a matching `topic_delimiter`, so a pair of these bridges
-can round-trip a topic. The default delimiter is `0x00`, the one octet a weida topic cannot
-contain. The `SUB` role's prefixes are applied locally, because SP subscriptions never
-reach the wire, and they are **not** derived from weida filters: that is new loss L11 in
-the mapping document, with the boundary rule of
-[decisions/0007](decisions/0007-topic-namespace.md) §4.5 as the reason only one shape could
-ever translate.
-
-**What is not here:** the interop bench against a real `nng` peer (slice 5), which is what
-would settle §11's PAIR v1 hop-count disagreement, L10's "is a close really all a peer
-learns", and this slice's own new question — whether an NNG `REP` minds a requester that
-never retransmits.
-
-**Delivered in the sixteenth increment — the cross-adapter test (B-057):**
-
-`crates/interop/cross-tests` is Phase B slice 6 ([LOOP.md](LOOP.md) §9): a message enters
-through one adapter and leaves through the other. It is its own crate with no library code,
-because `weida-zmq-bridge` and `weida-nng-bridge` each know one foreign protocol and nothing
-of the other — the property that keeps either checkable against its own specification
-([ARCHITECTURE.md](ARCHITECTURE.md) §4) — so a chain belongs to neither.
-
-**Nine tests, both foreign ends the real implementations**: `zeromq` in pure Rust and the
-`nng` C library through its Rust binding, neither `#[ignore]`d. Six are the pattern chains —
-REQ→REP with the reply returning, PUSH→PULL, PUB→SUB through both topic conventions, and the
-three reversed — and what they assert is that **neither envelope crosses**: the 28/REQREP
-delimiter is consumed on the ZMTP side and the 32-bit tag stack is written on the SP side, so
-the far peer answering the right bytes is the proof that each protocol was terminated rather
-than forwarded.
-
-**The chain's honest guarantee is `BestEffort`, and it is asserted rather than described.**
-A ZeroMQ send that returns has handed the message to a socket
-([adapters/zmtp.md](adapters/zmtp.md) §7); SP has no transfer point at all
-([adapters/nng.md](adapters/nng.md) §7). `the_chain_is_best_effort_end_to_end` sends with the
-NNG puller closed and asserts the pair — the send succeeded, the message is gone — which is
-what neither mapping document may be read as promising more than.
-
-**The composed losses are the part no single document could state.** A ZMTP multipart is
-refused at hop one, so the SP edge never sees it (L1 of zmtp.md §8); with a 4 KiB ZMTP cap
-against the SP side's 1 MiB, **the smaller cap decides** and the far edge buffers nothing; and
-an SP `MAXTTL` ceiling reached at the *second* hop reaches the first peer **as silence**,
-because SP has no error frame (L10) and the ZMTP bridge has no reply to attach its `ERROR` to.
-That conversion — a refusal at the far hop becoming silence at the near one — is what the
-chain adds to either document alone. That one test's SP peer is raw TCP on `weida-sp`, because
-a reply carrying three forwarder ids needs an `nng_device` topology that belongs to the interop
-bench.
-
-**What it settles from the increment above.** The `nng` run is no longer owed for the REQ
-question: a real `Rep0` answers this bridge's raw requester, which never retransmits. PAIR is
-not in any chain, so §11's hop-count disagreement is still open on the wire.
 
 **Delivered in the seventeenth increment — named pipes on Windows (B-039), which closes
 Phase A:**
@@ -1514,58 +1365,6 @@ beside it. For scale, 10 ns is **0.13 %** of a 1 KiB push (~7.9 µs), and dedupl
 opt-in — a connection that negotiated `core` allocates nothing here at all, which the
 capacity assertions in `dedup.rs` already prove.
 
----
-
-### Verified results — what the ZMTP bridge costs, against no bridge (B-043)
-
-The comparison [adapters/zmtp.md](adapters/zmtp.md) §10 item 6 asks for: the same work through
-the adapter and with no adapter in it, the foreign peer being the pure-Rust `zeromq` crate
-0.6 on both sides of the comparison. `direct` is zmq.rs to zmq.rs over loopback TCP with no
-weida at all; `bridged` is zmq.rs to the inbound bridge to a weida endpoint — one TCP hop, one
-QUIC hop and two protocol terminations. One process, one machine, so what the difference
-contains is the bridge and the second transport rather than a network.
-
-| Exchange | Payload | direct (zmq.rs ↔ zmq.rs) | bridged (zmq.rs → weida) | Ratio |
-| --- | --- | --- | --- | --- |
-| REQ/REP round trip | 1 KiB | **20.4-20.6 µs** | **80.9-81.4 µs** | 4.0× |
-| REQ/REP round trip | 1 MiB | **437-441 µs** | **3.34-3.41 ms** | 7.7× |
-| PUSH one-way | 1 KiB | **4.28-4.31 µs** | **5.16-5.28 µs** | 1.2× |
-| PUSH one-way | 1 MiB | **202-224 µs** | **1.43-1.45 ms** | 6.8× |
-
-`cargo bench -p weida-zmq-bridge --bench interop -- --warm-up-time 1 --measurement-time 3`
-
-**What the one-way rows do and do not say.** A PUSH that returns is a message accepted by a
-socket, not delivered to anybody: the direct 1 MiB row at 4.6 GiB/s is zmq.rs buffering into
-its own queue, and the bridged row is bounded by the bridge actually reading the message and
-forwarding it. So the honest reading of PUSH is the small-payload row — **+0.93 µs per
-message** for a whole ZMTP termination, a weida DATA header and a QUIC stream — and the
-round-trip rows are where a real end-to-end cost appears.
-
-**The cost is linear in size with no cliff**, which is the finding the two open questions
-needed. Between 1 KiB and 1 MiB the bridged round trip grows 41× for 1024× the bytes, and
-nothing in the adapter changes behaviour at a threshold in between.
-
-**§11's first open question, `max_message_bytes`, is therefore not a latency choice: it is a
-memory one, and it is now 1 MiB** (was 8 MiB, a number borrowed from `subscriber_buffer_bytes`
-for lack of anything better). The bridge holds at most one whole message per direction per
-connection, because a ZeroMQ peer cannot be handed a body before it is complete — so the
-exposure is `max_message_bytes × max_connections`, and at 8 MiB against the default 1024
-connections that product was **8 GiB** nobody had chosen. 1 MiB is `stream_receive_window`,
-the per-stream budget the bridge's own reads already live inside [PROTOCOL §10], and it is
-three orders of magnitude above the payload size these patterns are for.
-
-**The same arithmetic corrected a second bound the question had not asked about.** The PUB
-side's queue was `queue_depth: 1024` *messages*, which multiplies by the cap into the real
-figure: a slow subscriber could pin a gigabyte. It is now `queue_bytes: 8 MiB` — a byte budget,
-dropping the oldest until the new message fits, with `subscriber_buffer_bytes` as the weida
-neighbour it can be compared against. A message larger than the whole budget is still queued
-alone, because it passed `max_message_bytes` and a ZMTP message cannot be split.
-
-**The reply deadline of B-042 stays at 10 s, now with a ratio behind it.** The slowest exchange
-the cap allows measures 3.37 ms, so the default is ~3000× the working range: far enough above
-it that a merely slow peer cannot trip it, which is the only failure mode that matters — a
-request lost to a silent ROUTER costs one exchange, a deadline that fires early costs correct
-ones.
 
 ### Verified results — what the local transports cost against QUIC (B-059)
 
@@ -1587,14 +1386,14 @@ point estimates.
 | RSS per live connection | — | **995 KiB** (B-012) | **430-1761 B** | **0-655 B** |
 
 The ratio in brackets is against the QUIC row; above 1 means the local transport is that much
-faster. B-043's reading applies to the one-way rows and is the reason Req/Rep is the
-comparison: a Push returns when the transport has taken the bytes, which locally is a kernel
-buffer or a channel slot, so those rows compare enqueue rates and not delivery. The memory
-row is the delta over 200 live transfer connections read from `VmRSS`, and it varies with
-what the process already has: 1761 B (inproc) and 655 B (`AF_UNIX`) per connection when the
-report runs alone, 430 B and 0 B after the timing rows have already grown the heap. Either
-way it is **two to three orders of magnitude** under the 995 KiB a QUIC connection costs, and
-at the low end it is below what RSS can resolve.
+faster. The one-way rows compare enqueue rates rather than delivery: a Push returns when the
+transport has taken the bytes, which locally is a kernel buffer or a channel slot. Req/Rep is
+therefore the end-to-end timing comparison. The memory row is the delta over 200 live transfer
+connections read from `VmRSS`, and it varies with what the process already has: 1761 B
+(inproc) and 655 B (`AF_UNIX`) per connection when the report runs alone, 430 B and 0 B after
+the timing rows have already grown the heap. Either way it is **two to three orders of
+magnitude** under the 995 KiB a QUIC connection costs, and at the low end it is below what RSS
+can resolve.
 
 **What one connection per transfer costs, plainly.** Compare the two local transports at the
 same payload: the only structural difference between them is that `AF_UNIX` mints a real OS
@@ -1844,71 +1643,13 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 
 | Decision | Value | Rationale |
 | --- | --- | --- |
-| Dependencies | **none**, not even `weida-core` | The half of an adapter that can be checked against a foreign specification must not be able to reach for weida's types, limits or error vocabulary, or the check becomes a check against our reading of the specification. `Cargo.toml` has an empty `[dependencies]` on purpose, and the crate carries its own error vocabulary rather than borrowing `weida_core::Error`. |
-| Where the cap lives | an argument to every decode entry point, never a constant | ZMTP grants no credit, a long frame may declare 2^63-1 octets, and `ZMQ_MAXMSGSIZE` is unlimited by default, so the local limit is the whole defence. Passing it in means a bridge can use the weida-side number it already has (`subscriber_buffer_bytes`, 8 MiB) instead of a second, unrelated default invented here — which is [adapters/zmtp.md](adapters/zmtp.md) §11's open question, left open rather than answered by accident. The effective cap is `min(argument, 2^63-1)`, so a caller cannot switch the check off. |
-| What a decoder returns | borrowed slices (`Command<'a>`, `Metadata<'a>`) | A decoded frame body is a slice of the caller's buffer and a command points into that body, so the only allocation on the way in is a `READY`'s property list. It is also what lets a bridge hand a payload to a weida transfer without a copy. |
-| Illegal flag combinations | unrepresentable | MORE "SHALL be zero on command frames", so `FrameKind` is `Message { more }` or `Command` — the combination has no value in either direction, rather than a runtime check on the way out. |
-| Incomplete versus violated | separate per layer | A frame header can legitimately be short (read more); a command body arrives whole, so a field running past its end is a violation with nothing to wait for. Three error types, each answering `is_violation()`, rather than one type whose `Incomplete` means different things at different depths. |
-| Where the specification contradicts itself | follow the ABNF and libzmq, and say so | Command names are length-prefixed, not null-separated; an `ERROR` reason may contain spaces although `VCHAR` excludes them. Both are recorded in [adapters/zmtp.md](adapters/zmtp.md) §10.1 and in the crate docs, because an interop bug found later must be traceable to a decision rather than to an accident. |
+| Dependencies | **none**, not even `weida-core` | A codec checked against a foreign specification must not reach for weida's types, limits or error vocabulary. `Cargo.toml` has an empty `[dependencies]` on purpose, and the crate carries its own error vocabulary. |
+| Where the cap lives | an argument to every decode entry point, never a constant | ZMTP grants no credit, a long frame may declare 2^63-1 octets, and `ZMQ_MAXMSGSIZE` is unlimited by default, so the caller's local limit is the whole defence. The effective cap is `min(argument, 2^63-1)`, so a caller cannot switch the check off. |
+| What a decoder returns | borrowed slices (`Command<'a>`, `Metadata<'a>`) | A decoded frame body is a slice of the caller's buffer and a command points into that body, so the only allocation on the way in is a `READY` property list. |
+| Illegal flag combinations | unrepresentable | MORE “SHALL be zero on command frames”, so `FrameKind` is `Message { more }` or `Command` — the illegal combination has no value. |
+| Incomplete versus violated | separate per layer | A frame header can legitimately be short; a command body arrives whole, so a field running past its end is a violation with nothing to wait for. |
+| Where the specification contradicts itself | follow the ABNF and libzmq, and say so | Command names are length-prefixed, not null-separated; an `ERROR` reason may contain spaces although `VCHAR` excludes them. The crate docs and golden vectors record both choices. |
 
----
-
-### ZMTP inbound bridge decisions (Phase 9 slice 2, B-041)
-
-| Decision | Value | Rationale |
-| --- | --- | --- |
-| Where it lives | its own crate, `crates/zmq/weida-zmq-bridge` | A feature on the codec crate would put a weida dependency in the codec's manifest, and that manifest being empty is what keeps the codec checkable against 37/ZMTP rather than against our reading of it ([ARCHITECTURE.md](ARCHITECTURE.md) §4). |
-| The handshake state machine | in the bridge, not the codec | The codec deliberately shipped without one (B-030), so this slice decided its shape: `Session::handshake` sends the full greeting, reads the peer's, exchanges `READY`, and refuses with `ERROR` before closing on two things — a socket type §2's table forbids, and a `READY` naming no socket type at all. The second is a `SHOULD` in the specification and a MUST here: a bridge that does not know which pattern it is translating cannot translate it. |
-| One socket type per listener | `Presenting::{Rep, Pull, Pub}` | The three whose ZeroMQ counterparts bind rather than connect ([ARCHITECTURE.md](ARCHITECTURE.md) §6c.4). It also makes §9.1's refusal — a dropping policy bridged onto a blocking one — unrepresentable rather than checked: the pattern pair follows from the presented type, so there is nothing to misconfigure. |
-| Envelope versus multipart | consume `[empty, body]`, refuse everything else | REQ puts an empty delimiter on the wire and REP strips it, so that frame is envelope and is consumed and mirrored onto the reply; a bare `[body]` is accepted too, because a DEALER peer leaves the envelope to its application. Any other frame count is a genuine multipart message, refused: concatenating it would invent an application protocol weida does not have (loss L1, §9.2). |
-| The topic on the PUB side | its own frame, ahead of the payload | A SUB peer matches a byte prefix against the start of the message, so the topic has to be where that match lands. The zguide's envelope convention says the same thing and gives the reason: "the match won't cross a frame boundary" (§6). |
-| Subscriptions | reference-counted per raw prefix **and** per translated filter | ZeroMQ's SUBSCRIBE is not idempotent and weida's is (L3), so the weida side is told only when a count crosses zero. Two counts rather than one, because under the §9.3 opt-in two different prefixes can translate to the same filter, and cancelling one must not unsubscribe the other. |
-| A refused subscription | `ERROR` to the peer, connection stays up | The only non-fatal error in the bridge. A SUB peer with one untranslatable prefix and three good ones must keep the three, and a silently ignored subscription is a subscriber that waits forever for messages nobody will send. |
-| The weida-side reconnect | three attempts, then let the ZMTP connection fail | A bridge that retried forever would hide a weida outage from the ZeroMQ side, whose own reconnect loop is better at it: a ZMTP peer reconnects automatically, and a fresh connection rebuilds everything from that peer's own subscriptions — which is what `Subscriber::connect` re-sending its filters gives us, and why reconnection is not re-registration ([decisions/0008](decisions/0008-session-identity.md) §4.5). |
-| A slow SUB peer | bounded queue, drop the **oldest**, count and log it | Both sides already agree that fan-out drops rather than blocks. Oldest rather than newest because a subscriber that has fallen behind wants the freshest data it can still be given, and counted because ZeroMQ's PUB drops silently and the zguide names that as a debugging problem. |
-
-**What writing the tests found.** The PUB loop selects over the socket and the weida
-subscriber, so the framed reader's `fill` is dropped routinely — and the first version grew the
-buffer with `resize` before the await and truncated after it. A cancelled read left the
-zero-filled slack behind, which decodes as a stream of empty message frames: the bridge then
-refused its own buffer with "a SUB peer sent a message, which its socket type cannot do". The
-fix is to read into scratch and append only after the read completes, which is what makes the
-claim "cancel-safe" true; the comment on `fill` now records the version that looks equivalent
-and is not.
-
----
-
-### ZMTP outbound bridge decisions (Phase 9 slice 3, B-042)
-
-| Decision | Value | Rationale |
-| --- | --- | --- |
-| Which side binds | the **weida** side | The mirror of the inbound slice is not symmetric. Inbound the bridge binds on the ZeroMQ side because that is where the foreign peers dial; outbound it binds a weida endpoint and dials the foreign peer, because the endpoint path is what weida applications address and an endpoint that nobody can name is not reachable. One `Outbound` is therefore one weida path in front of one foreign peer. |
-| Req/Rep dials `DEALER`, not `REQ` | `Dialling::{Dealer, Pull, Sub}` | A weida `Replier` accepts concurrent exchanges ([ARCHITECTURE.md](ARCHITECTURE.md) §6b) and REQ is lockstep — "send and then receive exactly one message at a time" [zeromq §4.2] — so a REQ socket would serialize the very concurrency this side offers. DEALER carries the 28/REQREP envelope instead, and the bridge synthesizes it: an id frame it assigns, an empty delimiter, the body. |
-| What pairs a reply with its exchange | the id frame, in a table keyed by it | Not arrival order: a foreign ROUTER may answer out of order, and even against a REP peer nothing on the wire says the replies come back in the order the requests left. The test drives four exchanges at once and has the peer answer them in reverse; an id-blind bridge fails it. |
-| A reply that never comes | a deadline per exchange, then `ERROR{NO_REPLY}` | `ZMQ_ROUTER_MANDATORY` is an option on the ROUTER socket, and outbound that socket belongs to the peer — the adapter cannot set it and the loss (L5) arrives as silence. A weida requester hanging forever on somebody else's dropped message is the one outcome worth ruling out, so the exchange is refused with a typed error instead. What the deadline should be is measurement the interop bench owes ([adapters/zmtp.md](adapters/zmtp.md) §11). |
-| The refusal needed a public API | `IncomingRequest::refuse(code)` | The runtime already wrote `ERROR` frames for its own routing refusals and on drop (`NO_REPLY`), but an application could only refuse by dropping the handle — which says `NO_REPLY` and nothing else. [decisions/0005](decisions/0005-refusal-race.md) §4.3 says the ERROR frame is written by the application; until this slice needed it, nothing did. |
-| Heartbeats | `ZMQ_HEARTBEAT_IVL` on the adapter's own socket, never translated | 37/ZMTP's PING/PONG is the only liveness the ZeroMQ side has, and TCP's is not a substitute (§3 of the mapping document). It stays local to that hop: weida's `keep_alive`/`idle_timeout` are not derived from it and it is not derived from them, because a timer that crosses the adapter would let one side's idea of "dead" close the other side's healthy connection. |
-
----
-
-### ZMTP interop decisions (Phase 9 slice 5, B-043)
-
-Every row here exists because a foreign implementation disagreed with us. Nothing in this
-table could have been decided from the specification alone, which is the argument for the
-slice.
-
-| Decision | Value | Rationale |
-| --- | --- | --- |
-| A ZMTP **3.0** peer | accepted by downgrading, not refused | The codec's floor was 3.1 ("a peer MUST accept protocol versions greater or equal to 3.1") and the other half of the same rule permits a downgrade. Refusing 3.0 refuses the entire installed base of implementations that never adopted 3.1 — `zeromq` 0.6 announces 3.0 — and for a *bridge* that is not caution but uselessness. `Greeting::accept_downgrading` is a separate entry point rather than a relaxation of `accept`, so a caller that wants the strict floor still has it, and it **returns** the negotiated version instead of assuming one. |
-| `PING`/`PONG` toward a 3.0 peer | suppressed, whatever the configuration says | PING/PONG are 3.1 commands. Sending one to a 3.0 peer is a protocol violation, and the price is exact: `zeromq` answers any command but `READY` with "Unknown command received" and drops the connection. So the configuration asks for a heartbeat and the negotiated version decides whether it can be honoured, logged once per connection rather than left as a silent difference. |
-| The legacy subscription form | **accepted** on the PUB side, never sent by default | 3.x subscriptions are `SUBSCRIBE`/`CANCEL` commands; ZMTP 2.0's form is a one-frame message beginning `1` or `0`, which is also how libzmq presents subscriptions to an XPUB application. `zeromq` 0.6 sends and reads only the legacy form, so a bridge that accepts only commands has no subscribers from that implementation. Accepting both is unambiguous — a SUB peer may not send application messages at all — and sending is a configuration choice (`SubscriptionForm`) whose default stays the specified command, because libzmq is the reference and a knob is better than a guess. |
-| An over-cap payload | refuses **that transfer**, not the connection | Both loops used to propagate `LimitExceeded` and end the ZMTP connection over one oversized message the peer never saw. weida keeps refusals per stream — "a refusal is per-stream, a violation ends the connection" ([PROTOCOL.md](PROTOCOL.md) §3) — and `collect` has already sent `STOP_SENDING(REJECTED)` and buffered nothing, so the loop continues; the exchange form also refuses the requester with `ERROR{REJECTED}` rather than leaving it for the deadline. |
-| `max_message_bytes` | **1 MiB**, from the bench | The cost is linear in size, so the number bounds memory, not latency: one whole message per direction per connection against `max_connections`, which at the old 8 MiB was 8 GiB nobody had chosen. See the verified results above. |
-| The PUB-side queue | **bytes** (`queue_bytes`, 8 MiB), not messages | A depth of 1024 messages multiplies by the cap into the exposure that matters. Bytes make the ceiling the number an operator cares about and give it a weida neighbour to be compared against, `subscriber_buffer_bytes`. |
-| `max_pending_exchanges` (B-053) | 64, checked **before** the body is read | The review pass found the outbound DEALER loop holding one request *and* its body per waiting exchange with no ceiling at all, the count being whatever weida clients open — a bound the transport does not supply, since it limits concurrent streams per connection and not the sum across clients. 64 is `max_connections_per_peer`'s number, and the product it fixes is stated rather than implied: 64 MiB against a 1 MiB cap. Checked before the body because a request refused early costs this side nothing, and refused *immediately* rather than parked because a requester that will never be answered should not wait out the deadline to learn it. |
-| The subscription table's ceilings (B-054) | 256 prefixes of at most 256 B, refused with `ERROR`; a **repeat** always accepted | ZeroMQ subscriptions are additive and non-idempotent, which the sheet records as a denial-of-service surface in libzmq itself [zeromq §11] — so what needs a ceiling is the number of *distinct* prefixes and the length of each, since a repeat only increments a counter. Both numbers are weida's own for the same thing (`max_subscriptions`, and the wire's 256 B cap on a SUBSCRIBE `filter`), which makes the exposure comparable across the hop: 64 KiB of prefixes per peer. A repeat is accepted even at the ceiling because loss L3's count is the thing being preserved: refusing the second SUBSCRIBE would make the first cancellable by one CANCEL where the peer sent two. |
-
----
 
 ### Connection-tier decisions (B-017)
 

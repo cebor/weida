@@ -8,6 +8,12 @@ vocabulary, and each answers the problem catalogue P1-P18 of [README.md](README.
 reference to the sheet it comes from, and every claim about weida carries a reference to a
 weida document.
 
+**Architecture status.** The side-by-side comparisons remain research evidence. Any
+socket-to-pattern mapping, adapter table or general forwarder recommendation in §§7-8 predates
+the revised [0013](../decisions/0013-competitor-libraries.md) and is superseded by it. Similar
+protocol operations are not globally equivalent; a managed Connector names one concrete
+conversion policy.
+
 Reference form. `[zeromq §12/P4]` is the ZeroMQ sheet, section 12, problem 4;
 `[amqp10 §6.2]` is the AMQP 1.0 sheet, section 6.2. Sheet stems are `zeromq`,
 `nanomsg-nng`, `rabbitmq-amqp091`, `amqp10`, `mqtt5`, `nats`, `kafka`, `ipc`. Weida

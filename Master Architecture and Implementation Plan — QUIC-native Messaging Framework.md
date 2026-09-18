@@ -2,7 +2,7 @@
 
 ## 0. Purpose of this document
 
-Design and implement a modern messaging framework inspired by ZeroMQ, nanomsg/NNG and brokered systems such as RabbitMQ, but designed from first principles around QUIC, Rust, streaming payloads, explicit reliability guarantees, browser clients, brokerless operation, distributed brokers and legacy-protocol interoperability.
+Design and implement a modern messaging framework inspired by ZeroMQ, nanomsg/NNG and brokered systems such as RabbitMQ, but designed from first principles around QUIC, Rust, streaming payloads, explicit reliability guarantees, browser clients, brokerless operation, distributed brokers, standalone foreign-protocol libraries and explicitly managed broker connectors.
 
 This document is normative. Treat it as the architectural source of truth for the repository.
 
@@ -25,15 +25,13 @@ The project must not become a collection of loosely connected features. All comp
                               │
                     native protocol model
                               │
-              ┌───────────────┴────────────────────────┐
-              │                                        │
-          native QUIC                              adapters
-                                                  Web
-                                                  ZeroMQ
-                                                  MQTT
-                                                  AMQP 0-9-1
-                                                  ...
+              ┌───────────────┴───────────────┐
+              │                               │
+          native QUIC                    Web binding
 ```
+
+Standalone ZeroMQ, NNG, MQTT, AMQP and NATS libraries are a separate product line. They keep
+their own semantics and are not hidden behind the framework's patterns.
 
 The central idea is:
 
@@ -123,7 +121,7 @@ The Runtime owns or coordinates resources such as:
 - QUIC runtime integration;
 - connection pooling;
 - buffer pools;
-- transport/adapter registrations;
+- transport/binding registrations;
 - shutdown;
 - common resource limits;
 - observability infrastructure.
@@ -151,7 +149,7 @@ Listener
  ├── QUIC IPv4 :7443
  ├── QUIC IPv6 :7443
  ├── Web :443
- └── potentially other adapters
+ └── potentially other protocol-preserving bindings
 ```
 
 All bindings belonging to the same Listener expose the same endpoint namespace.
@@ -181,21 +179,21 @@ If two externally reachable interfaces are meant to be fundamentally isolated an
 
 ## Binding
 
-A Binding represents one concrete externally reachable transport/protocol binding.
+A Binding represents one concrete reachable transport of the weida protocol.
 
 Conceptually:
 
 ```rust
 listener.bind(Quic, "[::]:7443").await?;
 listener.bind(Web, "[::]:443").await?;
-listener.bind(ZeroMq, "...").await?;
 ```
 
-The exact Rust syntax remains open, but this semantic division is mandatory.
+The exact Rust syntax remains open, but this semantic division is mandatory. Native QUIC is
+the reference transport. Web is a binding because it preserves the same namespace and protocol
+model over browser transports.
 
-Native QUIC is the reference transport.
-
-Web, ZeroMQ, MQTT, AMQP and future protocols are adapter bindings.
+Foreign-protocol libraries are not bindings. Their addressing and semantics remain their own;
+broker integration uses explicitly configured Connector resources instead.
 
 ---
 
@@ -1487,14 +1485,14 @@ Architecture:
 ```text
 common protocol/pattern semantics
        ┌────────────┴────────────┐
-native QUIC                   web adapter
+native QUIC                   Web binding
                               WebTransport
                               WebSocket
 ```
 
 WebTransport may transparently use QUIC underneath, but the browser does not expose raw Quinn/QUIC semantics directly to us.
 
-Therefore Web is an adapter.
+Therefore Web is a protocol-preserving binding.
 
 ---
 
@@ -1517,7 +1515,7 @@ Both may expose:
 /rpc
 ```
 
-The Web adapter handles the transport-specific mapping.
+The Web binding handles the transport-specific mapping.
 
 ---
 
@@ -1550,9 +1548,8 @@ Do not force large browser payloads to become ArrayBuffers containing the entire
 
 WebSocket does not provide the same independent stream abstraction as native QUIC.
 
-Therefore the WebSocket adapter may need to implement logical stream multiplexing/framing.
-
-This complexity must remain inside `adapter-web`.
+Therefore the WebSocket binding may need to implement logical stream multiplexing/framing.
+This complexity must remain inside the Web binding crate.
 
 The common protocol model must not expose WebSocket-specific compromises to normal Endpoint APIs.
 
@@ -1577,94 +1574,64 @@ Durable local storage can guarantee persistence under documented assumptions, no
 
 ---
 
-# 43. Interoperability adapters
+# 43. Standalone foreign-protocol libraries
 
-Legacy protocols should be implemented as first-class adapters.
+ZeroMQ, nanomsg/NNG, MQTT, AMQP and NATS are implemented as standalone libraries. Each exposes
+its own protocol's native primitives, addresses, state machines, security, options and
+completion states. It may share reactor and OS plumbing with weida but must not depend on
+weida's protocol or pattern layer.
 
-Initial targets:
-
-```text
-ZeroMQ
-MQTT
-AMQP 0-9-1 / RabbitMQ-compatible
-```
-
-Future candidates may include:
-
-```text
-AMQP 1.0
-NNG/nanomsg variants
-others
-```
-
-Architecture:
-
-```text
-adapter-zeromq
-adapter-mqtt
-adapter-amqp091
-adapter-web
-```
-
-Each should ideally be an independent crate.
+There is no framework-wide socket-to-pattern mapping and no general bridge/forwarder product
+category. Applications may compose two public libraries explicitly and own the conversion.
+Protocol-native devices remain native; for example, a ZeroMQ proxy moves ZeroMQ messages
+between ZeroMQ sockets.
 
 ---
 
-# 44. Adapter symmetry
+# 44. Managed broker connectors
 
-Adapters work in both directions.
+Foreign-protocol integration owned by the broker is modeled as a long-lived **Connector**
+resource, not as a `Listener` binding or an `Endpoint` backend. A Connector is attached to one
+named Queue and describes one concrete source or sink.
 
-Inbound:
+The control plane owns Connector lifecycle:
 
-```rust
-listener.bind(ZeroMq, ...);
-listener.bind(Mqtt, ...);
-listener.bind(Amqp091, ...);
+```text
+create/apply Connector specification
+        ↓
+commit desired generation in control Raft
+        ↓
+controller reconciles placement and runtime
+        ↓
+observed generation and status advance
 ```
 
-Outbound:
-
-```rust
-endpoint.connect(ZeroMq, ...);
-endpoint.connect(Mqtt, ...);
-endpoint.connect(Amqp091, ...);
-```
-
-This allows both:
-
-- legacy applications to connect to our services/broker;
-- our applications/broker to consume legacy infrastructure.
-
-The broker benefits particularly strongly because it becomes a central interoperability point.
+A committed specification means desired state is durable, not that the connector is already
+ready. Delete marks the resource for drain and removal; it is asynchronous and observable.
+When control quorum is unavailable, existing connectors keep their last committed assignment
+while creation, update, deletion and replacement placement stop.
 
 ---
 
-# 45. Adapter semantics
+# 45. Connector semantics
 
-Adapters translate **semantics**, not merely bytes.
-
-Example MQTT mapping may include:
+A Connector specification must name:
 
 ```text
-topics
-QoS
-retained messages
-subscriptions
+protocol and direction
+foreign address and authentication
+source or sink Queue
+resource limits
+one explicit payload/topic conversion policy
+required and achieved guarantee level
 ```
 
-ZeroMQ adapters map corresponding messaging patterns.
-
-RabbitMQ/AMQP adapters map queues, acknowledgements and routing where possible.
-
-Hard rule:
-
-> Never silently claim a guarantee that the external protocol cannot provide.
-
-Unsupported semantic combinations must either:
-
-- be explicitly degraded with caller opt-in;
-- be rejected;
-- or have clearly documented translation behavior.
+The configuration is validated as one concrete composition. Unsupported combinations are
+rejected; no protocol similarity silently creates an equivalence. Durability comes from the
+attached Queue's store or replicated group, never from a socket buffer or translation task.
+Protocol-specific Connector controllers are optional broker integration components. They may
+depend on the broker resource API and one standalone foreign library; neither depends back on
+them, and they expose no free-standing forwarding product.
 
 ---
 
@@ -2219,7 +2186,7 @@ Expand this list during design.
 
 # 67. Fuzzing
 
-Fuzzing is mandatory because multiple interfaces process untrusted content, especially Web and legacy protocol adapters.
+Fuzzing is mandatory because multiple interfaces process untrusted content, especially Web bindings and foreign-protocol codecs.
 
 Use `cargo-fuzz`/libFuzzer or equivalent for Rust components.
 
@@ -2231,10 +2198,10 @@ negotiation parser
 capability messages
 ACK/CANCEL/ERROR state transitions
 WebSocket framing/multiplexing
-WebTransport adapter boundaries
-MQTT parser
-ZeroMQ adapter parser
-AMQP parser
+WebTransport binding boundaries
+MQTT codec
+ZeroMQ codec
+AMQP codec
 persistence/WAL recovery
 authentication metadata parsing
 ```
@@ -2288,9 +2255,9 @@ durable broker
 replicated broker
 browser WebTransport
 browser WebSocket
-ZeroMQ adapter
-MQTT adapter
-AMQP adapter
+standalone ZeroMQ library
+standalone MQTT library
+one named managed Connector configuration
 ```
 
 Measure:
@@ -2348,7 +2315,7 @@ The goal is to understand and document:
 
 > What does each stronger guarantee cost?
 
-For equivalent legacy adapter behavior, strive to be at least competitive with common standalone libraries.
+For equivalent standalone-library behavior, strive to be at least competitive with common implementations.
 
 ---
 
@@ -2382,32 +2349,17 @@ crates/
     core/
     protocol/
     runtime/
-
-    transport-quic/
-
-    adapter-web/
-    adapter-zeromq/
-    adapter-mqtt/
-    adapter-amqp091/
-
-    persistence/
+    weida/
     broker/
-    cluster/
-    observability/
-    cli/
-
-bindings/
-    python/
-    javascript/
-    java/
-    go/
-    ...
-
-apps/
-    broker/
-    admin/
-
-docs/
+    raft/
+    web/                         optional protocol-preserving binding
+    zmq/                         codec, standalone library, bindings
+    nng/                         codec, standalone library, bindings
+    mqtt/                        codec, standalone library, bindings
+    amqp/                        codec, standalone library, bindings
+    nats/                        codec, standalone library, bindings
+    connectors/                  optional broker Connector implementations
+    site/
 ```
 
 Do not create dozens of tiny crates prematurely.
@@ -2436,7 +2388,7 @@ broker / cluster
 applications
 ```
 
-Adapters depend on the shared core abstractions and translate foreign protocol semantics.
+Foreign-protocol libraries depend only on protocol-neutral foundations. A broker deployment's optional Connector controller may depend on the broker resource API and one foreign library; neither side depends back on it, and it is not a free-standing product.
 
 The broker uses the public/core messaging machinery.
 
@@ -2528,7 +2480,7 @@ Disabled guarantees should not participate in the hot path.
 
 No remote input can cause unbounded memory allocation.
 
-Protocol adapters may not silently invent guarantees their source protocol cannot provide.
+A managed Connector may claim only what its concrete source, Queue and sink can prove.
 ```
 
 The implementation agent must validate design changes against these invariants.
@@ -2712,25 +2664,24 @@ The single-node broker must already use abstractions compatible with later clust
 
 Implement:
 
-- Raft-based control plane;
+- one control Raft for cluster membership and managed Queue/Connector resources;
 - cluster membership;
 - ownership maps;
 - epochs;
 - placement;
-- derived partitioning;
-- replication;
+- one independent Raft group per replicated Queue;
+- payload streaming outside every Raft log;
 - configurable N-accept/quorum behavior;
-- failover;
-- online rebalance;
-- topology discovery.
+- failover and online rebalance;
+- topology discovery and resource reconciliation.
 
 The client must still perceive one logical broker.
 
 ---
 
-## Phase 8 — Web adapter
+## Phase 8 — Web binding
 
-Implement Web as a first-class adapter:
+Implement Web as a first-class protocol-preserving binding:
 
 - browser server binding;
 - WebTransport where useful/available;
@@ -2746,23 +2697,26 @@ Semantics should remain as close as possible to native clients.
 
 ---
 
-## Phase 9 — Legacy adapters
+## Phase 9 — Standalone foreign-protocol libraries
 
 Implement independently:
 
 1. ZeroMQ
-2. MQTT
-3. AMQP 0-9-1 / RabbitMQ interoperability
+2. nanomsg/NNG
+3. MQTT
+4. AMQP
+5. NATS
 
 For each:
 
-- inbound Listener binding;
-- outbound Endpoint connect;
-- semantics matrix;
-- unsupported-guarantee handling;
-- protocol conformance tests;
-- fuzzing;
-- performance benchmarks.
+- sans-I/O codec where the wire format warrants one;
+- native typed API and bounded resource model;
+- protocol conformance and hostile-input tests;
+- interop against named upstream implementations;
+- fuzzing and performance benchmarks;
+- language bindings after the native library.
+
+No general weida bridge or global pattern mapping is part of this phase.
 
 ---
 
@@ -3079,7 +3033,7 @@ distributed broker cluster
    ↓
 workers
    ↓
-legacy MQTT / ZeroMQ / RabbitMQ systems
+explicitly configured managed connectors to MQTT / ZeroMQ / RabbitMQ systems
 ```
 
 without replacing the fundamental messaging abstraction.

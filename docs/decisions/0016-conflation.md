@@ -292,12 +292,12 @@ that a peer can already read off the DATA header, and guarantee sets are deliber
 allocation-free: "every value is a `uint`, so a guarantee set introduces no new allocation a peer
 can influence" [PROTOCOL §6.5].
 
-**4.9 What an adapter may not do with this.** An adapter whose foreign side conflates —
-`ZMQ_CONFLATE` on a bridged ZeroMQ socket, a JetStream stream with `max_msgs_per_subject` — MUST
-NOT present the weida side as conflating, because "protocol adapters may not silently invent
-guarantees their source protocol cannot provide" [INVARIANTS] and the chain ends at the foreign
-transfer point [0006 §4.6]. The loss is named in the adapter's mapping document, in the shape
-[0006](0006-guarantee-sets.md) §4.7 requires, or the configuration is refused.
+**4.9 What a Connector may not do with this.** A managed Connector whose foreign side
+conflates — for example `ZMQ_CONFLATE` or a JetStream stream with
+`max_msgs_per_subject` — MUST NOT present the Queue side as conflating unless its concrete
+conversion policy can prove that property. Protocol similarity is not a guarantee. The
+Connector specification names the evidence and loss or the configuration is refused
+[INVARIANTS], [0006 §4.7].
 
 **4.10 If this is reopened, here is the bill.** Naming the numbers now is what makes the
 reservation checkable rather than decorative. Nothing below is taken by this note.

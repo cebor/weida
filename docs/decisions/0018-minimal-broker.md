@@ -15,16 +15,12 @@ Relates to: B-198; [LOOP.md](../LOOP.md) §5, §9 (Phase D, D2);
 
 ## 1. The question
 
-B-198's acceptance line, condensed to its questions: "the decision note Phase D needs before any
-code, per the roadmap's own condition ([LOOP.md](../LOOP.md) §9: 'only once B1-B3 have green
-cross-adapter tests and the credit of 0003 has a consumer on both ends' — both now true)… which
-of the reserved acknowledgement levels it implements first (`Accepted` alone, or `Accepted` plus
-`Stored(Written)`…), whether the L2 credit frame of [0003](0003-credit-unit.md) §4.2 is part of
-the first slice or follows it, where a queue's identity lives given that endpoint paths are
-opaque ([0007](0007-topic-namespace.md) §4), what it means for the drain of
-[0009](0009-drain.md) (a broker has a queue to drain, which the note says is a *different*
-operation), and what the persistence boundary is so that Phase 5 is not pre-empted. It names the
-first three code slices with their acceptance lines" [BACKLOG B-198].
+B-198 asks which reserved acknowledgement levels the first broker slice implements
+(`Accepted` alone, or `Accepted` plus `Stored(Written)`), whether the L2 credit frame of
+[0003](0003-credit-unit.md) §4.2 lands with that slice, where a queue's identity lives while
+endpoint paths remain opaque ([0007](0007-topic-namespace.md) §4), what the queue-level drain
+means, and where the persistence boundary lies so that Phase 5 is not pre-empted. It names the
+first three code slices with their acceptance lines [BACKLOG B-198].
 
 The layer is not in question. [ARCHITECTURE.md](../ARCHITECTURE.md) §1 names it — "L2 — broker
 semantics. The RabbitMQ-analog layer: queues, publisher confirms, consumer acknowledgements with
@@ -33,11 +29,10 @@ crate: "`weida-broker`… The broker is a separate crate because it is a separat
 depends on the patterns, nothing in the core may depend on it, and a brokerless deployment must
 not link it" [ARCHITECTURE §4]. What is in question is the **first slice**: which certificates
 it may issue, what it puts on the wire, what names a queue, and which neighbouring phase it must
-not quietly consume. Phase D's second row is why precision matters more than ambition: D2 is
-"AMQP 0-9-1 against RabbitMQ… producer and consumer clients (publisher confirms onto
-`Accepted`/`Stored` per 0004, `basic.qos` prefetch onto the L2 credit of 0003, topic-exchange
-bindings per 0007 §5), then weida as a broker for 0-9-1 clients" [LOOP §9]. Every clause there
-is a mapping onto something this note must already have decided.
+not quietly consume. The local `BrokerConfig` built here is bootstrap input, not the eventual
+cluster authority: [0022](0022-consensus-topology.md) later places managed Queue and Connector
+resources in the control Raft. This note must therefore define queue behavior without baking
+deployment ownership into the data path.
 
 ## 2. The evidence, condensed
 
@@ -69,11 +64,10 @@ changes nothing" [0003 §4.3], counting messages only [0003 §4.4]. The wire slo
 opaque. The invariant is not amended" — a path is "an exact key into a flat map, validated for
 bytes and length only", and dispatch keeps "exactly one answer per (stream kind, path), which is
 what makes `UNKNOWN_ENDPOINT` and `UNSUPPORTED` decidable" [0007 §4.1], [PROTOCOL §9.4].
-Hierarchy lives in the topic namespace: a segmented filter with `*` and a final `#`, matched
-allocation-free in one walk [0007 §4.2], [PROTOCOL §6.4]. And 0007's mapping table already
-assigned this note work: MQTT's `$share/{name}/{filter}` is "not a filter question… and
-single-delivery-per-group is the L2 credit and queue work of 0003 §4.2, not topic matching"
-[0007 §5].
+Hierarchy lives only in weida's topic namespace: a segmented filter with `*` and a final `#`,
+matched allocation-free in one walk [0007 §4.2], [PROTOCOL §6.4]. Similar foreign constructs,
+such as MQTT shared subscriptions, imply no mapping; a future Connector must name any
+conversion explicitly.
 
 **The drain is decided for L0 and explicitly not for L2.** `Runtime::drain(Duration)` waits for
 already-`finish()`ed transfers to reach the peer's transport, with a mandatory finite deadline
@@ -189,9 +183,9 @@ application reply, which is what every sheet says too [SYNTHESIS §2 D3].
 number PROTOCOL reserves [PROTOCOL §4], [PROTOCOL §11], and the slice spends it rather than
 deferring it, for four reasons in descending order of force:
 
-1. **The roadmap gated this phase on it.** Phase D starts "only once B1-B3 have green
-   cross-adapter tests and the credit of 0003 has a consumer on both ends" [LOOP §9]. A first
-   slice without it satisfies the gate and then does not use it.
+1. **The first Queue consumer flow needs it.** A broker that accepts responsibility must also
+   bound outstanding deliveries per subscription; deferring credit would make the first slice
+   runnable only under an unbounded consumer assumption.
 2. **Without it there is no per-queue bound on deliveries.** The alternative bound is the
    consumer's stream budget: per connection, not per subscription, and it "cannot be withdrawn
    without closing streams" [0003 §3]. A broker that cannot pause a consumer without resetting
@@ -232,19 +226,18 @@ consequences make the choice cheap:
 - **Consumers register with SUBSCRIBE, unchanged.** It names an endpoint and a filter, both
   required, idempotent per connection and path [PROTOCOL §6.4]. A consumer of a whole queue
   sends the empty filter, which "matches every topic"; a consumer of part of one sends a
-  segmented filter, which is how D2's topic-exchange bindings arrive [0007 §5], [LOOP §9].
-  Subscriptions stay bounded by `max_subscriptions` and are dropped wholesale when the
-  connection closes [PROTOCOL §6.4], [PROTOCOL §10].
-- **Who creates a queue: the broker's own configuration, not the wire.** No declare frame —
-  option F — following AMQP 1.0, where node lifecycle is "entirely out of scope of the core
-  standard" [amqp10 §2], Kafka, where partition count is administrative [kafka §11], and
-  JetStream, where a stream's configuration is server-side [nats §2]. A producer addressing a
-  path with no queue gets the refusal that already exists, ERROR `{UNKNOWN_ENDPOINT}` on the
-  reply half [PROTOCOL §9.4]. The named loss belongs in the D2 mapping document: AMQP 0-9-1
-  clients declare their own queues and expect server-named `amq.gen-*` ones
-  [rabbitmq-amqp091 §2], so a 0-9-1 server on this slice pre-declares from configuration or
-  refuses `queue.declare`, and MUST NOT present a pre-declared queue as a declared one
-  [INVARIANTS], [0006 §4.9].
+  segmented filter. A foreign filter reaches this surface only through an explicit Connector
+  conversion. Subscriptions stay bounded by `max_subscriptions` and are dropped wholesale when
+  the connection closes [PROTOCOL §6.4], [PROTOCOL §10].
+- **Who creates a Queue: the administrative resource API, not the messaging wire.** Before the
+  cluster cutover, process-local `BrokerConfig` is bootstrap input for the same runtime object.
+  No declare frame — option F — following AMQP 1.0, where node lifecycle is "entirely out of
+  scope of the core standard" [amqp10 §2], Kafka, where partition count is administrative
+  [kafka §11], and JetStream, where a stream's configuration is server-side [nats §2]. A
+  producer addressing a path with no Queue gets the refusal that already exists, ERROR
+  `{UNKNOWN_ENDPOINT}` on the reply half [PROTOCOL §9.4]. A Connector serving AMQP 0-9-1 must
+  explicitly refuse or implement `queue.declare`; it MUST NOT present a preconfigured Queue as
+  one dynamically declared by the client [rabbitmq-amqp091 §2], [INVARIANTS].
 
 **4.6 The confirm needs no new frame kind, because an exchange already has a reply half.** A
 producer's message to a queue is an exchange: DATA on the initiating half, and the reply half

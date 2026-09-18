@@ -80,11 +80,37 @@ mechanisms where one exists.
 **Option A.** One consensus group for the cluster, one per **replicated** queue, payload in
 neither, and a queue whose replication factor is 1 has no group.
 
-**4.1 The control group holds what the cluster is, and nothing that scales with traffic.** Its log
-carries: membership — which nodes exist, by the fingerprint [0020 §4.4] makes their identity —
-queue *existence* and configuration, the replication factor and placement of each queue, and the
-group membership of each queue's own Raft. That is a list that changes when an operator changes
-something, not when a producer sends something, which is what makes one group enough for it.
+**4.1 The control group holds desired resource state, and nothing that scales with traffic.**
+Its log carries cluster membership — nodes identified by the fingerprint [0020 §4.4] assigns
+them — and a declarative resource registry. The first resource kinds are **Queue** and
+**Connector**. A Queue specification names its endpoint path, limits, replication factor and
+placement. A Connector specification names one concrete foreign-protocol source or sink, its
+address and policy, and the Queue it attaches to; it does not assert a general equivalence
+between that protocol and a weida pattern.
+
+Each resource has a stable id, a name, a monotonically increasing specification generation and
+an optional deletion request. Its reconciled status records the observed generation, placement
+and a small phase such as Pending, Ready, Degraded or Deleting. High-frequency health samples,
+metrics and message traffic never enter this log.
+
+The committed log index is the resource version. Mutating calls may carry an expected version
+and are rejected on conflict; retrying the same apply with the same name and specification is
+idempotent. Names are unique within their resource kind, while the stable id prevents a deleted
+and later recreated name from inheriting the old resource's queue group or connector assignment.
+Deletion is a persisted intent: controllers first stop new work, drain according to policy,
+release placement and group membership, and only then remove the record.
+
+An administrative API performs create/apply, get/list/watch and delete by proposing these
+records to the control group. A successful mutation means the desired state is committed; it
+does not mean the resource is already ready. Controllers observe committed generations and
+idempotently create, update, drain or remove the runtime objects, then advance the observed
+generation. The messaging data plane has no declare operation and never creates a resource as
+a side effect.
+
+Node bootstrap remains local: cluster seeds, identities, storage paths and the addresses needed
+to start the process. Queue and Connector existence, configuration, placement and ownership are
+cluster state. This inventory changes when an operator changes something, not when a producer
+sends something, which is what makes one control group enough.
 
 **4.2 Each replicated queue is its own group, and that is the answer to "independent".** Its log
 carries what [0021 §4.5] listed minus the cluster-wide part: the commit record per admitted
@@ -132,18 +158,20 @@ follows the payload [STORE.md §5], and the Raft connection stays small-frame tr
 election heartbeats out of a payload's flow-control window.
 
 **4.7 The availability split, stated because it is the reason to have two kinds of group.** When
-the **control group** has no quorum: no queue may be created, deleted, reconfigured or moved, and
-no group membership may change — but **every existing queue keeps serving under its own group's
-quorum**. Administration stops; messaging does not. That is deliberately unlike Kafka, where a
-broker cut off from the controller "is fenced and omitted from client metadata" [kafka §8], and
-closer to RabbitMQ, where Khepri serves local cached reads while quorum queues continue
-[rabbitmq-amqp091 §8]. The reason is the one the owner gave: queues are meant to be independent,
-and a metadata outage that stops traffic would make them dependent again through the back door.
+the **control group** has no quorum: no resource may be created, deleted, reconfigured or moved,
+and no group membership may change — but every existing queue keeps serving under its own
+group's quorum, and every running Connector keeps its last committed specification and
+assignment. Administration and replacement placement stop; established messaging does not.
+That is deliberately unlike Kafka, where a broker cut off from the controller “is fenced and
+omitted from client metadata” [kafka §8], and closer to RabbitMQ, where Khepri serves local
+cached reads while quorum queues continue [rabbitmq-amqp091 §8]. The reason is the one the
+owner gave: queues are meant to be independent, and a metadata outage that stops traffic would
+make them dependent again through the back door.
 
 When a **queue's group** has no quorum, that queue refuses admission and pauses delivery, and
-nothing else on the cluster notices. A confirmed message is not lost while a majority survives; if
-a majority is permanently lost, the queue is unavailable and needs operator action, exactly as
-RabbitMQ documents [rabbitmq-amqp091 §9].
+nothing else on the cluster notices. A confirmed message is not lost while a majority survives;
+if a majority is permanently lost, the queue is unavailable and needs operator action, exactly
+as RabbitMQ documents [rabbitmq-amqp091 §9].
 
 **4.8 What the numbers will be is not decided here, but which numbers exist is.** Per cluster: the
 control group's membership. Per queue: replication factor, placement, and its group's membership.
@@ -172,15 +200,15 @@ alternative.
   per group, not per node.
 - **Backlog.** Three items, links relative to `docs/BACKLOG.md`.
 
-### B-229 — Several groups on one connection, and a queue group created by the control group
+### B-229 — Managed resources, several groups on one connection, and queue reconciliation
 kind: code | size: 90 | status: blocked | needs: [B-224, B-227]
-acceptance: `weida-raft` carries **more than one group** over one connection per peer pair — a group identifier in the RPC envelope, one exchange per RPC as B-224 built it, and a test asserting that a stalled RPC in one group does not delay another group's heartbeat ([0022](0022-consensus-topology.md) §4.5). The broker then creates a queue's group from a committed control-group entry: a three-node cluster where a queue is created, replicated, and its group dissolved when the replication factor drops to 1, with the queue still serving throughout.
-note: this is the item that makes the topology of [0022](0022-consensus-topology.md) real rather than described; it needs the transport and the log first.
+acceptance: the control-group state machine stores Queue and Connector resources with stable id, name, resource version, specification generation, observed generation, status and deletion intent. An administrative API proves create/apply with optimistic concurrency, get/list/watch and asynchronous delete; a repeated identical apply is idempotent. `weida-raft` carries more than one group over one connection per peer pair, and the Queue controller creates a queue's group from the committed resource: a three-node cluster where a Queue is created, replicated and its group dissolved when the replication factor drops to 1, with the queue still serving throughout. Connector runtime controllers remain protocol-specific follow-ups, but their lifecycle records are the same control-plane type.
+note: this item makes the control/data split real. Messaging paths never declare resources; the existing process-local `BrokerConfig::queues` remains only the single-process implementation until this cutover is complete.
 
 ### B-230 — The availability split: administration stops, messaging does not
 kind: code | size: 60 | status: blocked | needs: [B-229]
-acceptance: the property of [0022](0022-consensus-topology.md) §4.7 proved rather than claimed: with the **control group** below quorum, no queue may be created, deleted or reconfigured — each refused with a message naming the reason — while every existing queue keeps admitting and delivering under its own group's quorum. And the converse: a queue whose own group is below quorum refuses admission and pauses delivery while every other queue on the same nodes is unaffected. Two tests, each killing a different majority.
-note: this is the reason the topology has two kinds of group at all, so it is the test that earns the design. Deliberately unlike Kafka's fencing, and the note says why.
+acceptance: with the control group below quorum, create/apply/delete for Queue and Connector resources are refused with the reason named, while every existing queue keeps admitting and delivering under its own group's quorum and every running Connector keeps its last committed assignment. Conversely, a queue whose own group is below quorum refuses admission and pauses delivery while every other queue is unaffected. Two tests kill the different majorities.
+note: this is the reason the topology has two kinds of group at all. Deliberately unlike Kafka fencing.
 
 ### B-231 — The bounds a cluster adds, each with the failure it prevents
 kind: spec | size: 45 | status: ready | needs: []

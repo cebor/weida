@@ -41,8 +41,9 @@ first-class — every socket type of `zmq_socket(3)` bar `ZMQ_STREAM`, `tcp`/`ip
 NULL/PLAIN/CURVE with ZAP, the option table honoured or refused row by row, the monitor and
 the devices, the zguide's canonical recipes as examples that assert the guide's own claims,
 and interop against libzmq 4.3.5 and the pure-Rust `zeromq` crate in both roles
-([docs/libraries/zmq.md](docs/libraries/zmq.md)). `weida-zmq-bridge` and `weida-nng-bridge`
-are the forwarders beside them, joining foreign peers and weida endpoints in both directions.
+([docs/libraries/zmq.md](docs/libraries/zmq.md)). Its typed `proxy` and
+`proxy_steerable` devices include the canonical ROUTER/DEALER queue, XSUB/XPUB
+forwarder and PULL/PUSH streamer without involving the weida protocol.
 
 ## Documents
 
@@ -63,18 +64,18 @@ anything is built ([decisions/0026](docs/decisions/0026-the-guide-and-the-c8b-qu
 | [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md) | failure scope, required scenarios, sender outcome rules, `Indeterminate` |
 | [docs/INVARIANTS.md](docs/INVARIANTS.md) | the short invariant list every change is checked against |
 | [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md) | phase tracker, development loop, agent rules, acceptance, known debt |
-| [docs/libraries/zmq.md](docs/libraries/zmq.md) | the ZeroMQ feature-parity table against libzmq 4.3.5, row by row, with [docs/libraries/README.md](docs/libraries/README.md) as the index that says what a library parity document is and how it differs from an adapter mapping |
+| [docs/libraries/zmq.md](docs/libraries/zmq.md) | the ZeroMQ feature-parity table against libzmq 4.3.5, row by row, with [docs/libraries/README.md](docs/libraries/README.md) as the parity-document index |
 | [Master Architecture and Implementation Plan — QUIC-native Messaging Framework.md](Master%20Architecture%20and%20Implementation%20Plan%20%E2%80%94%20QUIC-native%20Messaging%20Framework.md) | the normative architectural source of truth for the whole project |
 
 ## Crates
 
 This repository holds **two kinds of product**: weida itself, and standalone implementations
-of foreign protocols that are usable with no weida in the picture — with a forwarder beside
-some of them for the deployments that want both networks joined, and a Python binding beside
-each finished library. The `kind` column says which is which, and no row calls a library an
-adapter, a bridge a library or a binding either
-([decisions/0013](docs/decisions/0013-competitor-libraries.md) §5.5). The table lists **every
-one of the twenty-eight `[workspace] members`** and is read off `cargo metadata`, not kept by
+of foreign protocols that are usable with no weida in the picture, with a Python binding
+beside each finished library. A user may compose those public APIs explicitly. The workspace
+does not define a general translation from foreign socket types onto weida patterns.
+The `kind` column says which product a crate belongs to
+([decisions/0013](docs/decisions/0013-competitor-libraries.md) §4). The table lists **every
+one of the twenty-five `[workspace] members`** and is read off `cargo metadata`, not kept by
 hand.
 
 | Path | Package | kind | Responsibility |
@@ -90,11 +91,9 @@ hand.
 | `crates/py/weida-py` | `weida-py` | binding | the Python surface of weida itself: every pattern including the streamed fan-out, asyncio and synchronous ([docs/libraries/weida-py.md](docs/libraries/weida-py.md)) |
 | `crates/zmq/weida-zmtp` | `weida-zmtp` | codec | ZMTP 3.1 — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |
 | `crates/zmq/weida-zmq` | `weida-zmq` | library | the ZeroMQ implementation: every socket type of `zmq_socket(3)` bar `ZMQ_STREAM`, `tcp`/`ipc`/`inproc`, NULL/PLAIN/CURVE with ZAP, the option table, the monitor and the devices, interop-tested against libzmq 4.3.5 in both roles ([docs/libraries/zmq.md](docs/libraries/zmq.md)) |
-| `crates/zmq/weida-zmq-bridge` | `weida-zmq-bridge` | bridge | joins ZeroMQ peers and weida endpoints in both directions, terminating both protocols; the ZeroMQ half is `weida-zmq`'s sockets and what is here is the mapping |
 | `crates/zmq/weida-zmq-py` | `weida-zmq-py` | binding | the Python ZeroMQ surface: all eleven socket types, the three transports, the option table, PLAIN/CURVE/ZAP with a handler in Python, and a synchronous surface beside the asyncio one ([docs/libraries/zmq-py.md](docs/libraries/zmq-py.md)) |
 | `crates/nng/weida-sp` | `weida-sp` | codec | nanomsg/NNG Scalability Protocols — the eight-octet header, the 64-bit framing, the REQ/REP tag stacks — with no I/O and no dependency on weida |
 | `crates/nng/weida-nng` | `weida-nng` | library | the SP implementation: one socket type per protocol, endpoints and pipes, the option table, TLS and IPC credentials, interop-tested against NNG 1.4.0-rc.0 in both roles ([docs/libraries/nng.md](docs/libraries/nng.md)) |
-| `crates/nng/weida-nng-bridge` | `weida-nng-bridge` | bridge | joins NNG peers and weida endpoints in both directions, built **on** `weida-nng`'s sockets rather than on a second implementation |
 | `crates/nng/weida-nng-py` | `weida-nng-py` | binding | the Python SP surface: one class per protocol, contexts as objects, asyncio and synchronous |
 | `crates/mqtt/weida-mqtt-codec` | `weida-mqtt-codec` | codec | MQTT 5.0 — the fixed header, Variable Byte Integers, the property framework and every control packet — sans-I/O |
 | `crates/mqtt/weida-mqtt` | `weida-mqtt` | library | the MQTT 5.0 **client**: connection, session, both QoS machines, subscriptions, retain and Will, aliases, TLS and AUTH, interop-tested against `rumqttd` 0.20.0 and `rmqtt` 0.23.1 ([docs/libraries/mqtt.md](docs/libraries/mqtt.md)) |
@@ -105,7 +104,6 @@ hand.
 | `crates/nats/weida-nats-codec` | `weida-nats-codec` | codec | the NATS client protocol — twelve control-line verbs and the `NATS/1.0` header block — sans-I/O |
 | `crates/nats/weida-nats` | `weida-nats` | library | the Core NATS client: subjects and wildcards, queue groups, request-reply over an inbox, five credential forms and TLS; interop is written and **not run**, because no `nats-server` was available ([docs/libraries/nats.md](docs/libraries/nats.md)) |
 | `crates/nats/weida-nats-py` | `weida-nats-py` | binding | the Python NATS surface: publish with headers, subscriptions as iterators, queue groups, `request` with a mandatory timeout, asyncio and synchronous |
-| `crates/interop/cross-tests` | `weida-cross-tests` | weida | no library code: one message in through one foreign protocol and out through the other, which belongs to neither family |
 | `crates/site` | `weida-site` | site | the website at [weida.doodleshnookie.net](https://weida.doodleshnookie.net), rendered from the documents in `docs/` rather than written beside them; the one member that is `publish = false` ([0025](docs/decisions/0025-the-website.md)) |
 
 ## Quick start, without writing a program
@@ -199,9 +197,9 @@ cargo test -p weida --test transports            # one pattern suite over QUIC, 
 cargo test -p weida --test identity              # pins, anchors, addresses, client identity
 cargo test -p weida --test large -- --ignored     # 1 GiB echo, asserts bounded peak RSS
 cargo test -p weida-zmtp                         # ZMTP golden vectors and hostile input
-cargo test -p weida-zmq-bridge                  # both bridge directions, plus a real ZeroMQ peer
+cargo test -p weida-zmq                         # native ZeroMQ sockets, devices and interop
 cargo bench                                      # codec and loopback QUIC throughput
-cargo bench -p weida-zmq-bridge --bench interop # the bridge's cost against no bridge
+cargo test -p weida-nng                         # native SP sockets and protocol semantics
 ```
 
 ## The website

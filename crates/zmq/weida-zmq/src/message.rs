@@ -32,16 +32,15 @@ use crate::error::{Error, Result};
 /// declaration is to believe it, and "no remote input can cause unbounded
 /// memory allocation" (`docs/INVARIANTS.md`) would be false by default.
 ///
-/// One mebibyte is the number the ZMTP bridge arrived at for the same
-/// quantity after review (B-051): it is weida's own `stream_receive_window`,
-/// so a payload that fits here fits the weida side of a forwarder too. It is
-/// settable back to anything, including far higher; it is never silent.
+/// One mebibyte is the ceiling selected by the hostile-input and memory-bound
+/// review (B-051). It is settable back to anything, including far higher; it
+/// is never silent.
 ///
 /// **The exposure was a product, and the product is now bounded.** The
 /// high-water marks bound a queue in *messages* — libzmq's unit — so one
 /// peer's queue could hold `hwm` messages of this size in each direction:
-/// 1000 × 1 MiB at the defaults, the arithmetic B-051 made explicit for the
-/// bridge and the reason a message count alone is not a memory bound. Each
+/// 1000 × 1 MiB at the defaults, the arithmetic B-051 made explicit and the
+/// reason a message count alone is not a memory bound. Each
 /// direction of each peer's queue therefore carries
 /// [`crate::DEFAULT_QUEUE_BYTES`] as well (8 MiB), and a queue that is not
 /// empty refuses past it (`pipe`'s module documentation, B-096). What this

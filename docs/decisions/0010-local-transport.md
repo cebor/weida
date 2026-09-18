@@ -235,8 +235,8 @@ rejected.
   backpressure row notes that a local transfer has no connection window, so `Block` is the
   socket's own buffer rather than a shared budget.
 - **Roadmap A9 becomes three items**, in the order of §4.1, each with the platform rules of
-  §4.5 as its acceptance; and `docs/adapters/zmtp.md` may then map ZeroMQ's `ipc://` and
-  `inproc://` onto them, which its §1 currently lists as out of scope.
+  §4.5 as its acceptance. These transports remain weida transports; similarly named ZeroMQ
+  transports keep their own protocol semantics.
 - **[SYNTHESIS.md](../research/SYNTHESIS.md) §8.8** is closed by this note. Every question in
   §8 is now decided.
 

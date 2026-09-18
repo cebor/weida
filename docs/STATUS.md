@@ -53,21 +53,15 @@ C10K, utopian on purpose — and every program in it is a file in the tree that 
 earns the framing: at this repository's own measured numbers, **two to four hops reach
 everybody**, which makes the hard problem at that scale neither throughput nor depth but what
 a hop may claim — and an acknowledgement per recipient converging on one root is 1.1 TB for one
-message. **Chapters 1, 2 and 4 are written** — fifteen claims, fifteen programs, seventeen
-tests — and the rest of the arc is filed slice by slice, in the order of what can be asserted
-rather than of the chapter numbers (B-258..B-261). Chapter 4 is the cross-protocol chain
-(ZeroMQ → ZMTP bridge → weida → SP bridge → nng, both foreign ends the real implementations),
-and it demonstrates the sentence the whole C8B argument turns on: the ZeroMQ send succeeds,
-nothing arrives at the SP end, neither protocol lied, and
-**`BestEffort` ∩ `BestEffort` = `BestEffort`**. Writing it also answered a question nobody had
-asked: **a live connection carries the set its runtime configured, and nothing reports it
-because nothing can report anything else** — `RuntimeConfig::guarantees` is offered *and*
-required, so `agreed = min(mine, theirs)` and `agreed ≥ mine` give `agreed = mine`, and a peer
-requiring more is refused at connect time rather than given less
-([0027](decisions/0027-the-negotiated-set-is-the-configured-set.md), B-262). Two document
-corrections came with it: HELLO keys `5` and `6` **are** on the wire, retiring a stale "spec
-ahead of code" caveat, and the website item had been sitting at `ready` for three rounds after
-the site shipped.
+message. **Chapters 1 and 2 are written** — ten claims exercised by the guide test — and the
+remaining broker chapters are filed slice by slice (B-258..B-261). The former cross-protocol
+chapter was removed with the rejected general bridge product category. Guarantee negotiation
+remains explicit: a live connection carries the set its runtime configured, and a peer
+requiring more is refused at connect time rather than silently given less
+([0027](decisions/0027-the-negotiated-set-is-the-configured-set.md)).
+Two document corrections came with it: HELLO keys `5` and `6` **are** on the wire, retiring a
+stale "spec ahead of code" caveat, and the website item had been sitting at `ready` for three
+rounds after the site shipped.
 
 **The fan-out width the whole argument rests on is now measured** (B-247), and it moved the
 argument rather than confirming it. Per subscriber: **396-436 KiB** of transport state at widths
@@ -96,24 +90,23 @@ report from a hop-local certificate, and
 Python, Node, Erlang, C, Java.
 
 One binary, `weida` (B-060), sits beside the library, and `weida::blocking` (B-194) beside the
-async API. **Twenty-eight `[workspace] members`**, read from `cargo metadata`: `weida-core`,
+async API. **Twenty-five `[workspace] members`**, read from `cargo metadata`: `weida-core`,
 `weida-protocol`, `weida-runtime`, `weida-winpipe`, `weida`, `weida-broker`,
 `crates/raft/weida-raft`, `crates/py/{weida-py-core, weida-py}`, then
-`crates/zmq/{weida-zmtp, weida-zmq, weida-zmq-bridge, weida-zmq-py}`,
-`crates/nng/{weida-sp, weida-nng, weida-nng-bridge, weida-nng-py}`,
+`crates/zmq/{weida-zmtp, weida-zmq, weida-zmq-py}`,
+`crates/nng/{weida-sp, weida-nng, weida-nng-py}`,
 `crates/mqtt/{weida-mqtt-codec, weida-mqtt, weida-mqtt-py}`,
 `crates/amqp/{weida-amqp-codec, weida-amqp, weida-amqp-py}`,
-`crates/nats/{weida-nats-codec, weida-nats, weida-nats-py}`,
-`crates/interop/cross-tests` and `crates/site`. The site renders this document set rather than
-maintaining a second one and remains unpublished while the workspace has no release form.
+`crates/nats/{weida-nats-codec, weida-nats, weida-nats-py}` and `crates/site`. The site
+renders this document set rather than maintaining a second one and remains unpublished while
+the workspace has no release form.
 
 ![Product line](status/product-line.svg)
 
 The two halves of that picture are the two products of
 [0013](decisions/0013-competitor-libraries.md) §4: weida on the left, with the guarantee
-dimensions, transports and patterns it offers, and the five foreign-protocol libraries on the
-right, each with what was measured against a real peer and what is still pending — joined only
-by the two forwarders in the middle and by the shared foundation both stand on.
+dimensions, transports and patterns it offers, and the five standalone foreign-protocol
+libraries on the right. They share runtime foundations but no implicit semantic conversion.
 
 ## 1. The roadmap
 
@@ -134,14 +127,12 @@ bindings, each binding following its own library, asyncio first and synchronous 
 
 - **B1 ZeroMQ** — `weida-zmq` and `weida-zmq-py`: eleven socket types against
   `zmq_socket(3)`'s twenty rows, three transports, NULL/PLAIN/CURVE with the ZAP dialog, a
-  98-row option table decided row by row, the monitor, the devices, nine zguide recipes,
-  interop in both roles against libzmq 4.3.5, and a forwarder rebuilt on the library that lost
-  1352 lines.
+  98-row option table decided row by row, the monitor, the devices, nine zguide recipes and
+  interop in both roles against libzmq 4.3.5.
 - **B2 nanomsg SP** — `weida-nng` and `weida-nng-py`: one socket type per protocol, the
-  endpoint engine, a 48-row option table, TLS and IPC credentials, **eleven interop tests
-  against NNG 1.4.0-rc.0 through the `nng` crate**, and the bridge rebuilt on the library —
-  780 insertions against 731 deletions, which is what a rebuild should look like. That rebuild
-  found two library bugs no unit test had.
+  endpoint engine, a 48-row option table, TLS and IPC credentials, and **eleven interop tests
+  against NNG 1.4.0-rc.0 through the `nng` crate**. That interop found two library bugs no
+  unit test had.
 - **B3 MQTT 5** — `weida-mqtt` and `weida-mqtt-py`, a **client**: the server half is Phase D
   ([0014](decisions/0014-parallel-libraries.md) §2), so its parity table adds a fourth verdict
   and says why. Interop ran against **two** brokers, `rumqttd` 0.20.0 and `rmqtt` 0.23.1, and
@@ -222,17 +213,8 @@ goes wrong: PAIR refuses a second peer with `LIMIT_EXCEEDED` and **keeps the fir
 counts a late reply where it arrives rather than where the caller reads, and a bus needs a
 writer per member — without one a single member that stops reading blocks the sender.
 
-## 3. The first message across two protocols
 
-![Cross-adapter chain](status/cross-adapter-chain.svg)
-
-This is roadmap slice B(6) and the reason both mapping documents were written in one shape.
-The chain's honest guarantee is `BestEffort`, and the test asserts that rather than implying
-more: ZMTP's `delivered()` proves the ZeroMQ hop's transport, SP has no transfer point at all,
-so a ZeroMQ send succeeds with the NNG side closed and nothing arrives. The composed losses —
-a multipart refused at hop one, the smaller `max_message_bytes` deciding — are each one test.
-
-## 4. Progress by the numbers
+## 3. Progress by the numbers
 
 ![Tests over time](status/tests-over-time.svg)
 
@@ -338,10 +320,10 @@ proof.
   decision notes, bindings and the five foreign-protocol libraries. Fifteen incoherences, all
   of the same four kinds: counts that had become false, superseded claims (including
   `GUARANTEES.md` contradicting itself on whether an acknowledgement level has a wire
-  representation), adapter mappings that still refused a pattern weida now ships, and claims
-  of completeness in the surfaces this plan deliberately left alone. The only code finding was
-  settled by a test rather than an argument: `tests/transports.rs` now runs **all six
-  patterns** over every transport, and `pair_over_unix` is the first thing here that proves
+  representation), former adapter mappings that treated protocol similarities as global, and
+  claims of completeness in the surfaces this plan deliberately left alone. The only code
+  finding was settled by a test rather than an argument: `tests/transports.rs` now runs **all
+  six patterns** over every transport, and `pair_over_unix` is the first thing here that proves
   the reverse pool of 0012 §4.4 carries an ordinary send rather than a fan-out copy.
 - **What moves next is no longer a human choice:** B-267 is the first ready item. It puts
   `delivery_attempt` on DATA key `12` without mixing that wire change into B-203's behavior

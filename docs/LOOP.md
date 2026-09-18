@@ -109,7 +109,7 @@ removal. Keep the file ordered by priority, ready items first.
 | spec | a change to a normative document | 45 | cross-references updated; `grep` shows no stale term left |
 | measure | a benchmark or probe that yields a number | 60 | the number in `docs/IMPLEMENTATION.md` verified results |
 | code | an implementation slice with tests | 90 | gate green; every public change reflected in docs |
-| adapter | a codec, bridge or test-bench slice for a foreign protocol | 90 | an interop test against the upstream implementation, or `#[ignore]` with the reason |
+| protocol | a codec, standalone library, binding or interop slice for a foreign protocol | 90 | an interop test against the upstream implementation, or `#[ignore]` with the reason |
 | review | the pass of §8 | 45 | findings as backlog items |
 
 ## 6. The gate
@@ -142,7 +142,7 @@ Two features are **excluded on purpose**, with the reason: `nng-interop` and `li
 need a foreign C library present at run time, so they belong to the item that touches them and
 to the interop suites that are `#[ignore]`d without it — `clippy -p weida-nng --features
 nng-interop --all-targets` and the `weida-zmq` equivalent still compile in 2 s each and are
-worth running when either bridge changes. `extension-module` on the five `weida-*-py` crates is
+worth running when either protocol library changes. `extension-module` on the five `weida-*-py` crates is
 turned on by maturin, never by cargo: a cargo run with it fails to link, and the wheel is proved
 by `develop.sh` and `package.sh` instead.
 
@@ -211,9 +211,10 @@ Stabilize the foundation first, then build on it; never start a later phase's sl
 **Phase A — the decided spec, realized.**
 A1 Decisions 0004-0008 as accepted notes (8.3 durability levels `Stored(Written|Flushed)`,
    `Replicated(n, flushed)`; 8.5 refusal race closed on RFC 9000 §3.2; 8.7 guarantee sets:
-   a default set plus a configurable superset inside the weida network, the chain ending
-   honestly at an adapter edge; 8.9 opaque paths, segmented Pub/Sub topics with wildcards,
-   ZeroMQ byte prefix as a named loss; session identity by fingerprint, resumption with L2).
+   a default set plus a configurable superset inside the weida network, and an explicit
+   managed Connector policy at a foreign-protocol boundary; 8.9 opaque paths, segmented
+   Pub/Sub topics with wildcards, foreign topic syntaxes independent; session identity by
+   fingerprint, resumption with L2).
 A2 Spec sync: PROTOCOL, GUARANTEES, PATTERNS, INVARIANTS, ARCHITECTURE on the decided state;
    SYNTHESIS §8 items marked closed with the decision number.
 A3 The four measurements of 0001/0002 §8 as benches or probes on the current tree; numbers
@@ -231,27 +232,22 @@ A8 Runtime ownership (`Runtime::owned`, `with_handle`), spawn/timer/DNS centrali
 A9 Local transports: inproc binding first; then `AF_UNIX` (Linux, macOS) and named pipes
    (Windows) per `docs/research/ipc.md` §11, peer credentials as the identity.
 
-**Phase B — the competitor implementations, and the helpers that marry them to weida.**
-Each foreign protocol family is its own directory under `crates/<family>/` and produces two
-products: a **standalone library** that a user of that protocol can use with no weida in the
-picture, and a **forwarder** between a weida endpoint and that library's sockets
-([decisions/0013](decisions/0013-competitor-libraries.md)). Six slices in this order:
-(1) sans-I/O codec with golden vectors and a fuzz target, with an empty `[dependencies]`;
-(2) `docs/adapters/<proto>.md` — stream, credit and guarantee mapping, transfer points and
-named losses, derived from the research sheet;
-(3) **the library**, in named sub-slices: 3a context, endpoints and error vocabulary on
-`weida-runtime`; 3b messages, per-peer queues and the high-water marks; 3c the connection
-engine with reconnect; 3d the pattern socket types, one sub-slice per family; 3e security
-and authorization; 3f options, monitoring and the devices;
-(4) **the marriage helpers** — the forwarder in both directions, rebuilt on the library,
-stating its guarantee set on the weida side and the foreign side's losses;
-(5) interop bench in both roles against the upstream implementations — pure Rust always,
-the C reference behind `#[ignore]` when absent — plus the numbers;
-(6) cross-adapter test: a message enters through one protocol and leaves through another,
-with the guarantees of both mapping documents asserted.
-Slice 3 is where the mass is: for ZeroMQ it is about eight times the three bridge slices it
-replaces. Slices 1, 2 and the bridges already exist for B1 and B2 and are not rebuilt from
-zero — [0013](decisions/0013-competitor-libraries.md) §5.2 says which code moves where.
+**Phase B — standalone foreign-protocol implementations.**
+Each foreign protocol family is its own directory under `crates/<family>/` and produces a
+standalone library that a user of that protocol can use with no weida in the picture
+([decisions/0013](decisions/0013-competitor-libraries.md)). The common slices are:
+(1) a sans-I/O codec with golden vectors and fuzz targets, with an empty `[dependencies]`
+where practical;
+(2) the library, in named sub-slices: context and endpoints; messages and bounded per-peer
+queues; connection engine and reconnect; native protocol primitives; security and
+authorization; options, monitoring and protocol-native devices;
+(3) interop in both roles against named upstream implementations, plus measured numbers;
+(4) language bindings, each following its own library, async first and sync second.
+
+There is no general bridge or cross-protocol test slice. Applications may compose public
+libraries explicitly. Broker integration is later Phase D work and takes the form of a managed
+Connector resource attached to a Queue, with one explicit conversion policy rather than a
+protocol-wide mapping.
 B1 ZeroMQ/ZMTP 3.1: `weida-zmq`, complete to the definition of done of
    [0013](decisions/0013-competitor-libraries.md) §4.7.
 B2 nanomsg/NNG SP: `weida-nng`, the library per
@@ -274,13 +270,14 @@ else: the library's interop slice is green, then the binding — **asyncio first
 surface** over that library's blocking facade, which is the order that builds the facade once.
 Python (PyO3 plus maturin) first, then Java, then Node; every binding sits on the one shared
 `weida-py-core` (error mapping, the Runtime/Context bridge to asyncio, the `bytes` boundary)
-and no binding re-derives it. Each reuses the interop bench: binding client against the Rust
-server against a foreign adapter, and later binding against binding.
+and no binding re-derives it. Each reuses the library's interop suite: binding client against
+the Rust implementation and a named upstream peer, and later binding against binding.
 
-**Phase D — the L2 broker** (master plan Phase 6), only once B1-B3 have green cross-adapter
-tests and the credit of 0003 has a consumer on both ends.
-D2 AMQP 0-9-1 against RabbitMQ, with or directly after the broker: producer and consumer
-clients (publisher confirms onto `Accepted`/`Stored` per 0004, `basic.qos` prefetch onto the
-L2 credit of 0003, topic-exchange bindings per 0007 §5), then weida as a broker for 0-9-1
-clients. Not a Phase B adapter: every 0-9-1 concept presupposes a broker, and the AMQP 1.0
-client of B4 already reaches RabbitMQ 4.x, which speaks 1.0 natively.
+**Phase D — the L2 broker** (master plan Phase 6): managed Queue and Connector resources in
+one control Raft, with one independent Raft group per replicated Queue and payload outside the
+logs. The current in-memory broker is the single-process slice; the control-plane cutover
+replaces `BrokerConfig::queues` as the inventory without adding declarations to the data plane.
+D2 protocol integrations follow as managed Connectors. AMQP 0-9-1 against RabbitMQ is first:
+publisher confirms map onto the attached Queue's achieved `Accepted`/`Stored` level,
+`basic.qos` drives consumer credit, and lifecycle is an administrative resource rather than a
+foreign-protocol backend hidden behind a weida pattern.

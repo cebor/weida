@@ -389,9 +389,9 @@ in the codec ([PROTOCOL.md](PROTOCOL.md) §6.5 keys `8` and `9`).
 at an endpoint's queue bound and `Drop` for fan-out only), producer naming `Fingerprint`,
 control isolation `No`. §6 is the normative source for `core`, so that the default cannot drift
 away from what the code does. An endpoint configured with nothing gets `core`, and every
-adapter may assume `core` on the weida side without asking [0006 §4.2]. On the wire a dimension
-left at its `core` level is **not written at all**, so a `core` declaration and no declaration
-are the same bytes ([PROTOCOL.md](PROTOCOL.md) §6.5).
+endpoint configured with no stronger set uses `core`. On the wire a dimension left at its
+`core` level is **not written at all**, so a `core` declaration and no declaration are the
+same bytes ([PROTOCOL.md](PROTOCOL.md) §6.5).
 
 **Inside the weida network a configured set may only be a superset of `core`.** Set `B` is at
 least `A` when, for every dimension, `B`'s level is greater than or equal to `A`'s in that
@@ -399,12 +399,11 @@ dimension's own order. Where a dimension is a partial order rather than a ladder
 level against replica count, §1 — the comparison is per axis and incomparable levels do not
 satisfy each other [0006 §4.3], [0004 §4.4].
 
-**At an adapter edge the chain ends at the foreign protocol's transfer point**, and the
-adapter's mapping document in [`adapters/`](adapters/README.md) names that point, the set it
-carries in each direction, its named losses and the configurations it refuses [0006 §4.6],
-[0006 §4.9]. Where the foreign protocol has no transfer point at all — ZeroMQ beyond
-`zmq_send`, core NATS — the chain ends at the adapter's own local queue and the document says
-so in those words.
+**Standalone foreign protocols are outside this guarantee negotiation.** Their libraries expose
+their own transfer points and completion states without translating them into weida levels. A
+future managed Connector validates the guarantee level of its one configured source–Queue or
+Queue–sink path and records that policy in the resource specification. That local declaration
+does not define a protocol-wide mapping.
 
 ---
 
@@ -447,17 +446,17 @@ Four rules govern configuration:
 
 - Invalid combinations MUST be rejected. Validation is explicit and happens at
   configuration time, not silently at runtime. A guarantee set is validated when an endpoint,
-  a connection or a bridge is configured, against what the build and the local configuration
-  can honour, before any connection is attempted
+  connection or managed resource is configured, against what the build and configuration can
+  honour, before traffic starts
   ([decisions/0006](decisions/0006-guarantee-sets.md) §4.5).
 - A requested guarantee MUST NEVER be silently weakened (master doc §81 rule 6). If a peer
   or a build cannot honour a requested guarantee, the operation MUST fail visibly. The v0
   core has no acknowledgement knob to weaken — it offers the transport receipt or nothing —
   so the rule shows up in routing instead: a stream addressed to an endpoint whose pattern
   cannot serve it is refused with `UNSUPPORTED` rather than quietly treated as something
-  the endpoint does understand (see [PROTOCOL.md](PROTOCOL.md) §9). At an adapter edge the
-  same rule permits a degradation only as a **named** configuration entry, which then *is*
-  the configured set, so nothing is weakened at runtime [0006 §4.7].
+  the endpoint does understand (see [PROTOCOL.md](PROTOCOL.md) §9). A Connector follows the
+  same rule at resource application: its explicit conversion policy either validates or the
+  resource is refused.
 - **Validation compares per axis, not per word.** A request for a completion state is
   honoured only when an offer covers it on the persistence axis *and* on the replica count;
   incomparable levels do not satisfy each other, and an acknowledgement reports the `n` that

@@ -1,4 +1,4 @@
-# 0006: Guarantee sets, and where the chain ends at an adapter edge
+# 0006: Guarantee sets and explicit managed-resource boundaries
 
 Status: accepted
 Date: 2026-09-11
@@ -6,23 +6,15 @@ Relates to: SYNTHESIS §8.7; P1, P7, P9, P14; decisions 0001 §7.3, 0003 §4.2, 
 
 ## 1. The question
 
-SYNTHESIS §8.7, verbatim:
+Two things have to be decided together. The first is what a guarantee is as a configurable
+object: the dimensions exist as independent vocabularies
+([GUARANTEES.md](../GUARANTEES.md) §3), while a connection needs one set it can negotiate and
+validate. The second is what happens when a future managed Connector joins a foreign-protocol
+source or sink to a Queue whose responsibility transfer sits in a different place.
 
-> **8.7 What does a bridge do when it cannot honour the source protocol's guarantee?** The
-> invariant is already written — "Protocol adapters may not silently invent guarantees their
-> source protocol cannot provide" [INVARIANTS] — and §7 shows the three concrete shapes: refuse
-> the configuration, store before forwarding, or degrade with an explicit statement. The
-> decision is which of the three is the default, and where the refusal surfaces: at
-> configuration time, which is what the guarantee-validation rule requires ("Invalid
-> combinations MUST be rejected… at configuration time, not silently at runtime"
-> [GUARANTEES §4]), or per message.
-
-Two things have to be decided together, because neither answers alone. The first is what a
-guarantee *is* as a configurable object: today the dimensions exist as five independent
-vocabularies [GUARANTEES §3] and the connection negotiates versions and capabilities, not
-guarantees [PROTOCOL §6.1]. The second is what happens where a weida chain meets a foreign
-protocol whose responsibility transfer sits in a different place, or nowhere at all
-[SYNTHESIS §4].
+The constraints are configuration-time refusal and hop-local honesty: invalid combinations are
+rejected before traffic, standalone foreign libraries keep their own completion vocabulary,
+and one Connector's explicit conversion policy never becomes a global protocol mapping.
 
 ## 2. The evidence, condensed
 
@@ -89,20 +81,20 @@ legal because it is declared and bounded, not because it is small.
 **The two invariants that fence this in**, verbatim [INVARIANTS]:
 
 > - All guarantees are defined against the immediate next hop.
-> - Protocol adapters may not silently invent guarantees their source protocol cannot provide.
+> - A managed Connector may claim only what its concrete source, queue and sink can prove.
 
-The first is mechanically checked today through the definition of `delivered()`; the second is
-deferred with its subsystem and is not yet mechanically checkable, "although v0 code must not
-foreclose it" [INVARIANTS].
+The first is mechanically checked today through the definition of `delivered()`. The second is
+deferred with the broker resource subsystem. Standalone foreign-protocol libraries terminate no
+weida guarantee chain and need no cross-protocol guarantee mapping.
 
 ## 3. Options considered
 
 | Option | Shape | Precedent | Named loss |
 | --- | --- | --- | --- |
-| A — per-message degradation | each message carries the guarantee it got; the sender inspects the outcome | MQTT's per-hop QoS minimum [mqtt5 §6] | every sender must check every message to learn what it received; a sender that does not check is silently weakened, which §4's second rule forbids |
-| B — a default set plus configured supersets, validated at configuration time; degradation only as a named configuration entry | guarantees are a tuple over the dimensions of §3; HELLO declares offered and required sets; the intersection decides; an adapter edge names its losses before any message flows | `required_capabilities` failing the handshake [PROTOCOL §2.3]; the "Maximum QoS granted" being stated up front [mqtt5 §6]; AMQP 1.0 refusing `header.durable` it cannot honour [amqp10 §6.5] | a validation step and a declaration on the wire; the strong-chain cases that need a durable bridge are refused rather than served |
-| C — exact equality only, no supersets | both sides must be configured identically or the connection fails | none | no adapter edge could ever be configured, since no foreign protocol matches weida's set exactly; a weida-only network could not opt into stronger behaviour either |
-| D — store before forwarding as the edge default | the bridge always becomes the durable transfer point | RabbitMQ→ZeroMQ chain [SYNTHESIS §7.1] | requires the durable hop of 0004, which exists only at L2 (Phase D), so it would make every Phase B adapter a broker first |
+| A — per-message degradation | each message carries the guarantee it got; the sender inspects the outcome | MQTT's per-hop QoS minimum [mqtt5 §6] | every sender must check every message to learn what it received; a sender that does not check is silently weakened |
+| B — a default set plus configured supersets, validated at configuration time | guarantees are a tuple over the dimensions of §3; HELLO declares offered and required sets; the intersection decides; a managed Connector declares the concrete level its configured path achieves | `required_capabilities` failing the handshake [PROTOCOL §2.3]; AMQP 1.0 refusing `header.durable` it cannot honour [amqp10 §6.5] | a validation step and a declaration on the wire; a Connector needing a durable queue is refused when none is configured |
+| C — exact equality only, no supersets | both sides must be configured identically or the connection fails | none | a weida-only network could not opt into stronger behaviour |
+| D — store before forwarding as every Connector's default | every Connector becomes a durable transfer point | RabbitMQ→ZeroMQ chain [SYNTHESIS §7.1] | turns protocol integration into mandatory persistence even where the resource asks for none |
 
 ## 4. Decision
 
@@ -118,10 +110,9 @@ Option B.
 2. **`core` is the default set, and it is what v0 does.** Delivery `BestEffort`,
    acknowledgement `TransportReceipt`, ordering `None`, deduplication `None`, backpressure
    `Block` (with `Reject` at an endpoint's queue bound and `Drop` for fan-out only)
-   [GUARANTEES §6]. An endpoint configured with nothing gets `core`; every adapter may assume
-   `core` on the weida side without asking; nothing in the hot path is allocated for a dimension
-   `core` leaves at `None`, which is the existing invariant that disabled guarantees do not
-   participate [INVARIANTS].
+   [GUARANTEES §6]. An endpoint configured with nothing gets `core`; nothing in the hot path
+   is allocated for a dimension `core` leaves at `None`, which is the existing invariant that
+   disabled guarantees do not participate [INVARIANTS].
 
 3. **Inside the weida network, a configured set may only be a superset of `core`.** "Superset"
    is defined per dimension: set `B` is at least `A` iff for every dimension `B`'s level is
@@ -140,52 +131,32 @@ Option B.
    quieter success. The wire encoding of the declaration is the work of decisions already
    scheduled (PROTOCOL §2.3/§6.1 sync and the `Hello` fields); what is decided here is the rule.
 
-5. **Validation is at configuration time.** A guarantee set is validated when an endpoint, a
-   connection or a bridge is configured, against what the build and the local configuration can
-   honour, before any connection is attempted — the first rule of [GUARANTEES.md](../GUARANTEES.md)
-   §4. Per-message refusal exists only where the foreign protocol itself makes the property
-   per-message: AMQP 1.0's `header.durable`, where a target that cannot honour it MUST NOT accept
-   the message and answers `amqp:precondition-failed` [amqp10 §6.5], [0004 §4.5]. weida itself
-   adds no per-message guarantee flag.
+5. **Validation is at configuration time.** A guarantee set is validated when an endpoint,
+   connection or managed resource is configured, against what the build and the local
+   configuration can honour, before traffic starts — the first rule of
+   [GUARANTEES.md](../GUARANTEES.md) §4. Per-message refusal exists only where the protocol
+   itself makes the property per-message: AMQP 1.0's `header.durable`, where a target that
+   cannot honour it MUST NOT accept the message and answers `amqp:precondition-failed`
+   [amqp10 §6.5], [0004 §4.5]. weida itself adds no per-message guarantee flag.
 
-6. **At an adapter edge the guarantee chain ends at the foreign protocol's transfer point.**
-   This is the answer to §8.7's first half. An adapter never claims a weida guarantee beyond the
-   point at which the foreign protocol marks responsibility as transferred [SYNTHESIS §4]. In
-   particular:
+6. **Standalone foreign-protocol libraries are outside this negotiation.** A ZeroMQ, NNG,
+   MQTT, AMQP or NATS socket speaks its own protocol and reports that protocol's own completion
+   states. Similar names do not create a weida guarantee, and no global mapping is inferred.
 
-   - Where the foreign protocol has a transfer point, the chain ends there and the adapter's
-     mapping document names the signal: confirm-mode `basic.ack`, PUBACK/PUBCOMP, a JetStream
-     publish acknowledgement, a Produce response, an AMQP `disposition`
-     [rabbitmq-amqp091 §6d], [mqtt5 §6], [nats §6], [kafka §6], [amqp10 §6.2].
-   - Where the foreign protocol has **no** transfer point — ZeroMQ beyond `zmq_send`, core NATS
-     [zeromq §6], [nats §6] — the chain ends at the adapter's own local queue, and the mapping
-     document says so in those words. That is a statement about the edge, not a guarantee of the
-     weida network behind it.
-   - The bridge becomes a transfer point only when it owns durable state, which is the L2
-     durable hop of 0004 and does not exist in Phase B. Until it does, §4.8 applies.
+7. **A managed Connector declares one concrete boundary.** Its resource specification names a
+   source or sink, the Queue it attaches to, its conversion policy and the guarantee level the
+   configured path requires. Apply is refused when that specific composition cannot honour the
+   declaration. This is resource validation, not a protocol-wide equivalence table.
 
-7. **The default at an edge is refusal at configuration time; degradation is available only as
-   a named configuration entry.** A bridge configuration whose foreign side cannot carry the
-   weida-side set, or whose weida side cannot carry the foreign guarantee, is rejected when the
-   bridge is configured. The operator may instead configure the degradation explicitly — naming
-   the dimension and the level the edge actually achieves, in the shape MQTT states its granted
-   maximum QoS before any message flows [mqtt5 §6]. Once named, the weaker level **is** the
-   configured set, so nothing is weakened at runtime and the second rule of §4 holds without
-   exception: naming it is what removes the silence. An adapter has no policy of its own to
-   apply per message.
+8. **Durability comes from the Queue, never from translation.** A Connector may report a durable
+   level only after the attached queue's store or replicated group has achieved it. Holding a
+   message in a task or socket queue is `Accepted` at most and must not be presented as
+   `Stored`.
 
-8. **Store before forwarding is not the default, and a chain that needs it is refused.** It
-   requires the bridge to be the durable hop, i.e. `Stored(...)` per 0004, which is L2 work
-   (Phase D) [SYNTHESIS §4], [SYNTHESIS §7.1]. A configuration that can only be honoured that
-   way is refused with a message naming the missing durable hop, rather than approximated by
-   holding messages in memory — an in-memory hold is `Accepted`, never `Stored`
-   [GUARANTEES §1].
-
-9. **Every adapter carries its guarantee mapping in its own document.** The mapping document of
-   a protocol (`docs/adapters/<proto>.md`, Phase B slice 2) states: the transfer point per §4.6,
-   the guarantee set the edge can carry in each direction, the named losses, and the
-   configurations it refuses. That document, not the code, is where the adapter-honesty invariant
-   is checked by a reader [INVARIANTS].
+9. **Protocol-specific facts stay protocol-specific.** Transfer points, acknowledgements,
+   security and overload behavior remain documented by the foreign library and its research
+   sheet. A Connector implementation documents only the resource schema and conversion it
+   actually implements; it must not publish a socket-to-pattern mapping as a framework rule.
 
 ## 5. Consequences and follow-ups
 
@@ -199,14 +170,13 @@ Option B.
   declarations and `negotiate()` computes the per-dimension intersection, failing with
   `NEGOTIATION_FAILED` on a shortfall. Wire keys, encoding and golden vectors are the scheduled
   wire work, not this note.
-- **[INVARIANTS.md](../INVARIANTS.md).** Once HELLO carries the declarations, the mechanical-check
-  table gains a row for adapter honesty: the enforcement is the mapping document plus the
-  configuration-time refusal, and the row says which part is mechanical and which is editorial.
-- **[ARCHITECTURE.md](../ARCHITECTURE.md) §5.** The configuration surface names where a guarantee
-  set is set (endpoint, connection, bridge) beside the two `Limits` profiles of 0002.
-- **Phase B.** Every adapter slice 2 produces the guarantee mapping of §4.9; the three chains of
-  SYNTHESIS §7 become the first three cross-adapter tests, each asserting the named losses rather
-  than an invented guarantee.
+- **[INVARIANTS.md](../INVARIANTS.md).** The future Connector subsystem is checked by
+  configuration-time validation against the concrete source, Queue and sink it names.
+- **[ARCHITECTURE.md](../ARCHITECTURE.md) §1.** The configuration surface distinguishes
+  endpoint/connection guarantee sets from a managed Connector resource's explicit policy.
+- **Phase D.** Connector implementations follow the control-plane resource model of
+  [0022](0022-consensus-topology.md); no protocol-wide mapping document or cross-adapter test
+  is required.
 - **[SYNTHESIS.md](../research/SYNTHESIS.md) §8.7** is closed by this note.
 - **Open, deliberately.** Whether a guarantee set may vary per endpoint on one connection, or
   only per connection, is left to the wire work: 0001 §7 already records the same question for

@@ -23,7 +23,7 @@ Reproduced verbatim from master doc §77.
 - Payload replication remains stream-oriented.
 - Disabled guarantees should not participate in the hot path.
 - No remote input can cause unbounded memory allocation.
-- Protocol adapters may not silently invent guarantees their source protocol cannot provide.
+- A managed Connector may claim only what its concrete source, Queue and sink can prove.
 
 ## v0 mechanical checks
 
@@ -78,30 +78,13 @@ new bound that is *local* rather than remote input — the member's own `endpoin
 messages per peer, past which a copy is dropped and counted (B-238) — and it is named here
 anyway, because an unbounded queue is an unbounded queue whoever fills it.
 
-**The adapters are inside this invariant too, and had been read as if they were not.** The
-review pass of B-051 swept the adapter crates for the first time and found two structures a
-foreign peer or a weida client could grow without a ceiling — both in the ZMTP bridge, which
-is the code actually exposed to strangers. The outbound bridge now bounds the exchanges
-waiting for a ZMTP reply with `max_pending_exchanges` (64), refusing past it with
-`ERROR{REJECTED}` **before** reading the
-body, so the exposure is a stated product — `max_pending_exchanges × max_message_bytes`,
-64 MiB at the defaults — rather than whatever weida clients choose to open. The inbound
-bridge bounds a foreign peer's subscription table the same way, with weida's own two numbers
-for the same thing: 256 distinct prefixes (`max_subscriptions`) of at most 256 B each (the
-wire cap on a SUBSCRIBE `filter`), which is 64 KiB of prefixes per peer. A **repeat** of a
-held prefix is still accepted at the ceiling, because ZeroMQ's non-idempotent count is what
-loss L3 exists to preserve and a refused second SUBSCRIBE would make the first cancellable
-by one CANCEL where the peer sent two. The lesson is worth keeping beside the list: a bound
-named for the core is not a bound until the code at the edge has it too.
-
-**And so are the standalone libraries** ([decisions/0013](decisions/0013-competitor-libraries.md)):
-`weida-zmq` and `weida-nng` are inside this invariant exactly as the adapters turned out to
-be, and their bounds carry the foreign protocol's own names, because a libzmq user must
-recognize them — `ZMQ_SNDHWM`, `ZMQ_RCVHWM`, `ZMQ_MAXMSGSIZE`, `ZMQ_MAX_SOCKETS`,
-`ZMQ_BACKLOG`, `ZMQ_HANDSHAKE_IVL`. Two of those defaults therefore differ from libzmq's and
-say so in the parity table: `ZMQ_MAXMSGSIZE` is a real number rather than "no limit", since
-a ZMTP frame may declare 2^63-1 octets, and `ZMQ_LINGER` is finite rather than infinite
-[0013 §4.4].
+**Standalone foreign-protocol libraries are inside this invariant too**
+([decisions/0013](decisions/0013-competitor-libraries.md)). Their bounds carry the foreign
+protocol's own names, because users of those protocols must recognize them —
+`ZMQ_SNDHWM`, `ZMQ_RCVHWM`, `ZMQ_MAXMSGSIZE`, `ZMQ_MAX_SOCKETS`, `ZMQ_BACKLOG`,
+`ZMQ_HANDSHAKE_IVL`. Two defaults deliberately differ from libzmq's and say so in the parity
+table: `ZMQ_MAXMSGSIZE` is finite because a ZMTP frame may declare 2^63-1 octets, and
+`ZMQ_LINGER` is finite rather than infinite [0013 §4.4].
 
 **A message count is not a memory bound**, and that is the one place a standalone library
 adds a name of its own rather than the foreign protocol's. `ZMQ_SNDHWM` and `ZMQ_RCVHWM`
@@ -199,12 +182,9 @@ broker hop can define it against real responsibility transfer instead of inherit
 brokerless ACK that only ever meant "arrived in RAM"
 ([IMPLEMENTATION.md](IMPLEMENTATION.md) §1, [GUARANTEES.md](GUARANTEES.md)).
 
-Adapter guarantee honesty is deferred as *code* and not as a rule: it has a home from now on.
-Every adapter's mapping document (`docs/adapters/<proto>.md`) states the foreign protocol's
-transfer point, where the guarantee chain therefore ends, the named losses, and the
-configurations the adapter refuses; that document, not the code, is what a reader checks the
-invariant against ([decisions/0006](decisions/0006-guarantee-sets.md) §4.6-§4.9,
-[docs/adapters/README.md](adapters/README.md)). The mechanical half is the refusal: a guarantee
-set an edge cannot carry is rejected at configuration time, and a degradation exists only as a
-named configuration entry [0006 §4.7]. The editorial half is the document, and it is required
-before the bridge code of its protocol exists.
+Standalone foreign-protocol libraries terminate no weida guarantee chain and have no global
+socket-to-pattern mapping. Future broker Connectors are inside the honesty invariant as concrete
+managed resources: each must name its source or sink, Queue, conversion policy, limits and
+achieved guarantee level, and resource application must refuse a composition it cannot honour.
+One Connector's explicit policy never becomes a framework-wide equivalence between protocols
+([decisions/0013](decisions/0013-competitor-libraries.md) §4.6).

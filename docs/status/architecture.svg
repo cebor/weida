@@ -58,14 +58,6 @@
   <rect x="788" y="188" width="152" height="50" rx="4" class="built"/><text x="796" y="204" class="lbl">weida-nats</text><text x="796" y="218" class="sub">core client, both wildcards</text><text x="796" y="231" class="sub">queue groups, inbox reply</text>
   <rect x="788" y="244" width="118" height="34" rx="4" class="built"/><text x="796" y="259" class="lbl">weida-nats-py</text><text x="796" y="272" class="sub">asyncio + sync</text>
 
-  <!-- forwarders and cross-tests -->
-  <rect x="140" y="286" width="500" height="20" rx="3" class="built"/><text x="148" y="300" class="sub">weida-zmq-bridge · weida-nng-bridge — name both sides; both now run on the libraries (B-094, B-134)</text>
-  <rect x="650" y="286" width="290" height="20" rx="3" class="built"/><text x="658" y="300" class="sub">crates/interop/cross-tests — ZMTP in, SP out</text>
-
-  <!-- forwarder -> library -->
-  <path d="M278,286 L278,242" class="arrow"/>
-  <path d="M440,286 L440,242" class="arrow"/>
-
   <!-- libraries -> shared foundation -->
   <path d="M216,314 L216,334" class="arrow"/>
   <path d="M540,314 L540,334" class="arrow"/>
@@ -88,8 +80,6 @@
   <path d="M864,446 L864,426" class="arrow"/>
   <text x="222" y="442" class="sub">depends on</text>
 
-  <!-- forwarder -> weida -->
-  <path d="M140,296 L126,296 L126,478 L136,478" class="arrow"/>
 
   <!-- band 4: weida itself -->
   <rect x="20" y="446" width="920" height="240" class="band"/>
@@ -112,6 +102,6 @@
   <rect x="544" y="636" width="192" height="46" rx="4" class="built"/><text x="552" y="652" class="lbl">AF_UNIX (Linux, macOS)</text><text x="552" y="665" class="sub">control conn + SO_PEERCRED</text><text x="552" y="677" class="sub">shared chunk framing (B-245)</text>
   <rect x="746" y="636" width="192" height="46" rx="4" class="built"/><text x="754" y="652" class="lbl">Named pipes (Windows)</text><text x="754" y="665" class="sub">B-039 built + Windows-gated</text><text x="754" y="677" class="sub">same grouped transport (0012)</text>
 
-  <text x="20" y="704" class="sub">No competitor library depends on weida or weida-protocol (0013 §4.2): it names its codec and weida-runtime, a codec names nothing, and a forwarder alone names both sides.</text>
-  <text x="20" y="720" class="sub">Sources: decisions 0013 §4.1–§4.2, 0014 §2; cargo metadata (28 members); docs/STATUS.md §2.</text>
+  <text x="20" y="704" class="sub">No foreign-protocol library depends on weida or weida-protocol (0013 §4.2): it names its codec and weida-runtime, while a codec names nothing.</text>
+  <text x="20" y="720" class="sub">Sources: decisions 0013 §4.1–§4.2, 0014 §2; cargo metadata (25 members); docs/STATUS.md §2.</text>
 </svg>

@@ -119,25 +119,37 @@ layer beneath L0 from which it could get one.
 
 ### L2 — broker semantics
 
-The RabbitMQ-analog layer: queues, publisher confirms, consumer acknowledgements with
-redelivery — three slices, of which the **first exists**. `weida-broker` registers a queue on
-each endpoint path its configuration names, admits a producer's message into memory and
-answers the exchange's reply half with the level it achieved: `Accepted`, and nothing above
-it. A consumer registers with SUBSCRIBE, states an absolute delivery limit with frame kind `5`
-(B-202) and receives each message as a one-way transfer — exactly one consumer per message,
-which is the difference from a publisher's fan-out. Nothing is durable, so `Stored` and
-`Replicated` stay unreachable by construction, and a delivery still has no *outcome*: the
-consumer acknowledgement that lets a queue forget or redeliver a message is the slice after it
-([decisions/0018](decisions/0018-minimal-broker.md)). The acknowledgement vocabulary
-**Accepted / Stored / Replicated / Processed** belongs to this layer; `Accepted` now has a
-wire representation — DATA key `8` on a reply half — and the other three do not
-([GUARANTEES.md](GUARANTEES.md), [PROTOCOL.md](PROTOCOL.md) §6.2).
+The RabbitMQ-analog layer: managed queues, publisher confirms, consumer reports with
+redelivery, storage and replication. The current `weida-broker` slice registers the queues
+named by its process-local configuration, admits a producer's message into memory, reports
+`Accepted`, and delivers under absolute per-subscription credit
+([decisions/0018](decisions/0018-minimal-broker.md)).
 
-### Adapters
+The cluster design replaces that process-local inventory with a **declarative control
+plane**. An administrative API commits long-lived resources to the control Raft; controllers
+reconcile those specifications into running queues and protocol connectors. A committed
+specification says what should exist, not that it is ready: each resource carries a generation
+and an observed generation plus a small status. Create, update and delete are therefore
+durable lifecycle operations rather than calls that happen to spawn or stop a task
+([decisions/0022](decisions/0022-consensus-topology.md) §4.1).
 
-Sideways, not above: the Web binding extends this namespace onto another transport, and the
-legacy-protocol adapters bridge foreign models into it. Both are described under Binding in
-§2 and in the crate map in §4.
+The data plane still has no declare operation. Sending to a path never creates infrastructure;
+an unknown or not-ready queue is refused. Node bootstrap configuration — identities, storage
+paths, listeners and cluster seeds — remains local, while queue and connector specifications,
+placement and ownership live in the control group.
+
+### Foreign protocols and managed connectors
+
+The foreign-protocol crates are standalone implementations, not weida adapters. A ZeroMQ user
+uses `weida-zmq` to speak to ZeroMQ peers; the same is true for NNG, MQTT, AMQP and NATS. The
+workspace defines no global equation between a foreign socket type and a weida pattern.
+
+Where the broker later exposes a foreign protocol, it does so through a managed **Connector**
+resource: an explicit source or sink attached to a named queue, with its protocol, direction,
+address, limits and conversion policy in that resource's specification. A broker deployment may
+link a protocol-specific Connector controller built on a standalone library; it exists only
+under broker resource lifecycle and is not a free-standing bridge product or a dependency of
+`weida`.
 
 ### Why the split exists
 
@@ -237,19 +249,15 @@ A binding must be able to carry weida's addressing model: an opaque endpoint pat
 namespace, several endpoints per binding. That is what makes QUIC and Web bindings of one
 Listener — both can name `/jobs` and `/events` on the same port.
 
-**Legacy-protocol adapters are not bindings.** ZeroMQ, nanomsg/NNG, MQTT and AMQP get
-separate crates (`weida-zeromq`, master doc §43: "each should ideally be an independent
-crate"), implemented natively in Rust and hosted by this runtime or by an extension of it —
-and usable standalone, so `weida-zeromq` can ship on its own, later also as e.g. a Python
-package. They are deliberately outside the Listener because their addressing model cannot
-express ours: a ZeroMQ socket is one endpoint, addressed by port, with no path component.
-Multiplexing many named endpoints over one port is precisely the limitation weida's
-namespace overcomes, so folding ZeroMQ back in as a Binding would push that limitation into
-the core model. An adapter *bridges* between the two worlds; it does not extend our
-namespace onto a transport that has none.
+**Foreign-protocol libraries are not bindings.** ZeroMQ, nanomsg/NNG, MQTT, AMQP and NATS
+have separate crates, implemented natively in Rust and hosted by `weida-runtime` or by an
+extension of it. They are usable standalone and expose their own protocol's addressing and
+semantics. A ZeroMQ socket, for example, is one ZeroMQ endpoint addressed by that protocol;
+it is not a restricted weida `Binding`, and no implicit conversion makes it one.
 
-Master doc §3 lists Web, ZeroMQ, MQTT and AMQP together as "adapter bindings"; §39 and §43
-draw the line above, and that is the one the implementation follows.
+The broker may later materialize a managed Connector backed by one of those libraries. That is
+an explicitly configured broker resource attached to a queue, not a transport hidden behind
+`Requester`, `Pusher`, `Subscriber` or any other weida pattern.
 
 An **Identity** is a property of the Binding, not of the Listener. A QUIC binding needs a
 certificate chain and the private key behind it; a Web binding terminates TLS on its own
@@ -435,12 +443,10 @@ crates/
     zmq/weida-zmtp/            →  weida-zmtp        ZMTP 3.1 codec, no I/O and no
                                                     weida dependency
     zmq/weida-zmq/             →  weida-zmq         the ZeroMQ implementation
-    zmq/weida-zmq-bridge/      →  weida-zmq-bridge  weida endpoints ↔ ZeroMQ sockets
     zmq/weida-zmq-py/          →  weida-zmq-py      its Python binding
     nng/weida-sp/              →  weida-sp          SP codec, no I/O and no weida
                                                     dependency
     nng/weida-nng/             →  weida-nng         the NNG implementation
-    nng/weida-nng-bridge/      →  weida-nng-bridge  weida endpoints ↔ SP sockets
     nng/weida-nng-py/          →  weida-nng-py      its Python binding
     mqtt/weida-mqtt-codec/     →  weida-mqtt-codec  MQTT 5 codec, no I/O
     mqtt/weida-mqtt/           →  weida-mqtt        the MQTT client
@@ -453,50 +459,38 @@ crates/
     nats/weida-nats-py/        →  weida-nats-py     its Python binding
     py/weida-py-core/          →  weida-py-core     the shared PyO3 foundation
     py/weida-py/               →  weida-py          weida's own Python binding
-    interop/cross-tests/       →  cross-tests       one protocol in, another out
 ```
 
-**This is the layout [decisions/0013](decisions/0013-competitor-libraries.md) §4.1 decided,
-and it is now the tree.** B-095 moved the crates and renamed the two bridges —
-`weida-zmtp-bridge` became `weida-zmq-bridge` and `weida-sp-bridge` became
-`weida-nng-bridge`, in one commit so that the two could never disagree — and **no other crate
-name changed**, so nothing published or depended upon broke. `weida-zmq` is complete against
-[0013](decisions/0013-competitor-libraries.md) §4.7's six clauses
-([libraries/zmq.md](libraries/zmq.md)), and `weida-nng`, the second implementation that row
-promised, exists beside it ([libraries/nng.md](libraries/nng.md)). Directories are named for
-the **protocol family** rather than for the role a crate plays in it, so that the directory
-list answers "does this repository ship a ZeroMQ?" — the
-old `crates/adapters/` answered no, because an adapter is a hop at a weida edge
-([0006](decisions/0006-guarantee-sets.md) §4.6) and a library has no edge.
+This is the family layout [decisions/0013](decisions/0013-competitor-libraries.md) §4 chose:
+each foreign protocol keeps its codec, standalone library and bindings together. `weida-zmq`
+is complete against [libraries/zmq.md](libraries/zmq.md), and `weida-nng` exists beside it
+([libraries/nng.md](libraries/nng.md)). Directories are named for the **protocol family**
+rather than for a role in a weida deployment, so the directory list answers “does this
+repository ship a ZeroMQ implementation?”
 
-`weida-zmtp` is the first slice of the ZeroMQ adapter
-([adapters/zmtp.md](adapters/zmtp.md)) and depends on **nothing at all** — not even
-`weida-core`. That is deliberate and stronger than the rule below: the half of an adapter
-that can be checked byte-for-byte against a foreign specification must not be able to reach
-for weida's types, limits or error vocabulary, or the check quietly becomes a check against
-our reading of the specification.
+`weida-zmtp` depends on **nothing at all** — not even `weida-core`. That is deliberate and
+stronger than the dependency rule below: code checked byte-for-byte against a foreign
+specification must not reach for weida's types, limits or error vocabulary, or the check
+quietly becomes a check against our reading of the protocol.
 
-`weida-zmq-bridge` is the forwarder and depends on both sides — `weida` and `weida-zmq` — and
-on no protocol of its own: B-094 moved the ZMTP session, the handshake, the heartbeat and the
-subscription counting into the library, so the bridge holds the mapping and nothing else. It
-is a separate crate rather than a feature of the codec for the reason above: a feature would
-put a weida dependency in the codec's manifest, and the codec's dependency-free manifest is
-the thing that keeps it honest.
+`weida-zmq` owns ZeroMQ's session, handshake, heartbeat, subscription counting and devices.
+Its `proxy` and `proxy_steerable` helpers run the protocol's own queue, forwarder and streamer
+topologies on the reactor. They do not name `weida`, and no second crate assigns global weida
+counterparts to ZeroMQ socket types. The same boundary applies to every foreign library.
 
-`weida-broker` is the L2 layer of §1, and its first slice: queues at endpoint paths,
-`Accepted` on the producer's reply half, nothing durable and nothing delivered yet
-([decisions/0018](decisions/0018-minimal-broker.md)). It is a separate crate because it is a
-separate layer: it depends on `weida`, nothing in the core may depend on it, and a brokerless
-deployment does not link it.
+`weida-broker` is the L2 layer of §1. Its current slice is an in-memory queue at each
+configured endpoint path; the cluster design moves queue existence and configuration into
+control-Raft resources without adding a declare operation to the messaging data plane
+([decisions/0018](decisions/0018-minimal-broker.md),
+[decisions/0022](decisions/0022-consensus-topology.md)). It is a separate crate because it is
+a separate layer: it depends on `weida`, nothing in the core may depend on it, and a
+brokerless deployment does not link it.
 
-Planned, not yet present: `weida-web` (the Web binding, Phase 8) and the `weida-amqp091`
-adapter that turns the broker above into a server for AMQP 0-9-1 clients (Phase 9, D2). The
-foreign-protocol crates are separate because they
-are separately useful: each is a native Rust implementation of a foreign protocol, hosted by
-this runtime or an extension of it, and each must be usable on its own — the ZMTP codec
-without a weida deployment at all today, and a whole ZeroMQ without one once 0013 §4.4 lands.
-They may depend on `weida-core`, `weida-protocol` and `weida-runtime`; the core never depends
-on them, and a library never depends on `weida`.
+Planned, not yet present: `weida-web` (the Web binding) and protocol-specific Connector
+crates that let the broker reconcile foreign-protocol listeners or diallers as managed
+resources. Each Connector names one concrete source or sink and one queue; it does not define
+a universal mapping between two messaging models. The standalone foreign libraries remain
+separately useful and never depend on `weida` or `weida-protocol`.
 
 ### `weida-core`
 
@@ -564,16 +558,17 @@ already holds and `weida` has no second way to reach the reactor.
 
 ### `weida-broker`
 
-L2, in the smallest form that is worth anything: a queue per configured endpoint path, held
-in memory; admission with a byte bound; and the producer's confirm on the reply half of its
-own exchange. Its whole dependency list is `weida` — the layer below it is the public API,
-not its internals — and **nothing in this workspace depends on it**, which is what makes a
-brokerless deployment brokerless.
+L2, currently implemented as the smallest useful local slice: an in-memory queue per
+configured endpoint path, bounded admission, `Accepted` on the producer hop, absolute consumer
+credit, settlement and requeue. Its whole dependency list is `weida`; the layer below is the
+public API, not its internals, and a brokerless deployment does not link it.
 
-What it deliberately does not have: a store (so `Stored` is not expressible in its types, not
-merely unused), a declare frame (a queue exists because the configuration named it), and a
-delivery *outcome* — the consumer acknowledgement and the redelivery it makes possible are the
-slice after this one ([decisions/0018](decisions/0018-minimal-broker.md) §4.2, §4.3, §4.5).
+The cluster target is a managed resource system. A control Raft stores queue and Connector
+specifications, generations, placement and ownership; one Raft group per replicated queue
+stores that queue's commit records and consumer state. Controllers reconcile committed desired
+state into runtime objects. The administrative API owns lifecycle; the messaging protocol has
+no declare frame and never creates a queue as a side effect
+([decisions/0022](decisions/0022-consensus-topology.md)).
 
 ### `weida-raft`
 
@@ -609,19 +604,16 @@ protocol   runtime
  ↑          ↑    ↖
 weida ──────┘     weida-zmq ──→ weida-zmtp   (the codec, which depends on nothing)
 
-weida-zmq-bridge  →  weida + weida-zmtp     today
-weida-nng-bridge    →  weida + weida-sp       today
-weida-broker        →  weida + weida-raft     L2; nothing depends on it
+weida-broker        →  weida + weida-raft     L2; cluster support is optional
 weida-raft          →  weida + openraft       consensus with I/O
-weida-zmq-bridge   →  weida + weida-zmq      B-094, on the library
 ```
 
 `weida-core` MUST NOT depend on `weida-protocol` or `weida`. `weida-protocol` MUST NOT
 depend on `weida`. `weida-runtime` MUST NOT depend on `weida-protocol` or `weida`, and a
-competitor library MUST NOT depend on `weida` or `weida-protocol`
-([0013](decisions/0013-competitor-libraries.md) §4.2): only a bridge names both sides.
-Circular architectural dependencies are prohibited (master doc §74). The core must not depend
-on transport, runtime or, later, broker implementation details.
+foreign-protocol library MUST NOT depend on `weida` or `weida-protocol`
+([0013](decisions/0013-competitor-libraries.md) §4.2). Future Connector crates may name the
+broker and one foreign library; neither side may depend back on them. Circular architectural
+dependencies are prohibited (master doc §74).
 
 ### Why runtime and transport are one crate
 
@@ -1370,8 +1362,7 @@ Type by type:
   the same thing said on purpose: the only place where an **application** decides an outcome
   the requester sees, which is what [decisions/0005](decisions/0005-refusal-race.md) §4.3
   means by "the ERROR frame is written by the application". `Rejected` where this side
-  declines, `NoReply` where the request was taken and no reply will exist — an adapter whose
-  far side dropped it silently, which is how the ZMTP bridge reports a ROUTER's silent drop.
+  declines, `NoReply` where the request was taken and no reply will exist.
 - **`ReplyStream`** — the requester's half of an exchange. `recv()` yields the reply's
   `IncomingTransfer`, or the peer's typed `Error` when the reply half carried an ERROR instead.
   Dropping it before `recv()` stops that half with `CANCELED`, so a responder streaming a long

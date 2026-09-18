@@ -44,20 +44,8 @@
   <text x="44" y="336" class="lbl">Proof</text>
   <text x="44" y="352" class="sub">tests/transports.rs runs all six patterns over QUIC, inproc, AF_UNIX</text>
   <text x="44" y="364" class="sub">and named pipes unchanged; broker settlement has four behavior tests;</text>
-  <text x="44" y="376" class="sub">the guarantee a chain states is asserted, never implied</text>
+  <text x="44" y="376" class="sub">broker guarantee claims are asserted at the hop that earns them</text>
 
-  <!-- the marriage helpers -->
-  <text x="472" y="180" class="ev" text-anchor="middle">the marriage</text>
-  <text x="472" y="192" class="ev" text-anchor="middle">helpers</text>
-  <text x="472" y="210" class="ev" text-anchor="middle">weida-zmq-bridge</text>
-  <text x="472" y="222" class="ev" text-anchor="middle">weida-nng-bridge</text>
-  <path d="M472,244 L436,244" class="arrow"/>
-  <path d="M472,244 L508,244" class="arrow"/>
-  <text x="472" y="266" class="ev" text-anchor="middle">a forwarder holds</text>
-  <text x="472" y="278" class="ev" text-anchor="middle">one endpoint and</text>
-  <text x="472" y="290" class="ev" text-anchor="middle">one foreign socket</text>
-  <text x="472" y="302" class="ev" text-anchor="middle">on one Exec</text>
-  <text x="472" y="314" class="ev" text-anchor="middle">(0013 §4.5)</text>
 
   <!-- right half: the competitors -->
   <rect x="514" y="44" width="426" height="370" class="band"/>
@@ -79,5 +67,5 @@
   <text x="32" y="462" class="sub">weida-runtime — Exec, the three reactor owners, the capped resolver, AF_UNIX hygiene, the name registry · weida-core — addresses, limits, errors</text>
   <text x="32" y="474" class="sub">weida-py-core — one exception class per errno variant, the asyncio bridge, the bytes boundary. No library depends on weida or weida-protocol (0013 §4.2)</text>
 
-  <text x="20" y="502" class="sub">Sources: docs/decisions/0013 §4 (two kinds of product), §4.5 (the marriage helpers), 0014 §2 (four workstreams, one PyO3 foundation), docs/libraries/*.md, docs/STATUS.md.</text>
+  <text x="20" y="502" class="sub">Sources: docs/decisions/0013 §4 (two kinds of product), 0014 §2 (four workstreams, one PyO3 foundation), docs/libraries/*.md, docs/STATUS.md.</text>
 </svg>

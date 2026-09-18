@@ -3402,22 +3402,6 @@ name = "weida-core"
 version = "0.1.0"
 
 [[package]]
-name = "weida-cross-tests"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "nng",
- "tokio",
- "tracing-subscriber",
- "weida",
- "weida-nng-bridge",
- "weida-sp",
- "weida-zmq-bridge",
- "weida-zmtp",
- "zeromq",
-]
-
-[[package]]
 name = "weida-mqtt"
 version = "0.1.0"
 dependencies = [
@@ -3491,18 +3475,6 @@ dependencies = [
  "weida-core",
  "weida-nng",
  "weida-runtime",
- "weida-sp",
-]
-
-[[package]]
-name = "weida-nng-bridge"
-version = "0.1.0"
-dependencies = [
- "tokio",
- "tracing",
- "tracing-subscriber",
- "weida",
- "weida-nng",
  "weida-sp",
 ]
 
@@ -3601,21 +3573,6 @@ dependencies = [
  "weida-zmtp",
  "zeromq",
  "zmq",
-]
-
-[[package]]
-name = "weida-zmq-bridge"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "criterion",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "weida",
- "weida-zmq",
- "weida-zmtp",
- "zeromq",
 ]
 
 [[package]]

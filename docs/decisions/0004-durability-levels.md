@@ -147,9 +147,9 @@ Option B.
    weaker level is not an available behaviour.
 
 6. **Nothing of this reaches the v0 wire.** The levels sharpen reserved vocabulary; they remain
-   without wire representation until the Phase 6 broker exists, exactly as `Accepted` and
-   `Processed` do [GUARANTEES §1]. What changes today is the definition an L2 design and every
-   adapter mapping must hit, and what the documents promise.
+   without wire representation until the broker resource subsystem exists, exactly as
+   `Accepted` and `Processed` do [GUARANTEES §1]. What changes today is the contract a replicated
+   Queue must satisfy before reporting a level.
 
 ## 5. Consequences and follow-ups
 
@@ -165,20 +165,20 @@ Option B.
 - **[PROTOCOL.md](../PROTOCOL.md) §11.** Beside the reserved L2 credit frame of 0003 §4.3, note
   that the L2 acknowledgement carries the achieved level, not the requested one; its encoding is
   fixed with the Phase 6 broker design, not before.
-- **Adapters.** The mapping table of §4.2 is the normative source for every adapter's guarantee
-  mapping document, and `docs/adapters/<proto>.md` states it per protocol. Two mappings are
-  deliberately weak and must stay named as such: RabbitMQ classic persistent confirms map to
-  `Stored(Written)` because the sheet certifies a disk write and no `fsync`
-  [rabbitmq-amqp091 §6d], and a JetStream stream with memory storage maps to `Accepted` and may
-  never report `Stored` [nats §11].
-- **Kafka's unclean leader election is a named loss, not a level.** With it enabled, a committed
-  record can be discarded by an out-of-sync replica taking leadership [kafka §8], [kafka §9].
-  That is an adapter-side configuration statement in the Kafka mapping document, not a fifth
-  weaker `Replicated` variant.
+- **Foreign-protocol states are not weida states by analogy.** A managed Connector that converts
+  between a Queue and a foreign system must name the evidence and loss in its own spec. There is
+  no protocol-wide guarantee table. For example, a RabbitMQ classic persistent confirm says that
+  a disk write occurred but does not certify `fsync` [rabbitmq-amqp091 §6d], while a JetStream
+  memory-backed stream certifies no disk state [nats §11]. Those are inputs to a concrete
+  Connector policy, not global mappings.
+- **Kafka's unclean leader election is a named Connector loss, not a level.** With it enabled, a
+  committed record can be discarded by an out-of-sync replica taking leadership [kafka §8],
+  [kafka §9]. A Connector configured for that system must expose the loss rather than inventing a
+  fifth weaker `Replicated` variant.
 - **[SYNTHESIS.md](../research/SYNTHESIS.md) §8.3** is closed by this note.
-- **`Processed` and `Accepted` are untouched.** AMQP 1.0's `accepted` outcome maps to
-  `Processed`, not to `Stored`, because it certifies receiver processing and "says nothing about
-  disk" [amqp10 §6.5]; that mapping belongs to the AMQP 1.0 adapter document.
+- **`Processed` and `Accepted` are untouched.** A foreign outcome such as AMQP 1.0 `accepted`
+  does not automatically become either weida state; a concrete Connector must state what it can
+  prove at its configured boundary [amqp10 §6.5].
 
 ## 6. Sources
 

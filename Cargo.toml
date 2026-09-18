@@ -15,16 +15,13 @@ members = [
     "crates/raft/weida-raft",
     # The one crate that calls Win32; empty everywhere else.
     "crates/winpipe",
-    # One directory per foreign protocol family, codec and library and bridge
-    # together, because everything belonging to one protocol belongs together
-    # (0013 §4.1).
+    # One directory per foreign protocol family: codec, standalone library
+    # and language bindings together (0013 §4.1).
     "crates/zmq/weida-zmtp",
     "crates/zmq/weida-zmq",
-    "crates/zmq/weida-zmq-bridge",
     "crates/zmq/weida-zmq-py",
     "crates/nng/weida-sp",
     "crates/nng/weida-nng",
-    "crates/nng/weida-nng-bridge",
     "crates/nng/weida-nng-py",
     "crates/mqtt/weida-mqtt-codec",
     "crates/mqtt/weida-mqtt",
@@ -39,8 +36,6 @@ members = [
     # protocol-specific in it (0014 §2).
     "crates/py/weida-py-core",
     "crates/py/weida-py",
-    # Belongs to no single family: one protocol in, another out.
-    "crates/interop/cross-tests",
     # The website at `homepage`, rendered from the documents in `docs/` rather
     # than written a second time beside them
     # ([decisions/0025](docs/decisions/0025-the-website.md)).

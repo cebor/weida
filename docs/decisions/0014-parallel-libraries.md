@@ -2,23 +2,20 @@
 
 Status: accepted
 Date: 2026-09-12
-Relates to: [0013](0013-competitor-libraries.md) §4.1, §4.4, §5.1, §5.3;
-[LOOP.md](../LOOP.md) §9 Phase B, Phase C, Phase D; [adapters/nng.md](../adapters/nng.md);
+Relates to: [0013](0013-competitor-libraries.md) §4.1, §4.4;
+[LOOP.md](../LOOP.md) §9 Phase B, Phase C, Phase D;
 [research/nanomsg-nng.md](../research/nanomsg-nng.md); [research/mqtt5.md](../research/mqtt5.md);
 [research/amqp10.md](../research/amqp10.md); [research/nats.md](../research/nats.md)
 
 ## 1. The question
 
-[0013](0013-competitor-libraries.md) settled *what* a competitor implementation is — a
+[0013](0013-competitor-libraries.md) settled *what* a foreign implementation is — a
 standalone library in this repository, sharing `weida-runtime` and none of weida's protocol —
-and proved the shape on ZeroMQ: twenty-six items, about thirty-six hours, one library and a
-forwarder rebuilt on it. What it did not settle is *how many of them run at once*, and
-[LOOP.md](../LOOP.md) §9 answered by ordering: B2 after B1, B3 after B2, Phase C after all of
-them. Two things have since made that order the wrong one. B1 is finished and nothing depends
-on B2, B3 or B4 finishing before the others start — they share `weida-runtime` and nothing
-else. And the Python binding (B-058) was parked behind "Phase C waits for B3" at a time when
-Phase C was one binding of one library; with four libraries arriving it is four bindings, and
-each of them is blocked only by *its own* library.
+and proved the shape on ZeroMQ. What it did not settle is how many implementations run at
+once. Nothing makes NNG, MQTT, AMQP or NATS depend on another foreign library finishing: they
+share `weida-runtime` and nothing else. The Python binding was parked behind “Phase C waits for
+B3” when Phase C meant one binding of one library; with several libraries it is several
+bindings, each blocked only by its own library.
 
 ## 2. The decision
 
@@ -29,7 +26,7 @@ colliding.
 | # | Products | Interop peer |
 | --- | --- | --- |
 | W1 | `weida-zmq-py` — the Python binding of the finished ZeroMQ library, asyncio surface first, then a sync surface over the `blocking` facade of [0013](0013-competitor-libraries.md) §4.4 item 3 | libzmq through `pyzmq`, plus the Rust interop bench of B-088/B-089 |
-| W2 | `weida-nng` — the NNG/SP library on the existing `weida-sp` codec, then `weida-nng-bridge` rebuilt on it, then `weida-nng-py` | the `nng` crate over the vendored NNG C library [nanomsg-nng §13] |
+| W2 | `weida-nng` — the NNG/SP library on the existing `weida-sp` codec, then `weida-nng-py` | the `nng` crate over the vendored NNG C library [nanomsg-nng §13] |
 | W3 | `weida-mqtt` — the MQTT 5 **client** library on a new sans-I/O `weida-mqtt-codec`, then `weida-mqtt-py` | `rumqttd` (pure Rust) for what it speaks, a 5.0 broker behind `#[ignore]` for the rest [mqtt5 §13] |
 | W4 | `weida-amqp` (AMQP 1.0 client) and `weida-nats` (NATS core client), two smaller libraries in one workstream, then their bindings | `fe2o3-amqp` and RabbitMQ 4.x [amqp10 §13]; `nats-server` through the supervisor, else an `async-nats` peer [nats §13] |
 
@@ -94,14 +91,9 @@ merge happens.
    session expiry or shared subscriptions. Those need a 5.0 broker, which on this machine means
    Mosquitto behind `#[ignore]` with its install command ([LOOP.md](../LOOP.md) §2). The
    backlog files that as two items rather than one honest-looking one.
-4. Forwarders (`weida-mqtt-bridge`, `weida-amqp-bridge`, `weida-nats-bridge`) and their
-   `docs/adapters/<proto>.md` mapping documents are **not** filed by this note. A forwarder
-   maps a library onto weida and states its guarantee set
-   ([0006](0006-guarantee-sets.md) §4.7); it is written after the library it forwards, and the
-   backlog gains it then. `docs/adapters/mqtt5.md` (B-062) is the exception, because it was
-   already filed and is the mapping the MQTT client is read against.
-5. Sizing is honest against the one precedent this repository has: ZeroMQ was twenty-six items
-   and about thirty-six hours for one library plus its forwarder and its interop. The four
-   workstreams together are filed at sixty-six items; the mirror (W2) is the cheapest per item
-   because its codec and both bridge directions exist, and the two new protocol families (W3,
-   W4) carry a codec each that does not.
+4. General foreign-protocol forwarders and protocol-wide mapping documents are not products.
+   Applications may compose public APIs explicitly. Broker integration is later Phase D work:
+   a managed Connector resource names one concrete source or sink, Queue and conversion policy
+   ([0013](0013-competitor-libraries.md) §4.6).
+5. Sizing is per standalone library and binding. Native interop, protocol inventories and
+   parity documents determine completion; no bridge or cross-protocol slice is counted.

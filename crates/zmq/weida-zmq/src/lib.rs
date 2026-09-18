@@ -1,11 +1,10 @@
 //! A ZeroMQ implementation in Rust, usable with no weida in the picture.
 //!
 //! This crate is a **product, not an adapter**: it implements ZeroMQ for
-//! applications that speak ZeroMQ, rather than bridging ZeroMQ into weida.
-//! Nothing of weida's protocol is in it and nothing of it is in weida — the
-//! two meet only in a forwarder that terminates both, which is a third crate
-//! ([decisions/0013](../../../docs/decisions/0013-competitor-libraries.md)
-//! §4, §4.5).
+//! applications that speak ZeroMQ. Nothing of weida's protocol is in it and
+//! nothing of it is in weida. Applications may compose both public APIs, but
+//! this workspace defines no implicit mapping between their messaging models
+//! ([decisions/0013](../../../docs/decisions/0013-competitor-libraries.md) §4).
 //!
 //! What it shares with weida is the machine room: `weida-runtime`'s reactor,
 //! resolver, `AF_UNIX` hygiene and name registry, and `weida-core`'s

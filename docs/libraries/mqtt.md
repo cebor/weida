@@ -7,10 +7,8 @@ sixth clause itself — the row-by-row table — and §10 gives the other five t
 The library is two crates: `weida-mqtt-codec`, the sans-I/O MQTT 5.0 codec whose
 `[dependencies]` is empty, and `weida-mqtt`, the client on top of it. Neither depends on
 `weida`; a caller who wants an MQTT client and nothing else uses `weida-mqtt` alone
-([0013](../decisions/0013-competitor-libraries.md) §4.3, §4.4). The bridge between a weida
-endpoint and an MQTT broker is a different product with a different document —
-[`../adapters/mqtt5.md`](../adapters/mqtt5.md); this one never asks what a weida guarantee
-becomes.
+([0013](../decisions/0013-competitor-libraries.md) §4.3, §4.4). It exposes MQTT's own client,
+session, subscription and QoS semantics. No crate assigns them global weida counterparts.
 
 ## 0. Why there is no server column
 
@@ -359,7 +357,7 @@ and where it is proved.
 | 2. Async first, on `weida-runtime` | met | `Context` mirrors `weida-zmq`'s three constructors, including `Context::owned` for a caller with no reactor of its own (`client.rs`) |
 | 3. Options honoured or refused, never ignored | met | §3, §5, §8 and §9; every refusal names the conformance statement and, where one exists, the reason code the server would have sent |
 | 4. Identity types apart | met | §8: no conversion from a TLS peer to an identity, and no accessor on `Delivery` returning one, because MQTT has none |
-| 5. A sans-I/O codec with an empty `[dependencies]` | met | `cargo tree -p weida-mqtt-codec` prints exactly one node; every decode takes its cap as an argument; golden vectors from `../adapters/mqtt5.md` §10.1 and six fuzz targets in its own workspace |
+| 5. A sans-I/O codec with an empty `[dependencies]` | met | `cargo tree -p weida-mqtt-codec` prints exactly one node; every decode takes its cap as an argument; golden vectors in `crates/mqtt/weida-mqtt-codec/tests/golden_vectors.rs` and six fuzz targets in its own workspace |
 | 6. This table | met | §2 through §8, with no row saying "partial" |
 
 ## 12. Sources
@@ -369,8 +367,8 @@ and where it is proved.
   request/response, §4.4 subscription options, §4.5 the Will, §4.6 the bridge options, §5–§6
   flow control and guarantees, §8 retained, §10 security and AUTH, §11 limits, §13 the
   ecosystem and the known incompatibilities.
-- [`../adapters/mqtt5.md`](../adapters/mqtt5.md): the mapping document, and §10.1's golden
-  vectors, which this codec is asserted against in both directions.
+- Code and tests: `crates/mqtt/weida-mqtt-codec/tests/golden_vectors.rs` asserts the codec's
+  accepted and rejected wire vectors in both directions.
 - [0013](../decisions/0013-competitor-libraries.md) §4.1–§4.4, §4.7;
   [0014](../decisions/0014-parallel-libraries.md) §2 for the client/broker line of §0.
 - Code: `crates/mqtt/weida-mqtt-codec/src/` (§2, §3, §7) and `crates/mqtt/weida-mqtt/src/`

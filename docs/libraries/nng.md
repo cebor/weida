@@ -8,10 +8,8 @@ five their verdicts.
 The library is two crates: `weida-sp`, the sans-I/O SP codec whose `[dependencies]` is empty,
 and `weida-nng`, the socket implementation on top of it. Neither depends on `weida`; a caller
 who wants an SP implementation and nothing else uses `weida-nng` alone
-([0013](../decisions/0013-competitor-libraries.md) §4.3, §4.4). The bridge between a weida
-endpoint and an SP socket is a different product with a different document —
-[`../adapters/nng.md`](../adapters/nng.md); this one never asks what a weida guarantee
-becomes.
+([0013](../decisions/0013-competitor-libraries.md) §4.3, §4.4). It exposes SP's own protocols
+and semantics. No crate assigns those protocols global weida counterparts.
 
 ## 1. What a row means
 

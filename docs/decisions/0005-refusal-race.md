@@ -164,12 +164,12 @@ a free upgrade in honesty: it moves the ambiguity, it does not remove it.
   the only delivery signal; add that a refusal is not ordered against it and that no frame
   will be added at wire version 0 to order it. §11 keeps the application acknowledgement in the
   "not specified in v0" list and now names decision 0005 as the reason.
-- **Adapter documents (`docs/adapters/<proto>.md`, Phase B slice 2).** Each mapping document
-  must state, under guarantee mapping, that the weida receipt does not certify the foreign
-  protocol's ownership transfer, and must name the transfer point the adapter itself owns —
-  MQTT PUBACK/PUBREC [mqtt5 §6], RabbitMQ `basic.ack`/`basic.nack` [rabbitmq-amqp091 §6],
-  AMQP 1.0 `disposition`/`rejected` [amqp10 §6.4] — or refuse the configuration
-  [INVARIANTS], [SYNTHESIS §7.2].
+- **Managed Connectors.** A Connector specification must state that a weida transport receipt
+  does not certify the foreign protocol's ownership transfer, name the concrete transfer point
+  it relies on — for example MQTT PUBACK/PUBREC [mqtt5 §6], RabbitMQ
+  `basic.ack`/`basic.nack` [rabbitmq-amqp091 §6], or AMQP 1.0
+  `disposition`/`rejected` [amqp10 §6.4] — and refuse a conversion whose claim it cannot prove
+  [INVARIANTS], [SYNTHESIS §7.2]. This is per resource, not a protocol-wide mapping.
 - **Code.** No change is required in `crates/weida` or `crates/weida-core`: the behaviour is
   what the implementation already does, and the three 2 MiB tests named in §2 are the
   regression guard for the deterministic half of the rule. They MUST keep their payload sizes;

@@ -6,14 +6,12 @@ Relates to: SYNTHESIS §8.9; P5, P11; decisions 0002 §6.2, 0003 §4.2
 
 ## 1. The question
 
-"Endpoint paths are opaque identifiers" is an invariant, and the topic prefix match is
-deliberately confined to Pub/Sub topics ([INVARIANTS.md](../INVARIANTS.md)). SYNTHESIS §8.9
-states the decision: "NATS subjects with `*`/`>` [nats §4], MQTT topic filters [mqtt5 §4.1]
-and RabbitMQ topic exchanges [rabbitmq-amqp091 §4] all assume hierarchical matching on the
-addressing namespace itself. The decision — required before any adapter maps a foreign
-hierarchical namespace onto weida endpoints — is whether the invariant is amended (with the
-reasoning recorded first, as [INVARIANTS] itself requires) or whether adapters keep their
-hierarchy entirely inside their own crate" [SYNTHESIS §8.9].
+"Endpoint paths are opaque identifiers" is an invariant, and topic matching is deliberately
+confined to Pub/Sub topics ([INVARIANTS.md](../INVARIANTS.md)). NATS subjects with `*`/`>`
+[nats §4], MQTT topic filters [mqtt5 §4.1] and RabbitMQ topic exchanges
+[rabbitmq-amqp091 §4] use their own hierarchical namespaces. This decision defines weida's
+native topic grammar only; it neither amends endpoint paths nor equates those foreign
+grammars with weida. A managed Connector must specify any concrete conversion.
 
 Two namespaces are in play and the question is different for each. An **endpoint path** is
 the addressing namespace: `weida://host:port/path`, carried as DATA key `0` and capped at
@@ -92,7 +90,7 @@ per-broker dialect, not a portable namespace.
 
 | Option | Shape | Precedent | Named loss |
 | --- | --- | --- | --- |
-| A — keep the byte prefix | filters stay opaque byte prefixes [PROTOCOL §6.4] | ZMTP `SUBSCRIBE` [zeromq §4.3] | no boundary, so `sensors.temp` selects `sensors.temperature`; no single-segment wildcard; every adapter must re-implement matching inside its own crate and over-deliver to weida subscribers |
+| A — keep the byte prefix | filters stay opaque byte prefixes [PROTOCOL §6.4] | ZMTP `SUBSCRIBE` [zeromq §4.3] | no boundary, so `sensors.temp` selects `sensors.temperature`; no single-segment wildcard; a concrete foreign conversion must over-deliver or refuse filters it cannot express |
 | B — segmented patterns for topics, paths stay opaque | a separator, a one-segment wildcard, a trailing rest wildcard; endpoint paths untouched | MQTT [mqtt5 §4.1], NATS [nats §4], AMQP 0-9-1 [rabbitmq-amqp091 §4] | special bytes in a filter stop being literal; matching cost moves into the publisher's fan-out path |
 | C — hierarchical endpoint paths too | amend "endpoint paths are opaque identifiers" and match paths by pattern | MQTT and NATS, where the addressing namespace *is* the hierarchy [mqtt5 §4.1], [nats §4] | the invariant's enforcement (a flat exact-match map) is replaced by a matching structure on the dispatch path of every transfer [INVARIANTS]; endpoint dispatch is currently "a function of the stream kind and the addressed path" with one answer [PROTOCOL §9.4] — pattern dispatch makes it a set, which changes refusal, `UNKNOWN_ENDPOINT` and the pool key of 0002 §6.2 |
 | D — a selector/predicate language | filter expressions over headers or content | AMQP 1.0 filters and JMS selectors [amqp10 §13] | three incompatible generations with no interoperability matrix [amqp10 §13]; unbounded matching cost in the publisher's hot path against [INVARIANTS] |
@@ -136,16 +134,11 @@ per-broker dialect, not a portable namespace.
 4. **The 256 B filter cap and `max_subscriptions` are unchanged**, and no new remote-influenced
    allocation is introduced [PROTOCOL §6.4], [INVARIANTS]. A pattern is not more expensive to
    store than a prefix of the same length.
-5. **ZeroMQ's byte-prefix subscription maps to a segment boundary, as a named loss.** A ZMTP
-   subscription `P` [zeromq §4.3] maps to the weida filter `P.#` when `P` ends at a segment
-   boundary — which by §4.2 also matches `P` itself — and has **no weida equivalent when it
-   ends mid-segment**. The adapter's choices are then: subscribe to the enclosing segment
-   boundary and re-apply the byte prefix locally before handing the message to the ZeroMQ
-   peer, or refuse the subscription. It MUST NOT present a boundary-aligned subscription as if
-   it were the byte prefix the peer asked for [INVARIANTS]. The loss is acceptable on the
-   sheet's own evidence: ZeroMQ's guide already recommends putting the key in its own frame so
-   that "the match won't cross a frame boundary" [zeromq §4.3], and the pattern's own successor
-   uses exact-match groups [zeromq §4.6].
+5. **Foreign topic syntaxes are independent.** ZeroMQ byte prefixes, MQTT topic filters, NATS
+   subjects and AMQP routing keys are not aliases for this grammar. The standalone libraries
+   expose each protocol unchanged. If an application or a managed Connector converts a topic,
+   its explicit configuration owns that one transformation and its losses; this decision
+   defines no protocol-wide mapping.
 6. **Two costs are accepted explicitly, against the objection recorded in
    `crates/weida/src/pubsub.rs`.** First, a filter can no longer select a topic segment that
    contains `*`, `#` or `.` literally; there is no escape character, and adding one is
@@ -159,31 +152,12 @@ per-broker dialect, not a portable namespace.
    drops, ordering stays `None`, and topic matching adds no delivery promise
    [PROTOCOL §9.5], [PATTERNS §4].
 
-## 5. The mapping table
+## 5. Protocol boundary
 
-Each row is what an adapter may claim. "Exact" means the foreign matcher and the weida matcher
-select the same set for every topic.
-
-| Foreign construct | Foreign semantics | weida filter | Exact? | Named loss / adapter obligation |
-| --- | --- | --- | --- | --- |
-| MQTT level separator `/` | levels of a topic name [mqtt5 §4.1] | `.` | no | the adapter translates `/` to `.`; an MQTT level containing `.` (or a topic containing weida's wildcard bytes) has no faithful translation and MUST be refused or escaped by the adapter, not silently flattened |
-| MQTT `+` | exactly one level, must occupy a whole level ([MQTT-4.7.1-2]) [mqtt5 §4.1] | `*` | yes | none |
-| MQTT `#` | zero or more trailing levels, including the parent; last and alone ([MQTT-4.7.1-1]) [mqtt5 §4.1] | `#` | yes | none |
-| MQTT `$`-prefixed topics | "A server MUST NOT match a filter beginning with a wildcard against a Topic Name beginning with `$`" ([MQTT-4.7.2-1]) [mqtt5 §4.1] | — | no | weida has no reserved topic prefix: `#` matches `$`-prefixed topics too. An MQTT-facing adapter MUST exclude them itself, and MUST subscribe twice (`#` and `$SYS.#`) where MQTT would [mqtt5 §4.1] |
-| MQTT `$share/{name}/{filter}` | shared subscription, a work queue over a filter [mqtt5 §4.2] | — | no | not a filter question: one weida subscription per group member selects the same set, and single-delivery-per-group is the L2 credit and queue work of 0003 §4.2, not topic matching |
-| MQTT filter length | up to 65,535 bytes [mqtt5 §11] | ≤ 256 B [PROTOCOL §6.4] | no | a longer filter MUST be refused at configuration time; it cannot be carried |
-| NATS token separator `.` | dot-tokenized subjects [nats §4] | `.` | yes | none |
-| NATS `*` | exactly one complete token [nats §4] | `*` | yes | none |
-| NATS `>` | **one** or more trailing tokens, must be final [nats §4] | `#` | no | weida's `#` additionally matches the parent: `a.#` selects `a`, while `a.>` does not. The adapter drops that one case locally, or subscribes and filters; it MUST NOT claim `>` semantics unchanged |
-| AMQP 0-9-1 word separator `.` | dot-delimited word lists [rabbitmq-amqp091 §4] | `.` | yes | none |
-| AMQP 0-9-1 `*` | exactly one word [rabbitmq-amqp091 §4] | `*` | yes | none |
-| AMQP 0-9-1 `#`, final | zero or more words; `audit.events.#` matches `audit.events` [rabbitmq-amqp091 §4] | `#` | yes | none; a binding of `#` alone is a fanout there and the empty filter here [rabbitmq-amqp091 §4], [PROTOCOL §6.4] |
-| AMQP 0-9-1 `#`, non-final | permitted mid-pattern, e.g. `lazy.#` beside `*.*.rabbit` [rabbitmq-amqp091 §4] | — | no | not expressible under §4.3's final-position rule: the adapter subscribes to the widest expressible prefix pattern and re-matches locally, or refuses the binding |
-| AMQP 0-9-1 routing key length | up to 255 bytes [rabbitmq-amqp091 §4] | ≤ 256 B [PROTOCOL §6.4] | yes | none; it fits |
-| ZMTP `SUBSCRIBE` prefix ending at a boundary | "A subscription of 'A' SHALL match all messages starting with 'A'" [zeromq §4.3] | `P.#` | yes, for boundary-aligned `P` | none beyond the boundary assumption the ZeroMQ guide already recommends [zeromq §4.3] |
-| ZMTP `SUBSCRIBE` prefix ending mid-segment | same, with no notion of a boundary [zeromq §4.3] | — | no | **the named loss of §4.5**: subscribe at the enclosing boundary and re-apply the byte prefix locally, or refuse |
-| ZMTP empty subscription | "An empty subscription SHALL match all messages" [zeromq §4.3] | `""` or `#` | yes | none |
-| ZeroMQ RADIO/DISH group | exact-match groups instead of prefix topics [zeromq §4.6] | a filter with no wildcard | yes | none |
+The segmented grammar above is only weida's Pub/Sub namespace. Similar separators or wildcard
+characters in another protocol do not establish semantic equality. Research and library parity
+documents describe those protocols on their own terms; a future Connector resource must name
+its concrete conversion policy rather than referring to a global table.
 
 ## 6. Consequences and follow-ups
 
@@ -221,13 +195,11 @@ select the same set for every topic.
   against the segment walker at a realistic subscriber and filter count is a task, in the
   shape of the measurement follow-ups of 0001 §8 and 0002 §7, and its number belongs in
   `docs/IMPLEMENTATION.md`.
-- **Adapters.** `docs/adapters/<proto>.md` (Phase B slice 2) copies its row group from §5
-  verbatim into its own mapping section and states the named loss there, which is the
-  document [0006](0006-guarantee-sets.md) §4.9 already makes the home of adapter honesty;
-  the ZMTP document owes the boundary rule of §4.5 explicitly, since the ZeroMQ backlog item
-  already lists "byte-prefix subscriptions" among its named losses. No adapter may present a
-  boundary-aligned or over-matching subscription as the foreign semantics [INVARIANTS]; a
-  filter it cannot express faithfully is refused at configuration time [0006 §4.7].
+- **Managed Connectors.** A Connector that converts topic filters names the concrete conversion
+  and its loss in the resource specification. It MUST NOT present boundary-aligned or
+  over-matching behavior as the foreign semantics [INVARIANTS]; a filter it cannot express
+  faithfully is refused at configuration time [0006 §4.7]. No global table equates a foreign
+  topic grammar with weida's.
 - **SYNTHESIS §8.9** is closed by this note.
 
 ## 7. Sources

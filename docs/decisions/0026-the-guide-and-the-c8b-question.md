@@ -154,19 +154,19 @@ mechanism rather than in an appendix:
 | 1 | one transfer | a transfer is a stream; the peer is a key; the outcome is a value; how far it got; what a receipt costs | **done** |
 | 2 | many peers | selection, fan-out, the drop-versus-block decision, counted drops per cause, what a slow reader does to everybody else | needs B-247's measurement to state a width honestly |
 | 3 | a hop that takes responsibility | the broker, `Accepted`, credit as the consumer's own bound, what a queue may promise before it has a store | after B-203 |
-| 4 | depth | chains of hops, guarantee sets intersected per hop, adapters at the edge, where a chain's honest claim ends up (`BestEffort`) | now (the cross-protocol chain exists and is tested) |
+| 4 | depth | chains of native weida and broker hops, each claim scoped to the hop that earns it; no protocol translation | after chapter 3 and a runnable multi-hop example |
 | 5 | a peer that comes back | reconnection, identity across a restart, what is *not* resumed | after B-018 |
 | 6 | the cluster | consensus for metadata and never for payload, one group per replicated queue | after the store phase |
 | 7 | eight billion | the arithmetic again with measured numbers in place of derived ones, and what is still missing | last, and only with numbers |
 
-Chapter 4 is buildable today and chapter 2 is not, which is the order the slices take rather
-than the order the arc reads. A chapter is written when its claims can be asserted, and not
-before.
+Chapter order is the reading arc, not permission to write ahead of evidence. A chapter is
+written when its claims have a runnable program and assertions; chapter 4 therefore waits for a
+native multi-hop example rather than borrowing a rejected cross-protocol product.
 
 ### 4.5 What the guide may not become
 
 - **Not a marketing page.** No claim about performance that is not a measured number with its
-  item, no comparison that is not in [libraries/](../libraries/) or [adapters/](../adapters/).
+  item, and no comparison that is not backed by [libraries/](../libraries/) or a named probe.
 - **Not a second specification.** If a reader can answer a question from the guide and get a
   different answer from PROTOCOL, the guide is wrong.
 - **Not a place where failure is optional.** The zguide's chapter 4 exists because chapters 1-3
@@ -188,8 +188,8 @@ before.
   [0028](0028-trace-propagation-is-the-callers.md) — a context is propagated and never minted,
   so a 64-byte push is now 76 B of which 12 are framing. The arithmetic of §3 is what found
   the second one, which is the strongest argument this note can make for having written it.
-- **The remaining chapters are slices**, filed as B-256..B-261 in the order of §4.4's "ready"
-  column rather than the chapter numbers.
+- **The remaining chapters are slices.** B-256's former cross-protocol chapter is retired;
+  chapter 4 waits for the native multi-hop evidence above. The other slices keep §4.4's order.
 - **Named loss: the guide will always lag the ambition.** Option C buys truth at the price of
   reach — chapter 6 cannot be written before the cluster exists, and no amount of wanting it
   changes that. The alternative was a chapter that reads well and is not true, and this

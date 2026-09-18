@@ -5,26 +5,21 @@ a crate usable with no weida in the picture ([0013](../decisions/0013-competitor
 §4, §5.5). The document is the parity table: it states, row by row, what the library does with
 every inventory item of the protocol's reference implementation.
 
-## A library document is not an adapter document
+## A library document is not a research sheet
 
-The two are easy to confuse and answer different questions, so the distinction is the first
-thing this index says.
+The documents answer different questions:
 
-| | `docs/adapters/<proto>.md` | `docs/libraries/<proto>.md` |
+| | `docs/research/<proto>.md` | `docs/libraries/<proto>.md` |
 | --- | --- | --- |
-| Subject | a **bridge** between weida and a foreign network | a **library** that speaks the foreign protocol and nothing else |
-| Question it answers | what does a weida guarantee become on the other side, and what is lost | does this implementation have what the reference implementation has |
-| Vocabulary | both, lined up — the document exists to line them up | the foreign protocol's only; weida is not mentioned except where a weida crate replaces a foreign construct |
-| Invariant it carries | adapter honesty: "protocol adapters may not silently invent guarantees their source protocol cannot provide" ([INVARIANTS.md](../INVARIANTS.md), [0006](../decisions/0006-guarantee-sets.md) §4.9) | parity honesty: every inventory row is present, refused with a reason, or absent with a reason — and **no row says "partial" without naming what is missing** (0013 §4.7 clause 6) |
-| Named loss | what the guarantee chain cannot carry across the edge | nothing at all: a library terminates no weida guarantee, so it has no edge and no loss list |
-| When it is written | Phase B slice 2, before the bridge code ([LOOP.md](../LOOP.md) §9) | last, after the library's slices are done, because it is the record of what they came to |
+| Subject | the upstream protocol and implementations | this repository's standalone library |
+| Question | what does the protocol specify and what do real peers do | does this implementation cover the reference inventory |
+| Vocabulary | the foreign protocol's only | the foreign protocol's public API and this library's implementation |
+| Verdicts | sourced fact or named open question | present, refused with a reason, or absent with a reason |
 
-A protocol may have both, and ZeroMQ does: [`zmq.md`](zmq.md) is the parity table for the
-`weida-zmq` library, and [`../adapters/zmtp.md`](../adapters/zmtp.md) maps the bridge that
-sits between a weida endpoint and a ZeroMQ socket. Neither replaces the other, and neither
-is the protocol's research sheet — a sheet in [`../research/`](../research/README.md)
-describes a protocol on its own terms and cites its specifications; a parity document cites
-the sheet and the code.
+The repository defines no global mapping between a foreign protocol and weida patterns.
+Applications may compose the public libraries explicitly. Future broker integration is
+documented by the schema of one managed Connector resource and its concrete conversion policy,
+not by a protocol-wide equivalence table.
 
 ## Required sections
 

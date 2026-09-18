@@ -76,17 +76,15 @@ connection, and the runtime's copy is an implementation detail of enforcement.
 **4.2 The documents say so.** [GUARANTEES.md](../GUARANTEES.md) §4 gains the sentence, with the
 arithmetic, and loses the stale caveat about the wire.
 
-**4.3 [GUIDE.md](../GUIDE.md) §4.5 teaches it as a property rather than a gap**, and its
-program demonstrates the refusal against a real handshake:
-`crates/interop/cross-tests/examples/guide_depth.rs`, asserted by
-`the_intersection_is_arithmetic_and_a_live_connection_carries_what_you_configured`.
+**4.3 The arithmetic is tested where negotiation is implemented.**
+`crates/protocol/src/negotiate.rs` asserts that the effective set is the weaker offer per
+dimension, that a required level the peer does not offer fails, and that unordered dimensions
+must match exactly. Connection-level hostile tests separately assert that a negotiation
+failure closes with `NEGOTIATION_FAILED`.
 
-**4.4 What the test does not pin.** The refusal's *wording* depends on which side observes the
-close first — `negotiation failed` when the dial has read the peer's CONNECTION_CLOSE reason,
-`connection lost` when the local teardown wins that race. Both were observed on this commit
-from the same program. The test asserts that the dial was refused and that it carries a reason;
-pinning which reason would pin a coin flip, exactly as
-[0005](0005-refusal-race.md) already established for a misrouted push.
+**4.4 Error wording remains observational.** Which side sees a negotiation error before the
+connection close is still a race; tests assert refusal and the protocol code, not one
+transport-dependent sentence.
 
 **4.5 This is revisited when either half of "one setting" stops holding.** Two futures would
 change the answer:
@@ -102,12 +100,11 @@ Until one of those exists, an accessor is an API with one possible answer.
 
 ## 5. What this does not decide
 
-**A hop's claim is still a document.** Nothing here helps an application learn what the *next*
-hop promised, let alone the far end of a chain: that is [GUIDE.md](../GUIDE.md) §4.2's
-`BestEffort ∩ BestEffort = BestEffort`, and the answer is the adapter's mapping document, not a
-runtime call. An accessor would not have changed that either — it reports one hop's
-configuration, which is exactly the scope a guarantee has ([GUARANTEES.md](../GUARANTEES.md)
-§1).
+**A hop's claim is still local.** Nothing here helps an application infer what a later hop
+promised. A future managed Connector declares the guarantee of its one configured source–Queue
+or Queue–sink path as resource policy; no runtime accessor turns that into a protocol-wide
+mapping. The accessor rejected here would still report only this connection's configuration
+([GUARANTEES.md](../GUARANTEES.md) §1).
 
 **Nothing about broker-level completion.** `Accepted`, `Stored`, `Replicated` and `Processed`
 are reserved for a hop that owns the message, and what a queue reports about them is

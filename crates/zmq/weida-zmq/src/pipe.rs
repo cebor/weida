@@ -34,17 +34,13 @@
 //! [`QueueConfig::max_bytes`] as well: [`DEFAULT_QUEUE_BYTES`], 8 MiB, per
 //! direction per peer.
 //!
-//! The two bounds are **not** the same thing said twice, which is why the
-//! byte ceiling is enforced here rather than divided into a smaller message
-//! count the way the bridge does it (`weida-zmq-bridge`'s
-//! `InboundConfig::queue_bytes`, B-053/B-054). The bridge knows the size of
-//! the messages it forwards, so a depth of `queue_bytes / max_message_bytes`
-//! is a real budget there. In the library `max_message_size` is a **ceiling**
-//! and not a size: dividing by it would cut libzmq's documented default from
-//! 1000 messages to 8 for every socket, including the ones whose messages are
-//! forty bytes. Enforcing bytes where the bytes actually are keeps
-//! `ZMQ_SNDHWM` behaving exactly as `zmq_setsockopt(3)` says it does and
-//! refuses only the peer that occupies the memory.
+//! The two bounds are **not** the same thing said twice. `max_message_size` is
+//! a ceiling and not a size: dividing the byte budget by it would cut
+//! libzmq's documented default from 1000 messages to 8 for every socket,
+//! including the ones whose messages are forty bytes. Enforcing bytes where
+//! the bytes actually are keeps `ZMQ_SNDHWM` behaving exactly as
+//! `zmq_setsockopt(3)` says it does and refuses only the peer that occupies
+//! the memory.
 //!
 //! **A queue always accepts one message**, however large, which is why the
 //! byte ceiling applies only to a queue that is not already empty. Without
@@ -84,13 +80,10 @@ pub const DEFAULT_RCVHWM: usize = 1000;
 /// (`docs/INVARIANTS.md`) would be a statement about a product nobody
 /// bounded.
 ///
-/// 8 MiB is the number the ZMTP bridge already uses for the same quantity
-/// (`weida-zmq-bridge`'s `InboundConfig::queue_bytes`, B-053) and the number
-/// weida's own runtime gives a subscriber (`Limits::subscriber_buffer_bytes`),
-/// so a socket, a bridge and a weida endpoint expose a peer to the same
-/// order of memory rather than three numbers chosen separately. `0` means no
-/// ceiling, which is libzmq's behaviour and is available for a caller who
-/// wants exactly it.
+/// 8 MiB matches the byte budget used by weida's own subscriber queues
+/// (`Limits::subscriber_buffer_bytes`), while remaining a ZeroMQ-local
+/// implementation bound. `0` means no ceiling, which is libzmq's behaviour
+/// and is available for a caller who wants exactly it.
 pub const DEFAULT_QUEUE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// What a socket does when a peer's queue is full, or when it has no peer to

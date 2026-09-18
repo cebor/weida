@@ -158,10 +158,9 @@ Option B.
 - **[PROTOCOL.md](../PROTOCOL.md) §11.** "Drain" joins the not-specified list as a *local*
   operation with no wire representation, with this note as the reason, so that no
   implementation invents a quiescence frame for it.
-- **`docs/adapters/zmtp.md` loss L9.** The loss stands and gets sharper: the adapter sets a
-  finite `ZMQ_LINGER` on its ZeroMQ sockets and maps its own shutdown onto `drain(timeout)`,
-  and it still MUST NOT present either side's shutdown as a drain acknowledgement — now with a
-  decision number instead of "SYNTHESIS §8.6, still open".
+- **Foreign-library composition.** ZeroMQ `ZMQ_LINGER` and weida `drain(timeout)` remain
+  protocol-native shutdown operations. An application or managed Connector that composes both
+  MUST NOT present either side's shutdown as a drain acknowledgement.
 - **[INVARIANTS.md](../INVARIANTS.md).** No new bound: a drain waits on receipts that already
   exist and holds nothing new. Worth stating, because "wait until things finish" is exactly the
   shape that usually grows a queue.
@@ -174,7 +173,7 @@ weida documents: [PATTERNS.md](../PATTERNS.md) §1.1, §1.8;
 [GUARANTEES.md](../GUARANTEES.md) §1, §3; [PROTOCOL.md](../PROTOCOL.md) §11;
 [INVARIANTS.md](../INVARIANTS.md); `crates/weida/src/runtime.rs` (`Runtime::shutdown`,
 `OwnedRuntime::drop`); [0003](0003-credit-unit.md) §4.2; [0005](0005-refusal-race.md) §4.2;
-[0006](0006-guarantee-sets.md) §4.2; `docs/adapters/zmtp.md` §8 L9.
+[0006](0006-guarantee-sets.md) §4.2.
 
 Research sheets: [SYNTHESIS.md](../research/SYNTHESIS.md) §1 (P17), §2 (D12), §8.6;
 [zeromq.md](../research/zeromq.md) §1, §5, §12/P17;

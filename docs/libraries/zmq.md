@@ -7,10 +7,10 @@ itself — the row-by-row table — and §10 gives the other five their verdicts
 The library is two crates: `weida-zmtp`, the sans-I/O ZMTP 3.1 codec whose `[dependencies]`
 is empty, and `weida-zmq`, the socket implementation on top of it. Neither depends on
 `weida`; a caller who wants a ZeroMQ and nothing else uses `weida-zmq` alone
-([0013](../decisions/0013-competitor-libraries.md) §4.3, §4.4). The bridge between a weida
-endpoint and a ZeroMQ socket is a different product with a different document —
-[`../adapters/zmtp.md`](../adapters/zmtp.md); this one never asks what a weida guarantee
-becomes.
+([0013](../decisions/0013-competitor-libraries.md) §4.3, §4.4). The standard queue,
+forwarder and streamer devices are `weida_zmq::proxy` helpers inside this library; they connect
+ZeroMQ sockets to ZeroMQ sockets. No crate assigns ZeroMQ socket types global weida
+counterparts.
 
 ## 1. What a row means
 

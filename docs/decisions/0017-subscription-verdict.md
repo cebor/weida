@@ -365,9 +365,9 @@ not an agent's.
 admit some subscribers and refuse others **on a path they are allowed to hold**, where the
 refused subscriber's next action depends on knowing it was refused — a failover to another
 publisher, a fallback to polling, an operator alert — *and* where the companion Req/Rep path of
-[0015 §4.5] is unavailable because the two sides are joined by an adapter rather than by an
-application. That last clause is what makes it real rather than hypothetical: it is exactly the
-case `weida-zmq`'s `XPubSocket::refuse` was built for, one protocol boundary further out
+[0015 §4.5] is unavailable because a managed Connector's explicit policy exposes only the
+subscription boundary. The native ZeroMQ precedent remains `weida-zmq`'s
+`XPubSocket::refuse`; that does not make the socket equivalent to a weida pattern
 [zmq.md §9]. The weaker second trigger is a measurement: subscribers observed waiting
 indefinitely on a path that publishes nothing for them, where `dropped_on(topic)` shows no drops
 at all — the failure mode where the subscription was never going to produce anything and nothing

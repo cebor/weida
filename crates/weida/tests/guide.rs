@@ -296,12 +296,7 @@ async fn a_silent_respondent_is_a_number() {
 /// here, which is the only mechanism that keeps a guide from drifting into
 /// prose nobody runs.
 ///
-/// The count lives here for every chapter, including the ones whose
-/// assertions do not: chapter 4's chain needs two foreign protocols, so its
-/// programs and tests are `crates/interop/cross-tests/{examples,tests}/guide_depth.rs`
-/// — the crate that exists because a chain through both adapters belongs to
-/// neither. The count is a property of the *document*, so it belongs with the
-/// document's other checks; the assertions belong where the dependencies are.
+/// The count lives here beside the assertions for every written chapter.
 #[test]
 fn every_claim_the_chapters_make_has_a_program_and_a_test() {
     let guide = std::fs::read_to_string(
@@ -312,9 +307,8 @@ fn every_claim_the_chapters_make_has_a_program_and_a_test() {
     )
     .expect("read the guide");
 
-    // One row per written chapter: the chapter number and how many claims are
-    // asserted for it. Chapter 4's five are in `weida-cross-tests`.
-    for (chapter, asserted) in [(1usize, 5usize), (2, 5), (4, 5)] {
+    // One row per written chapter.
+    for (chapter, asserted) in [(1usize, 5usize), (2, 5)] {
         let prefix = format!("**Claim §{chapter}.");
         let claims: Vec<&str> = guide
             .lines()
