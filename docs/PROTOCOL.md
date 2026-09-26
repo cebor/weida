@@ -5,8 +5,8 @@
 Wire protocol version: `0`.
 Status: **experimental**. Per master doc §15, `0.x` protocol versions are explicitly
 experimental and breaking changes are permitted. Implementations MUST NOT assume any
-compatibility guarantee across `0.x` releases. The library version (`0.1.0`) and the wire
-protocol version (`0`) are independent.
+compatibility guarantee across `0.x` releases. The library version (`0.1.0` and its
+pre-releases) and the wire protocol version (`0`) are independent.
 
 This version is a deliberate break from earlier `0.x` drafts: ACK and CANCEL frames are
 gone, the DATA header lost `transfer_id`, `role`, `correlation_id` and `ack_mode`, and
