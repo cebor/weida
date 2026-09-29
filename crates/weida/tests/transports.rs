@@ -23,7 +23,10 @@ mod common;
 use std::time::Duration;
 
 use common::{Harness, Transport};
-use weida::{Deduplication, Error, GuaranteeSet, OrderingMode, RuntimeConfig, TransferMeta};
+use weida::{
+    DEFAULT_DATAGRAM_RECEIVE_BYTES, Deduplication, Error, FlowMeta, GuaranteeSet, Incoming, Limits,
+    OrderingMode, RuntimeConfig, TransferMeta,
+};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -289,6 +292,78 @@ async fn pair_over_unix() {
 #[tokio::test]
 async fn pair_over_pipe() {
     pair_both_directions(&Harness::start(Transport::Pipe).await).await;
+}
+
+/// A runtime configuration with datagram flows on.
+fn with_flows() -> RuntimeConfig {
+    RuntimeConfig {
+        limits: Limits {
+            datagram_receive_bytes: DEFAULT_DATAGRAM_RECEIVE_BYTES,
+            ..Limits::default()
+        },
+        ..RuntimeConfig::default()
+    }
+}
+
+/// A datagram flow: registered once, then 100 paced datagrams, in order and
+/// byte for byte. On QUIC they ride DATAGRAM frames; on every local
+/// transport the FLOW stream carries them as length-prefixed records
+/// (`docs/PROTOCOL.md` §2.1), which is what this body proves is the same
+/// contract.
+async fn flow_carries_datagrams(h: &Harness) {
+    let acceptor = h.listener.acceptor("/v").expect("acceptor");
+    let client = h.client_with(with_flows());
+    let peer = client.peer(h.trust());
+    within(peer.connect(&h.url("/v"))).await.expect("connect");
+
+    let flow = within(peer.open_flow(FlowMeta::default().with_topic("mic")))
+        .await
+        .expect("open flow");
+    let sender = tokio::spawn(async move {
+        for i in 0..100u64 {
+            let mut payload = vec![0x5A; 200];
+            payload[..8].copy_from_slice(&i.to_be_bytes());
+            flow.send(payload).expect("send");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    });
+    let incoming = match within(acceptor.accept()).await.expect("accept") {
+        Incoming::Flow(flow) => flow,
+        other => panic!("expected a flow, got {other:?}"),
+    };
+    assert_eq!(incoming.info().topic.as_deref(), Some("mic"));
+    let mut seen = Vec::new();
+    while let Some(datagram) = within(incoming.recv()).await {
+        assert_eq!(datagram.len(), 200);
+        assert!(datagram[8..].iter().all(|b| *b == 0x5A));
+        seen.push(u64::from_be_bytes(datagram[..8].try_into().expect("index")));
+    }
+    sender.await.expect("sender");
+    assert!(seen.len() >= 90, "received {} of 100", seen.len());
+    assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn flow_over_quic() {
+    flow_carries_datagrams(&Harness::start_with(Transport::Quic, with_flows()).await).await;
+}
+
+#[tokio::test]
+async fn flow_over_inproc() {
+    flow_carries_datagrams(&Harness::start_with(Transport::Inproc, with_flows()).await).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn flow_over_unix() {
+    flow_carries_datagrams(&Harness::start_with(Transport::Unix, with_flows()).await).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn flow_over_pipe() {
+    flow_carries_datagrams(&Harness::start_with(Transport::Pipe, with_flows()).await).await;
 }
 
 #[tokio::test]
