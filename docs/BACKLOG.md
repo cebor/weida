@@ -50,7 +50,7 @@ kind: measure | size: 60 | status: done c45c63c | needs: [B-282]
 acceptance: one-way latency and loss of a 50 Hz, 200-byte flow while a bulk upload runs to the same host, in four configurations — flow on the bulk path's connection or on its own path, NewReno/Cubic or BBR on the bulk connection — on a shaped link (`tc netem` with a stated rate and queue), numbers into [IMPLEMENTATION.md](IMPLEMENTATION.md) §4. It decides whether a media profile needs its own congestion controller ([0034](decisions/0034-late-is-lost.md) §6).
 
 ### B-290 — The SFU and the relay as programs, and a guide section
-kind: code | size: 60 | status: ready | needs: [B-286]
+kind: code | size: 60 | status: done 2cb8b67 | needs: [B-286]
 acceptance: an example SFU (flows in, datagram segments out, payload opaque) and a relay (dish in, radio out, stream segments forwarded chunk by chunk), each asserted by a test the way the zguide recipes are, and a [GUIDE.md](GUIDE.md) section that teaches "late is lost" with them.
 
 ### B-291 — Documents for 0034
