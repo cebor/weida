@@ -37,6 +37,11 @@ mod guide_one_transfer;
 #[allow(dead_code)]
 mod guide_many_peers;
 
+#[path = "../examples/guide_late_is_lost.rs"]
+#[allow(dead_code)]
+mod guide_late_is_lost;
+
+use guide_late_is_lost::{sfu, supersession};
 use guide_many_peers::{ceilings, selection, slow_reader, survey_with_a_silent_peer, width};
 use guide_one_transfer::{Outcome, STREAMED, gigabyte, hello, how_far, outcome, receipt_cost};
 
@@ -287,6 +292,38 @@ async fn a_silent_respondent_is_a_number() {
     );
 }
 
+/// Claim §2.6: a dish that falls behind loses the old segment, never the new
+/// one, and never at another dish's expense.
+#[tokio::test]
+async fn a_dish_that_falls_behind_loses_the_old_segment() {
+    let seen = within(supersession()).await.expect("the broadcast");
+    assert_eq!(
+        seen.fast_received,
+        (0..10).collect::<Vec<u64>>(),
+        "the dish that keeps up receives every segment, whole and in order"
+    );
+    assert!(
+        seen.stalled_superseded >= 1,
+        "the stalled dish lost old segments to their successors"
+    );
+}
+
+/// Claim §2.7: an SFU and a relay are loops over opaque payload.
+#[tokio::test]
+async fn an_sfu_and_a_relay_are_loops_over_opaque_payload() {
+    let forwarded = within(sfu()).await.expect("the SFU and the relay");
+    assert!(
+        forwarded.forwarded >= 90,
+        "{} of 100 frames reached both listeners",
+        forwarded.forwarded
+    );
+    assert_eq!(forwarded.relayed_segments, 5);
+    assert!(
+        forwarded.payload_opaque,
+        "every byte that arrived is a byte that was sent"
+    );
+}
+
 /// The guide's own rule, checked against the guide: every claim a chapter
 /// makes is asserted somewhere in this workspace.
 ///
@@ -308,7 +345,7 @@ fn every_claim_the_chapters_make_has_a_program_and_a_test() {
     .expect("read the guide");
 
     // One row per written chapter.
-    for (chapter, asserted) in [(1usize, 5usize), (2, 5)] {
+    for (chapter, asserted) in [(1usize, 5usize), (2, 7)] {
         let prefix = format!("**Claim §{chapter}.");
         let claims: Vec<&str> = guide
             .lines()

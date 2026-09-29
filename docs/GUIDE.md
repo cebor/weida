@@ -17,8 +17,9 @@ are in the same chapter as the success case rather than in an appendix.
 
 1. **Every program here is a file in this repository, and a test drives that file.** The
    chapters do not carry snippets written for the page. Chapter 1's program is
-   `crates/weida/examples/guide_one_transfer.rs` and chapter 2's is
-   `crates/weida/examples/guide_many_peers.rs`; each is included as a module by
+   `crates/weida/examples/guide_one_transfer.rs`, chapter 2's is
+   `crates/weida/examples/guide_many_peers.rs` with §2.6's in
+   `crates/weida/examples/guide_late_is_lost.rs`; each is included as a module by
    `crates/weida/tests/guide.rs`, which asserts the claims its chapter makes. A claim added
    without a program and an assertion fails
    `every_claim_the_chapters_make_has_a_program_and_a_test`.
@@ -32,6 +33,7 @@ Run the chapters before reading them:
 ```text
 cargo run -p weida --example guide_one_transfer
 cargo run -p weida --example guide_many_peers          # --release for the timing figures
+cargo run -p weida --example guide_late_is_lost
 cargo test -p weida --test guide
 ```
 
@@ -570,7 +572,69 @@ That shape is the pattern's whole contribution, and it is worth naming because t
 is so common: a fan-out that waits for everybody has its availability set by its worst member,
 which at C8B scale is a certainty rather than a risk.
 
-### 2.6 What this chapter does not tell you
+### 2.6 Late is lost
+
+The program: `examples/guide_late_is_lost.rs`. The test: the same `crates/weida/tests/guide.rs`.
+
+Everything so far keeps what it can and drops what it must. A voice frame or a video frame
+turns that around: **a unit that arrives after its moment is worth nothing**, so the question
+is not how to keep it but how to lose it on purpose, visibly, and without stalling anybody.
+weida has three answers ([0034](decisions/0034-late-is-lost.md)): a **datagram flow** at L0,
+**expiry and priority** on the streams that exist, and the pattern ZeroMQ named for lossy
+fan-out, **RADIO/DISH** ([PATTERNS.md](PATTERNS.md) §6.4).
+
+**Claim §2.6: a dish that falls behind loses the old segment, never the new one, and never at
+another dish's expense.**
+
+A radio sends a camera's frames — ten segments of 256 KiB at 25 per second — to two dishes.
+One reads everything; the other never reads, behind a 64 KiB stream window:
+
+```text
+fast dish received segments [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]; the stalled dish lost 9 to supersession
+```
+
+**Opening segment *n+1* resets every copy of segment *n* on that topic that is still
+unacknowledged**, and nothing else. The stalled dish's copy never finishes, so each new frame
+resets the old one: it holds at most the newest segment, which is the only one worth showing.
+The fast dish acknowledged each frame before the next existed, so supersession never reaches
+it. Nothing was held to send instead — supersession discards bytes that are already in
+flight, which is why it costs the radio no memory — and a dish that joins late starts at the
+next segment, because a segment is the only point a decoder can start from.
+
+**Claim §2.7: an SFU and a relay are loops over opaque payload.**
+
+The forwarding path of a selective forwarding unit is this, whole:
+
+```rust
+while let Ok(Incoming::Flow(mic)) = mics.accept().await {
+    let radio = room.clone();
+    tokio::spawn(async move {
+        while let Some(frame) = mic.recv().await {
+            let _ = radio.datagram("room.voice", frame);
+        }
+    });
+}
+```
+
+A microphone is a flow into the SFU, and every frame goes back out as a one-packet segment on
+the radio. A relay is the same program with a dish on one side: it reads each upstream stream
+segment chunk by chunk and writes the chunks into a downstream segment as they arrive. The
+program speaks 100 frames of noise and pushes five 64 KiB video segments through the relay:
+
+```text
+100 of 100 frames reached both listeners; 5 of 5 segments crossed the relay; payload untouched: true
+```
+
+**weida forwards on nobody's behalf**, and the SFU is still an ordinary program: authorization
+is the acceptor's decision on each flow, and the payload — SFrame ciphertext, in griasdi's
+case — is bytes to it. What weida contributes is that every loss on the way is a count with a
+cause: `Radio::dropped_on` splits by budget, supersession, expiry, a datagram too large for a
+dish's connection, and a dish that carries no datagrams, and a datagram segment is never turned
+into a stream segment, which would deliver it late. Where both kinds share a bottleneck with a
+bulk upload, [IMPLEMENTATION.md](IMPLEMENTATION.md) §4 (B-289) measured what the path and the
+congestion controller cost the voice.
+
+### 2.7 What this chapter does not tell you
 
 - **Every number here is one process on loopback.** No propagation delay, no NIC, no loss, and
   a congestion controller that never sees a real bottleneck (§0.4).
