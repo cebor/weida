@@ -38,7 +38,7 @@ kind: code | size: 60 | status: done 270d588 | needs: [B-282, B-285]
 acceptance: `Radio::datagram` sends a one-packet segment on a flow per `(dish, topic)`, opened lazily on the connection the join arrived on and closed on `leave`; a dish without capability `1` and a datagram larger than a dish's `max_datagram_size` are counted drops with their causes, never a stream.
 
 ### B-287 — `PathStats` and `FlowStats`
-kind: code | size: 45 | status: ready | needs: [B-282]
+kind: code | size: 45 | status: done ef73c69 | needs: [B-282]
 acceptance: [0034](decisions/0034-late-is-lost.md) §4.9: `PathStats` (`rtt`, `cwnd`, `congestion_events`, `lost_packets`, `sent_packets`, `max_datagram_size`) on `Flow` and `IncomingFlow`, filled from `quinn` with no `quinn` type in a public signature, `None` on the local transports; `FlowStats` ships with B-282. No permanent test, because the struct is a pass-through; a throwaway example prints the values of one loopback flow.
 
 ### B-288 — A flow outlives a redial
