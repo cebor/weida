@@ -10,7 +10,7 @@ acceptance: `transport_config` sets `datagram_receive_buffer_size(None)` on both
 note: found while writing 0034: `quinn`'s default is `Some(1 250 000)` bytes per connection, drop-oldest, never read by weida — bounded, unnamed, and about 80 MB per peer at `max_connections_per_peer`.
 
 ### B-280 — PROTOCOL: the datagram capability, FLOW, and the two new keys
-kind: spec | size: 45 | status: ready | needs: []
+kind: spec | size: 45 | status: done 66bba00 | needs: []
 acceptance: [PROTOCOL.md](PROTOCOL.md) specifies capability code `1` `datagram` (§6.1, and the rule that neither kind `7` nor a DATAGRAM frame is sent unless both HELLOs listed it, a FLOW from a peer that did not being a `PROTOCOL_VIOLATION`), frame kind `7` FLOW (§4: uni, header only on QUIC, held open until FIN; §6.8: its key table, the sender-chosen flow id, refusal by `STOP_SENDING` with `UNKNOWN_ENDPOINT`, `UNSUPPORTED`, `REJECTED` or `LIMIT_EXCEEDED`, release with `CANCELED`), the DATAGRAM payload `varint flow` + opaque bytes and the early-hold rule (§6.9), the local-transport mapping of `varint length || bytes` records of at most 1200 bytes after the FLOW header (§2.1), DATA key `13` `segment` and SUBSCRIBE key `2` `max_age_ms`, golden vectors for FLOW, both keys, a datagram payload and a HELLO listing code `1` (§8), and the six new `Limits` rows (§10); §11 loses "QUIC datagrams. Only streams are used" and the empty-capability line, and `grep` finds no stale statement that the capability set is empty.
 
 ### B-281 — The codec for FLOW, the flow-id prefix and the two keys
