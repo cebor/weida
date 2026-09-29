@@ -97,9 +97,10 @@ async API. **Twenty-five `[workspace] members`**, read from `cargo metadata`: `w
 `crates/nng/{weida-sp, weida-nng, weida-nng-py}`,
 `crates/mqtt/{weida-mqtt-codec, weida-mqtt, weida-mqtt-py}`,
 `crates/amqp/{weida-amqp-codec, weida-amqp, weida-amqp-py}`,
-`crates/nats/{weida-nats-codec, weida-nats, weida-nats-py}` and `crates/site`. The site
-renders this document set rather than maintaining a second one and remains unpublished while
-the workspace has no release form.
+`crates/nats/{weida-nats-codec, weida-nats, weida-nats-py}` and `crates/site`. Since this
+snapshot `crates/openbao/weida-openbao` has joined and `crates/site` has left
+([0033](decisions/0033-the-website-moves-out.md)): the site is built from this document set
+in its own repository, and the count is still twenty-five.
 
 ![Product line](status/product-line.svg)
 
@@ -262,7 +263,9 @@ proof.
    is parked until the Erlang row.
 3. **The website and CI are parked by the owner, not blocked on code.** The site renders **58
    pages** from this tree and fails its build on a dangling link, but remains local while the
-   workspace is unpublished and untagged (B-254). CI is the owner's separate project (B-061);
+   workspace is unpublished and untagged (B-254). Since superseded:
+   [0033](decisions/0033-the-website-moves-out.md) moved the site to its own repository after
+   the first crates.io release. CI is the owner's separate project (B-061);
    this tree supplies a reproducible gate rather than a workflow file.
 4. **The gate's blind spots are closed.** LOOP §6 names all five default-off configurations and
    ten explicit rustdoc configurations, with `cargo clean --doc` first. The feature matrix had

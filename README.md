@@ -18,11 +18,11 @@ on a unidirectional stream of its own that never shares a stream with payload. S
 producer gets a reliable `Accepted` without an exchange, a reader learns how far the far end
 got rather than only whether it finished, and no pattern changes shape to gain any of it.
 
-**Status:** alpha, and **not released**: nothing is published to a registry, there is no tag
-and there are no binaries. The website at
-[weida.doodleshnookie.net](https://weida.doodleshnookie.net) says the same in one place, and
-is rendered from the documents below rather than written beside them
-([decisions/0025](docs/decisions/0025-the-website.md)).
+**Status:** alpha. Published on crates.io: `weida`, `weida-core`, `weida-protocol`,
+`weida-runtime` and `weida-winpipe` at `0.1.0-alpha.1` and `0.1.0-alpha.2`, and
+`weida-broker`, `weida-raft` and `weida-openbao` at `0.1.0-alpha.2`. The other seventeen
+members are not published: `weida-py-core`, every Python binding and all five protocol
+libraries with their codecs. Nothing is on PyPI and there are no prebuilt binaries.
 Wire protocol version `0` is experimental and breaking changes are permitted within `0.x`.
 Phases 0-3 are implemented — the docs, the core model, the native QUIC
 transport, the in-process, `AF_UNIX` and named-pipe transports, all six patterns, the raw L0
@@ -87,6 +87,7 @@ hand.
 | `crates/weida` | `weida` | weida | runtime, the QUIC, in-process, `AF_UNIX` and named-pipe transports, the raw stream core, all six patterns — Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY, BUS — and the cursor back channel |
 | `crates/broker` | `weida-broker` | weida | L2, and a layer rather than a fork: queues at endpoint paths, the publisher confirm and the absolute per-subscription credit; depends on `weida` and nothing depends on it ([0018](docs/decisions/0018-minimal-broker.md) §4.1) |
 | `crates/raft/weida-raft` | `weida-raft` | weida | openraft plus the I/O it deliberately does not have — weida's transport under it — so a Raft service needs only a state machine ([0021](docs/decisions/0021-consensus-openraft.md)) |
+| `crates/openbao/weida-openbao` | `weida-openbao` | weida | OpenBao/Vault for weida: token, AppRole and wrapped hand-off authentication, and identity sources signed by a PKI mount, anchored on its CA, or read from KV; its own crate because it carries the HTTP client and JSON the core does not ([0032](docs/decisions/0032-identity-sources-and-the-handoff.md) §4.3, [docs/libraries/weida-openbao.md](docs/libraries/weida-openbao.md)) |
 | `crates/py/weida-py-core` | `weida-py-core` | foundation | the shared PyO3 foundation under every binding, with nothing protocol-specific in it: errno exception families, the asyncio bridge that drives a Rust future on the caller's loop, and the bytes boundary ([0014](docs/decisions/0014-parallel-libraries.md) §2) |
 | `crates/py/weida-py` | `weida-py` | binding | the Python surface of weida itself: every pattern including the streamed fan-out, asyncio and synchronous ([docs/libraries/weida-py.md](docs/libraries/weida-py.md)) |
 | `crates/zmq/weida-zmtp` | `weida-zmtp` | codec | ZMTP 3.1 — greeting, framing, commands, metadata — with no I/O and no dependency on weida at all |
@@ -104,7 +105,6 @@ hand.
 | `crates/nats/weida-nats-codec` | `weida-nats-codec` | codec | the NATS client protocol — twelve control-line verbs and the `NATS/1.0` header block — sans-I/O |
 | `crates/nats/weida-nats` | `weida-nats` | library | the Core NATS client: subjects and wildcards, queue groups, request-reply over an inbox, five credential forms and TLS; interop is written and **not run**, because no `nats-server` was available ([docs/libraries/nats.md](docs/libraries/nats.md)) |
 | `crates/nats/weida-nats-py` | `weida-nats-py` | binding | the Python NATS surface: publish with headers, subscriptions as iterators, queue groups, `request` with a mandatory timeout, asyncio and synchronous |
-| `crates/site` | `weida-site` | site | the website at [weida.doodleshnookie.net](https://weida.doodleshnookie.net), rendered from the documents in `docs/` rather than written beside them; the one member that is `publish = false` ([0025](docs/decisions/0025-the-website.md)) |
 
 ## Quick start, without writing a program
 
@@ -205,19 +205,13 @@ cargo test -p weida-nng                         # native SP sockets and protocol
 ## The website
 
 [weida.doodleshnookie.net](https://weida.doodleshnookie.net) is this document set, rendered.
-It lives in the tree as `crates/site` and adds **no prose of its own** — a landing page with
-its own summary of the guarantees would be a second copy of every claim
-([decisions/0025](docs/decisions/0025-the-website.md)):
-
-```
-cargo run -p weida-site                          # writes target/site, prints the landing page
-xdg-open target/site/index.html                  # no server: the output is files
-cargo test -p weida-site                         # every document published or excluded on purpose,
-                                                 # and every link between documents resolves
-```
-
-Nothing here deploys it. The site is **not served from anywhere yet**, and the release it
-would announce does not exist: no crate on a registry, no tag, no binaries.
+It is built in a separate repository that imports `README.md` and `docs/` at build time and
+changes nothing in them but links and code-fence labels, so every sentence on a reference page
+is a sentence in this tree; the landing page is the only page written there, and it quotes
+this file, `cargo metadata` and crates.io
+([decisions/0033](docs/decisions/0033-the-website-moves-out.md)). The loop's
+bookkeeping, third parties' requirements, the research sheets and the master plan are not
+published there; links to them lead into this repository.
 
 ## License
 

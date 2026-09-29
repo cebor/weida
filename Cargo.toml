@@ -36,10 +36,6 @@ members = [
     # protocol-specific in it (0014 §2).
     "crates/py/weida-py-core",
     "crates/py/weida-py",
-    # The website at `homepage`, rendered from the documents in `docs/` rather
-    # than written a second time beside them
-    # ([decisions/0025](docs/decisions/0025-the-website.md)).
-    "crates/site",
     # The OpenBao client and the identity sources it drives, in its own
     # crate because of the two dependencies below
     # ([decisions/0032](docs/decisions/0032-identity-sources-and-the-handoff.md) §4.3).
@@ -162,17 +158,6 @@ crypto_box = "0.9"
 # version in common because two PyO3 versions in one interpreter cannot share a
 # type object.
 pyo3 = { version = "0.29", features = ["abi3-py39"] }
-# The website's one dependency, and the same Markdown implementation
-# `rustdoc` itself uses — so a document rendered for
-# [weida.doodleshnookie.net](https://weida.doodleshnookie.net) and a doc
-# comment rendered into the API documentation are the same dialect rather than
-# two readings of one file. Pure Rust with no `unsafe`, and
-# `default-features = false` drops the `getopts` command-line parser its own
-# binary needs and we do not. Used by `weida-site` alone, which is
-# `publish = false`, so it reaches no library user's dependency graph.
-pulldown-cmark = { version = "0.13", default-features = false, features = [
-    "html",
-] }
 
 rcgen = "0.14"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
