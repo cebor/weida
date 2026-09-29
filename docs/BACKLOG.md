@@ -14,7 +14,7 @@ kind: spec | size: 45 | status: done 66bba00 | needs: []
 acceptance: [PROTOCOL.md](PROTOCOL.md) specifies capability code `1` `datagram` (§6.1, and the rule that neither kind `7` nor a DATAGRAM frame is sent unless both HELLOs listed it, a FLOW from a peer that did not being a `PROTOCOL_VIOLATION`), frame kind `7` FLOW (§4: uni, header only on QUIC, held open until FIN; §6.8: its key table, the sender-chosen flow id, refusal by `STOP_SENDING` with `UNKNOWN_ENDPOINT`, `UNSUPPORTED`, `REJECTED` or `LIMIT_EXCEEDED`, release with `CANCELED`), the DATAGRAM payload `varint flow` + opaque bytes and the early-hold rule (§6.9), the local-transport mapping of `varint length || bytes` records of at most 1200 bytes after the FLOW header (§2.1), DATA key `13` `segment` and SUBSCRIBE key `2` `max_age_ms`, golden vectors for FLOW, both keys, a datagram payload and a HELLO listing code `1` (§8), and the six new `Limits` rows (§10); §11 loses "QUIC datagrams. Only streams are used" and the empty-capability line, and `grep` finds no stale statement that the capability set is empty.
 
 ### B-281 — The codec for FLOW, the flow-id prefix and the two keys
-kind: code | size: 60 | status: ready | needs: [B-280]
+kind: code | size: 60 | status: done e76584f | needs: [B-280]
 acceptance: `weida-protocol` encodes and decodes the FLOW header, the datagram prefix, DATA key `13`, SUBSCRIBE key `2` and capability code `1`, with golden vectors in [PROTOCOL.md](PROTOCOL.md) §8's shape and the fuzz targets extended; kind `7` from a peer whose HELLO did not list code `1` is a `PROTOCOL_VIOLATION`.
 
 ### B-282 — Datagram flows over QUIC
