@@ -58,7 +58,7 @@ kind: spec | size: 45 | status: done 5f92412 | needs: [B-285]
 acceptance: [0034](decisions/0034-late-is-lost.md) §5's edits to ARCHITECTURE, PATTERNS, GUARANTEES and INVARIANTS, the index rows, and the two requirement documents pointing at what shipped.
 
 ### B-292 — Flows and RADIO/DISH in `weida::blocking` and `weida-py`
-kind: code | size: 90 | status: ready | needs: [B-286]
+kind: code | size: 90 | status: done 59f79f6 | needs: [B-286]
 acceptance: RADIO/DISH in `weida::blocking` (flows stay async-only there, because `blocking` mirrors patterns and not `Peer`/`Acceptor`) and in both Python surfaces, with a `datagrams` runtime option; one stream segment and one datagram round trip per Python surface.
 
 ### B-274 — Identity and trust as sources: ephemeral, static, files with reload, live rotation
