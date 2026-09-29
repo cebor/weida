@@ -88,6 +88,11 @@ pub struct FlowInfo {
     /// Who sent it, as proved in the handshake; `None` in process or for an
     /// anonymous client.
     pub peer: Option<PeerIdentity>,
+    /// The certificate chain the peer presented behind `peer`, leaf first
+    /// ([decisions/0035](../../../docs/decisions/0035-keys-proved-not-judged.md)
+    /// §4.2). `None` when `peer` is not a key, and when the chain exceeded
+    /// the bound weida keeps.
+    pub peer_chain: Option<crate::PeerChain>,
 }
 
 /// Counters of one flow, on the side that holds it.
@@ -1009,6 +1014,7 @@ pub(crate) async fn handle_flow(
                 .as_deref()
                 .and_then(|v| TraceContext::parse_traceparent(v).ok()),
             peer: ctx.peer.clone(),
+            peer_chain: ctx.peer_chain.clone(),
         },
         inbound: Arc::clone(&inbound),
         conn: ConnHandle::clone(ctx),

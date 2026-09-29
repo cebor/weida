@@ -187,10 +187,14 @@ pub struct PyIncomingMeta {
 impl PyIncomingMeta {
     /// The metadata of one arrival, flattened into the Python shape.
     ///
-    /// Twelve of the Rust struct's thirteen fields. `tracestate` is the one
-    /// that stays behind, because a Python caller gets the `traceparent` and
-    /// not the vendor state. The three report fields are here since B-243
-    /// added the cursor surface: a caller can act on them.
+    /// Twelve of the Rust struct's fifteen fields. Three stay behind:
+    /// `tracestate`, because a Python caller gets the `traceparent` and not
+    /// the vendor state; `achieved`, a broker's completion claim no Python
+    /// surface reads; and `peer_chain`, because its use is admitting a
+    /// client's key and a Python binding cannot require a client
+    /// ([0035](../../../../docs/decisions/0035-keys-proved-not-judged.md)
+    /// §4.7). The three report fields are here since B-243 added the cursor
+    /// surface: a caller can act on them.
     pub fn of(meta: &IncomingMeta) -> PyIncomingMeta {
         PyIncomingMeta {
             endpoint: meta.endpoint.clone(),

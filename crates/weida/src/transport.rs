@@ -28,6 +28,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use weida_core::{Error, PeerIdentity};
 
 use crate::conn::{conn_error, read_error, write_error};
+use crate::identity::PeerChain;
 use crate::inproc::{LocalConn, LocalRecv, LocalSend};
 use weida_protocol::LOCAL_MAX_DATAGRAM;
 
@@ -80,6 +81,21 @@ impl Link {
             Link::Unix(conn) => conn.peer(),
             #[cfg(windows)]
             Link::Pipe(conn) => conn.peer(),
+        }
+    }
+
+    /// The chain behind [`Link::peer`], when the peer proved a key and the
+    /// chain fits the bound weida keeps
+    /// ([decisions/0035](../../../docs/decisions/0035-keys-proved-not-judged.md)
+    /// §4.2). No local transport has one.
+    pub(crate) fn peer_chain(&self) -> Option<PeerChain> {
+        match self {
+            Link::Quic(conn) => crate::tls::peer_chain(conn),
+            Link::Local(_) => None,
+            #[cfg(unix)]
+            Link::Unix(_) => None,
+            #[cfg(windows)]
+            Link::Pipe(_) => None,
         }
     }
 

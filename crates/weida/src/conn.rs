@@ -24,6 +24,7 @@ use weida_protocol::{
 
 use crate::cursor::CursorSet;
 use crate::dedup::DedupWindow;
+use crate::identity::PeerChain;
 use crate::listener::{Namespace, Route};
 use crate::ordering::{GapDetector, Reassembler, Sequencer};
 use crate::pubsub::SubRegistry;
@@ -62,6 +63,9 @@ pub(crate) struct ConnCtx {
     /// The identity the peer proved in the handshake, `None` for an anonymous
     /// client. Fixed for the life of the connection.
     pub peer: Option<PeerIdentity>,
+    /// The chain behind `peer`, when it fits the bound weida keeps; fixed for
+    /// the life of the connection.
+    pub peer_chain: Option<PeerChain>,
     /// The runtime this connection's tasks and timers run on.
     pub exec: Exec,
     /// The guarantee set this side offers and requires. Negotiation refuses a
@@ -114,6 +118,7 @@ impl ConnCtx {
         let streams_are_local = conn.streams_are_local();
         let ctx = Arc::new(ConnCtx {
             peer: conn.peer(),
+            peer_chain: conn.peer_chain(),
             conn,
             ctl: ctl_tx,
             limits,
@@ -569,7 +574,11 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
                     let request = IncomingRequest::new(
                         IncomingTransfer::new(
                             recv,
-                            Arc::new(IncomingMeta::from_header(&decoded, ctx.peer.clone())),
+                            Arc::new(IncomingMeta::from_header(
+                                &decoded,
+                                ctx.peer.clone(),
+                                ctx.peer_chain.clone(),
+                            )),
                             Arc::clone(ctx),
                         ),
                         send,
@@ -584,7 +593,11 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
                     let request = IncomingRequest::new(
                         IncomingTransfer::new(
                             recv,
-                            Arc::new(IncomingMeta::from_header(&decoded, ctx.peer.clone())),
+                            Arc::new(IncomingMeta::from_header(
+                                &decoded,
+                                ctx.peer.clone(),
+                                ctx.peer_chain.clone(),
+                            )),
                             Arc::clone(ctx),
                         ),
                         send,
@@ -1002,7 +1015,7 @@ async fn handle_data(ctx: &ConnHandle, stream: RecvHalf, header: &[u8]) -> Resul
         return drain(stream).await;
     }
 
-    let meta = IncomingMeta::from_header(&header, ctx.peer.clone());
+    let meta = IncomingMeta::from_header(&header, ctx.peer.clone(), ctx.peer_chain.clone());
 
     // Reassemble mode: hold this arrival if the numbers before it have not
     // come yet, and dispatch whatever run that completes. Held transfers are
@@ -1236,7 +1249,11 @@ async fn handle_bi(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Resu
     let request = IncomingRequest::new(
         IncomingTransfer::new(
             recv,
-            Arc::new(IncomingMeta::from_header(&header, ctx.peer.clone())),
+            Arc::new(IncomingMeta::from_header(
+                &header,
+                ctx.peer.clone(),
+                ctx.peer_chain.clone(),
+            )),
             Arc::clone(ctx),
         ),
         send,

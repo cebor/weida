@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use quinn::rustls::pki_types::CertificateDer;
 use tokio::sync::broadcast;
 use weida_core::{Error, Fingerprint};
 
@@ -691,6 +692,46 @@ impl std::fmt::Debug for TrustSource {
                 "trust",
                 &*self.inner.current.read().expect("trust poisoned"),
             )
+            .finish()
+    }
+}
+
+/// The certificate chain a peer presented in the TLS handshake: DER, leaf
+/// first, as it arrived. weida parsed only the leaf's public key, whose
+/// fingerprint is the peer; what the rest certifies is the application's to
+/// read
+/// ([decisions/0035](../../../docs/decisions/0035-keys-proved-not-judged.md)
+/// §4.2).
+///
+/// Bounded before it is kept, because the peer chooses it: at most 8
+/// certificates and 32 KiB together. Captured once per connection and shared,
+/// so a clone is a reference count.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PeerChain(Arc<[CertificateDer<'static>]>);
+
+impl PeerChain {
+    /// A chain of at least one certificate.
+    pub(crate) fn new(certs: Vec<CertificateDer<'static>>) -> PeerChain {
+        debug_assert!(!certs.is_empty(), "a peer chain has a leaf");
+        PeerChain(certs.into())
+    }
+
+    /// The leaf, whose public key is the peer's fingerprint.
+    pub fn leaf(&self) -> &[u8] {
+        &self.0[0]
+    }
+
+    /// Every certificate, leaf first.
+    pub fn certs(&self) -> impl ExactSizeIterator<Item = &[u8]> + '_ {
+        self.0.iter().map(|c| c.as_ref())
+    }
+}
+
+impl std::fmt::Debug for PeerChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerChain")
+            .field("certs", &self.0.len())
+            .field("bytes", &self.0.iter().map(|c| c.len()).sum::<usize>())
             .finish()
     }
 }

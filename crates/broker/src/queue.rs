@@ -373,6 +373,7 @@ mod tests {
             tracestate: None,
             topic: None,
             peer: None,
+            peer_chain: None,
             sequence: None,
             gap: None,
             achieved: None,

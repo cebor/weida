@@ -29,6 +29,7 @@ use weida_protocol::{DataHeader, ErrorHeader, FrameKind, codes};
 use crate::conn::{ConnHandle, Ctl, read_frame, write_error_frame};
 use crate::cursor::{Cursors, Reporter, order_report};
 use crate::drain::Receipt;
+use crate::identity::PeerChain;
 use crate::ordering::Gap;
 
 /// Per-transfer metadata supplied by the application.
@@ -166,6 +167,11 @@ pub struct IncomingMeta {
     /// from anything the peer wrote into a header, so it cannot be claimed —
     /// only proved (master doc §47).
     pub peer: Option<PeerIdentity>,
+    /// The certificate chain the peer presented behind `peer`, leaf first
+    /// ([decisions/0035](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0035-keys-proved-not-judged.md)
+    /// §4.2). `None` when `peer` is not a key, and when the chain exceeded
+    /// the bound weida keeps.
+    pub peer_chain: Option<PeerChain>,
     /// The sender's per-producer sequence number, when it numbered this
     /// transfer (DATA key `6`).
     pub sequence: Option<u64>,
@@ -209,7 +215,11 @@ pub struct IncomingMeta {
 }
 
 impl IncomingMeta {
-    pub(crate) fn from_header(header: &DataHeader, peer: Option<PeerIdentity>) -> IncomingMeta {
+    pub(crate) fn from_header(
+        header: &DataHeader,
+        peer: Option<PeerIdentity>,
+        peer_chain: Option<PeerChain>,
+    ) -> IncomingMeta {
         IncomingMeta {
             endpoint: header.endpoint.clone(),
             content_len: header.content_len,
@@ -221,6 +231,7 @@ impl IncomingMeta {
             tracestate: header.tracestate.clone(),
             topic: header.topic.clone(),
             peer,
+            peer_chain,
             sequence: header.sequence,
             gap: None,
             achieved: header.achieved,
@@ -1096,7 +1107,11 @@ impl ReplyStream {
         match preamble.kind {
             FrameKind::Data => {
                 let header = DataHeader::decode(&header)?;
-                let meta = Arc::new(IncomingMeta::from_header(&header, self.conn.peer.clone()));
+                let meta = Arc::new(IncomingMeta::from_header(
+                    &header,
+                    self.conn.peer.clone(),
+                    self.conn.peer_chain.clone(),
+                ));
                 Ok(IncomingTransfer::new(
                     recv,
                     meta,
@@ -1300,11 +1315,14 @@ mod tests {
     fn incoming_meta_ignores_a_malformed_traceparent() {
         let mut header = DataHeader::addressed("/x");
         header.traceparent = Some("not-a-traceparent".into());
-        let meta = IncomingMeta::from_header(&header, None);
+        let meta = IncomingMeta::from_header(&header, None, None);
         assert!(meta.trace.is_none());
 
         let good = new_trace();
         header.traceparent = Some(good.to_traceparent());
-        assert_eq!(IncomingMeta::from_header(&header, None).trace, Some(good));
+        assert_eq!(
+            IncomingMeta::from_header(&header, None, None).trace,
+            Some(good)
+        );
     }
 }

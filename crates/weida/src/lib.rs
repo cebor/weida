@@ -89,7 +89,9 @@ pub use endpoint::{
     Survey, SurveyRun, Surveyor, Tune,
 };
 pub use flow::{Flow, FlowInfo, FlowMeta, FlowStats, IncomingFlow, PathStats};
-pub use identity::{FilesOptions, IdentityEvent, IdentityEvents, IdentitySource, TrustSource};
+pub use identity::{
+    FilesOptions, IdentityEvent, IdentityEvents, IdentitySource, PeerChain, TrustSource,
+};
 #[cfg(windows)]
 pub use listener::PipeBinding;
 #[cfg(unix)]

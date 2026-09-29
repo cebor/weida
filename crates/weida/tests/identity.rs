@@ -324,7 +324,12 @@ async fn a_binding_that_requires_any_key_proves_it_and_judges_nothing() {
     let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Ok(request) = replier.accept().await {
-            let _ = seen_tx.send(request.meta().peer.clone());
+            let meta = request.meta();
+            let chain = meta
+                .peer_chain
+                .as_ref()
+                .map(|c| c.certs().map(<[u8]>::to_vec).collect::<Vec<_>>());
+            let _ = seen_tx.send((meta.peer.clone(), chain));
             let mut reply = request
                 .reply(weida::TransferMeta::default())
                 .await
@@ -349,26 +354,28 @@ async fn a_binding_that_requires_any_key_proves_it_and_judges_nothing() {
         let requester = client.requester(ClientTls::new(Trust::by_address()).with_identity(id));
         within(requester.connect(&url)).await.expect("connect");
         assert_eq!(roundtrip(&requester).await, b"ok");
+        let (peer, chain) = within(seen.recv()).await.expect("seen");
+        assert_eq!(peer, Some(PeerIdentity::Key(fp)));
         assert_eq!(
-            within(seen.recv()).await.expect("seen"),
-            Some(PeerIdentity::Key(fp))
+            chain.map(|c| c.len()),
+            Some(1),
+            "a generated identity is one certificate"
         );
         strangers.push(fp);
     }
     assert_ne!(strangers[0], strangers[1]);
 
     // A device leaf signed by a user key: parsed, proved, and the peer is
-    // the device key.
-    let (device, device_fp, _) = device_chain();
+    // the device key; the chain behind it arrives as presented, leaf first.
+    let (device, device_fp, device_ders) = device_chain();
     let requester = client.requester(ClientTls::new(Trust::by_address()).with_identity(device));
     within(requester.connect(&url))
         .await
         .expect("connect device");
     assert_eq!(roundtrip(&requester).await, b"ok");
-    assert_eq!(
-        within(seen.recv()).await.expect("seen"),
-        Some(PeerIdentity::Key(device_fp))
-    );
+    let (peer, chain) = within(seen.recv()).await.expect("seen");
+    assert_eq!(peer, Some(PeerIdentity::Key(device_fp)));
+    assert_eq!(chain, Some(device_ders));
 
     client.shutdown().await;
     runtime.shutdown().await;
@@ -380,7 +387,8 @@ async fn an_anonymous_client_is_seen_as_nobody() {
     let replier = server.listener.replier("/who").expect("replier");
     let seen = tokio::spawn(async move {
         let request = replier.accept().await.expect("accept");
-        request.meta().peer.clone()
+        let meta = request.meta();
+        (meta.peer.clone(), meta.peer_chain.clone())
     });
 
     let client = server.client_runtime();
@@ -393,7 +401,7 @@ async fn an_anonymous_client_is_seen_as_nobody() {
         .expect("open");
     within(transfer.write_all(b"?")).await.expect("write");
     let _ = transfer.finish();
-    assert_eq!(within(seen).await.expect("handler"), None);
+    assert_eq!(within(seen).await.expect("handler"), (None, None));
     drop(reply);
 
     client.shutdown().await;
@@ -413,6 +421,11 @@ async fn the_reply_names_the_server_the_requester_dialled() {
     assert_eq!(
         reply.meta().peer,
         Some(PeerIdentity::Key(server.certs.fingerprint()))
+    );
+    // The dialling side keeps the chain the server presented, too.
+    assert_eq!(
+        reply.meta().peer_chain.as_ref().map(|c| c.certs().len()),
+        Some(1)
     );
 
     client.shutdown().await;

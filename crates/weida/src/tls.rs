@@ -37,7 +37,7 @@ use quinn::{TransportConfig, VarInt};
 use weida_core::{Error, Fingerprint, Limits};
 
 use crate::config::{ClientTls, ClientTrust, Identity, Pem, ServerTls, Trust};
-use crate::identity::{IdentitySource, TrustSource};
+use crate::identity::{IdentitySource, PeerChain, TrustSource};
 
 /// Reads a certificate chain from either PEM source.
 pub(crate) fn certs_from(pem: &Pem) -> Result<Vec<CertificateDer<'static>>, Error> {
@@ -738,15 +738,39 @@ pub(crate) fn client_config(
     Ok((config, refused))
 }
 
+/// The chain a connected peer presented, if it presented one.
+fn presented(conn: &quinn::Connection) -> Option<Vec<CertificateDer<'static>>> {
+    conn.peer_identity()?
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .ok()
+        .map(|chain| *chain)
+}
+
 /// The fingerprint of the identity a connected peer proved, if it presented
 /// one. Computed once per connection, after the handshake.
 pub(crate) fn peer_fingerprint(conn: &quinn::Connection) -> Option<Fingerprint> {
-    let identity = conn.peer_identity()?;
-    let chain = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    let chain = presented(conn)?;
     let leaf = chain.first()?;
     // The verifier already parsed this certificate; a failure here would mean
     // it accepted something it could not parse, which it does not.
     spki_fingerprint(leaf).ok()
+}
+
+/// The chain a connected peer presented, when it fits the bound weida keeps.
+/// An `AnyKey` binding refused a larger one in the handshake; under a trust,
+/// and on the dialling side, it is not kept and the peer is still known by
+/// its fingerprint.
+pub(crate) fn peer_chain(conn: &quinn::Connection) -> Option<PeerChain> {
+    let chain = presented(conn)?;
+    let (leaf, rest) = chain.split_first()?;
+    if !chain_fits(leaf, rest) {
+        tracing::debug!(
+            certs = chain.len(),
+            "peer chain exceeds the bound weida keeps; not kept"
+        );
+        return None;
+    }
+    Some(PeerChain::new(chain))
 }
 
 #[cfg(test)]
