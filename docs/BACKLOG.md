@@ -21,7 +21,7 @@ kind: code | size: 30 | status: done b3ba683 | needs: [B-293]
 acceptance: [0035](decisions/0035-keys-proved-not-judged.md) §4.4: `Binding::disconnect(Fingerprint) -> usize` (and `weida::blocking::Binding::disconnect`) closes every live connection of that fingerprint on the binding with `REJECTED` and returns the count, from a per-peer table of connection handles still bounded by `max_connections`. Test `disconnect_closes_every_connection_of_one_peer_and_no_other` in `crates/weida/tests/identity.rs`: two connections of one key both see `PeerEvent::Lost { cause: PeerClosed }`, another key's requester still round-trips, and an unknown fingerprint closes 0 (open question 2).
 
 ### B-297 — Documents for 0035
-kind: spec | size: 30 | status: ready | needs: [B-293, B-294, B-295, B-296]
+kind: spec | size: 30 | status: done d07cbb7 | needs: [B-293, B-294, B-295, B-296]
 acceptance: §5's edits to ARCHITECTURE, IMPLEMENTATION, PATTERNS, GUARANTEES, INVARIANTS, `libraries/weida-py.md` and `README.md`; both griasdi requirement documents point at what shipped; no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says a binding's client trust is a pin list and nothing else.
 
 ### B-279 — Stop advertising datagrams nobody reads
