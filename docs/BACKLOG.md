@@ -34,7 +34,7 @@ kind: code | size: 90 | status: done c895a14 | needs: [B-281, B-284]
 acceptance: [0034](decisions/0034-late-is-lost.md) §4.6's table for stream segments: `Radio::segment`, `Dish::join` with `max_age`, segment numbers in DATA key `13`, supersession resets the unacknowledged copies of the previous segment on the same topic and no other, expiry per dish on the radio's clock (the smallest `max_age` of the matching filters), the dish discards a segment older than the newest it delivered, drops counted per topic and cause. Tests: a stalled dish loses segments by supersession while a fast one receives every segment; a segment on topic A never resets one on topic B; a joiner receives the next segment and nothing earlier; a dish's `max_age` expires its copy while a draining dish receives the same segment whole.
 
 ### B-286 — RADIO datagram segments over flows
-kind: code | size: 60 | status: ready | needs: [B-282, B-285]
+kind: code | size: 60 | status: done 270d588 | needs: [B-282, B-285]
 acceptance: `Radio::datagram` sends a one-packet segment on a flow per `(dish, topic)`, opened lazily on the connection the join arrived on and closed on `leave`; a dish without capability `1` and a datagram larger than a dish's `max_datagram_size` are counted drops with their causes, never a stream.
 
 ### B-287 — `PathStats` and `FlowStats`
