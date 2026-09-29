@@ -46,7 +46,7 @@ kind: code | size: 60 | status: done 7b47183 | needs: [B-282]
 acceptance: [0034](decisions/0034-late-is-lost.md) §4.10: a flow opened through a dialling endpoint is re-registered on the redialled connection under a new id, sends during the gap are counted `not_live` and never queued, a refused re-registration ends the flow with its code; tests in `crates/weida/tests/reconnect.rs`' shape.
 
 ### B-289 — Voice beside bulk: what the path and the controller cost
-kind: measure | size: 60 | status: ready | needs: [B-282]
+kind: measure | size: 60 | status: done c45c63c | needs: [B-282]
 acceptance: one-way latency and loss of a 50 Hz, 200-byte flow while a bulk upload runs to the same host, in four configurations — flow on the bulk path's connection or on its own path, NewReno/Cubic or BBR on the bulk connection — on a shaped link (`tc netem` with a stated rate and queue), numbers into [IMPLEMENTATION.md](IMPLEMENTATION.md) §4. It decides whether a media profile needs its own congestion controller ([0034](decisions/0034-late-is-lost.md) §6).
 
 ### B-290 — The SFU and the relay as programs, and a guide section

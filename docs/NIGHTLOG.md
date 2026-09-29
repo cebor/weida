@@ -158,6 +158,14 @@ for bulk and for in-process work and fails at high message rates over `AF_UNIX`;
 price of not reimplementing a stream layer, and it now has a number. Recorded in
 IMPLEMENTATION.md §4.
 
+**B-289 — voice beside bulk.**
+`cargo run --release -p weida --example voice_beside_bulk` (two runs, 20 Mbit/s client to
+server through an in-process shaper with a 64 KiB drop-tail queue, same machine). Voice p95
+with bulk on a separate path: **81.6 / 91.7 ms** under CUBIC, **6.7 / 47.7 ms** under BBR, at
+4-5 % against 9 % voice loss. On one path with CUBIC: p95 49.5 ms and **no** voice loss. BBR
+cleared the pre-set 30 % bar on separate paths, so 0034 §6 now names it for a bulk profile
+sharing a bottleneck with media; the default stays `Cubic`. Recorded in IMPLEMENTATION.md §4.
+
 ## Chronology
 
 2026-09-11T00:00Z | — | seeded | loop, backlog B-001..B-018 and this log created | next B-001
@@ -415,3 +423,4 @@ IMPLEMENTATION.md §4.
 2026-09-29T21:40Z | B-286 | done 270d588 | `Radio::datagram` numbers a one-packet segment on the topic's counter (superseding stream copies in flight), prefixes it with its segment varint and sends it on a flow per `(dish, topic)` the bound side opens lazily on the connection the join arrived on; while the flow opens the newest datagram waits; `leave` closes flows of topics no remaining filter matches; the dish pumps each flow into `Received::Datagram` behind the same stale check. `no_datagrams` and `too_large` are counted drops, never a stream. Three tests in `tests/radio.rs`; they are also the bound-side flow proof moved from B-282 | next B-287
 2026-09-29T21:45Z | B-287 | done ef73c69 | `PathStats { rtt, cwnd, congestion_events, lost_packets, sent_packets, max_datagram_size }` from `quinn::Connection::stats().path` through `Link::path_stats`, on `Flow::path_stats` and `IncomingFlow::path_stats`, `None` locally; no quinn type public. A throwaway loopback example printed rtt 208 µs / 793 µs, sent_packets 64 / 39, max_datagram_size Some(1414) on both ends, and was deleted | next B-288
 2026-09-29T21:50Z | B-288 | done 7b47183 | A flow from `Peer::open_flow` keeps its peer: a `send` finding its connection closed drops the binding, counts `not_live`, returns `Ok`, and starts one re-registration (`pick` bounded by `send_timeout`, then a new FLOW under a new id); a pick failure ends the flow with its error, a refusal on the new connection ends it with the code. Flows opened by the bound side have no peer and end with their connection. The carrier now finishes on drop, so a binding orphaned by a dropped flow cannot leak its writer. `a_flow_is_reopened_after_the_server_restarts` in `tests/reconnect.rs` | next B-289
+2026-09-29T22:00Z | B-289 | done c45c63c | `Limits::congestion` (`Cubic` default, `NewReno`, `Bbr`) selects quinn's controller per profile; `examples/voice_beside_bulk.rs` runs a 50 Hz 200 B flow beside 1 MiB uploads through an in-process 20 Mbit/s shaper with a 64 KiB drop-tail queue. Separate paths: voice p95 81.6/91.7 ms under CUBIC, 6.7/47.7 ms under BBR (loss 4-5 % vs 9 %); one path with CUBIC lost no voice. BBR cleared the pre-set 30 % bar, so 0034 §6 names it for a bulk profile beside media; default unchanged. The plan asked for `tc netem`; a userspace shaper was used instead because the loop runs without sudo. Also fixed on the way: the `roundtrip` fuzz target had not compiled since DATA key 13 (862ac88) | next B-290
