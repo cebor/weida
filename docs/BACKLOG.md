@@ -42,7 +42,7 @@ kind: code | size: 45 | status: done ef73c69 | needs: [B-282]
 acceptance: [0034](decisions/0034-late-is-lost.md) §4.9: `PathStats` (`rtt`, `cwnd`, `congestion_events`, `lost_packets`, `sent_packets`, `max_datagram_size`) on `Flow` and `IncomingFlow`, filled from `quinn` with no `quinn` type in a public signature, `None` on the local transports; `FlowStats` ships with B-282. No permanent test, because the struct is a pass-through; a throwaway example prints the values of one loopback flow.
 
 ### B-288 — A flow outlives a redial
-kind: code | size: 60 | status: ready | needs: [B-282]
+kind: code | size: 60 | status: done 7b47183 | needs: [B-282]
 acceptance: [0034](decisions/0034-late-is-lost.md) §4.10: a flow opened through a dialling endpoint is re-registered on the redialled connection under a new id, sends during the gap are counted `not_live` and never queued, a refused re-registration ends the flow with its code; tests in `crates/weida/tests/reconnect.rs`' shape.
 
 ### B-289 — Voice beside bulk: what the path and the controller cost
