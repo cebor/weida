@@ -13,7 +13,7 @@ kind: code | size: 45 | status: done c006232 | needs: [B-293]
 acceptance: [0035](decisions/0035-keys-proved-not-judged.md) §4.2: `PeerChain` (DER, leaf first, `Arc`-shared) is captured once per QUIC connection and carried on `IncomingMeta::peer_chain` and `FlowInfo::peer_chain` on both sides; `None` on the local transports, for anonymous peers, and when a `Trusted` binding's peer presented more than the bound. The B-293 test asserts the device requester's chain arrives byte-identical, two certificates, leaf first, and a generated identity's as one certificate; `an_anonymous_client_is_seen_as_nobody` asserts `None`.
 
 ### B-295 — RADIO admission and eviction
-kind: code | size: 60 | status: ready | needs: [B-294]
+kind: code | size: 60 | status: done 193b9c7 | needs: [B-294]
 acceptance: [0035](decisions/0035-keys-proved-not-judged.md) §4.3: `Radio::with_admission(Fn(&Join) -> bool)` is consulted before a join is recorded and on every repeat; a refusal records nothing, reserves no `max_subscriptions` slot and closes nothing; installing an admission re-screens recorded joins; `Radio::evict(&PeerIdentity, filter) -> usize` withdraws a filter from every connection of that peer and frees its slot; `weida::blocking::Radio` gains both. Tests in `crates/weida/tests/radio.rs`: `admission_refuses_a_join_silently_and_records_nothing`, `evict_withdraws_a_join_and_frees_its_subscription_slot`, `installing_an_admission_screens_joins_already_recorded`.
 
 ### B-296 — Disconnect a peer by fingerprint
