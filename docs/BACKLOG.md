@@ -17,7 +17,7 @@ kind: code | size: 60 | status: done 193b9c7 | needs: [B-294]
 acceptance: [0035](decisions/0035-keys-proved-not-judged.md) §4.3: `Radio::with_admission(Fn(&Join) -> bool)` is consulted before a join is recorded and on every repeat; a refusal records nothing, reserves no `max_subscriptions` slot and closes nothing; installing an admission re-screens recorded joins; `Radio::evict(&PeerIdentity, filter) -> usize` withdraws a filter from every connection of that peer and frees its slot; `weida::blocking::Radio` gains both. Tests in `crates/weida/tests/radio.rs`: `admission_refuses_a_join_silently_and_records_nothing`, `evict_withdraws_a_join_and_frees_its_subscription_slot`, `installing_an_admission_screens_joins_already_recorded`.
 
 ### B-296 — Disconnect a peer by fingerprint
-kind: code | size: 30 | status: ready | needs: [B-293]
+kind: code | size: 30 | status: done b3ba683 | needs: [B-293]
 acceptance: [0035](decisions/0035-keys-proved-not-judged.md) §4.4: `Binding::disconnect(Fingerprint) -> usize` (and `weida::blocking::Binding::disconnect`) closes every live connection of that fingerprint on the binding with `REJECTED` and returns the count, from a per-peer table of connection handles still bounded by `max_connections`. Test `disconnect_closes_every_connection_of_one_peer_and_no_other` in `crates/weida/tests/identity.rs`: two connections of one key both see `PeerEvent::Lost { cause: PeerClosed }`, another key's requester still round-trips, and an unknown fingerprint closes 0 (open question 2).
 
 ### B-297 — Documents for 0035
