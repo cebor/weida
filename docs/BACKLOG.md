@@ -22,7 +22,7 @@ kind: code | size: 90 | status: done 30ddad7 | needs: [B-279, B-281]
 acceptance: [0034](decisions/0034-late-is-lost.md) §4.2 and §4.5 in `crates/weida`, one mechanism for QUIC and the local transports: the six `Limits` fields with defaults that keep flows off, capability `1` advertised exactly when enabled, `Peer::open_flow`, `Incoming::Flow`, `Flow::send` synchronous with `TooLarge`, `DatagramsUnavailable`, or the error that closed the flow, one reader per connection with per-flow drop-oldest rings, the early hold, refusal by stop code. Tests in `crates/weida/tests/flows.rs`: a flow carries datagrams from a dialling peer to an acceptor; a flow to an unregistered path fails its sends with `UnknownEndpoint`; a stalled flow drops its oldest and counts them while a sibling flow keeps receiving; a runtime without the capability fails `open_flow` with `DatagramsUnavailable` and never falls back to a stream; a payload one byte over `max_payload()` is `TooLarge`; a unit test shows a datagram for an unknown id allocates nothing beyond the early ring. The bound side's flow toward a peer that dialled is proved by B-286's datagram segments.
 
 ### B-283 — Flows over the local transports
-kind: code | size: 90 | status: ready | needs: [B-282]
+kind: code | size: 90 | status: done 7edfa6d | needs: [B-282]
 acceptance: [0034](decisions/0034-late-is-lost.md) §4.4: B-282's flow scenario passes over QUIC, in process, over `AF_UNIX` and over named pipes in `crates/weida/tests/transports.rs`, with the datagrams carried on the FLOW stream as `varint length || bytes` records behind a drop-oldest writer ring.
 
 ### B-284 — Expiry and priority on an outgoing transfer
