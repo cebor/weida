@@ -5,6 +5,20 @@ first, then the numbers, then the chronology.
 
 ## Review needed
 
+**0034 is built, B-279 to B-292, and three things want your eye** (2026-09-29, main
+`59f79f6`, gate green after every item). **(1) Two proposals wait in the site repositories**:
+`weida.doodleshnookie.net/docs/requirements/weida-late-is-lost.md` (untracked, that directory
+is not a git repository) and `blog.doodleshnookie.net/docs/requirements/weida-late-is-lost.md`
+(committed `52ade4d`). Nothing else in either site was touched. **(2) B-289 measured with an
+in-process userspace shaper, not `tc netem`**, because the loop runs without sudo; the
+numbers and that limit are in IMPLEMENTATION.md §4, and BBR's sevenfold p95 spread between
+two runs is worth a look before anybody sets it on a real profile. **(3) Three corrections
+the plan did not ask for**, each noted on its item: the radio's topic eviction keeps a floor
+so a re-created topic cannot restart below a dish's newest segment (B-285); the `roundtrip`
+fuzz target had not compiled since DATA key 13 and is fixed (`862ac88`); the guide program
+paces segments at a frame interval, because back-to-back segments counted the reader's own
+copies as superseded before their ACK arrived (B-290).
+
 **Nothing is red, nothing is in flight, and one thing wants your eye: sixteen decision notes
 are `provisional`.** State at main `1599584`+ (2026-09-15, ~03:00Z), tree clean, gate green
 here: **1878 tests**, 0 failed, 37 ignored, plus the five default-off feature configurations at
@@ -427,3 +441,4 @@ sharing a bottleneck with media; the default stays `Cubic`. Recorded in IMPLEMEN
 2026-09-29T22:05Z | B-290 | done 2cb8b67 | `examples/guide_late_is_lost.rs`: `supersession()` (ten 256 KiB segments at 25 fps to a reading and a stalled dish: the reader gets 0..9 whole, the stalled dish loses 9 to supersession) and `sfu()` (an SFU that is one loop from flows to `Radio::datagram`, two listeners hearing 100 of 100 noise frames, and a relay copying five 64 KiB segments chunk by chunk, every byte compared). GUIDE §2.6 teaches both as Claims §2.6 and §2.7; `tests/guide.rs` counts (2,7). The first version sent segments back to back and counted the reader's own copies as superseded before their ACK came back; pacing at a frame interval is what a camera does and made the count mean the stalled dish only | next B-291
 2026-09-29T22:05Z | B-291 | done 5f92412 | INVARIANTS takes 0034 §4.11: the flow invariant amended in the list and its row, the payload row's datagram sentence, and a paragraph naming every new cap (datagram_receive_bytes, max_flows, flow_queue_bytes, flow_early_bytes/hold, the 1200-byte local record, the dish's newest table, the radio's topic table and chunk queue). ARCHITECTURE §1 has three carriers and the Flow/IncomingFlow row; PATTERNS gains §1.12, §5's flow, §6.4 RADIO/DISH, the §1.11 row and two §7 rows; GUARANTEES §6 two rows; README's lead and implemented list; STATUS no longer says no pattern adds wire vocabulary; both requirement documents point at 270d588 | next B-292
 2026-09-29T22:15Z | B-292 | done 59f79f6 | `weida::blocking` gains `Binding::radio`, `Runtime::dish`, `Radio` (`segment`, `datagram`, `dish_count`, `dropped`, `drops`), `Segment` and `Dish` (`join` with `max_age`, `leave`, `recv` -> `Delivered::{Segment, Datagram}`), plus a blocking round trip test; flows stay async-only, stated in the module doc. `weida-py`: `Runtime(datagrams=True)` on both surfaces, `Radio`/`Segment`/`Dish` asyncio and sync, a received datagram as `("datagram", topic, segment, bytes)` and a segment as `("segment", bytes, meta)`, `IncomingMeta.segment`; `develop.sh` 34 passed including both new tests; the parity document recounted (62 names, 25 exception classes, 44 classes) | next site proposals (plan step 15)
+2026-09-29T22:25Z | — | handoff | 0034's documentation handed to both sites as proposals: `weida.doodleshnookie.net/docs/requirements/weida-late-is-lost.md` (PRODUCT.md Positioning and Capabilities, the unchanged `pending_note`, the impeccable Proof line, rebuild and link check) and `blog.doodleshnookie.net/docs/requirements/weida-late-is-lost.md` (`52ade4d`: one log entry with sources for every fact, the agent angle, what must not be claimed); no file under either site's `content/`, `templates/`, `data/` or `PRODUCT.md` changed | next —
