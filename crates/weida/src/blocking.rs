@@ -1221,6 +1221,23 @@ impl Radio {
         self.endpoint.drops()
     }
 
+    /// Decides which dish may join which filter; see
+    /// [`crate::Radio::with_admission`]. A refused join is silence.
+    pub fn with_admission(
+        self,
+        admit: impl Fn(&crate::Join<'_>) -> bool + Send + Sync + 'static,
+    ) -> Radio {
+        Radio {
+            endpoint: self.endpoint.with_admission(admit),
+        }
+    }
+
+    /// Withdraws `filter` from every connection of `peer`; see
+    /// [`crate::Radio::evict`]. Returns how many joins went.
+    pub fn evict(&self, peer: &crate::PeerIdentity, filter: &str) -> usize {
+        self.endpoint.evict(peer, filter)
+    }
+
     /// The asynchronous radio underneath.
     pub fn endpoint(&self) -> &crate::Radio {
         &self.endpoint

@@ -13,9 +13,12 @@ mod common;
 
 use std::time::Duration;
 
-use common::Server;
+use common::{Certs, Server};
 use tokio::sync::mpsc;
-use weida::{DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Limits, Radio, Received, Runtime};
+use weida::{
+    ClientTls, ClientTrust, DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Identity, Limits, PeerIdentity,
+    Radio, Received, Runtime, RuntimeConfig, Trust,
+};
 
 /// Generous ceiling: every assertion below should settle well inside it.
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -320,4 +323,162 @@ async fn a_datagram_larger_than_the_dish_carries_is_counted_too_large() {
         "nothing too large arrived in any other form"
     );
     runtime.shutdown().await;
+}
+
+// --- admission and eviction ------------------------------------------------------
+
+/// A server whose binding requires any proved key, so every dish is a peer
+/// with a fingerprint ([decisions/0035](../../../docs/decisions/0035-keys-proved-not-judged.md)).
+struct Keyed {
+    listener: weida::Listener,
+    url: String,
+    _binding: weida::Binding,
+    _runtime: Runtime,
+    _certs: Certs,
+}
+
+impl Keyed {
+    async fn start(limits: Limits) -> Keyed {
+        let certs = Certs::generate();
+        let runtime = Runtime::new(RuntimeConfig {
+            limits,
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        let listener = runtime.listener();
+        let binding = listener
+            .bind_quic(
+                "127.0.0.1:0".parse().expect("loopback"),
+                certs.server_tls().require_client(ClientTrust::AnyKey),
+            )
+            .await
+            .expect("bind");
+        let url = format!(
+            "weida://{}@127.0.0.1:{}/r",
+            certs.fingerprint(),
+            binding.local_addr().port()
+        );
+        Keyed {
+            listener,
+            url,
+            _binding: binding,
+            _runtime: runtime,
+            _certs: certs,
+        }
+    }
+
+    /// A dish presenting a fresh key, joined to `filter`; and that key.
+    async fn dish(&self, runtime: &Runtime, filter: &str) -> (Dish, PeerIdentity) {
+        let id = Identity::generate().expect("identity");
+        let peer = PeerIdentity::Key(id.fingerprint().expect("fingerprint"));
+        let dish = runtime.dish(ClientTls::new(Trust::by_address()).with_identity(id));
+        within(dish.join(filter, None)).await.expect("join");
+        within(dish.connect(&self.url)).await.expect("connect");
+        (dish, peer)
+    }
+}
+
+/// Whether `dish` receives a segment within half a second.
+async fn hears(dish: &Dish) -> bool {
+    tokio::time::timeout(Duration::from_millis(500), dish.recv())
+        .await
+        .is_ok()
+}
+
+#[tokio::test]
+async fn admission_refuses_a_join_silently_and_records_nothing() {
+    let server = Keyed::start(Limits::default()).await;
+    let (asked_tx, mut asked) = mpsc::unbounded_channel();
+    let radio = server
+        .listener
+        .radio("/r")
+        .expect("radio")
+        .with_admission(move |join| {
+            let _ = asked_tx.send((join.peer.cloned(), join.filter.to_owned()));
+            join.filter == "room.a"
+        });
+    let runtime = server_client();
+
+    let (refused, refused_peer) = server.dish(&runtime, "#").await;
+    assert_eq!(
+        within(asked.recv()).await,
+        Some((Some(refused_peer), "#".to_owned())),
+        "the admission saw the proved key and the filter as sent"
+    );
+    assert_eq!(radio.dish_count(), 0, "a refused join is not recorded");
+
+    let (admitted, _) = server.dish(&runtime, "room.a").await;
+    dishes(&radio, 1).await;
+    send(&radio, "room.a", 1, 1024);
+    let segment = segment_of(within(admitted.recv()).await.expect("recv"));
+    assert_eq!(segment.meta().topic.as_deref(), Some("room.a"));
+
+    // `#` would have matched: the refused dish hears nothing, and its
+    // connection was not closed for asking.
+    assert!(!hears(&refused).await, "a refused join receives nothing");
+    assert_eq!(refused.peer_count(), 1, "a refusal is silence, not a close");
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn evict_withdraws_a_join_and_frees_its_subscription_slot() {
+    // One subscription per connection: a second join after the eviction
+    // fits only if the eviction released the first one's slot, and closes
+    // the connection with LIMIT_EXCEEDED otherwise.
+    let server = Keyed::start(Limits {
+        max_subscriptions: 1,
+        ..Limits::default()
+    })
+    .await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = server_client();
+    let (dish, peer) = server.dish(&runtime, "room.a").await;
+    dishes(&radio, 1).await;
+
+    assert_eq!(radio.evict(&peer, "room.a"), 1);
+    assert_eq!(radio.dish_count(), 0);
+    send(&radio, "room.a", 1, 1024);
+    assert!(!hears(&dish).await, "an evicted join receives nothing");
+
+    within(dish.join("room.b", None))
+        .await
+        .expect("join room.b");
+    dishes(&radio, 1).await;
+    send(&radio, "room.b", 1, 1024);
+    let segment = segment_of(within(dish.recv()).await.expect("recv"));
+    assert_eq!(segment.meta().topic.as_deref(), Some("room.b"));
+    assert_eq!(dish.peer_count(), 1, "the freed slot took the new join");
+
+    let stranger = PeerIdentity::Key(
+        Identity::generate()
+            .expect("identity")
+            .fingerprint()
+            .expect("fingerprint"),
+    );
+    assert_eq!(radio.evict(&stranger, "room.b"), 0);
+    assert_eq!(radio.dish_count(), 1);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn installing_an_admission_screens_joins_already_recorded() {
+    let server = Keyed::start(Limits::default()).await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = server_client();
+    let (kept, kept_peer) = server.dish(&runtime, "room.a").await;
+    let (screened, _) = server.dish(&runtime, "room.a").await;
+    dishes(&radio, 2).await;
+
+    let radio = radio.with_admission(move |join| join.peer == Some(&kept_peer));
+    assert_eq!(radio.dish_count(), 1, "the refused join was withdrawn");
+
+    send(&radio, "room.a", 1, 1024);
+    let segment = segment_of(within(kept.recv()).await.expect("recv"));
+    assert_eq!(segment.meta().topic.as_deref(), Some("room.a"));
+    assert!(!hears(&screened).await, "the screened dish hears nothing");
+    runtime.shutdown().await;
+}
+
+fn server_client() -> Runtime {
+    Runtime::new(RuntimeConfig::default()).expect("client runtime")
 }

@@ -839,8 +839,8 @@ async fn handle_subscription(
             if joined.is_err() {
                 return too_many_subscriptions(ctx);
             }
-        } else if hub.leave(conn_id, &header.filter) {
-            subs.release(conn_id);
+        } else {
+            hub.leave(conn_id, &header.filter);
         }
         return Ok(());
     }

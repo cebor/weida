@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{Notify, Semaphore, mpsc};
-use weida_core::{Error, Limits};
+use weida_core::{Error, Limits, PeerIdentity};
 use weida_protocol::header::limits::MAX_TOPIC_BYTES;
 use weida_protocol::{DataHeader, FrameKind, codes, encode_varint, filter, split_flow_datagram};
 
@@ -35,6 +35,7 @@ use crate::config::ClientTls;
 use crate::conn::{ConnHandle, Ctl};
 use crate::endpoint::{Dish, Radio, send_subscription};
 use crate::flow::{Flow, FlowMeta, IncomingFlow, open_flow_on};
+use crate::identity::PeerChain;
 use crate::listener::{Namespace, Route};
 use crate::pubsub::{DropCause, DropTable, TopicDrops};
 use crate::reconnect::PeerEvents;
@@ -51,6 +52,37 @@ pub(crate) const COPY_QUEUE: usize = 64;
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
+
+/// A dish's request to join a filter, as a radio's admission sees it
+/// ([`Radio::with_admission`],
+/// [decisions/0035](../../../docs/decisions/0035-keys-proved-not-judged.md)
+/// §4.3).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Join<'a> {
+    /// The key or principal the dish's connection proved; `None` when it is
+    /// anonymous.
+    pub peer: Option<&'a PeerIdentity>,
+    /// The certificate chain behind `peer`
+    /// ([decisions/0035](../../../docs/decisions/0035-keys-proved-not-judged.md)
+    /// §4.2).
+    pub peer_chain: Option<&'a PeerChain>,
+    /// The filter exactly as the dish sent it.
+    pub filter: &'a str,
+}
+
+impl<'a> Join<'a> {
+    fn of(conn: &'a ConnHandle, filter: &'a str) -> Join<'a> {
+        Join {
+            peer: conn.peer.as_ref(),
+            peer_chain: conn.peer_chain.as_ref(),
+            filter,
+        }
+    }
+}
+
+/// A radio's admission policy: `true` records the join.
+type Admission = Arc<dyn Fn(&Join<'_>) -> bool + Send + Sync>;
 
 // --- radio side ---------------------------------------------------------------
 
@@ -90,6 +122,21 @@ impl DishEntry {
             }
         }
         matched.then_some(max_age)
+    }
+
+    /// Withdraws `filter` and releases its `max_subscriptions` slot; `false`
+    /// when the dish did not hold it. A topic no remaining filter matches
+    /// loses its flow: dropping it closes the FLOW stream with FIN.
+    fn drop_filter(&mut self, withdrawn: &str) -> bool {
+        if self.filters.remove(withdrawn).is_none() {
+            return false;
+        }
+        if let Some(subs) = self.conn.subs.as_ref() {
+            subs.release(self.conn_id);
+        }
+        let filters = &self.filters;
+        lock(&self.flows).retain(|topic, _| filters.keys().any(|f| filter::matches(topic, f)));
+        true
     }
 }
 
@@ -143,6 +190,10 @@ pub(crate) struct RadioHub {
     topics: Mutex<(HashMap<Arc<str>, TopicState>, u64)>,
     drops: Arc<DropTable>,
     limits: Limits,
+    /// The admission policy and its generation, which moves with every
+    /// [`RadioHub::set_admission`] so a join screened under an older policy
+    /// is screened again.
+    admission: Mutex<(u64, Option<Admission>)>,
 }
 
 impl RadioHub {
@@ -153,6 +204,7 @@ impl RadioHub {
             topics: Mutex::new((HashMap::new(), 0)),
             drops: Arc::new(DropTable::new(limits.max_sequence_scopes)),
             limits,
+            admission: Mutex::new((0, None)),
         }
     }
 
@@ -166,6 +218,12 @@ impl RadioHub {
     /// Records a join. `reserve` counts a new filter against the
     /// connection's `max_subscriptions` and runs only for a filter the dish
     /// did not already hold; a repeated join updates its `max_age`.
+    ///
+    /// The admission, when there is one, decides first, every time: a
+    /// refusal records nothing, reserves nothing and is silence
+    /// ([decisions/0017](../../../docs/decisions/0017-subscription-verdict.md)
+    /// §4.1). It runs outside the dish table's lock, so user code never runs
+    /// under the hub's lock.
     pub(crate) fn join(
         &self,
         ctx: &ConnHandle,
@@ -175,7 +233,24 @@ impl RadioHub {
     ) -> Result<(), Error> {
         let conn_id = ctx.conn.stable_id();
         let max_age = max_age_ms.map(Duration::from_millis);
-        let mut dishes = self.dishes();
+        let mut dishes = loop {
+            let (generation, admit) = {
+                let admission = lock(&self.admission);
+                (admission.0, admission.1.clone())
+            };
+            if let Some(admit) = admit
+                && !admit(&Join::of(ctx, &filter))
+            {
+                tracing::debug!(path = %self.path, filter, "join refused by admission");
+                return Ok(());
+            }
+            let dishes = self.dishes();
+            // A policy installed meanwhile re-screens only what it finds
+            // recorded; this join is not yet, so it is screened again.
+            if lock(&self.admission).0 == generation {
+                break dishes;
+            }
+        };
         let index = match dishes.iter().position(|d| d.conn_id == conn_id) {
             Some(index) => index,
             None => {
@@ -204,23 +279,72 @@ impl RadioHub {
         Ok(())
     }
 
-    /// Withdraws a join; `true` when the dish held the filter.
-    pub(crate) fn leave(&self, conn_id: usize, filter: &str) -> bool {
+    /// Withdraws a join the dish asked to leave, and releases its slot.
+    pub(crate) fn leave(&self, conn_id: usize, filter: &str) {
         let mut dishes = self.dishes();
         let Some(index) = dishes.iter().position(|d| d.conn_id == conn_id) else {
-            return false;
+            return;
         };
-        let entry = &mut dishes[index];
-        let known = entry.filters.remove(filter).is_some();
-        if entry.filters.is_empty() {
+        dishes[index].drop_filter(filter);
+        if dishes[index].filters.is_empty() {
             dishes.swap_remove(index);
-        } else {
-            // A topic no remaining filter matches loses its flow: dropping
-            // it closes the FLOW stream with FIN.
-            let filters = &entry.filters;
-            lock(&entry.flows).retain(|topic, _| filters.keys().any(|f| filter::matches(topic, f)));
         }
-        known
+    }
+
+    /// Withdraws `filter` from every connection `peer` joined it on; the
+    /// number of joins withdrawn.
+    pub(crate) fn evict(&self, peer: &PeerIdentity, filter: &str) -> usize {
+        let mut dishes = self.dishes();
+        let mut evicted = 0;
+        for entry in dishes.iter_mut() {
+            if entry.conn.peer.as_ref() == Some(peer) && entry.drop_filter(filter) {
+                evicted += 1;
+            }
+        }
+        dishes.retain(|d| !d.filters.is_empty());
+        evicted
+    }
+
+    /// Installs `admit` and screens every join already recorded with it,
+    /// withdrawing the ones it refuses. The policy runs outside the lock,
+    /// on a snapshot; a join recorded meanwhile is screened in
+    /// [`RadioHub::join`], because the generation moved.
+    pub(crate) fn set_admission(&self, admit: Admission) {
+        {
+            let mut admission = lock(&self.admission);
+            admission.0 += 1;
+            admission.1 = Some(Arc::clone(&admit));
+        }
+        let recorded: Vec<(usize, ConnHandle, Vec<String>)> = self
+            .dishes()
+            .iter()
+            .map(|d| {
+                (
+                    d.conn_id,
+                    ConnHandle::clone(&d.conn),
+                    d.filters.keys().cloned().collect(),
+                )
+            })
+            .collect();
+        let refused: Vec<(usize, String)> = recorded
+            .iter()
+            .flat_map(|(conn_id, conn, filters)| {
+                filters
+                    .iter()
+                    .filter(|f| !admit(&Join::of(conn, f)))
+                    .map(|f| (*conn_id, f.clone()))
+            })
+            .collect();
+        if refused.is_empty() {
+            return;
+        }
+        let mut dishes = self.dishes();
+        for (conn_id, filter) in &refused {
+            if let Some(entry) = dishes.iter_mut().find(|d| d.conn_id == *conn_id) {
+                entry.drop_filter(filter);
+            }
+        }
+        dishes.retain(|d| !d.filters.is_empty());
     }
 
     /// Takes the next number on `topic` and resets every unacknowledged copy
@@ -459,6 +583,39 @@ impl Radio {
     /// Every topic that lost a copy, with its counts by cause.
     pub fn drops(&self) -> Vec<TopicDrops> {
         self.hub().drops.by_topic()
+    }
+
+    /// Decides which dish may join which filter
+    /// ([decisions/0035](../../../docs/decisions/0035-keys-proved-not-judged.md)
+    /// §4.3). `admit` sees each join — the proved peer, its chain and the
+    /// filter — before it is recorded, on every repeat too, and a join it
+    /// refuses is not recorded, reserves no `max_subscriptions` slot and
+    /// closes nothing: the dish is told nothing, which is what
+    /// [decisions/0017](../../../docs/decisions/0017-subscription-verdict.md)
+    /// §4.1 defines silence to mean. A refused repeat leaves the recorded
+    /// filter alone; withdrawing it is [`Radio::evict`]'s.
+    ///
+    /// Installing a policy screens the joins already recorded and withdraws
+    /// the ones it refuses, so no join slips in between creating the radio
+    /// and calling this. The policy is shared by every clone of this radio,
+    /// and a later call replaces it. It runs on the dish connection's task
+    /// and must not block.
+    pub fn with_admission(
+        self,
+        admit: impl Fn(&Join<'_>) -> bool + Send + Sync + 'static,
+    ) -> Radio {
+        self.hub().set_admission(Arc::new(admit));
+        self
+    }
+
+    /// Withdraws `filter` — the exact string the dish joined with — from
+    /// every connection of `peer`, and frees its `max_subscriptions` slot.
+    /// The dish is not told
+    /// ([decisions/0035](../../../docs/decisions/0035-keys-proved-not-judged.md)
+    /// §4.3); it receives nothing more on that filter, and a dish that joins
+    /// again meets the admission again. Returns how many joins went.
+    pub fn evict(&self, peer: &PeerIdentity, filter: &str) -> usize {
+        self.hub().evict(peer, filter)
     }
 }
 
