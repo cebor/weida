@@ -87,6 +87,8 @@ failures!(
     (Canceled),
     (Indeterminate),
     (LimitExceeded),
+    (DatagramsUnavailable),
+    (TooLarge),
     (Tls),
     (Untrusted),
     (Io),

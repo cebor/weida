@@ -23,5 +23,5 @@ pub use addr::{
 };
 pub use error::{Error, ErrorCode, LossCause, Result, StopReason};
 pub use identity::{Fingerprint, LocalPrincipal, PeerIdentity, WindowsPrincipal};
-pub use limits::Limits;
+pub use limits::{DEFAULT_DATAGRAM_RECEIVE_BYTES, Limits};
 pub use trace::{TraceContext, TraceError};

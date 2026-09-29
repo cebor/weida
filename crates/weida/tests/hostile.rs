@@ -90,8 +90,13 @@ async fn an_unknown_frame_kind_closes_the_connection() {
 #[tokio::test]
 async fn a_flow_from_a_peer_without_the_datagram_capability_closes_the_connection() {
     // Kind 7 is FLOW, legal only when both HELLOs listed capability code 1.
-    // This peer's HELLO lists nothing (`docs/PROTOCOL.md` §6.1, §3.2).
-    let server = Server::start().await;
+    // The server enables flows; this peer's HELLO lists nothing
+    // (`docs/PROTOCOL.md` §6.1, §3.2).
+    let server = Server::start_with(weida::Limits {
+        datagram_receive_bytes: weida::DEFAULT_DATAGRAM_RECEIVE_BYTES,
+        ..weida::Limits::default()
+    })
+    .await;
     let _acceptor = server.listener.acceptor("/v").expect("acceptor");
     let endpoint = raw::client_endpoint(&server.certs);
     let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))

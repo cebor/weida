@@ -450,6 +450,21 @@ impl Peer {
         open_transfer_on(&conn, &path, &meta).await
     }
 
+    /// Registers a datagram flow to the next peer, round-robin
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
+    /// §4.2).
+    ///
+    /// Writes the FLOW header and returns without waiting for an answer: a
+    /// refusal arrives later as the error of [`Flow::send`](crate::Flow::send).
+    /// Fails with [`Error::DatagramsUnavailable`] where the connection did
+    /// not agree capability `1` — both runtimes need
+    /// `Limits::datagram_receive_bytes` above zero — and never falls back to
+    /// a stream, which would deliver the units late.
+    pub async fn open_flow(&self, meta: crate::FlowMeta) -> Result<crate::Flow, Error> {
+        let (conn, path) = self.shared.pick().await?;
+        crate::flow::open_flow_on(&conn, &path, &meta).await
+    }
+
     /// Opens a bidirectional stream — an exchange — to the next peer.
     ///
     /// The returned [`ReplyStream`] is the return half. It needs no correlation
@@ -697,6 +712,8 @@ async fn watch_slot(
                     | Error::Negotiation(_)
                     | Error::AlreadyRegistered
                     | Error::Unsupported
+                    | Error::DatagramsUnavailable
+                    | Error::TooLarge { .. }
                     | Error::InvalidAddress(_)),
                 ) => {
                     give_up(&shared, id, cause, &url, GiveUp::Failed(e.to_string()));
@@ -952,6 +969,10 @@ pub enum Incoming {
         /// Which filter, or `None` for the whole connection.
         filter: Option<String>,
     },
+    /// A datagram flow: one registration, then datagrams until it ends
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
+    /// §4.2). Dropping it stops the flow with `CANCELED`.
+    Flow(crate::IncomingFlow),
 }
 
 /// Identifies one consuming connection on one path.

@@ -91,7 +91,38 @@ pub struct Limits {
     /// cap the oldest entry is evicted, which costs suppression rather than
     /// memory.
     pub max_dedup_entries: usize,
+
+    /// Bytes of a peer's QUIC datagrams buffered unread per connection,
+    /// oldest dropped first. **Zero turns flows off**: the connection then
+    /// advertises neither capability code `1` nor `max_datagram_frame_size`,
+    /// buffers nothing and runs no datagram reader
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.5).
+    /// [`DEFAULT_DATAGRAM_RECEIVE_BYTES`] is the documented value for turning
+    /// them on.
+    pub datagram_receive_bytes: usize,
+    /// Bytes of datagrams queued for sending per connection on QUIC, and per
+    /// flow on a local transport; beyond it the oldest queued one is
+    /// discarded. Bounds what this side holds for a peer that reads slowly.
+    pub datagram_send_bytes: usize,
+    /// Inbound flows one connection may hold live. Each is a FLOW stream the
+    /// peer opened and a ring this side keeps; a FLOW beyond it is stopped
+    /// with `LIMIT_EXCEEDED`.
+    pub max_flows: usize,
+    /// Unread datagram bytes held per inbound flow; a consumer that falls
+    /// behind loses its oldest datagrams, counted per flow.
+    pub flow_queue_bytes: usize,
+    /// Bytes of datagrams held per connection for flow ids with no live flow
+    /// yet — a datagram can overtake its FLOW header — and the one place a
+    /// peer can make this side hold datagrams it never registered.
+    pub flow_early_bytes: usize,
+    /// How long a datagram waits in that ring for its FLOW header before it
+    /// is dropped and counted.
+    pub flow_early_hold: Duration,
 }
+
+/// The documented `Limits::datagram_receive_bytes` for a profile that
+/// enables datagram flows: 64 KiB, about fifty full datagrams.
+pub const DEFAULT_DATAGRAM_RECEIVE_BYTES: usize = 65_536;
 
 impl Limits {
     /// Worst-case header memory a single hostile connection can pin, in bytes.
@@ -123,6 +154,12 @@ impl Default for Limits {
             max_parked_reverse: 8,
 
             max_dedup_entries: 4096,
+            datagram_receive_bytes: 0,
+            datagram_send_bytes: 65_536,
+            max_flows: 64,
+            flow_queue_bytes: 16_384,
+            flow_early_bytes: 4_096,
+            flow_early_hold: Duration::from_secs(1),
         }
     }
 }
@@ -149,6 +186,13 @@ mod tests {
         assert_eq!(l.max_local_streams, 255);
         assert_eq!(l.max_parked_reverse, 8);
         assert_eq!(l.max_dedup_entries, 4096);
+        assert_eq!(l.datagram_receive_bytes, 0);
+        assert_eq!(DEFAULT_DATAGRAM_RECEIVE_BYTES, 64 << 10);
+        assert_eq!(l.datagram_send_bytes, 64 << 10);
+        assert_eq!(l.max_flows, 64);
+        assert_eq!(l.flow_queue_bytes, 16 << 10);
+        assert_eq!(l.flow_early_bytes, 4 << 10);
+        assert_eq!(l.flow_early_hold, Duration::from_secs(1));
     }
 
     #[test]

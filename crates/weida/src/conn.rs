@@ -17,9 +17,9 @@ use tokio::sync::{mpsc, watch};
 use weida_core::{Error, ErrorCode, Limits, LossCause, PeerIdentity};
 use weida_protocol::header::{GuaranteeSet, MAX_CURSOR_RECORD_LEN};
 use weida_protocol::{
-    Agreed, CreditHeader, CursorHeader, DataHeader, ErrorHeader, FrameKind, Hello,
-    MAX_PREAMBLE_LEN, Preamble, PreambleError, SubscriptionHeader, codes, decode_cursor_record,
-    encode_frame, negotiate, parse_preamble,
+    Agreed, CAPABILITY_DATAGRAM, CreditHeader, CursorHeader, DataHeader, ErrorHeader, FrameKind,
+    Hello, MAX_PREAMBLE_LEN, Preamble, PreambleError, SubscriptionHeader, codes,
+    decode_cursor_record, encode_frame, negotiate, parse_preamble,
 };
 
 use crate::cursor::CursorSet;
@@ -87,6 +87,10 @@ pub(crate) struct ConnCtx {
     /// Counters and flags shared with every other connection of this
     /// runtime: the duplicate count and the drain's admission flag.
     pub shared: Arc<Shared>,
+    /// Datagram flows on this connection: the inbound table and the early
+    /// ring, bounded by `max_flows`, `flow_queue_bytes` and
+    /// `flow_early_bytes` ([`crate::flow`]).
+    pub flows: crate::flow::FlowTable,
     agreed: watch::Receiver<Option<Agreed>>,
 }
 
@@ -132,6 +136,7 @@ impl ConnCtx {
             parked: crate::drain::ConnDrain::new(&limits, streams_are_local),
             reports: crate::cursor::ReportTable::new(),
             shared,
+            flows: crate::flow::FlowTable::new(&limits),
             agreed: agreed_rx,
         });
 
@@ -144,6 +149,11 @@ impl ConnCtx {
         exec.spawn(accept_uni_loop(Arc::clone(&ctx), agreed_tx));
         exec.spawn(accept_bi_loop(Arc::clone(&ctx)));
         exec.spawn(send_hello(Arc::clone(&ctx), limits, guarantees));
+        // One reader per connection, and only where the profile enabled
+        // flows: a connection that enables nothing runs no reader at all.
+        if limits.datagram_receive_bytes > 0 && ctx.conn.is_quic() {
+            exec.spawn(crate::flow::datagram_reader(Arc::clone(&ctx)));
+        }
         ctx
     }
 
@@ -391,6 +401,13 @@ fn hello_for(limits: Limits, guarantees: GuaranteeSet) -> Hello {
     Hello {
         guarantees_offered: declaration,
         guarantees_required: declaration,
+        // Capability `1` exactly when the profile enables flows
+        // (`docs/PROTOCOL.md` §6.1).
+        capabilities: if limits.datagram_receive_bytes > 0 {
+            vec![CAPABILITY_DATAGRAM]
+        } else {
+            Vec::new()
+        },
         ..Hello::v0(
             limits.max_header_bytes,
             u64::from(limits.max_concurrent_uni_streams),
@@ -526,9 +543,10 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
             drop(send);
             handle_cursor(ctx, recv, &header).await
         }
-        // No profile lists capability `1` yet, so a FLOW is always from a
-        // peer that sends what was never agreed (`docs/PROTOCOL.md` §6.1).
-        FrameKind::Flow => violation(ctx, "FLOW without the datagram capability"),
+        FrameKind::Flow => {
+            drop(send);
+            crate::flow::handle_flow(ctx, recv, &header).await
+        }
         FrameKind::Data => {
             let decoded = match DataHeader::decode(&header) {
                 Ok(h) => h,
@@ -749,11 +767,11 @@ async fn handle_stream(
         FrameKind::Unsubscribe => handle_subscription(ctx, &header, false).await,
         FrameKind::Credit => handle_credit(ctx, &header).await,
         FrameKind::Cursor => handle_cursor(ctx, stream, &header).await,
-        FrameKind::Flow => violation(ctx, "FLOW without the datagram capability"),
+        FrameKind::Flow => crate::flow::handle_flow(ctx, stream, &header).await,
     }
 }
 
-fn violation(ctx: &ConnHandle, reason: &str) -> Result<(), Error> {
+pub(crate) fn violation(ctx: &ConnHandle, reason: &str) -> Result<(), Error> {
     tracing::debug!(reason, "closing connection: protocol violation");
     ctx.conn.close(codes::PROTOCOL_VIOLATION, reason);
     Err(Error::Protocol(reason.to_owned()))
@@ -1058,6 +1076,8 @@ pub(crate) enum Wanted {
     OneWay,
     /// The initiating half of an exchange: Req/Rep, SURVEY.
     Exchange,
+    /// A datagram flow's FLOW stream.
+    Flow,
 }
 
 /// `None` when the route serves `wanted`, otherwise the refusal it earns.
@@ -1281,6 +1301,17 @@ mod tests {
             refusal_for(Some(&Route::Pub), Wanted::Exchange),
             Some(Refusal::WRONG_SHAPE)
         );
+
+        // A flow is served by a raw acceptor only; everything else is the
+        // wrong shape, and no path at all is unknown.
+        assert_eq!(refusal_for(None, Wanted::Flow), Some(Refusal::UNKNOWN));
+        assert_eq!(refusal_for(Some(&raw()), Wanted::Flow), None);
+        for route in [transfer(), pair(), request(), Route::Pub] {
+            assert_eq!(
+                refusal_for(Some(&route), Wanted::Flow),
+                Some(Refusal::WRONG_SHAPE)
+            );
+        }
     }
 
     /// The three rows carry the codes the wire documents name, and the

@@ -60,6 +60,17 @@ pub enum Error {
     Indeterminate,
     /// A local or negotiated resource limit was reached.
     LimitExceeded,
+    /// The connection carries no datagrams: one side's profile did not
+    /// enable flows, so capability code `1` was not agreed
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.5).
+    /// weida never substitutes a stream, which would deliver the unit late.
+    DatagramsUnavailable,
+    /// A datagram payload exceeds the largest datagram this connection
+    /// carries right now, `max` bytes after the flow id's prefix.
+    TooLarge {
+        /// The largest payload the connection carries.
+        max: usize,
+    },
     /// TLS material could not be loaded or configured, or the handshake
     /// failed for a reason other than an untrusted peer.
     Tls(String),
@@ -140,6 +151,13 @@ impl fmt::Display for Error {
                 f.write_str("outcome indeterminate: the transfer may or may not have been accepted")
             }
             Error::LimitExceeded => f.write_str("resource limit exceeded"),
+            Error::DatagramsUnavailable => {
+                f.write_str("datagrams are not available on this connection")
+            }
+            Error::TooLarge { max } => write!(
+                f,
+                "payload exceeds the largest datagram this connection carries ({max} bytes)"
+            ),
             Error::Tls(m) => write!(f, "tls error: {m}"),
             Error::Untrusted(fp) => write!(f, "peer identity {fp} is not trusted"),
             Error::Io(e) => write!(f, "io error: {e}"),
@@ -181,6 +199,8 @@ impl Error {
                 | Error::Canceled
                 | Error::NotConnected
                 | Error::LimitExceeded
+                | Error::DatagramsUnavailable
+                | Error::TooLarge { .. }
                 | Error::Untrusted(_)
         )
     }
@@ -308,6 +328,8 @@ mod tests {
             Error::Canceled,
             Error::Indeterminate,
             Error::LimitExceeded,
+            Error::DatagramsUnavailable,
+            Error::TooLarge { max: 1200 },
             Error::Tls("x".into()),
             Error::Io(std::io::Error::other("x")),
             Error::Transport("x".into()),
@@ -328,6 +350,8 @@ mod tests {
             Error::Canceled,
             Error::NotConnected,
             Error::LimitExceeded,
+            Error::DatagramsUnavailable,
+            Error::TooLarge { max: 1200 },
         ] {
             assert!(definite.is_definite_failure(), "{definite:?}");
         }

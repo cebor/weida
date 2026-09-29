@@ -57,6 +57,7 @@ mod cursor;
 mod dedup;
 mod drain;
 mod endpoint;
+mod flow;
 #[cfg(any(unix, windows))]
 mod grouped;
 mod identity;
@@ -84,6 +85,7 @@ pub use endpoint::{
     Rep, Replier, Req, Requester, Respond, Respondent, Sub, Subscriber, Survey, SurveyRun,
     Surveyor,
 };
+pub use flow::{Flow, FlowInfo, FlowMeta, FlowStats, IncomingFlow};
 pub use identity::{FilesOptions, IdentityEvent, IdentityEvents, IdentitySource, TrustSource};
 #[cfg(windows)]
 pub use listener::PipeBinding;
@@ -92,12 +94,12 @@ pub use listener::UnixBinding;
 pub use listener::{Binding, Listener, LocalBinding};
 pub use ordering::Gap;
 pub use pubsub::{FanOut, TopicDrops};
-pub use weida_core::DEFAULT_PORT;
 pub use weida_core::{
     Address, EndpointAddr, Error, ErrorCode, Fingerprint, InprocAddr, Limits, LocalPrincipal,
     LossCause, PeerIdentity, PipeAddr, Result, StopReason, TraceContext, UnixAddr,
     WindowsPrincipal,
 };
+pub use weida_core::{DEFAULT_DATAGRAM_RECEIVE_BYTES, DEFAULT_PORT};
 pub use weida_protocol::{ALPN, VERSION, codes, filter};
 pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
 // `Delivery` keeps its transfer-receipt meaning at this level, so the

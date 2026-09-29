@@ -29,6 +29,7 @@ use weida_core::{Error, PeerIdentity};
 
 use crate::conn::{conn_error, read_error, write_error};
 use crate::inproc::{LocalConn, LocalRecv, LocalSend};
+use weida_protocol::LOCAL_MAX_DATAGRAM;
 
 /// One connection: a QUIC connection, one in-process link, or one peer's
 /// group of local connections — `AF_UNIX` or named pipe
@@ -322,6 +323,48 @@ impl Link {
                 .accept_bi()
                 .await
                 .map(|(s, r)| (SendHalf::Pipe(s), RecvHalf::Pipe(r))),
+        }
+    }
+
+    /// True on QUIC, where a flow's datagrams travel as DATAGRAM frames; the
+    /// local transports carry them on the FLOW stream (`docs/PROTOCOL.md`
+    /// §2.1).
+    pub(crate) fn is_quic(&self) -> bool {
+        matches!(self, Link::Quic(_))
+    }
+
+    /// The largest datagram this connection carries now, prefix included:
+    /// what the peer advertised and the path allows on QUIC, `None` when the
+    /// peer advertised nothing; [`LOCAL_MAX_DATAGRAM`] on a local transport.
+    pub(crate) fn max_datagram_size(&self) -> Option<usize> {
+        match self {
+            Link::Quic(conn) => conn.max_datagram_size(),
+            _ => Some(LOCAL_MAX_DATAGRAM),
+        }
+    }
+
+    /// Hands one datagram to `quinn` without waiting. QUIC only: a local
+    /// flow writes its datagrams on its FLOW stream instead.
+    pub(crate) fn send_datagram(&self, data: bytes::Bytes) -> Result<(), Error> {
+        match self {
+            Link::Quic(conn) => conn.send_datagram(data).map_err(|e| match e {
+                quinn::SendDatagramError::UnsupportedByPeer
+                | quinn::SendDatagramError::Disabled => Error::DatagramsUnavailable,
+                quinn::SendDatagramError::TooLarge => Error::TooLarge {
+                    max: conn.max_datagram_size().unwrap_or(0),
+                },
+                quinn::SendDatagramError::ConnectionLost(e) => conn_error(e),
+            }),
+            _ => Err(Error::Unsupported),
+        }
+    }
+
+    /// The next datagram the peer sent. QUIC only; a local transport has
+    /// none, and its flows never ask.
+    pub(crate) async fn read_datagram(&self) -> Result<bytes::Bytes, Error> {
+        match self {
+            Link::Quic(conn) => conn.read_datagram().await.map_err(conn_error),
+            _ => Err(Error::Unsupported),
         }
     }
 }

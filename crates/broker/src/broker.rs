@@ -431,6 +431,13 @@ async fn serve_queue(served: Arc<Served>) {
                 // put back at the head are now some other consumer's to take.
                 pump(&served).await;
             }
+            // A queue carries messages that must arrive, and a flow carries
+            // units that are worthless once late: the two do not mix, so the
+            // flow is refused rather than queued.
+            Ok(Incoming::Flow(flow)) => {
+                tracing::debug!(path = served.acceptor.path(), "refusing a datagram flow");
+                flow.refuse();
+            }
             Err(e) => {
                 tracing::debug!(path = served.acceptor.path(), error = %e, "queue stopped serving");
                 return;

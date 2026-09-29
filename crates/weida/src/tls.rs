@@ -441,10 +441,14 @@ pub(crate) fn transport_config(limits: &Limits, dialling: bool) -> Result<Transp
         .map_err(|e| Error::Runtime(format!("idle_timeout out of range: {e}")))?;
     tc.max_idle_timeout(Some(idle));
     tc.keep_alive_interval(dialling.then_some(limits.keep_alive));
-    // No datagram flows yet: without this, quinn buffers up to ~1.2 MB of a
-    // peer's datagrams per connection that nothing reads, and advertises
-    // `max_datagram_frame_size` (docs/decisions/0034-late-is-lost.md §2.3).
-    tc.datagram_receive_buffer_size(None);
+    // Datagrams follow the profile: with flows off (the default) the
+    // connection advertises no `max_datagram_frame_size` and quinn buffers
+    // none of a peer's datagrams (docs/decisions/0034-late-is-lost.md §2.3,
+    // §4.5).
+    tc.datagram_receive_buffer_size(
+        (limits.datagram_receive_bytes > 0).then_some(limits.datagram_receive_bytes),
+    );
+    tc.datagram_send_buffer_size(limits.datagram_send_bytes);
     Ok(tc)
 }
 
