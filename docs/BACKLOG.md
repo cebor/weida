@@ -54,7 +54,7 @@ kind: code | size: 60 | status: done 2cb8b67 | needs: [B-286]
 acceptance: an example SFU (flows in, datagram segments out, payload opaque) and a relay (dish in, radio out, stream segments forwarded chunk by chunk), each asserted by a test the way the zguide recipes are, and a [GUIDE.md](GUIDE.md) section that teaches "late is lost" with them.
 
 ### B-291 — Documents for 0034
-kind: spec | size: 45 | status: ready | needs: [B-285]
+kind: spec | size: 45 | status: done 5f92412 | needs: [B-285]
 acceptance: [0034](decisions/0034-late-is-lost.md) §5's edits to ARCHITECTURE, PATTERNS, GUARANTEES and INVARIANTS, the index rows, and the two requirement documents pointing at what shipped.
 
 ### B-292 — Flows and RADIO/DISH in `weida::blocking` and `weida-py`
