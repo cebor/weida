@@ -229,16 +229,25 @@ restart on the same address over QUIC, `AF_UNIX` and inproc with the same `Lost`
 A peer is named by the SHA-256 fingerprint of its public key (`Fingerprint`, text form
 `sha256:<64 hex>`). The dialling side states whom it accepts with `Trust` — pins, anchors, or
 only what the address names (`weida://sha256:…@host:port/path`) — and a binding may require a
-client identity with `ServerTls::require_client`. Whatever arrives on a stream carries the
-peer's identity in `IncomingMeta::peer`: `PeerIdentity::Key(fingerprint)` over QUIC, `None`
-for an anonymous client, `PeerIdentity::Local { uid, gid, pid }` over `AF_UNIX` and
-`PeerIdentity::Windows { sid, pid }` over a named pipe, where the **kernel** is the prover
-instead of TLS and a PID is an observation that must not be authorized on [0010 §4.4]. In
-process there is no identity at all, because there is no boundary to prove anything across.
-Whichever it is, it comes from the transport and never from a header, so it can be authorized
-on but not forged. A peer outside the terms fails `connect` with
+client identity with `ServerTls::require_client`: one a `Trust` accepts, or, with
+`ClientTrust::AnyKey`, any key the client proves it holds — the SSH user key or WireGuard peer
+model, where the key *is* the identity and nothing about it is judged
+([decisions/0035](decisions/0035-keys-proved-not-judged.md) §4.1). Whatever arrives on a
+stream carries the peer's identity in `IncomingMeta::peer`: `PeerIdentity::Key(fingerprint)`
+over QUIC, `None` for an anonymous client, `PeerIdentity::Local { uid, gid, pid }` over
+`AF_UNIX` and `PeerIdentity::Windows { sid, pid }` over a named pipe, where the **kernel** is
+the prover instead of TLS and a PID is an observation that must not be authorized on [0010
+§4.4]. In process there is no identity at all, because there is no boundary to prove anything
+across. Whichever it is, it comes from the transport and never from a header, so it can be
+authorized on but not forged. A peer outside the terms fails `connect` with
 `Error::Untrusted(fingerprint)`, carrying what answered so an operator can pin it after
 checking it out of band.
+
+Over QUIC, `IncomingMeta::peer_chain` (and `FlowInfo::peer_chain`) carries the chain behind the
+key as the peer presented it, DER and leaf first, at most 8 certificates and 32 KiB. weida
+parses only the leaf's public key; a device certified by its user's key is a chain the
+application verifies and derives the user from, while the device fingerprint stays the peer
+[0035 §4.2].
 
 **Authorizing on it is the application's, and the shape is decided**
 ([decisions/0015](decisions/0015-peer-authorization.md)): the handshake carries no
@@ -246,11 +255,16 @@ application credential and will not grow one, so a handler authorizes on `meta()
 together with the path the stream dispatched to, and refuses with `Rejected` — or, to keep
 the path invisible, by not registering it. A **token** flow, where the grant comes from a
 third party rather than from the key, needs two things and they are both existing pieces: a
-companion Req/Rep path the client posts the token to, and `ServerTls::require_client`, so
-that the verdict can be held against a proved fingerprint. Without client identity a verdict
-lives no longer than the connection it was given on, and a *subscription* cannot present a
-token at all, because SUBSCRIBE has no reply half ([PROTOCOL.md](PROTOCOL.md) §6.4) — the one
-cost that answer has, named here rather than discovered.
+companion Req/Rep path the client posts the token to, and `ServerTls::require_client` — with a
+`Trust` or with `ClientTrust::AnyKey` — so that the verdict can be held against a proved
+fingerprint. Without client identity a verdict lives no longer than the connection it was
+given on, and a *subscription* cannot present a token at all, because SUBSCRIBE has no reply
+half ([PROTOCOL.md](PROTOCOL.md) §6.4) — the one cost that answer has, named here rather than
+discovered. A verdict that changes is enforced with the two runtime operations 0035 added:
+`Radio::evict(peer, filter)` withdraws a join (§6.4), and `Binding::disconnect(fingerprint)`
+closes every connection of a key with `REJECTED`. The dialler redials under its
+`ReconnectPolicy`, so a disconnect is not a ban; a ban is refusing that peer's arrivals and
+joins.
 
 **Where the identity comes from is a source, not a value**
 ([decisions/0032](decisions/0032-identity-sources-and-the-handoff.md)). `ServerTls` and
@@ -839,12 +853,28 @@ SUBSCRIBE and UNSUBSCRIBE, count against `max_subscriptions`, and a redialling d
 them. Segments never carry DATA key `6`, so `PerProducer(reassemble)` passes them straight
 through and never holds one for a predecessor that was superseded on purpose.
 
+**Who may join is the radio's application's to decide**
+([decisions/0035](decisions/0035-keys-proved-not-judged.md) §4.3). `Radio::with_admission`
+installs a policy that sees every join as a `Join { peer, peer_chain, filter }` before it is
+recorded, repeats included. A refused join records nothing, reserves no `max_subscriptions`
+slot and closes nothing: the dish is told nothing, which is exactly what
+[0017](decisions/0017-subscription-verdict.md) §4.1 defines silence to mean — "received and not
+refused" is indistinguishable, by design, from every copy declined. Installing a policy screens
+the joins already recorded, so there is no window between `Listener::radio` and the policy.
+`Radio::evict(peer, filter)` withdraws a recorded join, by the exact filter string, from every
+connection of that peer and frees its slot, again without telling the dish; a room whose
+membership changed is one call. An anonymous dish can be admitted or refused but not evicted by
+name, which is one more reason an SFU's binding requires `ClientTrust::AnyKey`.
+
 *`a_stalled_dish_loses_old_segments_while_a_fast_one_gets_every_one`,
 `a_segment_supersedes_only_its_own_topic`,
 `a_joiner_receives_the_next_segment_and_nothing_earlier`,
 `a_dish_max_age_expires_its_copy`, `a_datagram_segment_reaches_every_joined_dish`,
 `a_dish_without_datagrams_is_a_named_drop`,
-`a_datagram_larger_than_the_dish_carries_is_counted_too_large`
+`a_datagram_larger_than_the_dish_carries_is_counted_too_large`,
+`admission_refuses_a_join_silently_and_records_nothing`,
+`evict_withdraws_a_join_and_frees_its_subscription_slot`,
+`installing_an_admission_screens_joins_already_recorded`
 (`crates/weida/tests/radio.rs`).*
 
 ---

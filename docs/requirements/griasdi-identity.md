@@ -23,6 +23,19 @@ client's key without **judging** it.
 Everything under "What weida provides today" was read from the weida source at
 commit `b719afd`. Everything under "Proposal" is design, not fact.
 
+**Answered by [decisions/0035](../decisions/0035-keys-proved-not-judged.md) (accepted; shipped
+in `b3ba683`).** Proposal 1 is `ServerTls::require_client(ClientTrust::AnyKey)`: the leaf must
+parse, the chain must fit 8 certificates and 32 KiB, the TLS 1.3 signature is verified, and
+nothing else is judged; the peer is `PeerIdentity::Key` of the leaf's fingerprint. Proposal 2
+is `PeerChain` on every arrival, `IncomingMeta::peer_chain` and `FlowInfo::peer_chain`, DER
+and leaf first. Proposal 3 is `Radio::with_admission`, which sees `Join { peer, peer_chain,
+filter }` before a join is recorded and refuses by silence, and `Radio::evict(peer, filter)`.
+Open question 1 is answered yes: a device leaf signed by a user key is admitted as its own
+fingerprint (`a_binding_that_requires_any_key_proves_it_and_judges_nothing`). Open question 2
+is `Binding::disconnect(fingerprint)`, which closes every connection of one key with
+`REJECTED`; the dialler redials, so it is not a ban. Deferred, as this document allows: the
+handshake `ClientPolicy` and `AnyKey` on the dialling side.
+
 ## What griasdi needs
 
 | Need | Shape |

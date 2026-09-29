@@ -226,7 +226,8 @@ anchors, with an address-named fingerprint overriding both. `ClientTls { trust, 
 and `ServerTls { identity, client_trust }` combine them; `impl Into` at every call site lets
 a bare `Trust` or `Identity` stand in, and the previous root-list client shape and
 certificate-and-key server shape are both gone. A binding may now require client identity
-(`ServerTls::require_client`), and whatever a peer proved in the handshake is surfaced as
+(`ServerTls::require_client`; since [0035](decisions/0035-keys-proved-not-judged.md) it takes a
+`ClientTrust`, a trust or `AnyKey`), and whatever a peer proved in the handshake is surfaced as
 `IncomingMeta::peer` on inbound transfers, requests and the requester's reply half — from the
 handshake, never from a header, so it can only be proved and never claimed (master doc §47).
 New errors: `Error::InvalidFingerprint` and the definite `Error::Untrusted(Fingerprint)`,
@@ -1653,7 +1654,7 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Address may name the peer | `weida://[sha256:<hex>@]host:port/path` | One string then carries both where to dial and whom to accept — which is exactly what a discovery record, a config line or a line pasted into a terminal has to survive as. Reaching a self-signed peer safely needs nothing else configured. |
 | Address fingerprint overrides `Trust` | the named identity is the only one accepted on that connection | The most specific statement of intent wins. An operator who wrote down which peer must answer did not mean "or anybody else my CA vouches for". |
 | Empty `Trust` dials nothing but pinned addresses | `Error::Tls("nothing to trust …")`, before any packet | The only alternative to failing here is trusting everything, which must never be reachable by omission. An endpoint with no trust configured stays usable — for addresses that name their peer, and for nothing else. |
-| Client identity | optional on the dialling side; a binding may require it | Master doc §6 makes client identity optional and §46 asks for mTLS. `ClientTls` therefore carries `Option<Identity>`, and `ServerTls::require_client(trust)` refuses anonymous and untrusted peers at the handshake. Requiring an empty trust is rejected at bind time, since it would accept nobody. |
+| Client identity | optional on the dialling side; a binding may require it | Master doc §6 makes client identity optional and §46 asks for mTLS. `ClientTls` therefore carries `Option<Identity>`, and `ServerTls::require_client` takes a `ClientTrust`: `Trusted(trust)` refuses anonymous and untrusted peers at the handshake, and `AnyKey` refuses only anonymous ones, verifying the handshake signature and judging nothing about the key ([0035](decisions/0035-keys-proved-not-judged.md) §4.1). Requiring an empty trust is rejected at bind time, since it would accept nobody. The chain a peer presented is kept only up to 8 certificates and 32 KiB (`MAX_PEER_CHAIN_CERTS`, `MAX_PEER_CHAIN_BYTES`): constants rather than `Limits` fields, because they bound what weida keeps rather than tune a workload; an `AnyKey` binding fails a larger chain in the handshake, a `Trusted` one keeps none of it. |
 | Certificate generation | `rcgen`, behind default feature `generate` | `Identity::generate()` is what lets a pinned deployment handle no PEM at all, so it is on by default; behind a feature so a deployment that only loads issued certificates does not link a certificate builder. |
 | Fingerprint dependencies | `rustls-webpki` (SPKI parsing) and `ring` (SHA-256) as direct dependencies | Both were already in the tree through rustls, so naming them directly adds no third-party code and no build time, which is what master doc §72's dependency discipline asks. Neither parsing a leaf's SPKI nor hashing it is something rustls exposes. |
 
@@ -1782,8 +1783,10 @@ Recorded deliberately, not discovered later.
   (`docs/PATTERNS.md` §1.8, §1.11).
 - **Authorization hooks are not implemented.** Master doc §46's authorization surface does not
   exist. What ships is authentication plus the identity: applications decide on
-  `IncomingMeta::peer`, and the only built-in allow list is a `Trust` pin list on a binding,
-  which is connection-wide and all-or-nothing.
+  `IncomingMeta::peer`, and what is built in acts on a proved peer without a policy language: a
+  binding's `Trust` of pins and anchors or `ClientTrust::AnyKey` in the handshake, a radio's
+  `with_admission`/`evict` on joins, and `Binding::disconnect` on live connections
+  ([0035](decisions/0035-keys-proved-not-judged.md)).
 - **`stream_receive_window` is not a payload budget.** The DATA header spends the same window
   as the payload, and a receiver announces more window only per eighth of it, so a payload
   sized exactly to the window cannot be written until the application starts reading (§4).

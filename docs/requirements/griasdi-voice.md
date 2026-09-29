@@ -187,7 +187,11 @@ in griasdi's topology, so they are recorded here.
   (`crates/weida/src/identity.rs:564-605`), and an empty trust is refused
   (`crates/weida/src/tls.rs:551-555`). griasdi needs a client-verification hook
   that receives the presented chain and returns accept (reporting the
-  fingerprint as today) or reject. The defaults stay as they are.
+  fingerprint as today) or reject. The defaults stay as they are. **Answered by
+  [decisions/0035](../decisions/0035-keys-proved-not-judged.md):** a binding accepts any
+  proved key with `ServerTls::require_client(ClientTrust::AnyKey)` and the presented chain
+  reaches the application as `IncomingMeta::peer_chain`; the handshake-time hook that may
+  reject is deferred there as `ClientPolicy`.
 - **Device certificates.** A griasdi user is a root key; each device has its own
   key, certified by the root. The minimum weida needs is the hook above; griasdi
   can bind device to user with an application exchange on an `/auth` path (0015

@@ -270,8 +270,9 @@ terms; and two interfaces of the same service may present different identities �
 one issued by an internal CA, a public one facing outward. Putting server identity on the
 Listener would make the namespace object depend on one transport's notion of identity. A
 binding MAY additionally require an identity from every peer that dials it
-(`ServerTls::require_client`), which is per binding for the same reason: two interfaces of
-one service may differ in whom they let in.
+(`ServerTls::require_client`, taking a `ClientTrust`: a trust the key must satisfy, or
+`ClientTrust::AnyKey`, any key the client proves it holds), which is per binding for the same
+reason: two interfaces of one service may differ in whom they let in.
 
 ### Identity and Trust
 
@@ -296,14 +297,20 @@ code.
 
 The two combinations are `ClientTls { trust, identity }` — a dialling endpoint always needs
 trust and may present an identity — and `ServerTls { identity, client_trust }` — a binding
-always needs an identity and may demand trust of its clients. Both compare by content, and
-the client connection pool keys on `ClientTls` together with the authority and the
+always needs an identity and may require its clients to present a key, one a `Trust` accepts
+or, under `ClientTrust::AnyKey`, any key they prove
+([decisions/0035](decisions/0035-keys-proved-not-judged.md) §4.1). Both compare by content,
+and the client connection pool keys on `ClientTls` together with the authority and the
 fingerprint the address named (§5).
 
 Identity is symmetric on the wire. Whatever a peer proved in the handshake is surfaced to the
 receiving application as `IncomingMeta::peer` — `None` for a client that dialled
 anonymously. It comes from the handshake and never from a header, so it cannot be claimed,
-only proved (master doc §47).
+only proved (master doc §47). Beside it, `IncomingMeta::peer_chain` (and
+`FlowInfo::peer_chain`) carries the certificate chain the peer presented, DER and leaf first,
+bounded to 8 certificates and 32 KiB; weida parses only the leaf's public key, and what the
+rest certifies is the application's to read ([0035](decisions/0035-keys-proved-not-judged.md)
+§4.2).
 
 **There are two kinds of proof, and a local peer uses the other one**
 ([decisions/0010](decisions/0010-local-transport.md) §4.4). A local transport runs no TLS, so
@@ -884,9 +891,12 @@ configuration applies the stream and connection windows, both stream-count limit
 idle timeout from `Limits`. The bidirectional limit was hardcoded to `0` while Req/Rep rode
 unidirectional streams — the transport refused bidirectional streams outright — and is now
 `max_concurrent_bidi_streams`, which is what bounds the exchanges a peer may hold open on us.
-A binding whose `client_trust` is set requires client authentication: an anonymous client and
-a client whose identity it does not trust both fail the handshake and see `Error::Tls`.
-Requiring an empty `Trust` is rejected at bind time, because it would accept nobody.
+A binding whose `client_trust` is set requires client authentication: an anonymous client
+fails the handshake and sees `Error::Tls`, and so does a client whose identity a
+`ClientTrust::Trusted` trust does not accept. `ClientTrust::AnyKey` refuses no key: it checks
+that the leaf parses and the chain fits the bound, and verifies the handshake signature
+([decisions/0035](decisions/0035-keys-proved-not-judged.md) §4.1). Requiring an empty `Trust`
+is rejected at bind time, because it would accept nobody.
 
 Client: same ALPN, plus the 10 s keep-alive. Keep-alives are sent by the dialling side only,
 so an idle connection is held open by the client alone.
@@ -904,11 +914,16 @@ its host application.
 description of what happens to be missing. A completed handshake says which key answered and
 nothing about what that peer may do. Deciding that is the acceptor's job, on
 `IncomingMeta::peer`: the identity is on every inbound transfer and request, so a handler can
-refuse per endpoint, per topic or per payload. The only allow list built into v0 is a `Trust`
-pin list on a binding, which is connection-wide and all-or-nothing; the authorization hooks
-of master doc §46 are not implemented **by decision** — 0015 asked whether the handshake
-should carry an application credential and answered no, so there is nothing for a hook to
-carry that `(proved peer, dispatched path)` does not already say.
+refuse per endpoint, per topic or per payload. Built into weida are the admission a binding
+applies in the handshake — a `Trust` of pins and anchors, or `ClientTrust::AnyKey`, which admits
+any proved key and leaves every decision to the application
+([decisions/0035](decisions/0035-keys-proved-not-judged.md)) — plus two local decision points
+that act on a proved peer after it is connected: a radio's admission and eviction of joins
+(`Radio::with_admission`, `Radio::evict`) and `Binding::disconnect(fingerprint)`, which closes
+a peer's connections and is not a ban. The authorization hooks of master doc §46 are not
+implemented **by decision** — 0015 asked whether the handshake should carry an application
+credential and answered no, so there is nothing for a hook to carry that `(proved peer,
+dispatched path)` does not already say.
 
 Per endpoint path, an acceptor MAY decide whether the path exists at all (a non-registration
 answers `UNKNOWN_ENDPOINT`, which deliberately does not distinguish "no such endpoint" from
@@ -1155,9 +1170,10 @@ impl Trust {
 pub struct ClientTls { pub trust: Trust, pub identity: Option<Identity> } // Eq+Hash: pool keys on it
 impl ClientTls { pub fn new(trust: Trust) -> Self;            // dials anonymously
     pub fn with_identity(self, identity: Identity) -> Self; }  // From<Trust> for ClientTls
-pub struct ServerTls { pub identity: Identity, pub client_trust: Option<Trust> }
+pub enum ClientTrust { Trusted(TrustSource), AnyKey }         // From<Trust>, From<TrustSource>
+pub struct ServerTls { pub identity: Identity, pub client_trust: Option<ClientTrust> }
 impl ServerTls { pub fn new(identity: Identity) -> Self;      // accepts anonymous peers
-    pub fn require_client(self, trust: Trust) -> Self; }       // From<Identity> for ServerTls
+    pub fn require_client(self, trust: impl Into<ClientTrust>) -> Self; } // From<Identity> for ServerTls
 
 pub struct Runtime;                                          // Clone (Arc inner); owns or borrows a tokio reactor
 impl Runtime {
@@ -1199,7 +1215,8 @@ impl Listener {
     pub fn acceptor(&self, path: &str) -> Result<Acceptor, Error>; // L0: both stream kinds, one queue
 }
 pub struct Binding;
-impl Binding { pub fn local_addr(&self) -> SocketAddr; pub async fn close(&self); }
+impl Binding { pub fn local_addr(&self) -> SocketAddr; pub async fn close(&self);
+    pub fn disconnect(&self, peer: Fingerprint) -> usize; }  // closes with REJECTED; not a ban [0035 §4.4]
 pub struct LocalBinding;                                     // unbinds the bus when dropped
 impl LocalBinding { pub fn bus(&self) -> &str; }
 #[cfg(unix)]
@@ -1316,8 +1333,14 @@ Type by type:
 - **`ClientTls`** — a dialling endpoint's `Trust` plus an optional `Identity` to present. A
   bare `Trust` converts into it. Required to `connect()`; there is no platform-root or
   skip-verification path in v0.
-- **`ServerTls`** — a binding's `Identity` plus an optional client `Trust`. A bare `Identity`
-  converts into it; `require_client(trust)` makes the binding authenticate its clients.
+- **`ServerTls`** — a binding's `Identity` plus an optional `ClientTrust`. A bare `Identity`
+  converts into it; `require_client(trust)` makes the binding authenticate its clients against
+  a `Trust`, and `require_client(ClientTrust::AnyKey)` makes it require a proved key and judge
+  none ([decisions/0035](decisions/0035-keys-proved-not-judged.md)).
+- **`ClientTrust`** — whom a binding that requires clients lets in: `Trusted(TrustSource)` or
+  `AnyKey`.
+- **`PeerChain`** — the certificate chain a peer presented, DER, leaf first, at most 8
+  certificates and 32 KiB; `leaf()` and `certs()`.
 - **`Runtime`** — the process-level container of §2. `Clone`, sharing an `Arc` inner. It
   holds the reactor rather than requiring one: `new` takes the ambient tokio runtime and
   fails with `Error::Runtime` when there is none, `with_handle` takes somebody else's, and
@@ -1325,7 +1348,8 @@ Type by type:
 - **`Listener`** — one logical messaging namespace, owning the endpoint `Namespace` shared by
   all of its bindings.
 - **`Binding`** — one concrete QUIC binding; exposes its resolved local address, which is how
-  tests learn an ephemeral port.
+  tests learn an ephemeral port, and `disconnect(fingerprint)`, which closes every live
+  connection of one proved key with `REJECTED` — the dialler redials, so it is not a ban.
 - **`Peer`** — the L0 dialling side: a set of connections, the terms they were authenticated
   on (`ClientTls`, plus whatever each address named), and the two open calls. `peer_count`
   reports live peers only — a closed connection leaves the set when the next `connect()` adds
@@ -1357,7 +1381,8 @@ Type by type:
   Reaching EOF is just EOF; the v0 core emits nothing in response. `collect(max_bytes)` is the
   opt-in materialization convenience with a mandatory cap; it is never used internally.
   `meta().peer` is the fingerprint the sender proved in the handshake, `None` for an
-  anonymous client, and it is what an application authorizes on.
+  anonymous client, and it is what an application authorizes on; `meta().peer_chain` is the
+  chain behind it, for an application that derives more from the key than the key itself.
 - **`IncomingRequest`** — an accepted exchange: its metadata, its body as an
   `IncomingTransfer`, and the reply half it owes the requester. `reply()` consumes it, because
   an exchange has exactly one reply and a second one should not be representable. It may be

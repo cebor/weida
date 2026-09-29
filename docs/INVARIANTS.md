@@ -87,6 +87,16 @@ topic table is capped at `max_sequence_scopes` too and evicts only a topic with 
 flight, a copy holds at most 64 queued chunks, and a dish's chunks are charged against
 `subscriber_buffer_bytes` exactly as a subscriber's are.
 
+**The chain a peer presented is inside it with a cap of its own**
+([decisions/0035](decisions/0035-keys-proved-not-judged.md) §4.2). A connection keeps the
+certificate chain behind a proved key for its whole life and shares it into every arrival, so
+it is bounded before it is kept: at most 8 certificates and 32 KiB together
+(`MAX_PEER_CHAIN_CERTS`, `MAX_PEER_CHAIN_BYTES` in `crates/weida/src/tls.rs`). A binding that
+requires `ClientTrust::AnyKey` refuses a larger chain in the handshake; a `Trusted` binding and
+the dialling side keep none of it and know the peer by its fingerprint alone. The per-peer table
+of the accept loop holds connection handles rather than a count since `Binding::disconnect`,
+and is still bounded by `max_connections`.
+
 **The sender outbox and the event stream of
 [0031](decisions/0031-transparent-redial-and-the-sender-outbox.md) are inside it too, and
 neither is remote input.** An outbox holds bodies the local application handed to `send`

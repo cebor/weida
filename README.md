@@ -157,8 +157,9 @@ No certificate file changes hands, no CA exists, and a peer with any other key i
 across restarts so the address stays stable; `--cert-out PATH` plus `transform_client --ca
 PATH` is the same exchange through a trusted certificate and a plain address instead. In
 code: `Identity::generate()`, `Trust::by_address()` / `Trust::pin(fp)` / `Trust::anchor(pem)`,
-`ServerTls::require_client(trust)` for mutual identity, and `IncomingMeta::peer` to see who
-sent what.
+`ServerTls::require_client(trust)` for mutual identity or
+`ServerTls::require_client(ClientTrust::AnyKey)` for clients whose key is their only identity,
+and `IncomingMeta::peer` to see who sent what.
 
 Expected on stderr: `delivered` — QUIC's transport receipt for the request, not an application
 acknowledgement — and a trace id that also appears in the server's log line for the request.
