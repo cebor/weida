@@ -63,7 +63,9 @@ scratch of a draining reader — is a constant. The publisher's per-topic drop t
 (B-067) is bounded by `max_sequence_scopes`, the same ceiling as the sequencer's per-topic
 table: the topics are the local application's, not a peer's, but a table nobody bounds is a
 table that grows for the life of the process, and at the cap a topic's drops count in the
-aggregate only.
+aggregate only. A weida QUIC connection advertises no `max_datagram_frame_size` and buffers no
+datagrams, so a peer's datagrams are refused at the transport parameter until flows are
+enabled per profile and their bounds are named (B-279, B-282).
 
 **The sender outbox and the event stream of
 [0031](decisions/0031-transparent-redial-and-the-sender-outbox.md) are inside it too, and

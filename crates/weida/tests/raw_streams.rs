@@ -113,3 +113,15 @@ async fn an_acceptor_path_is_claimed_like_any_other() {
         Err(weida::Error::InvalidEndpointPath)
     ));
 }
+
+/// A weida binding does not advertise `max_datagram_frame_size`, so a peer
+/// may send it no datagrams and quinn buffers none (0034 §2.3).
+#[tokio::test]
+async fn a_weida_binding_advertises_no_datagrams() {
+    let server = Server::start().await;
+    let endpoint = common::raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+    assert_eq!(conn.max_datagram_size(), None);
+}
