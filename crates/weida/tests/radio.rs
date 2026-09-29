@@ -3,8 +3,11 @@
 //!
 //! Each test defends one row of the note's table: supersession resets the
 //! copies a dish could not take in time and no other topic's, a late joiner
-//! starts at the next segment, and a dish's `max_age` expires its copy
-//! without touching another dish's.
+//! starts at the next segment, a dish's `max_age` expires its copy without
+//! touching another dish's, and a datagram segment is a counted drop where
+//! it cannot be a datagram, never a stream. The datagram segments travel on
+//! flows the **bound** side opens toward a peer that dialled it, which is
+//! B-282's bound-side proof.
 
 mod common;
 
@@ -12,7 +15,7 @@ use std::time::Duration;
 
 use common::Server;
 use tokio::sync::mpsc;
-use weida::{Dish, Limits, Radio, Received, Runtime};
+use weida::{DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Limits, Radio, Received, Runtime};
 
 /// Generous ceiling: every assertion below should settle well inside it.
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -211,4 +214,110 @@ async fn a_dish_max_age_expires_its_copy() {
     assert_eq!(drops.superseded, 0, "{drops:?}");
     stalled_rt.shutdown().await;
     draining_rt.shutdown().await;
+}
+
+// --- datagram segments ---------------------------------------------------------
+
+fn with_datagrams() -> Limits {
+    Limits {
+        datagram_receive_bytes: DEFAULT_DATAGRAM_RECEIVE_BYTES,
+        ..Limits::default()
+    }
+}
+
+/// Collects datagram segments until `count` arrived or the dish stays quiet.
+async fn datagrams(dish: &Dish, count: usize) -> Vec<(u64, usize)> {
+    let mut seen = Vec::new();
+    while seen.len() < count {
+        match tokio::time::timeout(Duration::from_millis(500), dish.recv()).await {
+            Ok(Ok(Received::Datagram {
+                topic,
+                segment,
+                payload,
+            })) => {
+                assert_eq!(topic, "voice");
+                seen.push((segment, payload.len()));
+            }
+            Ok(Ok(other)) => panic!("expected a datagram, got {other:?}"),
+            Ok(Err(e)) => panic!("recv: {e}"),
+            Err(_) => break,
+        }
+    }
+    seen
+}
+
+#[tokio::test]
+async fn a_datagram_segment_reaches_every_joined_dish() {
+    let server = Server::start_with(with_datagrams()).await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let first_rt = server.client_runtime_with(with_datagrams());
+    let first = joined(&server, &first_rt, "voice", None).await;
+    let second_rt = server.client_runtime_with(with_datagrams());
+    let second = joined(&server, &second_rt, "voice", None).await;
+    dishes(&radio, 2).await;
+
+    let readers = tokio::spawn(async move {
+        let (a, b) = tokio::join!(datagrams(&first, 50), datagrams(&second, 50));
+        (a, b)
+    });
+    for _ in 0..50 {
+        assert_eq!(radio.datagram("voice", vec![0x33; 150]).expect("send"), 2);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (a, b) = within(readers).await.expect("readers");
+    for seen in [a, b] {
+        assert!(seen.len() >= 45, "received {} of 50", seen.len());
+        assert!(seen.iter().all(|(_, len)| *len == 150));
+        assert!(seen.windows(2).all(|w| w[0].0 < w[1].0), "{seen:?}");
+    }
+    first_rt.shutdown().await;
+    second_rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_dish_without_datagrams_is_a_named_drop() {
+    let server = Server::start_with(with_datagrams()).await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = server.client_runtime();
+    let dish = joined(&server, &runtime, "voice", None).await;
+    dishes(&radio, 1).await;
+
+    assert_eq!(radio.datagram("voice", vec![0x33; 150]).expect("send"), 0);
+    let drops = radio.dropped_on("voice").expect("drops on voice");
+    assert!(drops.no_datagrams >= 1, "{drops:?}");
+    // And no stream segment stands in for it.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), dish.recv())
+            .await
+            .is_err()
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_datagram_larger_than_the_dish_carries_is_counted_too_large() {
+    let server = Server::start_with(with_datagrams()).await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = server.client_runtime_with(with_datagrams());
+    let dish = joined(&server, &runtime, "voice", None).await;
+    dishes(&radio, 1).await;
+
+    // The first one opens the flow; the rest meet the open flow directly.
+    for _ in 0..3 {
+        radio.datagram("voice", vec![0x33; 4000]).expect("send");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    within(async {
+        while radio.dropped_on("voice").map_or(0, |d| d.too_large) < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), dish.recv())
+            .await
+            .is_err(),
+        "nothing too large arrived in any other form"
+    );
+    runtime.shutdown().await;
 }

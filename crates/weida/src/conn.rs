@@ -191,6 +191,12 @@ impl ConnCtx {
         }
     }
 
+    /// The negotiated parameters if negotiation has completed, without
+    /// waiting.
+    pub(crate) fn agreed_now(&self) -> Option<Agreed> {
+        *self.agreed.borrow()
+    }
+
     /// Sends a control message without waiting.
     ///
     /// Used from `Drop`, where blocking is not an option. A full queue means
@@ -1103,6 +1109,8 @@ pub(crate) fn refusal_for(route: Option<&Route>, wanted: Wanted) -> Option<Refus
         (Some(Route::Raw(_)), _) => None,
         (Some(Route::Transfer(_) | Route::Pair { .. } | Route::Dish(_)), Wanted::OneWay) => None,
         (Some(Route::Request(_)), Wanted::Exchange) => None,
+        // A dish takes a radio's datagram segments on flows (0034 §4.6).
+        (Some(Route::Dish(_)), Wanted::Flow) => None,
         // Everything else is the path being served by the wrong shape: a
         // publisher or a radio takes nothing inbound, a replier takes no
         // one-way transfer, and a pair carries one-way transfers in both

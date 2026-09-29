@@ -891,7 +891,12 @@ pub(crate) async fn handle_flow(
                 );
             }
         }
-        _ => unreachable!("refusal_for serves a flow on a raw acceptor only"),
+        // A radio's datagram segments: a pump moves them into the dish's
+        // queue, so this task is free to watch the stream.
+        Some(Route::Dish(route)) => {
+            ctx.exec.spawn(crate::radio::pump_flow(route, flow));
+        }
+        _ => unreachable!("refusal_for serves a flow on a raw acceptor or a dish only"),
     }
     let outcome = run_stream(ctx, &mut stream, &inbound).await;
     ctx.flows.remove(header.flow, &inbound);

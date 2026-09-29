@@ -110,6 +110,10 @@ pub(crate) enum DropCause {
     Superseded,
     /// The dish's `max_age` passed before this copy was acknowledged.
     Expired,
+    /// A datagram segment exceeded the dish connection's datagram size.
+    TooLarge,
+    /// The dish's connection did not agree the datagram capability.
+    NoDatagrams,
 }
 
 /// What a publisher dropped on one topic, by cause.
@@ -166,6 +170,8 @@ impl Causes {
             DropCause::NoParkedConnection => &self.no_parked,
             DropCause::Superseded => &self.superseded,
             DropCause::Expired => &self.expired,
+            DropCause::TooLarge => &self.too_large,
+            DropCause::NoDatagrams => &self.no_datagrams,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }

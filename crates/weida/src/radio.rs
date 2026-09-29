@@ -29,11 +29,12 @@ use bytes::Bytes;
 use tokio::sync::{Notify, Semaphore, mpsc};
 use weida_core::{Error, Limits};
 use weida_protocol::header::limits::MAX_TOPIC_BYTES;
-use weida_protocol::{DataHeader, FrameKind, codes, filter};
+use weida_protocol::{DataHeader, FrameKind, codes, encode_varint, filter, split_flow_datagram};
 
 use crate::config::ClientTls;
 use crate::conn::{ConnHandle, Ctl};
 use crate::endpoint::{Dish, Radio, send_subscription};
+use crate::flow::{Flow, FlowMeta, IncomingFlow, open_flow_on};
 use crate::listener::{Namespace, Route};
 use crate::pubsub::{DropCause, DropTable, TopicDrops};
 use crate::reconnect::PeerEvents;
@@ -61,6 +62,17 @@ struct DishEntry {
     filters: HashMap<String, Option<Duration>>,
     /// Chunk bytes this dish's copies may hold unwritten, over all topics.
     budget: Arc<Semaphore>,
+    /// One datagram flow per topic, opened lazily on the connection the join
+    /// arrived on; bounded by the topics the dish's filters match.
+    flows: Arc<Mutex<HashMap<Arc<str>, FlowSlot>>>,
+}
+
+/// A dish's datagram flow for one topic.
+enum FlowSlot {
+    /// The FLOW header is on its way; holds the newest datagram meanwhile,
+    /// never more than one.
+    Opening(Option<Bytes>),
+    Open(Flow),
 }
 
 impl DishEntry {
@@ -172,6 +184,7 @@ impl RadioHub {
                     conn_id,
                     filters: HashMap::new(),
                     budget: Arc::new(Semaphore::new(self.limits.subscriber_buffer_bytes)),
+                    flows: Arc::new(Mutex::new(HashMap::new())),
                 });
                 dishes.len() - 1
             }
@@ -197,9 +210,15 @@ impl RadioHub {
         let Some(index) = dishes.iter().position(|d| d.conn_id == conn_id) else {
             return false;
         };
-        let known = dishes[index].filters.remove(filter).is_some();
-        if dishes[index].filters.is_empty() {
+        let entry = &mut dishes[index];
+        let known = entry.filters.remove(filter).is_some();
+        if entry.filters.is_empty() {
             dishes.swap_remove(index);
+        } else {
+            // A topic no remaining filter matches loses its flow: dropping
+            // it closes the FLOW stream with FIN.
+            let filters = &entry.filters;
+            lock(&entry.flows).retain(|topic, _| filters.keys().any(|f| filter::matches(topic, f)));
         }
         known
     }
@@ -342,6 +361,78 @@ impl Radio {
             copies,
             drops: Arc::clone(&hub.drops),
         })
+    }
+
+    /// Sends a one-packet segment on `topic` to every joined dish, as a
+    /// datagram on that dish's flow for the topic; returns how many dishes it
+    /// was handed to.
+    ///
+    /// It takes the topic's next segment number and supersedes the stream
+    /// copies still in flight there, exactly as [`Radio::segment`] does. The
+    /// flow is opened lazily on the connection the join arrived on; while it
+    /// opens, the newest datagram waits and an older one is dropped. A dish
+    /// whose connection carries no datagrams, and a payload larger than a
+    /// dish's connection carries, are counted drops with their causes —
+    /// never turned into a stream segment, which would arrive late
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
+    /// §4.6 rule 4).
+    pub fn datagram(&self, topic: &str, payload: impl Into<Bytes>) -> Result<usize, Error> {
+        if topic.len() > MAX_TOPIC_BYTES {
+            return Err(Error::LimitExceeded);
+        }
+        let hub = self.hub();
+        let topic: Arc<str> = Arc::from(topic);
+        let number = hub.next_segment(&topic)?;
+        let payload = payload.into();
+        let mut body = Vec::with_capacity(8 + payload.len());
+        encode_varint(number, &mut body).expect("segment numbers stay below 2^62");
+        body.extend_from_slice(&payload);
+        let body = Bytes::from(body);
+
+        let mut handed = 0;
+        for entry in hub.dishes().iter() {
+            if entry.matching(&topic).is_none() {
+                continue;
+            }
+            if !entry.conn.agreed_now().is_some_and(|a| a.datagrams) {
+                hub.drops.record(&topic, DropCause::NoDatagrams);
+                continue;
+            }
+            let mut flows = lock(&entry.flows);
+            match flows.get_mut(&topic) {
+                Some(FlowSlot::Open(flow)) => match flow.send(body.clone()) {
+                    Ok(()) => handed += 1,
+                    Err(Error::TooLarge { .. }) => hub.drops.record(&topic, DropCause::TooLarge),
+                    Err(Error::DatagramsUnavailable) => {
+                        hub.drops.record(&topic, DropCause::NoDatagrams);
+                    }
+                    // The flow ended — refused, released or its connection
+                    // gone. This datagram is lost; the next one reopens.
+                    Err(_) => {
+                        flows.remove(&topic);
+                        hub.drops.record(&topic, DropCause::SubscriberQueue);
+                    }
+                },
+                Some(FlowSlot::Opening(pending)) => {
+                    if pending.replace(body.clone()).is_some() {
+                        hub.drops.record(&topic, DropCause::SubscriberQueue);
+                    }
+                    handed += 1;
+                }
+                None => {
+                    flows.insert(Arc::clone(&topic), FlowSlot::Opening(Some(body.clone())));
+                    entry.conn.exec.spawn(open_datagram_flow(
+                        ConnHandle::clone(&entry.conn),
+                        Arc::clone(&hub.path),
+                        Arc::clone(&topic),
+                        Arc::clone(&entry.flows),
+                        Arc::clone(&hub.drops),
+                    ));
+                    handed += 1;
+                }
+            }
+        }
+        Ok(handed)
     }
 
     /// The path this radio serves.
@@ -592,9 +683,79 @@ async fn run_copy(
     }
 }
 
+/// Opens a dish's datagram flow for one topic and sends the datagram that
+/// waited for it; on failure the slot goes, so the next datagram tries again.
+async fn open_datagram_flow(
+    conn: ConnHandle,
+    path: Arc<str>,
+    topic: Arc<str>,
+    flows: Arc<Mutex<HashMap<Arc<str>, FlowSlot>>>,
+    drops: Arc<DropTable>,
+) {
+    let meta = FlowMeta::default().with_topic(topic.as_ref());
+    let opened = open_flow_on(&conn, &path, &meta).await;
+    let mut flows = lock(&flows);
+    match opened {
+        Ok(flow) => {
+            // The dish may have left the topic meanwhile, which removed the
+            // slot; the new flow then just closes.
+            let Some(slot) = flows.get_mut(&topic) else {
+                return;
+            };
+            if let FlowSlot::Opening(pending) = slot
+                && let Some(body) = pending.take()
+            {
+                match flow.send(body) {
+                    Ok(()) => {}
+                    Err(Error::TooLarge { .. }) => drops.record(&topic, DropCause::TooLarge),
+                    Err(_) => drops.record(&topic, DropCause::SubscriberQueue),
+                }
+            }
+            *slot = FlowSlot::Open(flow);
+        }
+        Err(e) => {
+            if let Some(FlowSlot::Opening(Some(_))) = flows.remove(&topic) {
+                let cause = match e {
+                    Error::DatagramsUnavailable => DropCause::NoDatagrams,
+                    _ => DropCause::SubscriberQueue,
+                };
+                drops.record(&topic, cause);
+            }
+        }
+    }
+}
+
 fn reset(stream: &mut SendHalf, stop: Stop) -> Option<Stop> {
     stream.reset(codes::CANCELED);
     Some(stop)
+}
+
+/// Moves a radio's datagram segments from one flow into its dish's queue:
+/// stale ones against the newest delivered on the topic are discarded, and a
+/// full queue discards rather than waits.
+pub(crate) async fn pump_flow(route: DishRoute, flow: IncomingFlow) {
+    let Some(topic) = flow.info().topic.clone() else {
+        // A radio names its topic; a flow without one is not a segment.
+        return;
+    };
+    while let Some(datagram) = flow.recv().await {
+        let Some((segment, offset)) = split_flow_datagram(&datagram) else {
+            route.shared.overflow.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        if !route.shared.fresh(&topic, segment) {
+            route.shared.stale.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let received = Received::Datagram {
+            topic: topic.clone(),
+            segment,
+            payload: datagram.slice(offset..),
+        };
+        if route.queue.try_send(received).is_err() {
+            route.shared.overflow.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 async fn open_copy(conn: &ConnHandle, copy: &Copy) -> Result<SendHalf, Error> {
