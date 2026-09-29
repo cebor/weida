@@ -9,7 +9,7 @@ kind: code | size: 45 | status: done e467a68 | needs: []
 acceptance: `ServerTls::require_client(ClientTrust::AnyKey)` ([0035](decisions/0035-keys-proved-not-judged.md) §4.1) requires a client certificate, verifies the TLS 1.3 handshake signature, and judges nothing else; the peer is `PeerIdentity::Key` of the leaf's SPKI fingerprint. `ClientTrust::Trusted(TrustSource)` keeps today's meaning and the empty-trust refusal, and existing `require_client(Trust::…)` calls compile unchanged. A chain above `MAX_PEER_CHAIN_CERTS` (8) or `MAX_PEER_CHAIN_BYTES` (32 KiB) fails an `AnyKey` handshake. Tests: `tls::tests::any_key_bounds_the_chain_it_keeps`, and `a_binding_that_requires_any_key_proves_it_and_judges_nothing` in `crates/weida/tests/identity.rs` — an anonymous client fails with `Error::Tls`, two generated keys are admitted as two distinct peers, and a device leaf signed by a user key is admitted as its own fingerprint (open question 1).
 
 ### B-294 — The presented chain on every arrival
-kind: code | size: 45 | status: ready | needs: [B-293]
+kind: code | size: 45 | status: done c006232 | needs: [B-293]
 acceptance: [0035](decisions/0035-keys-proved-not-judged.md) §4.2: `PeerChain` (DER, leaf first, `Arc`-shared) is captured once per QUIC connection and carried on `IncomingMeta::peer_chain` and `FlowInfo::peer_chain` on both sides; `None` on the local transports, for anonymous peers, and when a `Trusted` binding's peer presented more than the bound. The B-293 test asserts the device requester's chain arrives byte-identical, two certificates, leaf first, and a generated identity's as one certificate; `an_anonymous_client_is_seen_as_nobody` asserts `None`.
 
 ### B-295 — RADIO admission and eviction
