@@ -4,6 +4,26 @@ Maintained by the loop of [LOOP.md](LOOP.md). Ordered by priority; `ready` items
 Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
+### B-293 — A binding that proves client keys and judges none
+kind: code | size: 45 | status: ready | needs: []
+acceptance: `ServerTls::require_client(ClientTrust::AnyKey)` ([0035](decisions/0035-keys-proved-not-judged.md) §4.1) requires a client certificate, verifies the TLS 1.3 handshake signature, and judges nothing else; the peer is `PeerIdentity::Key` of the leaf's SPKI fingerprint. `ClientTrust::Trusted(TrustSource)` keeps today's meaning and the empty-trust refusal, and existing `require_client(Trust::…)` calls compile unchanged. A chain above `MAX_PEER_CHAIN_CERTS` (8) or `MAX_PEER_CHAIN_BYTES` (32 KiB) fails an `AnyKey` handshake. Tests: `tls::tests::any_key_bounds_the_chain_it_keeps`, and `a_binding_that_requires_any_key_proves_it_and_judges_nothing` in `crates/weida/tests/identity.rs` — an anonymous client fails with `Error::Tls`, two generated keys are admitted as two distinct peers, and a device leaf signed by a user key is admitted as its own fingerprint (open question 1).
+
+### B-294 — The presented chain on every arrival
+kind: code | size: 45 | status: ready | needs: [B-293]
+acceptance: [0035](decisions/0035-keys-proved-not-judged.md) §4.2: `PeerChain` (DER, leaf first, `Arc`-shared) is captured once per QUIC connection and carried on `IncomingMeta::peer_chain` and `FlowInfo::peer_chain` on both sides; `None` on the local transports, for anonymous peers, and when a `Trusted` binding's peer presented more than the bound. The B-293 test asserts the device requester's chain arrives byte-identical, two certificates, leaf first, and a generated identity's as one certificate; `an_anonymous_client_is_seen_as_nobody` asserts `None`.
+
+### B-295 — RADIO admission and eviction
+kind: code | size: 60 | status: ready | needs: [B-294]
+acceptance: [0035](decisions/0035-keys-proved-not-judged.md) §4.3: `Radio::with_admission(Fn(&Join) -> bool)` is consulted before a join is recorded and on every repeat; a refusal records nothing, reserves no `max_subscriptions` slot and closes nothing; installing an admission re-screens recorded joins; `Radio::evict(&PeerIdentity, filter) -> usize` withdraws a filter from every connection of that peer and frees its slot; `weida::blocking::Radio` gains both. Tests in `crates/weida/tests/radio.rs`: `admission_refuses_a_join_silently_and_records_nothing`, `evict_withdraws_a_join_and_frees_its_subscription_slot`, `installing_an_admission_screens_joins_already_recorded`.
+
+### B-296 — Disconnect a peer by fingerprint
+kind: code | size: 30 | status: ready | needs: [B-293]
+acceptance: [0035](decisions/0035-keys-proved-not-judged.md) §4.4: `Binding::disconnect(Fingerprint) -> usize` (and `weida::blocking::Binding::disconnect`) closes every live connection of that fingerprint on the binding with `REJECTED` and returns the count, from a per-peer table of connection handles still bounded by `max_connections`. Test `disconnect_closes_every_connection_of_one_peer_and_no_other` in `crates/weida/tests/identity.rs`: two connections of one key both see `PeerEvent::Lost { cause: PeerClosed }`, another key's requester still round-trips, and an unknown fingerprint closes 0 (open question 2).
+
+### B-297 — Documents for 0035
+kind: spec | size: 30 | status: ready | needs: [B-293, B-294, B-295, B-296]
+acceptance: §5's edits to ARCHITECTURE, IMPLEMENTATION, PATTERNS, GUARANTEES, INVARIANTS, `libraries/weida-py.md` and `README.md`; both griasdi requirement documents point at what shipped; no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says a binding's client trust is a pin list and nothing else.
+
 ### B-279 — Stop advertising datagrams nobody reads
 kind: code | size: 30 | status: done ef27f72 | needs: []
 acceptance: `transport_config` sets `datagram_receive_buffer_size(None)` on both roles, so a weida QUIC connection no longer sends `max_datagram_frame_size` and `quinn` buffers nothing for a peer's datagrams ([0034](decisions/0034-late-is-lost.md) §2.3). A test over a real QUIC pair asserts `max_datagram_size()` is `None` on both sides — and fails on today's code, where it is `Some`. [INVARIANTS.md](INVARIANTS.md)'s bound list says datagrams are refused at the transport parameter until B-282 names their bounds.
