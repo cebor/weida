@@ -27,7 +27,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -40,7 +40,7 @@ use weida_protocol::{
 
 use crate::conn::{ConnHandle, Wanted, refusal_for, violation};
 use crate::listener::Route;
-use crate::stream::Incoming;
+use crate::stream::{Incoming, PeerShared};
 use crate::transport::{RecvHalf, SendHalf};
 
 /// What a sender attaches to a flow, once, when it registers it.
@@ -362,6 +362,8 @@ enum End {
     Stopped(u64),
     /// The connection went away.
     Lost(LossCause),
+    /// The dialled address is gone for good, so a redial will not come.
+    NotConnected,
 }
 
 impl End {
@@ -373,6 +375,7 @@ impl End {
             Error::LimitExceeded => End::Stopped(codes::LIMIT_EXCEEDED),
             Error::Canceled => End::Stopped(codes::CANCELED),
             Error::ConnectionLost(cause) => End::Lost(*cause),
+            Error::NotConnected => End::NotConnected,
             _ => End::Lost(LossCause::TransportError),
         }
     }
@@ -381,6 +384,7 @@ impl End {
         match self {
             End::Stopped(code) => codes::stop_reason(code).into(),
             End::Lost(cause) => Error::ConnectionLost(cause),
+            End::NotConnected => Error::NotConnected,
         }
     }
 }
@@ -479,9 +483,51 @@ impl FlowTable {
 /// [`Flow::send`] never waits: it hands the datagram to the connection and
 /// returns. Dropping the flow closes it with FIN, which the receiver sees as
 /// the end of the flow; [`Flow::abort`] resets it instead.
+///
+/// A flow opened through a dialling [`crate::Peer`] belongs to the address,
+/// not to the connection: when the connection is lost it is registered again
+/// on the redialled one, under a new id, and every datagram sent while no
+/// connection is live is dropped and counted as `not_live` — never queued,
+/// because a queued unit is a late one
+/// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.10).
 pub struct Flow {
-    binding: Mutex<Option<Binding>>,
+    binding: Arc<Mutex<Option<Binding>>>,
     counters: Arc<Counters>,
+    /// Present for a flow opened through a dialling peer.
+    redial: Option<Arc<Redial>>,
+}
+
+/// What re-registering a flow on a redialled connection needs.
+struct Redial {
+    peer: Arc<PeerShared>,
+    meta: FlowMeta,
+    /// A re-registration is under way; at most one at a time.
+    running: AtomicBool,
+    /// Why re-registration gave up, which ends the flow.
+    failed: OnceLock<End>,
+}
+
+/// Finds a live connection for `redial`'s peer and registers the flow on it
+/// again. A failure ends the flow with its error.
+async fn reregister(slot: Weak<Mutex<Option<Binding>>>, redial: Arc<Redial>) {
+    let bound = async {
+        let (conn, path) = redial.peer.pick().await?;
+        bind(&conn, &path, &redial.meta).await
+    }
+    .await;
+    match bound {
+        // A flow dropped meanwhile is gone; the new binding then closes as
+        // it drops.
+        Ok(binding) => {
+            if let Some(slot) = slot.upgrade() {
+                *lock(&slot) = Some(binding);
+            }
+        }
+        Err(e) => {
+            let _ = redial.failed.set(End::from_error(&e));
+        }
+    }
+    redial.running.store(false, Ordering::Release);
 }
 
 /// A flow's registration on one connection.
@@ -626,8 +672,26 @@ pub(crate) async fn open_flow_on(
 ) -> Result<Flow, Error> {
     let binding = bind(conn, path, meta).await?;
     Ok(Flow {
-        binding: Mutex::new(Some(binding)),
+        binding: Arc::new(Mutex::new(Some(binding))),
         counters: Arc::new(Counters::default()),
+        redial: None,
+    })
+}
+
+/// Registers a flow through a dialling peer: on its next live connection
+/// now, and on the redialled one after a loss.
+pub(crate) async fn open_flow_via(peer: &Arc<PeerShared>, meta: FlowMeta) -> Result<Flow, Error> {
+    let (conn, path) = peer.pick().await?;
+    let binding = bind(&conn, &path, &meta).await?;
+    Ok(Flow {
+        binding: Arc::new(Mutex::new(Some(binding))),
+        counters: Arc::new(Counters::default()),
+        redial: Some(Arc::new(Redial {
+            peer: Arc::clone(peer),
+            meta,
+            running: AtomicBool::new(false),
+            failed: OnceLock::new(),
+        })),
     })
 }
 
@@ -687,15 +751,27 @@ impl Binding {
         }
     }
 
-    fn close(self, how: Close) {
-        match self.carrier {
-            Carrier::Quic(mut send) => match how {
-                Close::Finish => {
-                    let _ = send.finish();
-                }
-                Close::Abort => send.reset(codes::CANCELED),
-            },
-            Carrier::Local(ring) => ring.close(how),
+    /// Ends this registration; a carrier not aborted is finished as it
+    /// drops.
+    fn close(mut self, how: Close) {
+        if let Close::Abort = how {
+            match &mut self.carrier {
+                Carrier::Quic(send) => send.reset(codes::CANCELED),
+                Carrier::Local(ring) => ring.close(Close::Abort),
+            }
+        }
+    }
+}
+
+impl Drop for Carrier {
+    /// FIN, whichever way the registration went: closed, replaced by a
+    /// redial, or orphaned by a flow dropped while it was being made.
+    fn drop(&mut self) {
+        match self {
+            Carrier::Quic(send) => {
+                let _ = send.finish();
+            }
+            Carrier::Local(ring) => ring.close(Close::Finish),
         }
     }
 }
@@ -715,7 +791,27 @@ impl Flow {
     ///   ([`Error::Canceled`]), or [`Error::ConnectionLost`].
     pub fn send(&self, payload: impl Into<Bytes>) -> Result<(), Error> {
         let payload = payload.into();
-        let binding = lock(&self.binding);
+        let mut binding = lock(&self.binding);
+        if let Some(redial) = &self.redial {
+            if let Some(end) = redial.failed.get() {
+                return Err(end.to_error());
+            }
+            let live = binding
+                .as_ref()
+                .is_some_and(|b| b.conn.conn.close_reason().is_none());
+            if !live {
+                binding.take();
+                drop(binding);
+                Counters::add(&self.counters.not_live, 1);
+                if !redial.running.swap(true, Ordering::AcqRel) {
+                    redial.peer.exec().spawn(reregister(
+                        Arc::downgrade(&self.binding),
+                        Arc::clone(redial),
+                    ));
+                }
+                return Ok(());
+            }
+        }
         let Some(binding) = binding.as_ref() else {
             return Err(Error::Canceled);
         };

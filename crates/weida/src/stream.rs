@@ -155,7 +155,7 @@ impl PeerShared {
 
     /// The next live slot, waiting for a redial when every slot is down
     /// (0031 §4.4), bounded by `RuntimeConfig::send_timeout`.
-    async fn pick(&self) -> Result<(ConnHandle, Arc<str>), Error> {
+    pub(crate) async fn pick(&self) -> Result<(ConnHandle, Arc<str>), Error> {
         let wait = self.wait_live();
         match self.runtime.config.send_timeout {
             None => wait.await,
@@ -461,8 +461,7 @@ impl Peer {
     /// `Limits::datagram_receive_bytes` above zero — and never falls back to
     /// a stream, which would deliver the units late.
     pub async fn open_flow(&self, meta: crate::FlowMeta) -> Result<crate::Flow, Error> {
-        let (conn, path) = self.shared.pick().await?;
-        crate::flow::open_flow_on(&conn, &path, &meta).await
+        crate::flow::open_flow_via(&self.shared, meta).await
     }
 
     /// Opens a bidirectional stream — an exchange — to the next peer.
@@ -744,6 +743,11 @@ fn give_up(shared: &PeerShared, id: u64, cause: LossCause, url: &Arc<str>, why: 
 }
 
 impl PeerShared {
+    /// The runtime's executor, for work a handle hands off.
+    pub(crate) fn exec(&self) -> &crate::runtime::Exec {
+        &self.runtime.exec
+    }
+
     fn outbox_is_empty(&self) -> bool {
         self.outbox
             .queue

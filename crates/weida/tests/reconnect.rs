@@ -17,7 +17,8 @@ use std::time::Duration;
 use common::Certs;
 use tokio::time::timeout;
 use weida::{
-    Binding, Error, GiveUp, Listener, LossCause, OutboxFull, PeerEvent, PeerEvents, Puller,
+    Acceptor, Binding, DEFAULT_DATAGRAM_RECEIVE_BYTES, Error, FlowMeta, GiveUp, Incoming,
+    IncomingFlow, Limits, Listener, LossCause, OutboxFull, PeerEvent, PeerEvents, Puller,
     ReconnectPolicy, Runtime, RuntimeConfig,
 };
 
@@ -453,6 +454,117 @@ async fn a_subscriber_is_resubscribed_on_the_redialled_connection() {
         assert_eq!(got, body);
     }
 
+    client.shutdown().await;
+}
+
+// --- B-288: a flow outlives a redial -----------------------------------------
+
+fn with_flows(config: RuntimeConfig) -> RuntimeConfig {
+    RuntimeConfig {
+        limits: Limits {
+            datagram_receive_bytes: DEFAULT_DATAGRAM_RECEIVE_BYTES,
+            ..Limits::default()
+        },
+        ..config
+    }
+}
+
+/// A server with flows on and an acceptor on `/v` registered **before** the
+/// port is bound, so a flow re-registered the moment the redial lands finds
+/// its path.
+async fn flow_server(certs: &Certs, addr: SocketAddr) -> (Server, Acceptor) {
+    let runtime = Runtime::new(with_flows(RuntimeConfig::default())).expect("runtime");
+    let listener = runtime.listener();
+    let acceptor = listener.acceptor("/v").expect("acceptor");
+    let binding = within(async {
+        loop {
+            match listener.bind_quic(addr, certs.server_tls()).await {
+                Ok(binding) => break binding,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await;
+    let addr = binding.local_addr();
+    let server = Server {
+        _runtime: runtime,
+        listener,
+        binding,
+        addr,
+    };
+    (server, acceptor)
+}
+
+/// Sends on `flow` every 10 ms until `incoming` receives one datagram.
+async fn until_one_arrives(flow: &weida::Flow, incoming: &IncomingFlow) {
+    within(async {
+        loop {
+            flow.send(&b"frame"[..]).expect("send");
+            if let Ok(Some(_)) =
+                tokio::time::timeout(Duration::from_millis(10), incoming.recv()).await
+            {
+                return;
+            }
+        }
+    })
+    .await;
+}
+
+async fn accepted_flow(acceptor: &Acceptor) -> IncomingFlow {
+    match within(acceptor.accept()).await.expect("accept") {
+        Incoming::Flow(flow) => flow,
+        other => panic!("expected a flow, got {other:?}"),
+    }
+}
+
+/// Claim: a flow opened through a dialling peer is registered again on the
+/// redialled connection (0034 §4.10). Every send during the outage returns
+/// `Ok`, is dropped, and is counted `not_live`; after the redial a new FLOW
+/// arrives at the restarted server and carries what is sent next.
+#[tokio::test]
+async fn a_flow_is_reopened_after_the_server_restarts() {
+    let certs = Certs::generate();
+    let (first, acceptor) = flow_server(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let addr = first.addr;
+
+    let client = Runtime::new(with_flows(client_config())).expect("client runtime");
+    let peer = client.peer(certs.client_tls());
+    let mut events = peer.events();
+    within(peer.connect(&first.url("/v")))
+        .await
+        .expect("connect");
+    assert!(matches!(
+        next_transition(&mut events).await,
+        PeerEvent::Connected { .. }
+    ));
+    let flow = within(peer.open_flow(FlowMeta::default()))
+        .await
+        .expect("open flow");
+    let incoming = accepted_flow(&acceptor).await;
+    until_one_arrives(&flow, &incoming).await;
+
+    drop((incoming, acceptor));
+    first.stop().await;
+    assert!(matches!(
+        next_transition(&mut events).await,
+        PeerEvent::Lost { .. }
+    ));
+    let before = flow.stats().not_live;
+    for _ in 0..20 {
+        flow.send(&b"into the gap"[..])
+            .expect("a send while nothing is live is a counted drop, not an error");
+    }
+    assert_eq!(flow.stats().not_live, before + 20);
+
+    let (_second, acceptor) = flow_server(&certs, addr).await;
+    assert!(matches!(
+        next_transition(&mut events).await,
+        PeerEvent::Connected { .. }
+    ));
+    let incoming = timeout(Duration::from_secs(5), accepted_flow(&acceptor))
+        .await
+        .expect("the flow was registered again within 5 s");
+    until_one_arrives(&flow, &incoming).await;
     client.shutdown().await;
 }
 
