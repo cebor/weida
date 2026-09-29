@@ -214,6 +214,12 @@ goes wrong: PAIR refuses a second peer with `LIMIT_EXCEEDED` and **keeps the fir
 counts a late reply where it arrives rather than where the caller reads, and a bus needs a
 writer per member — without one a single member that stops reading blocks the sender.
 
+**Late is lost has a vocabulary now** ([decisions/0034](decisions/0034-late-is-lost.md)). A
+datagram flow is L0's third carrier; `expire_at` and `set_priority` stop a stream on time;
+RADIO/DISH fans segments out with supersession and per-dish expiry. Of all the patterns it is
+the one that adds wire vocabulary — DATA key `13` and SUBSCRIBE key `2` — while the six above
+still add none.
+
 
 ## 3. Progress by the numbers
 

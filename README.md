@@ -1,15 +1,17 @@
 # weida
 
 weida is a messaging framework for Rust built from first principles around QUIC. Every user
-data flow maps to one QUIC stream, so a 40-byte transfer and a 40-GB transfer use the same
-protocol semantics and neither requires the payload to be materialized in memory.
+data flow maps to one QUIC stream, and a flow whose units are worthless once late maps to QUIC
+datagrams, so a 40-byte transfer and a 40-GB transfer use the same protocol semantics and
+neither requires the payload to be materialized in memory.
 
 It is built in layers. **L0** is a stream core: ZeroMQ's idea rebuilt on QUIC, whose
-primitives are unidirectional and bidirectional streams with exactly the guarantees QUIC
-gives — ordered bytes within a stream, none across streams, flow control, a transport
-delivery receipt, and cancellation by reset. **L1** is the ZeroMQ/nanomsg pattern family as
-thin wrappers over L0: Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY and BUS — the whole nanomsg
-set, and none of them adds wire vocabulary. **L2** is a RabbitMQ-analog broker,
+primitives are unidirectional and bidirectional streams and datagram flows with exactly the
+guarantees QUIC gives — ordered bytes within a stream, none across streams, flow control, a
+transport delivery receipt, and cancellation by reset. **L1** is the ZeroMQ/nanomsg pattern
+family as thin wrappers over L0: Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY and BUS — the whole
+nanomsg set — and RADIO/DISH for lossy fan-out of segments; only RADIO/DISH adds wire
+vocabulary (DATA key 13, SUBSCRIBE key 2). **L2** is a RabbitMQ-analog broker,
 `weida-broker`: queues at endpoint paths, publisher confirms, and an absolute per-subscription
 credit. Consumer acknowledgement and redelivery are the slice still to come.
 
@@ -26,11 +28,12 @@ libraries with their codecs. Nothing is on PyPI and there are no prebuilt binari
 Wire protocol version `0` is experimental and breaking changes are permitted within `0.x`.
 Phases 0-3 are implemented — the docs, the core model, the native QUIC
 transport, the in-process, `AF_UNIX` and named-pipe transports, all six patterns, the raw L0
-stream API, peer identity by public-key fingerprint, opt-in per-producer ordering and bounded
-deduplication, a bounded `drain`, the cursor back channel, a synchronous facade
-(`weida::blocking`), a `weida` binary and a Python binding (`weida-py`) — and the first two
-broker slices with them. Beside weida the repository ships **five protocol libraries**, none
-of which has weida in its picture: ZeroMQ (`weida-zmtp` + `weida-zmq` + `weida-zmq-py`), the
+stream API, datagram flows and RADIO/DISH, peer identity by public-key fingerprint, opt-in
+per-producer ordering and bounded deduplication, a bounded `drain`, the cursor back channel, a
+synchronous facade (`weida::blocking`), a `weida` binary and a Python binding (`weida-py`) —
+and the first two broker slices with them. Beside weida the repository ships **five protocol
+libraries**, none of which has weida in its picture: ZeroMQ (`weida-zmtp` + `weida-zmq` +
+`weida-zmq-py`), the
 nanomsg SP protocols (`weida-sp` + `weida-nng` + `weida-nng-py`), MQTT 5 (`weida-mqtt-codec` +
 `weida-mqtt` + `weida-mqtt-py`), AMQP 1.0 (`weida-amqp-codec` + `weida-amqp` +
 `weida-amqp-py`) and Core NATS (`weida-nats-codec` + `weida-nats` + `weida-nats-py`), each

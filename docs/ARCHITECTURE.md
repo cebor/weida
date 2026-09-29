@@ -13,14 +13,14 @@ Related: [PROTOCOL.md](PROTOCOL.md), [GUARANTEES.md](GUARANTEES.md),
 
 ## 1. What a user chooses from
 
-weida is **two stream kinds and three vocabularies over them**, plus adapters. A user picks the
+weida is **three carriers and three vocabularies over them**, plus adapters. A user picks the
 vocabulary their problem has; there is no stack to climb, and no vocabulary is further from the
 metal than another ([decisions/0024](decisions/0024-three-families-one-back-channel.md)).
 
 | Vocabulary | What it gives you | What it is made of |
 | --- | --- | --- |
-| **stream** | `Peer`, `Acceptor`, one-way transfers, exchanges, `Delivery`, cancellation | QUIC's two stream kinds, nothing invented |
-| **message** | the ZeroMQ/nanomsg family: Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY, BUS | the same two stream kinds, plus a selection policy and a name |
+| **stream** | `Peer`, `Acceptor`, one-way transfers, exchanges, datagram flows, `Delivery`, cancellation | the three carriers QUIC has — uni streams, bidi streams, datagrams — nothing invented |
+| **message** | the ZeroMQ/nanomsg family: Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY, BUS, and RADIO/DISH for lossy fan-out of segments | the same carriers, plus a selection policy and a name |
 | **broker** | queues, confirms, subscriptions, redelivery | an ordinary weida process using the two above, plus a store |
 
 The families **overlap on purpose**. Req/Rep is a stream pattern and a message pattern at once,
@@ -54,7 +54,7 @@ rather than to a private one.
                            SURVEY, BUS             redelivery
       └───────────────────────┴───────────────────────┘
                               │
-     two stream kinds + the cursor stream (uni, never mixed with payload)
+     three carriers + the cursor stream (uni, never mixed with payload)
                               │
               ┌───────────────┴────────────────────────┐
               │                                        │
@@ -83,12 +83,16 @@ name exactly that boundary — which is what they are for.
 ### L0 — the stream core
 
 The socket replacement: ZeroMQ's idea rebuilt directly on QUIC. Its primitives are exactly
-the two stream kinds QUIC has, and nothing else:
+the three carriers QUIC has, and nothing else:
 
 - a **one-way transfer** — one unidirectional stream: bytes in one direction, ended by FIN,
   with a transport receipt and refusal by stop code;
 - an **exchange** — one bidirectional stream: the **initiating half** carries a request, the
-  **reply half** carries the reply or an ERROR.
+  **reply half** carries the reply or an ERROR;
+- a **datagram flow** — one registration stream plus QUIC datagrams: the FLOW stream is the
+  flow's lifetime and its refusal, and its units travel as datagrams that are never sent late
+  on purpose and are dropped oldest-first at either end
+  ([decisions/0034](decisions/0034-late-is-lost.md) §4.2).
 
 Its guarantees are exactly QUIC's: in-order bytes within a stream, **no order across
 streams**, flow control per stream and per connection, cancellation via RESET_STREAM and
@@ -102,12 +106,13 @@ two entry points, and both layers share the transfer handles they hand out:
 | --- | --- |
 | `Peer` | the dialling side: `open()` a one-way transfer, `open_bi()` an exchange |
 | `Acceptor` | the bound side: one path, both stream kinds, one queue |
-| `Incoming` | what an `Acceptor` yields: `Stream(..)` or `Exchange(..)` |
+| `Incoming` | what an `Acceptor` yields: `Stream(..)`, `Exchange(..)` or `Flow(..)` |
 | `OutgoingTransfer` | the write half; `finish()` yields a `Delivery` |
 | `Delivery` | the transport receipt — QUIC's own fin-acknowledgement |
 | `IncomingTransfer` | the read half plus the metadata that described it |
 | `IncomingRequest` | an accepted exchange: the body plus the reply half it owes |
 | `ReplyStream` | the requester's half of an exchange; dropping it cancels the reply |
+| `Flow` / `IncomingFlow` | a datagram flow's two ends: `send` never waits, `recv` yields the oldest datagram still held; `FlowStats` and `PathStats` say what was lost and what the path looks like |
 
 ### L1 — patterns
 

@@ -387,6 +387,7 @@ Which answer a pattern needs follows from the pattern, not from the transport:
 | PAIR | **reschedule** | symmetric, so either side can re-send what it still holds; neither has a reply half to ask with, exactly as Push/Pull |
 | SURVEY | **cancel** | a survey is a partial result by construction: an answer that did not arrive before the deadline is dropped and counted, and re-asking is a new survey |
 | BUS | **cancel** | a copy is per member and best effort, as Pub/Sub's is; a member that could not take one is counted in `dropped()` |
+| RADIO/DISH | **cancel** | a segment is worth something only until its successor opens or the dish's `max_age` passes; a lost segment is a gap in the segment numbers the dish sees, counted at the radio by cause (§6.4, `crates/weida/tests/radio.rs`) |
 | a queue (L2) | **cancel on the way in, reschedule on the way out** | an inbound stream that never reached FIN was never a message, so nothing was admitted and nothing was confirmed; a delivery that broke is redelivered, because the queue still holds the message |
 
 That last row is the whole bridge from the stream primitives to the message world: **a message is
@@ -416,6 +417,26 @@ cursor over a verdict: a whole-message verdict tells an interrupted sender nothi
 tells it a number. Beside them sits the liveness bound a reliable work chain depends on:
 a bound side observes a dead dialler within `Limits::idle_timeout`
 (*`a_bound_side_observes_a_dead_dialler_within_the_idle_timeout`*).
+
+### 1.12 Expiry and priority
+
+Two sender-local mechanisms, neither on the wire
+([decisions/0034](decisions/0034-late-is-lost.md) §4.3):
+
+- **`OutgoingTransfer::expire_at(deadline)`** resets the stream with `CANCELED` if its bytes
+  are not all acknowledged by then. A `write_all` still blocked at the deadline fails with
+  `Error::Expired`; on QUIC the deadline also holds after `finish`, whose receipt then resolves
+  to `Expired`, because a reset is accepted until every byte is acknowledged; on a local
+  transport it acts until `finish`. The reader sees what it sees for any cancellation —
+  `Canceled`, never EOF (§1.5). `Expired` is **not** a definite failure: the peer may have read
+  every byte before the reset landed. `Runtime::expired_transfers` counts expiries apart from
+  cancels, which the wire cannot tell apart.
+- **`OutgoingTransfer::set_priority(i32)`** orders a stream against the other streams of **its
+  connection**, on `quinn`'s scale. A connection is one dialled path (§1.3), so priority orders
+  transfers on one path and never across paths; on a local transport, where each stream is its
+  own OS connection, it is a no-op. A datagram outranks every stream on its connection already.
+
+*`a_transfer_past_its_deadline_is_reset`.*
 
 ---
 
@@ -607,9 +628,10 @@ not a frame. Both are counted exactly like any other fan-out drop, in `dropped_o
 ## 5. Raw streams: `Peer` and `Acceptor`
 
 The L0 core, for topologies the patterns do not cover. A `Peer` dials and opens either stream
-kind; an `Acceptor` binds one path and receives both kinds as `Incoming::Stream` or
-`Incoming::Exchange`. Everything in §1 applies without translation, and nothing else is added:
-no selection policy beyond round-robin over peers, no fan-out, no filters.
+kind or a datagram flow; an `Acceptor` binds one path and receives them as `Incoming::Stream`,
+`Incoming::Exchange` or `Incoming::Flow`. Everything in §1 applies without translation, and
+nothing else is added: no selection policy beyond round-robin over peers, no fan-out, no
+filters.
 
 Two things the patterns cannot express are natural here:
 
@@ -624,15 +646,40 @@ Two things the patterns cannot express are natural here:
 
 *`acceptor_receives_both_stream_kinds`.*
 
+**A datagram flow** is the third carrier
+([decisions/0034](decisions/0034-late-is-lost.md) §4.2), for units worthless once late — a
+20 ms voice frame. `Peer::open_flow(FlowMeta)` writes a FLOW header on a stream that stays open
+as long as the flow and returns without waiting; `Flow::send(bytes)` is synchronous and never
+waits. Its errors are `TooLarge { max }` against the connection's current datagram size,
+`DatagramsUnavailable` where the capability was not agreed — both runtimes need
+`Limits::datagram_receive_bytes` above zero, and weida never substitutes a stream — or, once
+the flow has ended, the error that ended it: the acceptor's refusal (`IncomingFlow::refuse` is
+`Rejected`), its release (dropping an `IncomingFlow` is `Canceled`), `UnknownEndpoint`,
+`Unsupported`, `LimitExceeded` past `max_flows`, or `ConnectionLost`. The receiver holds each
+flow's unread datagrams in a drop-oldest ring of `flow_queue_bytes`, so a slow consumer loses
+its oldest and stalls nobody; `FlowStats` counts both ends and `PathStats` passes the path's
+RTT, window and loss through. A flow opened through a dialling `Peer` survives a redial:
+sends while no connection is live are dropped and counted `not_live`, never queued, and the
+flow is registered again on the new connection. On the local transports the FLOW stream carries
+the datagrams itself, at most 1200 bytes each.
+
+*`a_flow_carries_datagrams_to_an_acceptor`, `a_flow_to_an_unregistered_path_is_refused`,
+`a_stalled_flow_loses_its_oldest_and_its_sibling_keeps_receiving`,
+`a_runtime_without_datagrams_cannot_open_a_flow`,
+`a_payload_over_the_datagram_size_is_too_large` (`crates/weida/tests/flows.rs`);
+`flow_over_quic`, `flow_over_inproc`, `flow_over_unix`;
+`a_flow_is_reopened_after_the_server_restarts`.*
+
 ---
 
-## 6. PAIR, SURVEY and BUS
+## 6. PAIR, SURVEY, BUS and RADIO/DISH
 
-The three patterns [ARCHITECTURE.md](ARCHITECTURE.md) §6b mapped and nobody had built. All
-three are built now, and all three added **no wire vocabulary**: a `Paired` talks to a bare
-`Peer` and `Acceptor` on the same path, a `Respondent`'s route is byte-for-byte a replier's, a
-`BusMember`'s is a puller's. Router/Dealer stay emergent (§2); connecting publishers and
-binding pushers stay recorded deferrals.
+The three patterns [ARCHITECTURE.md](ARCHITECTURE.md) §6b mapped and nobody had built, and the
+one ZeroMQ named for lossy fan-out. The first three are built and added **no wire
+vocabulary**: a `Paired` talks to a bare `Peer` and `Acceptor` on the same path, a
+`Respondent`'s route is byte-for-byte a replier's, a `BusMember`'s is a puller's. RADIO/DISH
+adds two keys, DATA `13` and SUBSCRIBE `2` (§6.4). Router/Dealer stay emergent (§2); connecting
+publishers and binding pushers stay recorded deferrals.
 
 ### 6.1 PAIR
 
@@ -759,6 +806,47 @@ holds a reference to the same `Bytes`, so *n* members cost one copy rather than 
 `a_body_above_the_fan_out_budget_is_refused_rather_than_dropped_for_everyone`,
 `a_slow_member_is_bounded_in_bytes_before_its_message_count`.*
 
+### 6.4 RADIO/DISH
+
+Lossy fan-out of **segments** ([decisions/0034](decisions/0034-late-is-lost.md) §4.6). A
+segment is a unit whose parts may depend on each other and on nothing earlier — a voice frame, a
+raw preview frame, a video GOP — and it is the join point. `Listener::radio` binds,
+`Runtime::dish` connects.
+
+| | `Radio` | `Dish` |
+| --- | --- | --- |
+| Compatible peer | `Dish` | `Radio` |
+| Direction | binds | connects |
+| Send/receive pattern | `segment(topic)` → `write` chunks → `finish`; `datagram(topic, bytes)` for a one-packet segment | `join(filter, max_age)` / `leave(filter)`, then `recv` → `Received::Segment` (a streamed `IncomingTransfer`) or `Received::Datagram { topic, segment, payload }` |
+| Topics | Pub/Sub's namespace and filter grammar, unchanged — ZeroMQ's "group" is weida's topic | |
+| Outgoing routing | every dish whose filter matches, one copy each; the dish set is fixed when a segment opens | — |
+| Carrier | a stream segment: one uni DATA stream per dish, numbered in DATA key `13`; a datagram segment: a flow per `(dish, topic)`, opened lazily on the connection the join arrived on, its payload `varint segment` + bytes | |
+| Supersession | opening segment *n+1* on a topic **resets every copy of segment *n* on that topic still unacknowledged**, with `CANCELED`, and no other topic's | a segment not newer than the newest it delivered on that topic is discarded on arrival, so segments never go backwards |
+| Expiry | per dish: its `max_age` on the radio's clock from the segment's open; the smallest among the dish's matching filters applies | states `max_age` when it joins (SUBSCRIBE key `2`) |
+| Backpressure | never blocks: `write` hands a chunk to every copy with room in its dish's `subscriber_buffer_bytes` and its 64-chunk queue, and a copy without room loses the segment | a full receive queue discards on arrival and never blocks the connection |
+| Delivery | `BestEffort`; a lost segment is a gap in the numbers the dish sees, counted per topic and cause in `dropped_on`: budget, queue, no parked connection, superseded, expired, too large, no datagrams | `stale()` and `overflow()` count the dish's own discards |
+| Late joiner | receives the next segment; nothing is retained for it | |
+
+Five rules a caller can get wrong. **Supersession holds nothing**: it discards bytes already in
+flight, which is why it is not the coalescer [0016](decisions/0016-conflation.md) §4.2 refused.
+**A late joiner waits for the next segment**: a segment is the only point a decoder can start
+from, so the application chooses how often a join point comes. **Topics under one radio share
+one connection per dish**, so a datagram outranks a stream segment there and stream segments
+can be ordered with §1.12's priority; topics on different paths cannot be ordered at all. **A
+datagram segment is never turned into a stream segment**: a dish whose connection did not agree
+the datagram capability loses it with the cause named. **Joins are subscriptions**: they ride
+SUBSCRIBE and UNSUBSCRIBE, count against `max_subscriptions`, and a redialling dish re-sends
+them. Segments never carry DATA key `6`, so `PerProducer(reassemble)` passes them straight
+through and never holds one for a predecessor that was superseded on purpose.
+
+*`a_stalled_dish_loses_old_segments_while_a_fast_one_gets_every_one`,
+`a_segment_supersedes_only_its_own_topic`,
+`a_joiner_receives_the_next_segment_and_nothing_earlier`,
+`a_dish_max_age_expires_its_copy`, `a_datagram_segment_reaches_every_joined_dish`,
+`a_dish_without_datagrams_is_a_named_drop`,
+`a_datagram_larger_than_the_dish_carries_is_counted_too_large`
+(`crates/weida/tests/radio.rs`).*
+
 ---
 
 ## 7. Choosing
@@ -777,3 +865,5 @@ holds a reference to the same `Bytes`, so *n* members cost one copy rather than 
 | every member to hear every other member | BUS | *n* × (*n* − 1) deliveries, no relay, counted drops (§6.3) |
 | a reliable verdict without an exchange | any pattern, plus `TransferMeta::with_report` | a cursor rides a stream of its own, so a Push transfer stays one unidirectional stream and still gets an answer (§1.11, [decisions/0024](decisions/0024-three-families-one-back-channel.md) §4.4a) |
 | how far the far end got, not merely whether it finished | cursors, via `OutgoingTransfer::cursors` | a whole-message verdict tells an interrupted sender nothing; an absolute offset tells it a number (§1.11) |
+| voice, or any unit worthless once late, to one peer | a datagram flow | never sent late, never waits, loses its oldest at a bound, and says what it lost (§5) |
+| a live feed to many, where a laggard should lose the old unit rather than the new one | RADIO/DISH | supersession and per-dish expiry reset what is late, and a joiner starts at the next segment (§6.4) |

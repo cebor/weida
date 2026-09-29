@@ -22,7 +22,7 @@ commit `5a20f15` (`0.1.0-alpha.2`); file and line references are given so a
 reader can check rather than trust. Everything under "Proposal" is design, not
 fact.
 
-**Answered by [decisions/0034](../decisions/0034-late-is-lost.md) (provisional).** The flow of
+**Answered by [decisions/0034](../decisions/0034-late-is-lost.md) (accepted; shipped in 270d588).** The flow of
 "Proposal" becomes an L0 carrier with frame kind `7` and capability code `1`, answering open
 question 1 for a frame kind and open question 4 with a redial that re-opens flows; beyond this
 document, the note adds RADIO/DISH so that the SFU's fan-out has a name in weida's vocabulary

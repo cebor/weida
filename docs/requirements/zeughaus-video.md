@@ -239,7 +239,7 @@ Nothing above blocks stage 1. Items 1 and 2 are what turn stage 3 from a
 workaround into the natural shape.
 
 **Stage 3 and open question 2 now have a lossy shape:
-[decisions/0034](../decisions/0034-late-is-lost.md) (provisional).** RADIO/DISH carries a frame
+[decisions/0034](../decisions/0034-late-is-lost.md) (accepted; shipped in 270d588).** RADIO/DISH carries a frame
 as a stream *segment*: a new segment resets the unacknowledged copies of the previous one on the
 same topic, so conflation holds nothing and needs no producer-side slot; a viewer states a
 `max_age` when it joins; and a compressed GOP is one segment read as it arrives, never

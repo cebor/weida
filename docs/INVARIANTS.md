@@ -8,12 +8,18 @@ is amended here first, with the reasoning recorded, and only then is code change
 
 ## Invariant list
 
-Reproduced verbatim from master doc §77.
+Reproduced verbatim from master doc §77, with one amendment marked where it stands: the fourth
+item gained its second half with [decisions/0034](decisions/0034-late-is-lost.md) §4.11, which
+the owner accepted before any code depended on it. The flow is still one stream in every sense
+the invariant protects — lifetime, refusal, cancellation, accounting — and the datagrams are the
+carrier QUIC provides for units a stream would deliver late.
 
 - Endpoint paths are opaque identifiers.
 - All user payloads may remain streams end-to-end.
 - Core transport does not require payload materialization.
-- One data flow maps naturally to one transport stream where the transport supports it.
+- One data flow maps naturally to one transport stream where the transport supports it; a flow
+  of units that are worthless once late maps to one registration stream and the transport's
+  datagrams (amended by [0034](decisions/0034-late-is-lost.md) §4.11).
 - Replies and ACKs are distinct concepts.
 - Transfer-related control messages do not require a permanent control stream.
 - All guarantees are defined against the immediate next hop.
@@ -36,8 +42,8 @@ the subsystem they constrain does not exist.
 | Invariant | Enforced by |
 | --- | --- |
 | Endpoint paths are opaque identifiers | `EndpointAddr` in `weida-core` validates bytes and length only; the endpoint namespace in `weida` is a flat map keyed by the exact path string — no splitting, no prefix match, no wildcards. Pub/Sub **topics** are a separate namespace from endpoint paths and are matched by a segmented pattern with a one-segment and a trailing rest wildcard; that matching is on topics only and never on paths ([PROTOCOL.md](PROTOCOL.md) §6.4, [decisions/0007](decisions/0007-topic-namespace.md) §4.1-§4.2). The invariant was **considered for amendment and deliberately kept**: hierarchy lives in the topic namespace so that endpoint dispatch keeps exactly one answer per (stream kind, path) [0007 §4.1] |
-| All user payloads may remain streams end-to-end | DATA payload is opaque bytes until FIN, with no internal framing ([PROTOCOL.md](PROTOCOL.md) §4) |
-| One data flow maps naturally to one transport stream | one QUIC stream per data flow, and QUIC's two stream kinds are the only primitives: a one-way transfer is one unidirectional stream; a Req/Rep exchange is one bidirectional stream whose initiating half carries the request and whose reply half carries the reply or an ERROR; HELLO, SUBSCRIBE and UNSUBSCRIBE each get their own short stream ([PROTOCOL.md](PROTOCOL.md) §4). On the in-process transport the same holds by construction and more literally: a stream *is* a channel pair, minted when the stream is opened and dead with it ([decisions/0010](decisions/0010-local-transport.md) §4.2) |
+| All user payloads may remain streams end-to-end | DATA payload is opaque bytes until FIN, with no internal framing ([PROTOCOL.md](PROTOCOL.md) §4). A datagram payload is materialized by definition and bounded by `max_datagram_size` (about a kilobyte); every payload larger than one packet still may be, and under RADIO is, a stream end to end ([decisions/0034](decisions/0034-late-is-lost.md) §4.11) |
+| One data flow maps naturally to one transport stream | one QUIC stream per data flow, and QUIC's three carriers are the only primitives: a one-way transfer is one unidirectional stream; a Req/Rep exchange is one bidirectional stream whose initiating half carries the request and whose reply half carries the reply or an ERROR; HELLO, SUBSCRIBE and UNSUBSCRIBE each get their own short stream ([PROTOCOL.md](PROTOCOL.md) §4); a datagram flow is one FLOW stream that lives as long as the flow, with its units in QUIC DATAGRAM frames ([PROTOCOL.md](PROTOCOL.md) §6.8, §6.9). On the in-process transport the same holds by construction and more literally: a stream *is* a channel pair, minted when the stream is opened and dead with it ([decisions/0010](decisions/0010-local-transport.md) §4.2); on every local transport a flow's datagrams ride its FLOW stream as length-prefixed records ([PROTOCOL.md](PROTOCOL.md) §2.1) |
 | Replies and ACKs are distinct concepts | held by construction: the v0 core has no application acknowledgement to confuse a reply with. The only delivery signal is `Delivery`, a sender-side transport receipt backed by QUIC's fin-acknowledgement, which is never a frame on the wire and never arrives where a reply would. Accepted / Stored / Replicated / Processed are reserved for the L2 broker ([GUARANTEES.md](GUARANTEES.md) §6) |
 | Transfer-related control messages do not require a permanent control stream | ERROR rides the reply half of the exchange it concerns and nothing else; SUBSCRIBE and UNSUBSCRIBE are short header-only unidirectional streams; cancellation is `RESET_STREAM`/`STOP_SENDING`, transport signalling rather than a message. There is no multiplexed control stream anywhere in the implementation. A **control connection** per peer ([decisions/0002](decisions/0002-control-and-bulk-separation.md), [PROTOCOL.md](PROTOCOL.md) §2.5) does not violate this: the invariant forbids a permanent multiplexed control *stream* inside a connection, where transfer frames would queue behind each other; a separate connection carries its own short streams and is what removes that coupling rather than creating it |
 | All guarantees are defined against the immediate next hop | `Delivery::delivered()` is defined strictly as "the next hop's **transport** acknowledged every byte and the FIN", explicitly not "the application read it" — quinn's `stopped()` says "although not necessarily the processing of it" ([GUARANTEES.md](GUARANTEES.md), [FAILURE_MODEL.md](FAILURE_MODEL.md) §4) |
@@ -64,8 +70,22 @@ scratch of a draining reader — is a constant. The publisher's per-topic drop t
 table: the topics are the local application's, not a peer's, but a table nobody bounds is a
 table that grows for the life of the process, and at the cap a topic's drops count in the
 aggregate only. A weida QUIC connection advertises no `max_datagram_frame_size` and buffers no
-datagrams, so a peer's datagrams are refused at the transport parameter until flows are
-enabled per profile and their bounds are named (B-279, B-282).
+datagrams unless its profile enables flows (B-279).
+
+**Datagram flows and RADIO/DISH are inside it with a cap each**
+([decisions/0034](decisions/0034-late-is-lost.md)). `datagram_receive_bytes` (0 by default,
+64 KiB when enabled) bounds what `quinn` holds unread per connection, oldest first;
+`max_flows` (64) bounds the inbound flows one connection may hold, each a FLOW stream the peer
+opened; `flow_queue_bytes` (16 KiB) bounds the unread datagrams of one flow, charged with a
+per-entry overhead so a flood of empty datagrams is bounded by the same cap; `flow_early_bytes`
+(4 KiB) and `flow_early_hold` (1 s) bound the one per-connection ring a peer can fill with
+datagrams for ids it never registered; a local flow's record is refused above 1200 bytes, so a
+reader's reassembly buffer is a constant. On the dish side the `newest` table that discards stale
+segments holds at most `max_sequence_scopes` topics — an untracked topic is simply never stale —
+and its queue is `endpoint_queue` deep and discards rather than blocks. On the radio side the
+topic table is capped at `max_sequence_scopes` too and evicts only a topic with no copy in
+flight, a copy holds at most 64 queued chunks, and a dish's chunks are charged against
+`subscriber_buffer_bytes` exactly as a subscriber's are.
 
 **The sender outbox and the event stream of
 [0031](decisions/0031-transparent-redial-and-the-sender-outbox.md) are inside it too, and
