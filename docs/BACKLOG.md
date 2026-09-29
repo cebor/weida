@@ -5,7 +5,7 @@ Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
 ### B-279 — Stop advertising datagrams nobody reads
-kind: code | size: 30 | status: ready | needs: []
+kind: code | size: 30 | status: done ef27f72 | needs: []
 acceptance: `transport_config` sets `datagram_receive_buffer_size(None)` on both roles, so a weida QUIC connection no longer sends `max_datagram_frame_size` and `quinn` buffers nothing for a peer's datagrams ([0034](decisions/0034-late-is-lost.md) §2.3). A test over a real QUIC pair asserts `max_datagram_size()` is `None` on both sides — and fails on today's code, where it is `Some`. [INVARIANTS.md](INVARIANTS.md)'s bound list says datagrams are refused at the transport parameter until B-282 names their bounds.
 note: found while writing 0034: `quinn`'s default is `Some(1 250 000)` bytes per connection, drop-oldest, never read by weida — bounded, unnamed, and about 80 MB per peer at `max_connections_per_peer`.
 
