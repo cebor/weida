@@ -68,6 +68,7 @@ mod ordering;
 mod pipe;
 mod pool;
 mod pubsub;
+mod radio;
 mod reconnect;
 mod runtime;
 mod stream;
@@ -81,9 +82,9 @@ pub use config::{ClientTls, Discovery, Identity, Pem, RuntimeConfig, ServerTls, 
 pub use cursor::{CursorSet, Cursors, Reported, Reporter};
 pub use drain::Drained;
 pub use endpoint::{
-    Bus, BusMember, Endpoint, Pair, Paired, Pattern, Pub, Publisher, Pull, Puller, Push, Pusher,
-    Rep, Replier, Req, Requester, Respond, Respondent, Sub, Subscriber, Survey, SurveyRun,
-    Surveyor,
+    Bus, BusMember, Cast, Dish, Endpoint, Pair, Paired, Pattern, Pub, Publisher, Pull, Puller,
+    Push, Pusher, Radio, Rep, Replier, Req, Requester, Respond, Respondent, Sub, Subscriber,
+    Survey, SurveyRun, Surveyor, Tune,
 };
 pub use flow::{Flow, FlowInfo, FlowMeta, FlowStats, IncomingFlow};
 pub use identity::{FilesOptions, IdentityEvent, IdentityEvents, IdentitySource, TrustSource};
@@ -94,6 +95,7 @@ pub use listener::UnixBinding;
 pub use listener::{Binding, Listener, LocalBinding};
 pub use ordering::Gap;
 pub use pubsub::{FanOut, TopicDrops};
+pub use radio::{Received, Segment};
 pub use weida_core::{
     Address, EndpointAddr, Error, ErrorCode, Fingerprint, InprocAddr, Limits, LocalPrincipal,
     LossCause, PeerIdentity, PipeAddr, Result, StopReason, TraceContext, UnixAddr,

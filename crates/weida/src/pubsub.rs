@@ -87,11 +87,14 @@ struct SubEntry {
 
 /// Why a published copy was dropped.
 ///
-/// Three causes, because they are three different failures: the first two
-/// are the subscriber not keeping up, the third is the *local* transport
-/// having no connection to carry the copy
+/// The first three are fan-out's: two are the subscriber not keeping up, the
+/// third is the *local* transport having no connection to carry the copy
 /// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
-/// §4.4).
+/// §4.4). The other four are RADIO's
+/// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.6):
+/// a copy reset because its successor opened, because the dish's `max_age`
+/// passed, a datagram too large for the dish's connection, and a dish whose
+/// connection carries no datagrams.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum DropCause {
     /// The subscriber's byte budget (`Limits::subscriber_buffer_bytes`) had
@@ -103,6 +106,10 @@ pub(crate) enum DropCause {
     /// transport's fan-out rides connections the subscriber parks, and the
     /// pool was empty.
     NoParkedConnection,
+    /// A newer segment opened on the topic while this copy was unacknowledged.
+    Superseded,
+    /// The dish's `max_age` passed before this copy was acknowledged.
+    Expired,
 }
 
 /// What a publisher dropped on one topic, by cause.
@@ -116,21 +123,39 @@ pub struct TopicDrops {
     pub subscriber_queue: u64,
     /// Copies dropped because the subscriber had parked no connection.
     pub no_parked_connection: u64,
+    /// RADIO copies reset because a newer segment opened on the topic.
+    pub superseded: u64,
+    /// RADIO copies reset because the dish's `max_age` passed.
+    pub expired: u64,
+    /// RADIO datagram segments larger than the dish's connection carries.
+    pub too_large: u64,
+    /// RADIO datagram segments for a dish that carries no datagrams.
+    pub no_datagrams: u64,
 }
 
 impl TopicDrops {
-    /// All three causes summed.
+    /// Every cause summed.
     pub fn total(&self) -> u64 {
-        self.subscriber_budget + self.subscriber_queue + self.no_parked_connection
+        self.subscriber_budget
+            + self.subscriber_queue
+            + self.no_parked_connection
+            + self.superseded
+            + self.expired
+            + self.too_large
+            + self.no_datagrams
     }
 }
 
-/// Three counters, one per cause.
+/// One counter per cause.
 #[derive(Default)]
 struct Causes {
     budget: AtomicU64,
     queue: AtomicU64,
     no_parked: AtomicU64,
+    superseded: AtomicU64,
+    expired: AtomicU64,
+    too_large: AtomicU64,
+    no_datagrams: AtomicU64,
 }
 
 impl Causes {
@@ -139,6 +164,8 @@ impl Causes {
             DropCause::SubscriberBudget => &self.budget,
             DropCause::SubscriberQueue => &self.queue,
             DropCause::NoParkedConnection => &self.no_parked,
+            DropCause::Superseded => &self.superseded,
+            DropCause::Expired => &self.expired,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -149,6 +176,10 @@ impl Causes {
             subscriber_budget: self.budget.load(Ordering::Relaxed),
             subscriber_queue: self.queue.load(Ordering::Relaxed),
             no_parked_connection: self.no_parked.load(Ordering::Relaxed),
+            superseded: self.superseded.load(Ordering::Relaxed),
+            expired: self.expired.load(Ordering::Relaxed),
+            too_large: self.too_large.load(Ordering::Relaxed),
+            no_datagrams: self.no_datagrams.load(Ordering::Relaxed),
         }
     }
 }
@@ -162,14 +193,14 @@ impl Causes {
 /// table that grows for the life of the process. At the cap a new topic's
 /// drops count in the total and nowhere else, which is what the sequencer
 /// does with a new scope.
-struct DropTable {
+pub(crate) struct DropTable {
     total: AtomicU64,
     per_topic: RwLock<HashMap<Arc<str>, Causes>>,
     max_topics: usize,
 }
 
 impl DropTable {
-    fn new(max_topics: usize) -> DropTable {
+    pub(crate) fn new(max_topics: usize) -> DropTable {
         DropTable {
             total: AtomicU64::new(0),
             per_topic: RwLock::new(HashMap::new()),
@@ -182,7 +213,7 @@ impl DropTable {
     /// A read lock on the common path — the topic is known — and a write
     /// lock only for a topic's first drop. Drops are the exceptional path of
     /// fan-out, so neither is on the path of a message that gets through.
-    fn record(&self, topic: &Arc<str>, cause: DropCause) {
+    pub(crate) fn record(&self, topic: &Arc<str>, cause: DropCause) {
         self.total.fetch_add(1, Ordering::Relaxed);
         {
             let table = self.per_topic.read().expect("drop table poisoned");
@@ -201,14 +232,19 @@ impl DropTable {
         }
     }
 
-    fn on_topic(&self, topic: &str) -> Option<TopicDrops> {
+    /// Every drop on the path, over topics and causes.
+    pub(crate) fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn on_topic(&self, topic: &str) -> Option<TopicDrops> {
         let table = self.per_topic.read().expect("drop table poisoned");
         table
             .get_key_value(topic)
             .map(|(topic, causes)| causes.snapshot(topic))
     }
 
-    fn by_topic(&self) -> Vec<TopicDrops> {
+    pub(crate) fn by_topic(&self) -> Vec<TopicDrops> {
         let table = self.per_topic.read().expect("drop table poisoned");
         table
             .iter()

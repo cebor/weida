@@ -49,6 +49,13 @@ pub(crate) enum Route {
         /// The one connection this endpoint talks to.
         owner: Arc<PairOwner>,
     },
+    /// A radio. Like a publisher it accepts nothing inbound; its SUBSCRIBE
+    /// frames are dish joins, kept in the hub
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.6).
+    Radio(Arc<crate::radio::RadioHub>),
+    /// A dish: inbound segments are checked against the newest delivered on
+    /// their topic and queued without ever blocking the connection.
+    Dish(crate::radio::DishRoute),
 }
 
 /// The single peer of a paired endpoint, and the claim on it.
@@ -269,6 +276,8 @@ impl Route {
                 owner: Arc::clone(owner),
             },
             Route::Pub => Route::Pub,
+            Route::Radio(hub) => Route::Radio(Arc::clone(hub)),
+            Route::Dish(route) => Route::Dish(route.clone()),
         }
     }
 }
@@ -507,6 +516,29 @@ impl Listener {
             path,
             Arc::clone(&self.inner.subs),
             self.inner.runtime.config.limits.subscriber_buffer_bytes,
+        )))
+    }
+
+    /// Registers a radio for `path`
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.6).
+    ///
+    /// RADIO binds and DISH connects. Nothing inbound is accepted on the
+    /// path; a dish's join is a SUBSCRIBE and lands in the radio. Every
+    /// segment goes to the dishes joined when it opens, and each copy is
+    /// dropped rather than waited for: by its successor, by the dish's
+    /// `max_age`, or by the dish's byte budget.
+    pub fn radio(&self, path: &str) -> Result<crate::Radio, Error> {
+        validate_endpoint_path(path)?;
+        let hub = Arc::new(crate::radio::RadioHub::new(
+            path,
+            self.inner.runtime.config.limits,
+        ));
+        self.inner
+            .namespace
+            .register(path, Route::Radio(Arc::clone(&hub)))?;
+        Ok(Endpoint::from_state(crate::radio::RadioState::new(
+            hub,
+            Arc::clone(&self.inner.namespace),
         )))
     }
 

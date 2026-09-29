@@ -63,6 +63,11 @@ pub enum Survey {}
 pub enum Respond {}
 /// A member of a BUS.
 pub enum Bus {}
+/// The sending side of RADIO/DISH: lossy fan-out of segments
+/// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.6).
+pub enum Cast {}
+/// The receiving side of RADIO/DISH.
+pub enum Tune {}
 
 impl sealed::Sealed for Req {}
 impl Pattern for Req {
@@ -114,6 +119,16 @@ impl Pattern for Bus {
     type State = BusState;
 }
 
+impl sealed::Sealed for Cast {}
+impl Pattern for Cast {
+    type State = crate::radio::RadioState;
+}
+
+impl sealed::Sealed for Tune {}
+impl Pattern for Tune {
+    type State = crate::radio::DishState;
+}
+
 /// A typed messaging endpoint.
 pub struct Endpoint<P: Pattern> {
     state: P::State,
@@ -122,6 +137,11 @@ pub struct Endpoint<P: Pattern> {
 impl<P: Pattern> Endpoint<P> {
     pub(crate) fn from_state(state: P::State) -> Endpoint<P> {
         Endpoint { state }
+    }
+
+    /// The pattern's state, for patterns implemented outside this module.
+    pub(crate) fn state(&self) -> &P::State {
+        &self.state
     }
 }
 
@@ -141,6 +161,12 @@ pub type Subscriber = Endpoint<Sub>;
 pub type Paired = Endpoint<Pair>;
 /// One member of a BUS.
 pub type BusMember = Endpoint<Bus>;
+/// The sending half of RADIO/DISH: binds, and fans segments out to every
+/// dish whose filter matches, dropping rather than waiting.
+pub type Radio = Endpoint<Cast>;
+/// The receiving half of RADIO/DISH: connects, joins topics, and receives
+/// the newest segment of each.
+pub type Dish = Endpoint<Tune>;
 
 /// State of a requester.
 pub struct ReqState {
@@ -530,7 +556,7 @@ impl Attach for SubAttach {
                 .cloned()
                 .collect();
             for filter in filters {
-                send_subscription(conn, FrameKind::Subscribe, path, &filter).await?;
+                send_subscription(conn, FrameKind::Subscribe, path, &filter, None).await?;
             }
             Ok(())
         })
@@ -717,19 +743,24 @@ impl Subscriber {
 
     async fn broadcast(&self, kind: FrameKind, filter: &str) -> Result<(), Error> {
         for (conn, path) in self.state.peer.live_peers() {
-            send_subscription(&conn, kind, &path, filter).await?;
+            send_subscription(&conn, kind, &path, filter, None).await?;
         }
         Ok(())
     }
 }
 
-async fn send_subscription(
+pub(crate) async fn send_subscription(
     conn: &ConnHandle,
     kind: FrameKind,
     path: &str,
     filter: &str,
+    max_age_ms: Option<u64>,
 ) -> Result<(), Error> {
-    let header = SubscriptionHeader::new(path, filter).encode();
+    let header = SubscriptionHeader {
+        max_age_ms,
+        ..SubscriptionHeader::new(path, filter)
+    }
+    .encode();
     write_control(&conn.conn, kind, &header).await
 }
 

@@ -379,6 +379,7 @@ mod tests {
             report: Vec::new(),
             report_mode: weida::ReportMode::default(),
             report_id: None,
+            segment: None,
         }
     }
 

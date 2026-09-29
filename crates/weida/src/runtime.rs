@@ -323,6 +323,21 @@ impl Runtime {
         ))
     }
 
+    /// Creates a dish that dials on `tls`'s terms
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.6).
+    ///
+    /// Arrived segments queue up to `endpoint_queue`; a dish that stops
+    /// reading loses segments at the radio — superseded, expired or over its
+    /// budget — and never stalls it, and one whose queue is full discards on
+    /// arrival.
+    pub fn dish(&self, tls: impl Into<ClientTls>) -> crate::Dish {
+        Endpoint::from_state(crate::radio::DishState::new(
+            Arc::clone(&self.inner),
+            Arc::new(tls.into()),
+            self.inner.config.endpoint_queue,
+        ))
+    }
+
     /// Creates a dialling paired endpoint on `tls`'s terms.
     ///
     /// The other half is [`crate::Listener::pair`]. PAIR is symmetric above

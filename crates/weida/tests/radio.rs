@@ -1,0 +1,214 @@
+//! RADIO/DISH: lossy fan-out of segments
+//! ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.6).
+//!
+//! Each test defends one row of the note's table: supersession resets the
+//! copies a dish could not take in time and no other topic's, a late joiner
+//! starts at the next segment, and a dish's `max_age` expires its copy
+//! without touching another dish's.
+
+mod common;
+
+use std::time::Duration;
+
+use common::Server;
+use tokio::sync::mpsc;
+use weida::{Dish, Limits, Radio, Received, Runtime};
+
+/// Generous ceiling: every assertion below should settle well inside it.
+const DEADLINE: Duration = Duration::from_secs(10);
+
+async fn within<F: Future>(f: F) -> F::Output {
+    tokio::time::timeout(DEADLINE, f)
+        .await
+        .expect("operation timed out")
+}
+
+/// A client runtime whose streams stall after 64 KiB unread: a dish on it
+/// that never reads leaves a large segment unacknowledged.
+fn stalling(server: &Server) -> Runtime {
+    server.client_runtime_with(Limits {
+        stream_receive_window: 64 * 1024,
+        ..Limits::default()
+    })
+}
+
+async fn joined(
+    server: &Server,
+    runtime: &Runtime,
+    filter: &str,
+    max_age: Option<Duration>,
+) -> Dish {
+    let dish = runtime.dish(server.trust());
+    within(dish.join(filter, max_age)).await.expect("join");
+    within(dish.connect(&server.url("/r")))
+        .await
+        .expect("connect");
+    dish
+}
+
+/// Waits until the radio holds `n` dishes: a join is a SUBSCRIBE, and the
+/// radio learns it when that stream is dispatched.
+async fn dishes(radio: &Radio, n: usize) {
+    within(async {
+        while radio.dish_count() < n {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
+fn segment_of(received: Received) -> weida::IncomingTransfer {
+    match received {
+        Received::Segment(transfer) => transfer,
+        other => panic!("expected a stream segment, got {other:?}"),
+    }
+}
+
+fn send(radio: &Radio, topic: &str, chunks: usize, chunk: usize) {
+    let mut segment = radio.segment(topic).expect("segment");
+    for _ in 0..chunks {
+        segment.write(vec![0x42; chunk]).expect("write");
+    }
+    segment.finish();
+}
+
+#[tokio::test]
+async fn a_stalled_dish_loses_old_segments_while_a_fast_one_gets_every_one() {
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let fast_rt = server.client_runtime();
+    let fast = joined(&server, &fast_rt, "v", None).await;
+    let stalled_rt = stalling(&server);
+    let stalled = joined(&server, &stalled_rt, "v", None).await;
+    dishes(&radio, 2).await;
+
+    const SEGMENT: usize = 256 * 1024;
+    let (read_tx, mut read_rx) = mpsc::channel(1);
+    let reader = tokio::spawn(async move {
+        for _ in 0..20 {
+            let transfer = segment_of(fast.recv().await.expect("recv"));
+            let number = transfer.meta().segment.expect("a segment number");
+            let body = transfer
+                .collect(2 * SEGMENT)
+                .await
+                .expect("a whole segment");
+            assert_eq!(body.len(), SEGMENT);
+            read_tx.send(number).await.expect("report");
+        }
+    });
+    // The fast dish reads each segment before the next opens, so nothing of
+    // its own is ever in flight when supersession strikes.
+    for n in 0..20u64 {
+        send(&radio, "v", 16, 16 * 1024);
+        assert_eq!(within(read_rx.recv()).await, Some(n));
+    }
+    within(reader).await.expect("reader");
+
+    let drops = radio.dropped_on("v").expect("drops on v");
+    assert!(drops.superseded >= 1, "{drops:?}");
+
+    // The stalled dish holds a queue of segments, and at most the newest of
+    // them can still be read whole: every older copy was reset.
+    let mut whole = 0;
+    while let Ok(Ok(received)) =
+        tokio::time::timeout(Duration::from_millis(200), stalled.recv()).await
+    {
+        if let Ok(body) = within(segment_of(received).collect(2 * SEGMENT)).await {
+            assert_eq!(body.len(), SEGMENT);
+            whole += 1;
+        }
+    }
+    assert!(whole <= 1, "{whole} whole segments at the stalled dish");
+    fast_rt.shutdown().await;
+    stalled_rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_segment_supersedes_only_its_own_topic() {
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = stalling(&server);
+    let dish = joined(&server, &runtime, "", None).await;
+    dishes(&radio, 1).await;
+
+    // 256 KiB on `a` cannot be acknowledged through a 64 KiB window the dish
+    // does not read, so its copy is in flight while `b` moves on.
+    send(&radio, "a", 16, 16 * 1024);
+    for _ in 0..5 {
+        send(&radio, "b", 1, 1024);
+    }
+    let mut on_a = None;
+    while on_a.is_none() {
+        let transfer = segment_of(within(dish.recv()).await.expect("recv"));
+        if transfer.meta().topic.as_deref() == Some("a") {
+            on_a = Some(transfer);
+        }
+    }
+    let body = within(on_a.expect("a").collect(1 << 20))
+        .await
+        .expect("the copy on `a` survived five segments on `b`");
+    assert_eq!(body.len(), 256 * 1024);
+    assert_eq!(radio.dropped_on("a").map_or(0, |d| d.superseded), 0);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_joiner_receives_the_next_segment_and_nothing_earlier() {
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    for _ in 0..3 {
+        send(&radio, "v", 1, 1024);
+    }
+    let runtime = server.client_runtime();
+    let dish = joined(&server, &runtime, "v", None).await;
+    dishes(&radio, 1).await;
+    send(&radio, "v", 1, 1024);
+
+    let first = segment_of(within(dish.recv()).await.expect("recv"));
+    assert_eq!(first.meta().segment, Some(3));
+    assert_eq!(first.meta().topic.as_deref(), Some("v"));
+    assert_eq!(within(first.collect(4096)).await.expect("body").len(), 1024);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), dish.recv())
+            .await
+            .is_err(),
+        "nothing was retained for the joiner"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_dish_max_age_expires_its_copy() {
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let stalled_rt = stalling(&server);
+    let _stalled = joined(&server, &stalled_rt, "v", Some(Duration::from_millis(200))).await;
+    let draining_rt = server.client_runtime();
+    let draining = joined(&server, &draining_rt, "v", None).await;
+    dishes(&radio, 2).await;
+
+    const SEGMENT: usize = 4 << 20;
+    let reader = tokio::spawn(async move {
+        segment_of(draining.recv().await.expect("recv"))
+            .collect(2 * SEGMENT)
+            .await
+    });
+    send(&radio, "v", 16, SEGMENT / 16);
+
+    let body = within(reader)
+        .await
+        .expect("reader")
+        .expect("a whole segment");
+    assert_eq!(body.len(), SEGMENT);
+    within(async {
+        while radio.dropped_on("v").map_or(0, |d| d.expired) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let drops = radio.dropped_on("v").expect("drops on v");
+    assert_eq!(drops.expired, 1, "{drops:?}");
+    assert_eq!(drops.superseded, 0, "{drops:?}");
+    stalled_rt.shutdown().await;
+    draining_rt.shutdown().await;
+}

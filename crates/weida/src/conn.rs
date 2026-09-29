@@ -810,6 +810,22 @@ async fn handle_subscription(
     };
     let conn_id = ctx.conn.stable_id();
 
+    // A radio's joins: kept in its hub, and counted against the same
+    // per-connection `max_subscriptions` as every other subscription.
+    if let Some(Route::Radio(hub)) = ctx.namespace.lookup(&header.endpoint) {
+        if subscribe {
+            let joined = hub.join(ctx, header.filter, header.max_age_ms, || {
+                subs.reserve(conn_id)
+            });
+            if joined.is_err() {
+                return too_many_subscriptions(ctx);
+            }
+        } else if hub.leave(conn_id, &header.filter) {
+            subs.release(conn_id);
+        }
+        return Ok(());
+    }
+
     if let Some(Route::Raw(queue)) = ctx.namespace.lookup(&header.endpoint) {
         if subscribe {
             if subs.reserve(conn_id).is_err() {
@@ -1085,16 +1101,24 @@ pub(crate) fn refusal_for(route: Option<&Route>, wanted: Wanted) -> Option<Refus
     match (route, wanted) {
         (None, _) => Some(Refusal::UNKNOWN),
         (Some(Route::Raw(_)), _) => None,
-        (Some(Route::Transfer(_) | Route::Pair { .. }), Wanted::OneWay) => None,
+        (Some(Route::Transfer(_) | Route::Pair { .. } | Route::Dish(_)), Wanted::OneWay) => None,
         (Some(Route::Request(_)), Wanted::Exchange) => None,
         // Everything else is the path being served by the wrong shape: a
-        // publisher takes nothing inbound, a replier takes no one-way
-        // transfer, and a pair carries one-way transfers in both directions so
-        // an exchange aimed at one is the same category error as an exchange
-        // aimed at a puller.
-        (Some(Route::Request(_) | Route::Transfer(_) | Route::Pub | Route::Pair { .. }), _) => {
-            Some(Refusal::WRONG_SHAPE)
-        }
+        // publisher or a radio takes nothing inbound, a replier takes no
+        // one-way transfer, and a pair carries one-way transfers in both
+        // directions so an exchange aimed at one is the same category error
+        // as an exchange aimed at a puller.
+        (
+            Some(
+                Route::Request(_)
+                | Route::Transfer(_)
+                | Route::Pub
+                | Route::Pair { .. }
+                | Route::Radio(_)
+                | Route::Dish(_),
+            ),
+            _,
+        ) => Some(Refusal::WRONG_SHAPE),
     }
 }
 
@@ -1142,8 +1166,12 @@ async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
                 e.0.refuse(Refusal::UNKNOWN.stop);
             }
         }
+        // A segment: the dish discards one older than the newest it
+        // delivered on the topic, and never blocks the connection on a full
+        // queue (0034 §4.6).
+        Some(Route::Dish(route)) => crate::radio::deliver_segment(&route, transfer),
         // `refusal_for` above already refused these.
-        Some(Route::Request(_) | Route::Pub) | None => {
+        Some(Route::Request(_) | Route::Pub | Route::Radio(_)) | None => {
             unreachable!("refusal_for refuses every route that cannot serve a one-way transfer")
         }
     }
@@ -1226,7 +1254,10 @@ async fn handle_bi(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> Resu
             }
         }
         // `refusal_for` above already refused these.
-        Some(Route::Transfer(_) | Route::Pub | Route::Pair { .. }) | None => {
+        Some(
+            Route::Transfer(_) | Route::Pub | Route::Pair { .. } | Route::Radio(_) | Route::Dish(_),
+        )
+        | None => {
             unreachable!("refusal_for refuses every route that cannot serve an exchange")
         }
     }
@@ -1309,6 +1340,18 @@ mod tests {
         for route in [transfer(), pair(), request(), Route::Pub] {
             assert_eq!(
                 refusal_for(Some(&route), Wanted::Flow),
+                Some(Refusal::WRONG_SHAPE)
+            );
+        }
+
+        // A radio, like a publisher, takes nothing inbound.
+        let radio = Route::Radio(Arc::new(crate::radio::RadioHub::new(
+            "/r",
+            weida_core::Limits::default(),
+        )));
+        for wanted in [Wanted::OneWay, Wanted::Exchange, Wanted::Flow] {
+            assert_eq!(
+                refusal_for(Some(&radio), wanted),
                 Some(Refusal::WRONG_SHAPE)
             );
         }

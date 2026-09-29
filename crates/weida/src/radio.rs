@@ -1,0 +1,852 @@
+//! RADIO/DISH: lossy fan-out of segments
+//! ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.6).
+//!
+//! A **segment** is a unit whose parts may depend on each other and on
+//! nothing earlier — a voice frame, a raw preview frame, a video GOP — and it
+//! is the join point. A radio numbers segments per topic (DATA key `13`) and
+//! sends each to every dish joined when it opens, one uni stream per dish.
+//! Three things drop a copy, and each is counted per topic and cause:
+//!
+//! * **supersession** — opening segment *n+1* resets every copy of segment
+//!   *n* on that topic that is still unacknowledged, and no other topic's;
+//! * **expiry** — a dish's `max_age`, on the radio's clock from the segment's
+//!   open;
+//! * **the dish's budget** — `subscriber_buffer_bytes` of chunks a copy may
+//!   hold unwritten, and a queue of [`COPY_QUEUE`] chunks.
+//!
+//! Nothing here ever waits for a dish: [`Segment::write`] is synchronous.
+//! The dish in turn discards a segment older than the newest it delivered
+//! on the topic and never blocks its connection on a full queue.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use bytes::Bytes;
+use tokio::sync::{Notify, Semaphore, mpsc};
+use weida_core::{Error, Limits};
+use weida_protocol::header::limits::MAX_TOPIC_BYTES;
+use weida_protocol::{DataHeader, FrameKind, codes, filter};
+
+use crate::config::ClientTls;
+use crate::conn::{ConnHandle, Ctl};
+use crate::endpoint::{Dish, Radio, send_subscription};
+use crate::listener::{Namespace, Route};
+use crate::pubsub::{DropCause, DropTable, TopicDrops};
+use crate::reconnect::PeerEvents;
+use crate::runtime::RuntimeInner;
+use crate::stream::{Attach, Peer};
+use crate::transfer::{IncomingTransfer, write_data_preamble};
+use crate::transport::SendHalf;
+
+/// Chunks one copy may hold queued for its writer task. The real bound is
+/// the dish's byte budget; this keeps the channel from growing on tiny
+/// chunks.
+pub(crate) const COPY_QUEUE: usize = 64;
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// --- radio side ---------------------------------------------------------------
+
+/// One joined dish: a connection and the filters it joined with.
+struct DishEntry {
+    conn: ConnHandle,
+    conn_id: usize,
+    /// Filter to `max_age`.
+    filters: HashMap<String, Option<Duration>>,
+    /// Chunk bytes this dish's copies may hold unwritten, over all topics.
+    budget: Arc<Semaphore>,
+}
+
+impl DishEntry {
+    /// The dish's latency budget for `topic`: the smallest `max_age` among
+    /// the matching filters that carry one. `None` for no match at all.
+    fn matching(&self, topic: &str) -> Option<Option<Duration>> {
+        let mut matched = false;
+        let mut max_age: Option<Duration> = None;
+        for (f, age) in &self.filters {
+            if filter::matches(topic, f) {
+                matched = true;
+                if let Some(age) = age {
+                    max_age = Some(max_age.map_or(*age, |m| m.min(*age)));
+                }
+            }
+        }
+        matched.then_some(max_age)
+    }
+}
+
+/// One copy's control: how its segment's successor or its end reach it.
+#[derive(Default)]
+struct CopyCtl {
+    superseded: AtomicBool,
+    acked: AtomicBool,
+    ended: AtomicBool,
+    notify: Notify,
+}
+
+impl CopyCtl {
+    fn supersede(&self) {
+        if !self.acked.load(Ordering::Acquire) {
+            self.superseded.store(true, Ordering::Release);
+            self.notify.notify_one();
+        }
+    }
+
+    fn live(&self) -> bool {
+        !self.ended.load(Ordering::Acquire)
+    }
+
+    async fn superseded(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.superseded.load(Ordering::Acquire) {
+                return;
+            }
+            // `notify_one` leaves a permit when nobody waits, so a
+            // supersession between the check and this await is not lost.
+            notified.await;
+        }
+    }
+}
+
+/// Per-topic segment numbering and the copies the next segment supersedes.
+#[derive(Default)]
+struct TopicState {
+    next: u64,
+    live: Vec<Arc<CopyCtl>>,
+}
+
+/// Everything a radio path holds: its dishes, its topics and its drops.
+pub(crate) struct RadioHub {
+    path: Arc<str>,
+    dishes: Mutex<Vec<DishEntry>>,
+    /// Per-topic state, and the number a topic created after an eviction
+    /// starts from.
+    topics: Mutex<(HashMap<Arc<str>, TopicState>, u64)>,
+    drops: Arc<DropTable>,
+    limits: Limits,
+}
+
+impl RadioHub {
+    pub(crate) fn new(path: &str, limits: Limits) -> RadioHub {
+        RadioHub {
+            path: Arc::from(path),
+            dishes: Mutex::new(Vec::new()),
+            topics: Mutex::new((HashMap::new(), 0)),
+            drops: Arc::new(DropTable::new(limits.max_sequence_scopes)),
+            limits,
+        }
+    }
+
+    /// The dish table, with every entry whose connection closed removed.
+    fn dishes(&self) -> MutexGuard<'_, Vec<DishEntry>> {
+        let mut dishes = lock(&self.dishes);
+        dishes.retain(|d| d.conn.conn.close_reason().is_none());
+        dishes
+    }
+
+    /// Records a join. `reserve` counts a new filter against the
+    /// connection's `max_subscriptions` and runs only for a filter the dish
+    /// did not already hold; a repeated join updates its `max_age`.
+    pub(crate) fn join(
+        &self,
+        ctx: &ConnHandle,
+        filter: String,
+        max_age_ms: Option<u64>,
+        reserve: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let conn_id = ctx.conn.stable_id();
+        let max_age = max_age_ms.map(Duration::from_millis);
+        let mut dishes = self.dishes();
+        let index = match dishes.iter().position(|d| d.conn_id == conn_id) {
+            Some(index) => index,
+            None => {
+                dishes.push(DishEntry {
+                    conn: ConnHandle::clone(ctx),
+                    conn_id,
+                    filters: HashMap::new(),
+                    budget: Arc::new(Semaphore::new(self.limits.subscriber_buffer_bytes)),
+                });
+                dishes.len() - 1
+            }
+        };
+        let entry = &mut dishes[index];
+        if let Some(age) = entry.filters.get_mut(&filter) {
+            *age = max_age;
+            return Ok(());
+        }
+        if let Err(e) = reserve() {
+            if entry.filters.is_empty() {
+                dishes.swap_remove(index);
+            }
+            return Err(e);
+        }
+        entry.filters.insert(filter, max_age);
+        Ok(())
+    }
+
+    /// Withdraws a join; `true` when the dish held the filter.
+    pub(crate) fn leave(&self, conn_id: usize, filter: &str) -> bool {
+        let mut dishes = self.dishes();
+        let Some(index) = dishes.iter().position(|d| d.conn_id == conn_id) else {
+            return false;
+        };
+        let known = dishes[index].filters.remove(filter).is_some();
+        if dishes[index].filters.is_empty() {
+            dishes.swap_remove(index);
+        }
+        known
+    }
+
+    /// Takes the next number on `topic` and resets every unacknowledged copy
+    /// of the previous segment there.
+    fn next_segment(&self, topic: &Arc<str>) -> Result<u64, Error> {
+        let mut guard = lock(&self.topics);
+        let (topics, floor) = &mut *guard;
+        if !topics.contains_key(topic) && topics.len() >= self.limits.max_sequence_scopes {
+            // The table is the application's, but still bounded: a topic
+            // with no copy in flight has nothing to supersede and can go.
+            let idle = topics.iter_mut().find_map(|(topic, state)| {
+                state.live.retain(|c| c.live());
+                state
+                    .live
+                    .is_empty()
+                    .then(|| (Arc::clone(topic), state.next))
+            });
+            match idle {
+                Some((idle, next)) => {
+                    topics.remove(&idle);
+                    // A topic that comes back must not restart below what a
+                    // dish already delivered on it, or the dish would
+                    // discard it as stale: numbering resumes above every
+                    // number an evicted topic reached.
+                    *floor = (*floor).max(next);
+                }
+                None => return Err(Error::LimitExceeded),
+            }
+        }
+        let state = topics
+            .entry(Arc::clone(topic))
+            .or_insert_with(|| TopicState {
+                next: *floor,
+                live: Vec::new(),
+            });
+        let number = state.next;
+        state.next += 1;
+        for copy in state.live.drain(..) {
+            copy.supersede();
+        }
+        Ok(number)
+    }
+
+    fn track(&self, topic: &Arc<str>, copy: &Arc<CopyCtl>) {
+        if let Some(state) = lock(&self.topics).0.get_mut(topic) {
+            state.live.push(Arc::clone(copy));
+        }
+    }
+}
+
+/// State of a radio.
+///
+/// Clonable: a clone is another handle to the same radio, and the path is
+/// released when the last one goes.
+#[derive(Clone)]
+pub struct RadioState {
+    hub: Arc<RadioHub>,
+    _claim: Arc<Claim>,
+}
+
+/// The radio's claim on its path, released with the last handle.
+struct Claim {
+    namespace: Arc<Namespace>,
+    path: Arc<str>,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.namespace.unregister(&self.path);
+    }
+}
+
+impl RadioState {
+    pub(crate) fn new(hub: Arc<RadioHub>, namespace: Arc<Namespace>) -> RadioState {
+        let path = Arc::clone(&hub.path);
+        RadioState {
+            hub,
+            _claim: Arc::new(Claim { namespace, path }),
+        }
+    }
+}
+
+impl Clone for Radio {
+    fn clone(&self) -> Radio {
+        Radio::from_state(self.state().clone())
+    }
+}
+
+impl Radio {
+    fn hub(&self) -> &RadioHub {
+        &self.state().hub
+    }
+
+    /// Opens segment *n+1* on `topic` as one stream per joined dish, and
+    /// resets every copy of segment *n* on that topic still unacknowledged.
+    ///
+    /// The dish set is fixed here: a dish that joins while the segment is in
+    /// flight receives the next one. Zero dishes is not an error. Fails with
+    /// [`Error::LimitExceeded`] for a topic above 256 bytes, or when
+    /// `max_sequence_scopes` topics all have a copy in flight.
+    pub fn segment(&self, topic: &str) -> Result<Segment, Error> {
+        if topic.len() > MAX_TOPIC_BYTES {
+            return Err(Error::LimitExceeded);
+        }
+        let hub = self.hub();
+        let topic: Arc<str> = Arc::from(topic);
+        let number = hub.next_segment(&topic)?;
+        let mut copies = Vec::new();
+        for entry in hub.dishes().iter() {
+            let Some(max_age) = entry.matching(&topic) else {
+                continue;
+            };
+            let (tx, rx) = mpsc::channel(COPY_QUEUE);
+            let ctl = Arc::new(CopyCtl::default());
+            hub.track(&topic, &ctl);
+            let deadline = max_age.map(|age| Box::pin(entry.conn.exec.sleep(age)));
+            entry.conn.exec.spawn(segment_copy(
+                ConnHandle::clone(&entry.conn),
+                Copy {
+                    path: Arc::clone(&hub.path),
+                    topic: Arc::clone(&topic),
+                    number,
+                    ctl: Arc::clone(&ctl),
+                    budget: Arc::clone(&entry.budget),
+                    drops: Arc::clone(&hub.drops),
+                },
+                rx,
+                deadline,
+            ));
+            copies.push(CopyTx {
+                tx,
+                budget: Arc::clone(&entry.budget),
+            });
+        }
+        Ok(Segment {
+            number,
+            topic,
+            copies,
+            drops: Arc::clone(&hub.drops),
+        })
+    }
+
+    /// The path this radio serves.
+    pub fn path(&self) -> &str {
+        &self.hub().path
+    }
+
+    /// Dishes currently joined.
+    pub fn dish_count(&self) -> usize {
+        self.hub().dishes().len()
+    }
+
+    /// Copies dropped, over topics and causes.
+    pub fn dropped(&self) -> u64 {
+        self.hub().drops.total()
+    }
+
+    /// What was dropped on `topic`, by cause, or `None` if nothing was. The
+    /// table holds at most `Limits::max_sequence_scopes` topics.
+    pub fn dropped_on(&self, topic: &str) -> Option<TopicDrops> {
+        self.hub().drops.on_topic(topic)
+    }
+
+    /// Every topic that lost a copy, with its counts by cause.
+    pub fn drops(&self) -> Vec<TopicDrops> {
+        self.hub().drops.by_topic()
+    }
+}
+
+/// What a copy's writer task is told.
+enum SegItem {
+    Chunk(Bytes),
+    Finish,
+}
+
+/// The sending side of one copy, kept by the [`Segment`].
+struct CopyTx {
+    tx: mpsc::Sender<SegItem>,
+    budget: Arc<Semaphore>,
+}
+
+/// One segment, open on every dish that was joined when it opened.
+///
+/// [`Segment::write`] never waits: a dish without room for a chunk loses
+/// the segment, counted. Dropping a segment without [`Segment::finish`]
+/// resets every copy, so no dish mistakes a partial segment for a whole one.
+pub struct Segment {
+    number: u64,
+    topic: Arc<str>,
+    copies: Vec<CopyTx>,
+    drops: Arc<DropTable>,
+}
+
+impl Segment {
+    /// This segment's number on its topic.
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+
+    /// The topic this segment belongs to.
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    /// Hands `chunk` to every copy still open; returns how many that is.
+    ///
+    /// A copy whose dish has no budget or queue room left for the chunk is
+    /// dropped and counted, and its dish loses this segment. Fails with
+    /// [`Error::LimitExceeded`] for a chunk above 4 GiB, which no budget can
+    /// account.
+    pub fn write(&mut self, chunk: impl Into<Bytes>) -> Result<usize, Error> {
+        let chunk = chunk.into();
+        let len = u32::try_from(chunk.len()).map_err(|_| Error::LimitExceeded)?;
+        let (topic, drops) = (&self.topic, &self.drops);
+        self.copies.retain(|copy| {
+            let Ok(permit) = copy.budget.try_acquire_many(len) else {
+                drops.record(topic, DropCause::SubscriberBudget);
+                return false;
+            };
+            match copy.tx.try_send(SegItem::Chunk(chunk.clone())) {
+                Ok(()) => {
+                    // Given back by the writer once the bytes are written.
+                    permit.forget();
+                    true
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    drops.record(topic, DropCause::SubscriberQueue);
+                    false
+                }
+                // The copy already ended — superseded or expired — and its
+                // task counted why.
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        });
+        Ok(self.copies.len())
+    }
+
+    /// Ends the segment on every copy still open; returns how many that is.
+    pub fn finish(mut self) -> usize {
+        let copies = std::mem::take(&mut self.copies);
+        let mut finished = 0;
+        for copy in copies {
+            match copy.tx.try_send(SegItem::Finish) {
+                Ok(()) => finished += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.drops.record(&self.topic, DropCause::SubscriberQueue);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
+        }
+        finished
+    }
+}
+
+impl fmt::Debug for Segment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Segment")
+            .field("topic", &self.topic)
+            .field("number", &self.number)
+            .field("copies", &self.copies.len())
+            .finish()
+    }
+}
+
+/// What a copy's task needs besides its channel and deadline.
+struct Copy {
+    path: Arc<str>,
+    topic: Arc<str>,
+    number: u64,
+    ctl: Arc<CopyCtl>,
+    budget: Arc<Semaphore>,
+    drops: Arc<DropTable>,
+}
+
+/// How a copy's race ended.
+enum Stop {
+    Superseded,
+    Expired,
+}
+
+async fn expiry(deadline: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+    match deadline {
+        Some(sleep) => sleep.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Writes one dish's copy of one segment, racing every step against
+/// supersession and the dish's deadline.
+async fn segment_copy(
+    conn: ConnHandle,
+    copy: Copy,
+    mut rx: mpsc::Receiver<SegItem>,
+    mut deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+) {
+    let stop = run_copy(&conn, &copy, &mut rx, &mut deadline).await;
+    match stop {
+        Some(Stop::Superseded) => copy.drops.record(&copy.topic, DropCause::Superseded),
+        Some(Stop::Expired) => copy.drops.record(&copy.topic, DropCause::Expired),
+        None => {}
+    }
+    copy.ctl.ended.store(true, Ordering::Release);
+    // Chunks still queued were charged to the dish's budget and will never
+    // be written: give their bytes back.
+    rx.close();
+    while let Ok(item) = rx.try_recv() {
+        if let SegItem::Chunk(chunk) = item {
+            copy.budget.add_permits(chunk.len());
+        }
+    }
+}
+
+async fn run_copy(
+    conn: &ConnHandle,
+    copy: &Copy,
+    rx: &mut mpsc::Receiver<SegItem>,
+    deadline: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+) -> Option<Stop> {
+    let ctl = &copy.ctl;
+    let opened = tokio::select! {
+        biased;
+        () = ctl.superseded() => return Some(Stop::Superseded),
+        () = expiry(deadline) => return Some(Stop::Expired),
+        opened = open_copy(conn, copy) => opened,
+    };
+    let mut stream = match opened {
+        Ok(stream) => stream,
+        Err(Error::NoParkedConnection) => {
+            copy.drops
+                .record(&copy.topic, DropCause::NoParkedConnection);
+            return None;
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "a segment copy could not be opened");
+            return None;
+        }
+    };
+    loop {
+        let item = tokio::select! {
+            biased;
+            () = ctl.superseded() => return reset(&mut stream, Stop::Superseded),
+            () = expiry(deadline) => return reset(&mut stream, Stop::Expired),
+            item = rx.recv() => item,
+        };
+        match item {
+            Some(SegItem::Chunk(chunk)) => {
+                let written = tokio::select! {
+                    biased;
+                    () = ctl.superseded() => Err(Stop::Superseded),
+                    () = expiry(deadline) => Err(Stop::Expired),
+                    written = stream.write_all(&chunk) => Ok(written),
+                };
+                copy.budget.add_permits(chunk.len());
+                match written {
+                    Ok(Ok(())) => {}
+                    // The dish refused the stream or went away.
+                    Ok(Err(_)) => return None,
+                    Err(stop) => return reset(&mut stream, stop),
+                }
+            }
+            Some(SegItem::Finish) => {
+                if stream.finish().is_err() {
+                    return None;
+                }
+                // Until the dish's transport holds every byte, the copy can
+                // still be superseded or expire: a reset is accepted after
+                // FIN until then.
+                let stopped = stream.stopped();
+                return tokio::select! {
+                    biased;
+                    () = ctl.superseded() => reset(&mut stream, Stop::Superseded),
+                    () = expiry(deadline) => reset(&mut stream, Stop::Expired),
+                    receipt = stopped => {
+                        if matches!(receipt, Ok(None)) {
+                            ctl.acked.store(true, Ordering::Release);
+                        }
+                        None
+                    }
+                };
+            }
+            // The segment was dropped unfinished, or this copy was dropped
+            // for its budget or queue, which the writer already counted.
+            None => {
+                stream.reset(codes::CANCELED);
+                return None;
+            }
+        }
+    }
+}
+
+fn reset(stream: &mut SendHalf, stop: Stop) -> Option<Stop> {
+    stream.reset(codes::CANCELED);
+    Some(stop)
+}
+
+async fn open_copy(conn: &ConnHandle, copy: &Copy) -> Result<SendHalf, Error> {
+    let header = DataHeader {
+        topic: Some(copy.topic.to_string()),
+        segment: Some(copy.number),
+        ..DataHeader::addressed(copy.path.as_ref())
+    };
+    let mut stream = conn.open_uni().await?;
+    write_data_preamble(&mut stream, &header).await?;
+    Ok(stream)
+}
+
+// --- dish side ----------------------------------------------------------------
+
+/// What a dish receives.
+#[derive(Debug)]
+pub enum Received {
+    /// A stream segment: read it as it arrives. Its topic and number are on
+    /// [`crate::IncomingMeta::topic`] and [`crate::IncomingMeta::segment`].
+    Segment(IncomingTransfer),
+    /// A datagram segment: one packet, whole.
+    Datagram {
+        /// The topic it was sent on.
+        topic: String,
+        /// Its segment number on that topic.
+        segment: u64,
+        /// The payload.
+        payload: Bytes,
+    },
+}
+
+/// The dish's per-topic memory of the newest segment it delivered, and its
+/// counters.
+pub(crate) struct DishShared {
+    newest: Mutex<HashMap<String, u64>>,
+    stale: AtomicU64,
+    overflow: AtomicU64,
+    max_topics: usize,
+}
+
+impl DishShared {
+    /// `true` when `segment` is newer than every segment delivered on
+    /// `topic`, which it then becomes. At the table's cap an untracked topic
+    /// is always fresh: the check needs memory, and memory is bounded.
+    fn fresh(&self, topic: &str, segment: u64) -> bool {
+        let mut newest = lock(&self.newest);
+        match newest.get_mut(topic) {
+            Some(last) if segment <= *last => false,
+            Some(last) => {
+                *last = segment;
+                true
+            }
+            None => {
+                if newest.len() < self.max_topics {
+                    newest.insert(topic.to_owned(), segment);
+                }
+                true
+            }
+        }
+    }
+}
+
+/// A dish's route on its connection's namespace.
+#[derive(Clone)]
+pub(crate) struct DishRoute {
+    queue: mpsc::Sender<Received>,
+    shared: Arc<DishShared>,
+}
+
+/// Delivers one arrived stream segment to its dish, or discards it: stale
+/// against the newest delivered on its topic, or with the dish's queue full.
+/// Never blocks the connection.
+pub(crate) fn deliver_segment(route: &DishRoute, transfer: IncomingTransfer) {
+    let meta = transfer.meta();
+    let (Some(topic), Some(segment)) = (meta.topic.as_deref(), meta.segment) else {
+        transfer.refuse(codes::UNSUPPORTED);
+        return;
+    };
+    if !route.shared.fresh(topic, segment) {
+        route.shared.stale.fetch_add(1, Ordering::Relaxed);
+        transfer.refuse(codes::CANCELED);
+        return;
+    }
+    if let Err(e) = route.queue.try_send(Received::Segment(transfer)) {
+        route.shared.overflow.fetch_add(1, Ordering::Relaxed);
+        if let Received::Segment(transfer) = e.into_inner() {
+            transfer.refuse(codes::CANCELED);
+        }
+    }
+}
+
+/// What a dish does on every connection it gets: fill the reverse pool
+/// where the transport needs one, claim its path, and re-send its joins.
+struct DishAttach {
+    joins: Arc<Mutex<HashMap<String, Option<Duration>>>>,
+    route: DishRoute,
+}
+
+impl Attach for DishAttach {
+    fn attach<'a>(
+        &'a self,
+        conn: &'a ConnHandle,
+        path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async move {
+            if conn.conn.needs_reverse_pool() && conn.conn.park_reverse().await? == 0 {
+                return Err(Error::Unsupported);
+            }
+            conn.namespace
+                .register(path, Route::Dish(self.route.clone()))?;
+            if conn.conn.needs_reverse_pool() {
+                let maintaining = ConnHandle::clone(conn);
+                conn.exec
+                    .spawn(async move { maintaining.conn.maintain_reverse().await });
+            }
+            let joins: Vec<(String, Option<Duration>)> = lock(&self.joins)
+                .iter()
+                .map(|(f, age)| (f.clone(), *age))
+                .collect();
+            for (filter, max_age) in joins {
+                send_subscription(
+                    conn,
+                    FrameKind::Subscribe,
+                    path,
+                    &filter,
+                    max_age.map(millis),
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+fn millis(age: Duration) -> u64 {
+    u64::try_from(age.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// State of a dish.
+pub struct DishState {
+    peer: Peer,
+    joins: Arc<Mutex<HashMap<String, Option<Duration>>>>,
+    queue: tokio::sync::Mutex<mpsc::Receiver<Received>>,
+    shared: Arc<DishShared>,
+}
+
+impl DishState {
+    pub(crate) fn new(runtime: Arc<RuntimeInner>, tls: Arc<ClientTls>, depth: usize) -> DishState {
+        let (queue_tx, queue) = mpsc::channel(depth);
+        let joins = Arc::new(Mutex::new(HashMap::new()));
+        let shared = Arc::new(DishShared {
+            newest: Mutex::new(HashMap::new()),
+            stale: AtomicU64::new(0),
+            overflow: AtomicU64::new(0),
+            max_topics: runtime.config.limits.max_sequence_scopes,
+        });
+        let attach = DishAttach {
+            joins: Arc::clone(&joins),
+            route: DishRoute {
+                queue: queue_tx,
+                shared: Arc::clone(&shared),
+            },
+        };
+        DishState {
+            peer: Peer::with_attach(runtime, tls, Some(Arc::new(attach))),
+            joins,
+            queue: tokio::sync::Mutex::new(queue),
+            shared,
+        }
+    }
+}
+
+impl Dish {
+    /// Connects to a radio at `url` and joins every topic joined so far. A
+    /// redial joins again: what was sent in between is gone.
+    pub async fn connect(&self, url: &str) -> Result<(), Error> {
+        self.state().peer.connect(url).await
+    }
+
+    /// Number of connected radios.
+    pub fn peer_count(&self) -> usize {
+        self.state().peer.peer_count()
+    }
+
+    /// The event stream of this dish's addresses; see [`Peer::events`].
+    pub fn events(&self) -> PeerEvents {
+        self.state().peer.events()
+    }
+
+    /// Joins every topic `filter` matches, with the latency budget `max_age`:
+    /// a copy the radio cannot get acknowledged within it, on the radio's
+    /// clock from the segment's open, is reset and counted. The filter
+    /// grammar is Pub/Sub's. Joining a filter again updates its `max_age`.
+    pub async fn join(&self, filter: &str, max_age: Option<Duration>) -> Result<(), Error> {
+        weida_protocol::filter::validate(filter)?;
+        lock(&self.state().joins).insert(filter.to_owned(), max_age);
+        for (conn, path) in self.state().peer.live_peers() {
+            send_subscription(
+                &conn,
+                FrameKind::Subscribe,
+                &path,
+                filter,
+                max_age.map(millis),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Leaves a filter. An unknown filter is ignored.
+    pub async fn leave(&self, filter: &str) -> Result<(), Error> {
+        if lock(&self.state().joins).remove(filter).is_none() {
+            return Ok(());
+        }
+        for (conn, path) in self.state().peer.live_peers() {
+            send_subscription(&conn, FrameKind::Unsubscribe, &path, filter, None).await?;
+        }
+        Ok(())
+    }
+
+    /// Waits for the next segment.
+    pub async fn recv(&self) -> Result<Received, Error> {
+        let mut queue = self.state().queue.lock().await;
+        queue.recv().await.ok_or(Error::NotConnected)
+    }
+
+    /// Segments discarded on arrival because a newer one on the same topic
+    /// had already been delivered.
+    pub fn stale(&self) -> u64 {
+        self.state().shared.stale.load(Ordering::Relaxed)
+    }
+
+    /// Segments discarded on arrival because the receive queue was full.
+    pub fn overflow(&self) -> u64 {
+        self.state().shared.overflow.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for DishState {
+    fn drop(&mut self) {
+        // Best effort, through the connection actor for the same reason a
+        // subscriber's drop is: a destructor may run with no reactor.
+        let joins: Vec<String> = lock(&self.joins).keys().cloned().collect();
+        for (conn, path) in self.peer.live_peers() {
+            conn.namespace.unregister(&path);
+            for filter in &joins {
+                conn.notify(Ctl::SendUnsubscribe {
+                    path: Arc::clone(&path),
+                    filter: filter.clone(),
+                });
+            }
+        }
+    }
+}
