@@ -170,6 +170,19 @@ pipe reader that stops therefore reads and discards the rest of the stream, and 
 learns of the refusal from the reply or from nothing, which is the socket's own named loss
 of [0012 §4.7] moved from the write to the receipt.
 
+**A FLOW stream carries its datagrams itself on a local transport** (§6.8,
+[decisions/0034](decisions/0034-late-is-lost.md) §4.4). There is no DATAGRAM frame locally, so
+after its header a FLOW stream carries zero or more records until FIN:
+
+```text
+<varint length> <length bytes>             one datagram, length <= 1200 (LOCAL_MAX_DATAGRAM)
+```
+
+The varint is §6.9's QUIC variable-length integer. A record longer than 1200 bytes MUST close
+the connection with `PROTOCOL_VIOLATION`. On a named pipe the records ride inside payload
+chunks like any other stream bytes, and a record boundary need not coincide with a chunk
+boundary.
+
 ### 2.2 HELLO exchange
 
 Immediately after the QUIC handshake completes, each side MUST open exactly one uni stream
@@ -202,8 +215,9 @@ The algorithm is:
 2. If the intersection is empty, negotiation fails.
 3. The effective version is the maximum element of the intersection.
 4. If any code in `theirs.required_capabilities` is outside the local supported capability
-   set, negotiation fails. The v0 supported capability set is empty, therefore any non-empty
-   `required_capabilities` from the peer MUST fail negotiation.
+   set (`ours.capabilities`), negotiation fails. The only code defined is `1` `datagram`
+   (§6.1), so a peer that requires anything else, or requires `1` of a side that did not list
+   it, fails negotiation.
 5. Compute the effective guarantee set, dimension by dimension, as the **weaker** of
    `ours.guarantees_offered` and `theirs.guarantees_offered`, an absent declaration meaning
    `core` (§6.1, §6.5). For a dimension whose levels are not ordered — `backpressure`, and
@@ -221,6 +235,7 @@ Agreed {
     version: u64,                 // the effective version from step 3
     send_max_header_bytes: u64,   // = theirs.max_header_bytes
     guarantees: GuaranteeSet,     // the effective set from step 5; spec ahead of code
+    datagrams: bool,              // both HELLOs listed capability code 1 (§6.1)
 }
 ```
 
@@ -324,7 +339,7 @@ a defect because it lets a remote peer choose the allocation size.
 ### 3.2 Conditions that MUST close the connection with PROTOCOL_VIOLATION
 
 - Magic byte not equal to `0x57`.
-- Unknown `kind` value, i.e. anything in `7..=255`. Kinds `5` and `6` were reserved for the
+- Unknown `kind` value, i.e. anything in `8..=255`. Kinds `5` and `6` were reserved for the
   L2 credit frame and the cursor stream and are now defined (§6.6, §6.7): the reservation was
   a promise not to reuse the number, and the promise was kept when the number was spent.
 - `header_len` greater than the local `limits.max_header_bytes` (§3.1).
@@ -337,6 +352,9 @@ a defect because it lets a remote peer choose the allocation size.
 - A frame kind used on a stream kind where §4 does not permit it.
 - A DATA frame without `endpoint` on a stream that initiates a transfer (§6.2).
 - A guarantee set whose value or dimension combination §6.5 forbids.
+- A FLOW stream (§6.8) from a peer whose HELLO did not list capability code `1` in key `3`.
+- Any byte after a FLOW header on a QUIC stream, a FLOW naming a flow id that is still live on
+  that connection and direction, or a local FLOW record longer than 1200 bytes (§2.1).
 
 These rules are symmetric: they apply identically to streams received by the QUIC client
 and by the QUIC server. All network input is hostile (master doc §81 rule 18); neither role
@@ -359,8 +377,9 @@ connection-fatal framing violation.
 | `4` | UNSUBSCRIBE | header only, FIN directly after the header | uni |
 | `5` | CREDIT | header only, FIN directly after the header | uni |
 | `6` | CURSOR | head frame, then (level, offset) records until FIN | uni |
+| `7` | FLOW | header, then nothing on QUIC (datagrams on local transports, §2.1); FIN closes the flow | uni |
 
-Kinds `7..=255` are reserved and MUST close the connection with `PROTOCOL_VIOLATION`. This
+Kinds `8..=255` are reserved and MUST close the connection with `PROTOCOL_VIOLATION`. This
 is not a forward-compatibility hook: a receiver cannot know whether an unknown stream kind
 carries payload it would have to drain.
 
@@ -379,8 +398,14 @@ header-only nor payload-carrying — a head frame naming the report, then `(leve
 records until FIN (§6.7) — and it **never shares a stream with payload**, which is what
 makes a report add nothing to a pattern's topology. A peer that ordered no report has no
 state for the id a CURSOR stream names and resets that stream with `CANCELED` rather than
-closing the connection: nothing was allocated for an id it never handed out. Kind `7` is now
-the first free number.
+closing the connection: nothing was allocated for an id it never handed out.
+
+**Kind `7` is known as of B-281**, and it is the datagram flow of
+[decisions/0034](decisions/0034-late-is-lost.md) §4.2: a registration whose stream is the
+flow's lifetime and whose units travel as QUIC DATAGRAM frames (§6.8, §6.9). It is sent only
+to a peer that listed capability code `1` (§6.1), so a peer that never listed the code never
+sees one. On QUIC a FLOW stream carries its header and then nothing until FIN; a byte after
+the header is a `PROTOCOL_VIOLATION`. Kind `8` is now the first free number.
 
 HELLO, ERROR, SUBSCRIBE, UNSUBSCRIBE and CREDIT are header-only frames: the sender MUST FIN
 the stream immediately after the header. Receiver handling of bytes appearing after the
@@ -393,7 +418,7 @@ a DATA stream.
 
 ### 4.1 Which frame may open which stream
 
-- A **uni stream** MUST open with HELLO, DATA, SUBSCRIBE, UNSUBSCRIBE, CREDIT or CURSOR. An
+- A **uni stream** MUST open with HELLO, DATA, SUBSCRIBE, UNSUBSCRIBE, CREDIT, CURSOR or FLOW. An
   ERROR frame on a uni stream is a violation (§3.2): an ERROR is the alternative to a reply,
   and it therefore has meaning only where a reply would have gone.
 - A **bidi stream** MUST open with DATA on its initiating half. Any other kind there is a
@@ -460,15 +485,25 @@ and above.
 | `0` | `[uint]` | `versions` | yes | — | wire protocol versions supported by the sender; v0 sends `[0]` |
 | `1` | `uint` | `max_header_bytes` | yes | — | largest header size the sender is willing to receive |
 | `2` | `uint` | `max_transfers` | yes | — | maximum concurrent inbound transfers; **advisory in v0**, not enforced |
-| `3` | `[uint]` | `capabilities` | yes | — | optional capability codes supported; v0 sends `[]` |
-| `4` | `[uint]` | `required_capabilities` | yes | — | capability codes the sender requires the peer to support; v0 sends `[]` |
+| `3` | `[uint]` | `capabilities` | yes | — | optional capability codes supported (table below); a side that enables nothing sends `[]` |
+| `4` | `[uint]` | `required_capabilities` | yes | — | capability codes the sender requires the peer to support; `[]` unless a profile requires one |
 | `5` | `map` | `guarantees_offered` | no | §6.5 | guarantee set the sender can honour; **optional, absent in v0** |
 | `6` | `map` | `guarantees_required` | no | §6.5 | guarantee set the sender requires of the peer; **optional, absent in v0** |
 
 Keys `0` to `4` are required. A missing one of them is a framing violation per §3.2.
 
-Capability code assignment is unspecified in v0: no codes are defined and the v0 supported
-set is empty.
+Capability codes:
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| `1` | `datagram` | the sender reads QUIC DATAGRAM frames and FLOW streams (§6.8, §6.9) |
+
+A FLOW stream or a DATAGRAM frame MUST NOT be sent unless both HELLOs listed code `1` in key
+`3`. A FLOW stream from a peer whose HELLO did not list it closes the connection with
+`PROTOCOL_VIOLATION` (§3.2). A side lists code `1` exactly when its profile enables flows
+(`datagram_receive_bytes > 0`, §10); on QUIC the same setting decides whether the transport
+parameter `max_datagram_frame_size` is advertised at all
+([decisions/0034](decisions/0034-late-is-lost.md) §4.5).
 
 **Keys `5` and `6` are specified ahead of code** (§11) and are the only optional HELLO keys.
 They declare guarantee sets per [decisions/0006](decisions/0006-guarantee-sets.md) §4.4,
@@ -495,6 +530,7 @@ configuration error, not a negotiation position.
 | `10` | `array` of `uint` | `report` | no | 16 items, strictly ascending | levels the sender **orders** a report for; an order, not a guarantee |
 | `11` | `uint` | `report_mode` | no | one of §6.2's `report_mode` values | `0` `progress` (default, never written), `1` `final-only` |
 | `12` | `uint` | `delivery_attempt` | no | — | how often an L2 queue has handed this message out, first attempt included; **absent means `1`**. A count rather than a flag: a repeat is visible, and a poison message is countable. **Reserved and written by nobody today** — the number is spent so it cannot be spent twice, and B-203 is the slice that writes it |
+| `13` | `uint` | `segment` | no | — | RADIO segment number per (radio path, topic), from 0; **written by a radio only** ([decisions/0034](decisions/0034-late-is-lost.md) §4.6) |
 
 **Every key is optional at the decoder, and that is deliberate.** A decoder sees a byte
 slice, not a stream: it cannot tell an initiating half from a reply half, so it cannot
@@ -674,8 +710,9 @@ from withdrawing it.
 | --- | --- | --- | --- | --- | --- |
 | `0` | `tstr` | `endpoint` | yes | 512 B | publisher endpoint path the subscription applies to |
 | `1` | `tstr` | `filter` | yes | 256 B | topic filter; the grammar below. The empty string matches every topic |
+| `2` | `uint` | `max_age_ms` | no | — | the dish's latency budget; meaningful on a RADIO path only ([decisions/0034](decisions/0034-late-is-lost.md) §4.6). Encoded only when present |
 
-Both keys are required. `filter` is required even when empty: an absent key and an empty
+Keys `0` and `1` are required. `filter` is required even when empty: an absent key and an empty
 string would otherwise be indistinguishable, and the empty filter is the "every topic"
 subscription.
 
@@ -884,6 +921,54 @@ An undefined level below the application floor is a protocol violation at the de
 exactly as an undefined `achieved` value is (§6.2): the number decides what a sender believes
 about its own transfer.
 
+### 6.8 FLOW (kind 7)
+
+| Key | CBOR type | Name | Required | Cap | Meaning |
+| --- | --- | --- | --- | --- | --- |
+| `0` | `tstr` | `endpoint` | yes | 512 B | endpoint path the flow is addressed to |
+| `1` | `uint` | `flow` | yes | — | flow id, chosen by the sender; prefixes every datagram of the flow (§6.9) |
+| `2` | `tstr` | `content_type` | no | 256 B | opaque media type label |
+| `3` | `tstr` | `traceparent` | no | 128 B | W3C Trace Context `traceparent` |
+| `4` | `tstr` | `tracestate` | no | 512 B | W3C Trace Context `tracestate`, opaque passthrough |
+| `5` | `tstr` | `topic` | no | 256 B | topic the flow carries; set by a radio's datagram flow |
+
+A FLOW stream is the registration **and the lifetime** of a datagram flow
+([decisions/0034](decisions/0034-late-is-lost.md) §4.2). Rules:
+
+1. **The flow id is the sender's.** It is unique per connection and direction. A second FLOW
+   naming an id that is still live on that connection and direction is a
+   `PROTOCOL_VIOLATION`; an id may be reused once its FLOW stream has ended.
+2. **Refusal is `STOP_SENDING`** with `UNKNOWN_ENDPOINT` (no path), `UNSUPPORTED` (a path whose
+   pattern takes no flow), `REJECTED` (the acceptor declined it) or `LIMIT_EXCEEDED` (more
+   inbound flows than the receiver's `max_flows`). A receiver that no longer wants an accepted
+   flow stops it with `CANCELED`. The sender learns any of them as the stop code of its FLOW
+   stream; datagrams it sent before the stop arrived are dropped at the receiver, which is
+   [decisions/0005](decisions/0005-refusal-race.md)'s race, unchanged.
+3. **FIN is an orderly close; `RESET_STREAM` is an abandoned flow.** Either ends the flow at
+   the receiver, which removes the id.
+4. **On QUIC nothing follows the header**; on a local transport §2.1's records follow it.
+
+### 6.9 DATAGRAM payload
+
+A QUIC DATAGRAM frame's payload is
+
+```text
+<varint flow> <opaque bytes>
+```
+
+where `varint` is RFC 9000 §16's variable-length integer, the same encoding as §6.7's cursor
+records. The receiver demultiplexes by `flow` into the flow its FLOW stream registered.
+
+- **An unknown id is held, never an error.** Streams and datagrams are unordered relative to
+  each other, so a flow's first datagrams can arrive before its FLOW header. A datagram naming
+  an id with no live flow is held for at most `flow_early_hold` in one per-connection ring of
+  `flow_early_bytes`, oldest first, and dropped after that; a FLOW header claiming the id
+  adopts its held datagrams in order. A truncated varint is dropped the same way and is not an
+  error either.
+- **A RADIO datagram segment** carries, inside the flow's opaque bytes, `<varint segment>
+  <opaque bytes>`: the segment number of DATA key `13`, for a one-packet segment. This is L1
+  framing inside the flow payload, not a wire rule of the flow itself.
+
 ---
 
 ## 7. QUIC application error codes
@@ -987,6 +1072,21 @@ DATA   {endpoint:"/t", report_id:1, report:[2]}
 
 DATA   {endpoint:"/t", report_id:1, report:[3,17], report_mode:1}
        57 01 0D  A4 00 62 2F 74 09 01 0A 82 03 11 0B 01
+
+FLOW   {endpoint:"/v", flow:7}
+       57 07 07  A2 00 62 2F 76 01 07
+
+DATAGRAM flow 7, payload "hi"                (a DATAGRAM payload, not a frame: no preamble)
+       07 68 69
+
+DATA   {endpoint:"/t", segment:5}            (key 13, written by a radio)
+       57 01 07  A2 00 62 2F 74 0D 05
+
+SUB    {endpoint:"/t", filter:"a", max_age_ms:150}   (key 2, a dish's latency budget)
+       57 03 0B  A3 00 62 2F 74 01 61 61 02 18 96
+
+HELLO  {versions:[0], max_header_bytes:16384, max_transfers:1024, caps:[1], req_caps:[]}
+       57 00 11  A5 00 81 00 01 19 40 00 02 19 04 00 03 81 01 04 80
 ```
 
 Decoded field lists:
@@ -1105,6 +1205,24 @@ of §5 unchanged: uint keys, strictly ascending, no duplicates, unknown keys ski
 
 **ERROR vector** — magic `0x57`, kind `0x02` (ERROR), `header_len = 0x03` (3 bytes), CBOR
 map of 1 entry: key `0` `code = 5` (`NO_REPLY`).
+
+**FLOW vector** — magic `0x57`, kind `0x07` (FLOW), `header_len = 0x07` (7 bytes), CBOR map
+of 2 entries: key `0` `endpoint = "/v"`, key `1` `flow = 7`. Both keys are required; the
+optional keys are omitted when absent (§6.8).
+
+**DATAGRAM payload vector** — not a frame: the payload of one QUIC DATAGRAM frame. `07` is the
+one-byte varint of flow id `7`, and `68 69` is the opaque payload `"hi"` (§6.9).
+
+**Segment DATA vector** — `header_len = 0x07`, CBOR map of 2 entries: key `0` `endpoint = "/t"`,
+key `13` `segment = 5` (`0D 05`). Only a radio writes key `13`.
+
+**SUBSCRIBE with `max_age_ms` vector** — `header_len = 0x0B` (11 bytes), CBOR map of 3 entries:
+key `0` `endpoint = "/t"`, key `1` `filter = "a"`, key `2` `max_age_ms = 150`, which needs the
+one-byte-argument form `18 96` because it is above `23`.
+
+**HELLO-with-datagram vector** — the v0 HELLO with key `3` `capabilities = [1]` (`81 01`
+instead of `80`), so `header_len` grows by one to `0x11` (17 bytes). This is what a side that
+enables flows sends (§6.1).
 
 ---
 
@@ -1308,6 +1426,12 @@ Per connection (`Limits`):
 | `max_dedup_entries` | `4096` | identities a receiver remembers per connection under `Bounded` deduplication; the negotiated window bounds how long an identity is kept and this bounds how many, evicting the oldest at the cap (§6.5) |
 | `max_local_streams` | `255` | live transfers on one **local** connection (§2.1), where the stream is the OS object and there is no multiplexing; an `open` at the cap waits for a live transfer to end, exactly as a QUIC `open` waits on the peer's stream budget, rather than refusing. The number was chosen as Windows' named-pipe instance range [0010 §4.2]; the pipe itself is created with `PIPE_UNLIMITED_INSTANCES`, so this per-peer count is the only ceiling on every platform |
 | `max_parked_reverse` | `8` | connections a subscriber parks toward a peer it dialled, so that peer can open a stream back (§2.1); each is a descriptor held for a copy that may never come and each counts against `max_local_streams` on both sides. A publisher that finds none parked drops that copy and counts it; zero disables the pool, which makes subscribing over a socket transport an error rather than a silence [0012 §4.4] |
+| `datagram_receive_bytes` | `0` | datagrams quinn buffers unread per connection, oldest dropped first; `0` turns flows off, so neither capability code `1` nor `max_datagram_frame_size` is advertised and nothing is buffered. `DEFAULT_DATAGRAM_RECEIVE_BYTES` (64 KiB) is the documented value for turning flows on ([decisions/0034](decisions/0034-late-is-lost.md) §4.5) |
+| `datagram_send_bytes` | 64 KiB | datagrams queued for sending per connection; beyond it the oldest is discarded (§6.9) |
+| `max_flows` | `64` | inbound flows one connection may hold live; a FLOW beyond it is stopped with `LIMIT_EXCEEDED` (§6.8) |
+| `flow_queue_bytes` | 16 KiB | unread datagram bytes held per inbound flow; a slow consumer loses its oldest datagrams, counted per flow |
+| `flow_early_bytes` | 4 KiB | per-connection ring for datagrams naming an id with no live flow yet (§6.9) |
+| `flow_early_hold` | 1 s | how long a datagram waits in that ring for its FLOW header before it is dropped |
 
 Per runtime (`RuntimeConfig`):
 
@@ -1463,9 +1587,6 @@ versions.
   §8; `Bounded(window)` and the receiver-side window that would use it are decided
   [0001 §7.6], [0008 §4.4] and unbuilt, so no v0 peer suppresses a duplicate. `Durable`
   deduplication is L2 work.
-- **Capability codes.** The capability negotiation mechanism exists (HELLO keys `3` and
-  `4`), but no capability code is assigned and the supported set is empty.
-- **QUIC datagrams.** Only streams are used.
 - **Resumable or checkpointed streams.** No offsets, content addressing or resume semantics
   (master doc §82 leaves this for after the basic protocol is proven).
 - **Retries.** The protocol carries no retry or attempt metadata; retry is entirely an
