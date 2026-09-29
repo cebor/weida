@@ -53,6 +53,8 @@ tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
 criterion.workspace = true
 futures.workspace = true
+# Tests build device chains signed by a user key (decisions/0035).
+rcgen.workspace = true
 
 # `weida send|request|sub|serve` (B-060). `serve` mints a self-signed identity
 # when no `--identity` file is given, so the binary needs the `generate`

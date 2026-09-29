@@ -11,9 +11,11 @@
 //! ([`Policy`]): a presented leaf certificate passes if its public-key
 //! fingerprint is pinned, or — when anchors are configured — if it chains to
 //! one of them under the usual webpki rules. A fingerprint named by the dialled
-//! address is the only thing accepted on that connection. Whatever the trust
-//! path, the handshake signature is verified with the provider's algorithms,
-//! so a peer is only ever accepted for a key it proved it holds.
+//! address is the only thing accepted on that connection. A binding may
+//! instead accept any key a client proves ([`ClientTrust::AnyKey`], judged by
+//! nothing but the chain bound). Whatever the trust path, the handshake
+//! signature is verified with the provider's algorithms, so a peer is only
+//! ever accepted for a key it proved it holds.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -34,7 +36,7 @@ use quinn::rustls::{
 use quinn::{TransportConfig, VarInt};
 use weida_core::{Error, Fingerprint, Limits};
 
-use crate::config::{ClientTls, Identity, Pem, ServerTls, Trust};
+use crate::config::{ClientTls, ClientTrust, Identity, Pem, ServerTls, Trust};
 use crate::identity::{IdentitySource, TrustSource};
 
 /// Reads a certificate chain from either PEM source.
@@ -295,12 +297,12 @@ impl ServerCertVerifier for PeerVerifier {
 struct ClientVerifier {
     trust: TrustSource,
     provider: Arc<CryptoProvider>,
-    cached: Mutex<(u64, Arc<ClientTrust>)>,
+    cached: Mutex<(u64, Arc<ClientGeneration>)>,
 }
 
 /// One generation of a binding's client trust.
 #[derive(Debug)]
-struct ClientTrust {
+struct ClientGeneration {
     policy: Policy,
     chain: Option<Arc<dyn ClientCertVerifier>>,
 }
@@ -308,7 +310,7 @@ struct ClientTrust {
 impl ClientVerifier {
     fn new(trust: TrustSource, provider: Arc<CryptoProvider>) -> Result<ClientVerifier, Error> {
         let generation = trust.generation();
-        let built = ClientTrust::build(&trust.current(), &provider)?;
+        let built = ClientGeneration::build(&trust.current(), &provider)?;
         Ok(ClientVerifier {
             trust,
             provider,
@@ -316,11 +318,11 @@ impl ClientVerifier {
         })
     }
 
-    fn current(&self) -> Arc<ClientTrust> {
+    fn current(&self) -> Arc<ClientGeneration> {
         let generation = self.trust.generation();
         let mut cached = self.cached.lock().expect("trust cache poisoned");
         if cached.0 != generation {
-            match ClientTrust::build(&self.trust.current(), &self.provider) {
+            match ClientGeneration::build(&self.trust.current(), &self.provider) {
                 Ok(built) => *cached = (generation, Arc::new(built)),
                 // Unreadable anchors: the previous trust stays in force and
                 // the source reported it.
@@ -331,8 +333,8 @@ impl ClientVerifier {
     }
 }
 
-impl ClientTrust {
-    fn build(trust: &Trust, provider: &Arc<CryptoProvider>) -> Result<ClientTrust, Error> {
+impl ClientGeneration {
+    fn build(trust: &Trust, provider: &Arc<CryptoProvider>) -> Result<ClientGeneration, Error> {
         let chain = match root_store(trust)? {
             Some(roots) => Some(
                 quinn::rustls::server::WebPkiClientVerifier::builder_with_provider(
@@ -345,7 +347,7 @@ impl ClientTrust {
             ),
             None => None,
         };
-        Ok(ClientTrust {
+        Ok(ClientGeneration {
             policy: Policy::new(None, trust),
             chain,
         })
@@ -376,6 +378,89 @@ impl ClientCertVerifier for ClientVerifier {
                 None => Err(trust.policy.refuse(presented)),
             },
         }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, quinn::rustls::Error> {
+        quinn::rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, quinn::rustls::Error> {
+        quinn::rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// The most certificates of a peer's chain weida keeps
+/// ([decisions/0035](../../../docs/decisions/0035-keys-proved-not-judged.md)
+/// §4.2). The chain is the peer's choice, so it is bounded before it is kept.
+pub(crate) const MAX_PEER_CHAIN_CERTS: usize = 8;
+
+/// The most bytes of a peer's chain weida keeps, all certificates together
+/// (decisions/0035 §4.2).
+pub(crate) const MAX_PEER_CHAIN_BYTES: usize = 32 * 1024;
+
+/// Whether a presented chain fits the bound weida keeps: the leaf and at
+/// most `MAX_PEER_CHAIN_CERTS - 1` more.
+fn chain_fits(leaf: &CertificateDer<'_>, rest: &[CertificateDer<'_>]) -> bool {
+    rest.len() < MAX_PEER_CHAIN_CERTS
+        && leaf.len() + rest.iter().map(|c| c.len()).sum::<usize>() <= MAX_PEER_CHAIN_BYTES
+}
+
+/// Accepts any client key the client proves it holds
+/// ([`ClientTrust::AnyKey`]): the leaf must parse and the chain fit the
+/// bound, and the handshake signature is verified as for any peer. Nothing
+/// about the key is judged.
+#[derive(Debug)]
+struct AnyKeyVerifier {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ClientCertVerifier for AnyKeyVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, quinn::rustls::Error> {
+        if !chain_fits(end_entity, intermediates) {
+            return Err(quinn::rustls::Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        // The fingerprint is the peer: a leaf it cannot be computed from
+        // names nobody.
+        spki_fingerprint(end_entity)
+            .map_err(|_| quinn::rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
+        Ok(ClientCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -566,7 +651,10 @@ pub(crate) fn server_config(
         .map_err(|e| tls_err("selecting TLS 1.3", e))?;
     let builder = match &tls.client_trust {
         None => builder.with_no_client_auth(),
-        Some(trust) => {
+        Some(ClientTrust::AnyKey) => builder.with_client_cert_verifier(Arc::new(AnyKeyVerifier {
+            provider: Arc::clone(&provider),
+        })),
+        Some(ClientTrust::Trusted(trust)) => {
             if trust.is_empty() {
                 return Err(Error::Tls(
                     "client trust is empty: a binding cannot require clients it would never accept"
@@ -790,6 +878,48 @@ mod tests {
         );
         let other = Identity::generate().unwrap().fingerprint().unwrap();
         assert_ne!(spki_fingerprint(a.der()).unwrap(), other);
+    }
+
+    #[test]
+    fn any_key_bounds_the_chain_it_keeps() {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let leaf = CertificateDer::from(
+            rcgen::CertificateParams::new(vec!["d".to_owned()])
+                .expect("params")
+                .self_signed(&key)
+                .expect("cert")
+                .der()
+                .to_vec(),
+        );
+        let verifier = AnyKeyVerifier {
+            provider: provider(),
+        };
+        let verify = |leaf: &CertificateDer<'_>, rest: &[CertificateDer<'_>]| {
+            verifier.verify_client_cert(leaf, rest, UnixTime::now())
+        };
+
+        assert!(verify(&leaf, &vec![leaf.clone(); MAX_PEER_CHAIN_CERTS - 1]).is_ok());
+        assert!(matches!(
+            verify(&leaf, &vec![leaf.clone(); MAX_PEER_CHAIN_CERTS]),
+            Err(quinn::rustls::Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure
+            ))
+        ));
+        assert!(matches!(
+            verify(
+                &leaf,
+                &[CertificateDer::from(vec![0u8; MAX_PEER_CHAIN_BYTES])]
+            ),
+            Err(quinn::rustls::Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure
+            ))
+        ));
+        assert!(matches!(
+            verify(&CertificateDer::from(vec![0x30, 0x00]), &[]),
+            Err(quinn::rustls::Error::InvalidCertificate(
+                CertificateError::BadEncoding
+            ))
+        ));
     }
 
     #[test]

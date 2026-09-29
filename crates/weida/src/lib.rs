@@ -78,7 +78,9 @@ mod transport;
 #[cfg(unix)]
 mod unix;
 
-pub use config::{ClientTls, Discovery, Identity, Pem, RuntimeConfig, ServerTls, Trust};
+pub use config::{
+    ClientTls, ClientTrust, Discovery, Identity, Pem, RuntimeConfig, ServerTls, Trust,
+};
 pub use cursor::{CursorSet, Cursors, Reported, Reporter};
 pub use drain::Drained;
 pub use endpoint::{

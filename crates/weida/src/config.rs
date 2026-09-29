@@ -431,7 +431,8 @@ pub struct ClientTls {
     /// Whom to accept as the peer.
     pub trust: TrustSource,
     /// The identity to present. `None` dials anonymously, which a binding
-    /// that requires client trust ([`ServerTls::require_client`]) refuses.
+    /// that requires clients ([`ServerTls::require_client`]) refuses, under
+    /// [`ClientTrust::AnyKey`] as under a trust.
     pub identity: Option<IdentitySource>,
 }
 
@@ -463,6 +464,31 @@ impl From<TrustSource> for ClientTls {
     }
 }
 
+/// Whom a binding lets in when it requires clients to present a key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ClientTrust {
+    /// Keys this source trusts: pinned, or chaining to an anchor.
+    Trusted(TrustSource),
+    /// Any key the client proves it holds. The handshake signature is
+    /// verified and nothing about the key is judged: no pin, no issuer, no
+    /// validity dates
+    /// ([decisions/0035](../../../docs/decisions/0035-keys-proved-not-judged.md)
+    /// §4.1).
+    AnyKey,
+}
+
+impl From<TrustSource> for ClientTrust {
+    fn from(trust: TrustSource) -> ClientTrust {
+        ClientTrust::Trusted(trust)
+    }
+}
+
+impl From<Trust> for ClientTrust {
+    fn from(trust: Trust) -> ClientTrust {
+        ClientTrust::Trusted(TrustSource::from(trust))
+    }
+}
+
 /// TLS configuration of a binding: who it is and, optionally, whom it lets in.
 ///
 /// The identity is a source: a binding serves whatever the source holds at
@@ -475,10 +501,12 @@ impl From<TrustSource> for ClientTls {
 pub struct ServerTls {
     /// The identity presented to every dialling peer.
     pub identity: IdentitySource,
-    /// When set, every peer must present an identity this trusts; anonymous
-    /// peers and untrusted identities fail the handshake. When `None`, peers
-    /// are anonymous and [`crate::IncomingMeta::peer`] is `None`.
-    pub client_trust: Option<TrustSource>,
+    /// When set, every peer must present a key and prove it holds it;
+    /// anonymous peers fail the handshake. [`ClientTrust::Trusted`] also
+    /// refuses a key its trust does not accept, [`ClientTrust::AnyKey`]
+    /// refuses none. When `None`, peers are anonymous and
+    /// [`crate::IncomingMeta::peer`] is `None`.
+    pub client_trust: Option<ClientTrust>,
 }
 
 impl ServerTls {
@@ -491,8 +519,10 @@ impl ServerTls {
         }
     }
 
-    /// Requires every peer to present an identity that `trust` accepts.
-    pub fn require_client(mut self, trust: impl Into<TrustSource>) -> ServerTls {
+    /// Requires every peer to present a key: one `trust` accepts — a
+    /// [`Trust`] or a [`TrustSource`] — or, with [`ClientTrust::AnyKey`],
+    /// any key the peer proves it holds.
+    pub fn require_client(mut self, trust: impl Into<ClientTrust>) -> ServerTls {
         self.client_trust = Some(trust.into());
         self
     }

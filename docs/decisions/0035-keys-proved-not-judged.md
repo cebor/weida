@@ -176,10 +176,12 @@ authorization surface and §4.3's admission), or the deferred `ClientPolicy`.
 
 ### 4.5 Open question 1: a leaf signed by a user key
 
-Answered by `a_binding_that_requires_any_key_proves_it_and_judges_nothing` in
-`crates/weida/tests/identity.rs` (B-293): a device leaf issued by `rcgen` under a separate user
-key, presented as a two-certificate chain, against an `AnyKey` binding. The observed result is
-recorded here when B-293 runs.
+Answered **yes** by `a_binding_that_requires_any_key_proves_it_and_judges_nothing` in
+`crates/weida/tests/identity.rs` (B-293): a device leaf issued by `rcgen` 0.14.10 under a
+separate, self-signed user key — no CA profile, no `BasicConstraints` on the issuer — presented
+as the two-certificate chain `[device, user]`, completes the handshake against an `AnyKey`
+binding over QUIC loopback, and the replier sees `PeerIdentity::Key` of the device key's
+fingerprint. `webpki::EndEntityCert::try_from` parses the leaf; nothing checks its issuer.
 
 ### 4.6 What does not change
 

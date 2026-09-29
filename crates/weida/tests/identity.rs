@@ -13,7 +13,10 @@ use std::future::Future;
 use std::time::Duration;
 
 use common::{Certs, Server};
-use weida::{ClientTls, Error, Identity, PeerIdentity, Runtime, RuntimeConfig, ServerTls, Trust};
+use weida::{
+    ClientTls, ClientTrust, Error, Fingerprint, Identity, PeerIdentity, Runtime, RuntimeConfig,
+    ServerTls, Trust,
+};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -268,6 +271,104 @@ async fn a_binding_that_requires_clients_learns_who_they_are() {
         .await
         .expect("open");
     drop(reply);
+
+    client.shutdown().await;
+    runtime.shutdown().await;
+}
+
+/// A griasdi-shaped device identity: a device key certified by a user key,
+/// presented as the two-certificate chain `[device, user]`. Returns the
+/// identity, the device key's fingerprint and the chain's DER, leaf first.
+fn device_chain() -> (Identity, Fingerprint, Vec<Vec<u8>>) {
+    let user_key = rcgen::KeyPair::generate().expect("user key");
+    let user_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("user params");
+    let user_cert = user_params.self_signed(&user_key).expect("user cert");
+    let device_key = rcgen::KeyPair::generate().expect("device key");
+    let device_cert = rcgen::CertificateParams::new(vec!["device".to_owned()])
+        .expect("device params")
+        .signed_by(&device_key, &rcgen::Issuer::new(user_params, &user_key))
+        .expect("device cert");
+    let identity = Identity::from_pem(
+        device_cert.pem() + &user_cert.pem(),
+        device_key.serialize_pem(),
+    );
+    let fingerprint = identity.fingerprint().expect("device fingerprint");
+    let ders = vec![device_cert.der().to_vec(), user_cert.der().to_vec()];
+    (identity, fingerprint, ders)
+}
+
+/// Claim: a binding that requires any key proves the key and judges nothing
+/// about it ([0035](../../../docs/decisions/0035-keys-proved-not-judged.md)
+/// §4.1). An anonymous client is refused; two strangers are admitted as two
+/// peers; and a leaf signed by a user key, not a CA, parses and is admitted
+/// as its own fingerprint (0035 §4.5, the requirement's open question 1).
+#[tokio::test]
+async fn a_binding_that_requires_any_key_proves_it_and_judges_nothing() {
+    let identity = Identity::generate().expect("identity");
+    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let listener = runtime.listener();
+    let binding = listener
+        .bind_quic(
+            "127.0.0.1:0".parse().expect("loopback"),
+            ServerTls::new(identity.clone()).require_client(ClientTrust::AnyKey),
+        )
+        .await
+        .expect("bind");
+    let url = format!(
+        "weida://{}@127.0.0.1:{}/who",
+        identity.fingerprint().expect("fingerprint"),
+        binding.local_addr().port()
+    );
+
+    let replier = listener.replier("/who").expect("replier");
+    let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok(request) = replier.accept().await {
+            let _ = seen_tx.send(request.meta().peer.clone());
+            let mut reply = request
+                .reply(weida::TransferMeta::default())
+                .await
+                .expect("reply");
+            reply.write_all(b"ok").await.expect("write");
+            let _ = reply.finish();
+        }
+    });
+
+    let client = Runtime::new(RuntimeConfig::default()).expect("client");
+
+    // Anonymous: refused in the handshake, as under a trust.
+    let anonymous = client.requester(Trust::by_address());
+    let err = within(anonymous.connect(&url)).await.unwrap_err();
+    assert!(matches!(err, Error::Tls(_)), "{err:?}");
+
+    // Two strangers nobody pinned: both admitted, as two peers.
+    let mut strangers = Vec::new();
+    for _ in 0..2 {
+        let id = Identity::generate().expect("id");
+        let fp = id.fingerprint().expect("fingerprint");
+        let requester = client.requester(ClientTls::new(Trust::by_address()).with_identity(id));
+        within(requester.connect(&url)).await.expect("connect");
+        assert_eq!(roundtrip(&requester).await, b"ok");
+        assert_eq!(
+            within(seen.recv()).await.expect("seen"),
+            Some(PeerIdentity::Key(fp))
+        );
+        strangers.push(fp);
+    }
+    assert_ne!(strangers[0], strangers[1]);
+
+    // A device leaf signed by a user key: parsed, proved, and the peer is
+    // the device key.
+    let (device, device_fp, _) = device_chain();
+    let requester = client.requester(ClientTls::new(Trust::by_address()).with_identity(device));
+    within(requester.connect(&url))
+        .await
+        .expect("connect device");
+    assert_eq!(roundtrip(&requester).await, b"ok");
+    assert_eq!(
+        within(seen.recv()).await.expect("seen"),
+        Some(PeerIdentity::Key(device_fp))
+    );
 
     client.shutdown().await;
     runtime.shutdown().await;
