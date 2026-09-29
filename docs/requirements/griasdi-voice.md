@@ -22,6 +22,14 @@ commit `5a20f15` (`0.1.0-alpha.2`); file and line references are given so a
 reader can check rather than trust. Everything under "Proposal" is design, not
 fact.
 
+**Answered by [decisions/0034](../decisions/0034-late-is-lost.md) (provisional).** The flow of
+"Proposal" becomes an L0 carrier with frame kind `7` and capability code `1`, answering open
+question 1 for a frame kind and open question 4 with a redial that re-opens flows; beyond this
+document, the note adds RADIO/DISH so that the SFU's fan-out has a name in weida's vocabulary
+while staying the application's code. It also verifies the one unverified line below: quinn's
+defaults do leave datagrams enabled on every weida connection today (B-279). Open questions 2
+and 3 and the adjacent requirements stay open.
+
 ## What griasdi needs
 
 | Need | Shape | Volume |
