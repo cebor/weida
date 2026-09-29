@@ -370,6 +370,27 @@ impl Link {
 }
 
 impl SendHalf {
+    /// True for a QUIC stream, whose reset is still accepted after `finish`
+    /// until every byte is acknowledged.
+    pub(crate) fn is_quic(&self) -> bool {
+        matches!(self, SendHalf::Quic(_))
+    }
+
+    /// Orders this stream against the other streams of its connection, on
+    /// `quinn`'s scale: higher is sent first.
+    ///
+    /// A no-op on every local transport, where each stream is its own OS
+    /// connection and there is nothing on the same connection to order it
+    /// against ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
+    /// §4.3).
+    pub(crate) fn set_priority(&self, priority: i32) {
+        if let SendHalf::Quic(s) = self {
+            let _ = s.set_priority(priority);
+        }
+    }
+}
+
+impl SendHalf {
     pub(crate) async fn write_all(&mut self, buf: &[u8]) -> Result<(), Error> {
         match self {
             SendHalf::Quic(s) => s.write_all(buf).await.map_err(write_error),

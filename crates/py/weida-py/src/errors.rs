@@ -85,6 +85,7 @@ failures!(
     (NoParkedConnection),
     (NoReply),
     (Canceled),
+    (Expired),
     (Indeterminate),
     (LimitExceeded),
     (DatagramsUnavailable),

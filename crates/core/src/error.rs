@@ -55,6 +55,12 @@ pub enum Error {
     NoReply,
     /// The transfer was canceled, locally or by the peer.
     Canceled,
+    /// The transfer's deadline passed before the peer acknowledged every
+    /// byte, so this side reset it with `CANCELED`
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.3).
+    /// **Not** a definite failure: the peer may have read every byte before
+    /// the reset landed.
+    Expired,
     /// The connection was lost after the local FIN while awaiting an ACK or a
     /// reply: the outcome is genuinely unknown (master doc §22).
     Indeterminate,
@@ -147,6 +153,9 @@ impl fmt::Display for Error {
             }
             Error::NoReply => f.write_str("peer accepted the request but sent no reply"),
             Error::Canceled => f.write_str("transfer canceled"),
+            Error::Expired => {
+                f.write_str("the transfer expired before the peer acknowledged it")
+            }
             Error::Indeterminate => {
                 f.write_str("outcome indeterminate: the transfer may or may not have been accepted")
             }
@@ -326,6 +335,7 @@ mod tests {
             Error::Unsupported,
             Error::NoReply,
             Error::Canceled,
+            Error::Expired,
             Error::Indeterminate,
             Error::LimitExceeded,
             Error::DatagramsUnavailable,
@@ -355,10 +365,12 @@ mod tests {
         ] {
             assert!(definite.is_definite_failure(), "{definite:?}");
         }
-        // `Indeterminate` is unknown by construction, and a missing reply says
-        // nothing about whether the request had an effect.
+        // `Indeterminate` is unknown by construction, a missing reply says
+        // nothing about whether the request had an effect, and an expired
+        // transfer may have been read whole before its reset landed.
         assert!(!Error::Indeterminate.is_definite_failure());
         assert!(!Error::NoReply.is_definite_failure());
+        assert!(!Error::Expired.is_definite_failure());
     }
 
     #[test]

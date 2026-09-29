@@ -341,9 +341,12 @@ pub(crate) fn outgoing_header(
 /// destination. [`OutgoingTransfer::finish`] marks the FIN and hands back the
 /// [`Delivery`] receipt.
 pub struct OutgoingTransfer {
-    stream: SendHalf,
+    /// `None` only after `finish` moved it into the expiry task.
+    stream: Option<SendHalf>,
     trace: Option<TraceContext>,
     settled: bool,
+    /// The deadline of [`OutgoingTransfer::expire_at`], if one was set.
+    expiry: Option<Pin<Box<tokio::time::Sleep>>>,
     /// The connection this stream belongs to: where an unawaited receipt is
     /// parked so a drain can wait on it
     /// (`docs/decisions/0009-drain.md` §4.2).
@@ -365,9 +368,10 @@ impl OutgoingTransfer {
         cursors: Option<Cursors>,
     ) -> OutgoingTransfer {
         OutgoingTransfer {
-            stream,
+            stream: Some(stream),
             trace,
             settled: false,
+            expiry: None,
             conn,
             cursors,
         }
@@ -396,13 +400,88 @@ impl OutgoingTransfer {
         self.cursors.take()
     }
 
+    fn stream(&mut self) -> &mut SendHalf {
+        self.stream
+            .as_mut()
+            .expect("the stream is taken only by finish, which consumes the transfer")
+    }
+
+    /// Orders this transfer against the other streams of its connection, on
+    /// `quinn`'s scale: higher is sent first, and the default is `0`.
+    ///
+    /// A connection is one dialled path, so a priority orders transfers on
+    /// one path and never across paths. On a local transport, where each
+    /// stream is its own OS connection, it is a no-op
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
+    /// §4.3).
+    pub fn set_priority(&mut self, priority: i32) {
+        self.stream().set_priority(priority);
+    }
+
+    /// Resets this transfer with `CANCELED` if its bytes are not all
+    /// acknowledged by `deadline`
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
+    /// §4.3).
+    ///
+    /// A write still running at the deadline fails with [`Error::Expired`].
+    /// On QUIC the deadline also holds after [`OutgoingTransfer::finish`]:
+    /// the receipt then resolves to [`Error::Expired`] if the tail was still
+    /// unacknowledged, because a reset is accepted until every byte is. On a
+    /// local transport it acts until `finish`. The reader sees `Canceled`,
+    /// never EOF. `Expired` is not a definite failure: the peer may have
+    /// read every byte before the reset landed.
+    pub fn expire_at(&mut self, deadline: std::time::Instant) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        self.expiry = Some(Box::pin(self.conn.exec.sleep(left)));
+    }
+
+    /// Resets the stream for an expiry and counts it, once.
+    fn expire(&mut self) {
+        if !self.settled {
+            self.settled = true;
+            self.stream().reset(codes::CANCELED);
+            self.conn
+                .shared
+                .expired
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.expiry.as_ref().is_some_and(|e| e.is_elapsed())
+    }
+
     /// Writes the whole buffer.
     ///
     /// A peer that refuses the transfer mid-write surfaces here as
     /// [`Error::Rejected`], [`Error::UnknownEndpoint`], [`Error::Unsupported`]
-    /// or [`Error::Canceled`].
+    /// or [`Error::Canceled`]; a deadline set with
+    /// [`OutgoingTransfer::expire_at`] that passes first, as
+    /// [`Error::Expired`].
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), Error> {
-        self.stream.write_all(buf).await
+        if self.expired() {
+            self.expire();
+            return Err(Error::Expired);
+        }
+        let stream = self
+            .stream
+            .as_mut()
+            .expect("the stream is taken only by finish, which consumes the transfer");
+        let Some(expiry) = self.expiry.as_mut() else {
+            return stream.write_all(buf).await;
+        };
+        let written = tokio::select! {
+            biased;
+            () = expiry.as_mut() => None,
+            written = stream.write_all(buf) => Some(written),
+        };
+        match written {
+            Some(written) => written,
+            None => {
+                self.expire();
+                Err(Error::Expired)
+            }
+        }
     }
 
     /// Marks the end of the payload and returns the delivery receipt.
@@ -412,14 +491,46 @@ impl OutgoingTransfer {
     /// entirely by dropping the receipt.
     ///
     /// Fails only if the stream is already closed — the peer reset it, or the
-    /// connection went away — in which case no FIN was ever sent.
+    /// connection went away — in which case no FIN was ever sent, or if the
+    /// transfer's deadline has already passed ([`Error::Expired`]).
     pub fn finish(mut self) -> Result<Delivery, Error> {
+        if self.expired() {
+            self.expire();
+            return Err(Error::Expired);
+        }
         self.settled = true;
-        self.stream.finish()?;
+        let mut stream = self
+            .stream
+            .take()
+            .expect("the stream is taken only here, and finish consumes the transfer");
+        stream.finish()?;
         // `stopped()` yields a `'static` future, so the receipt outlives the
         // handle it came from.
+        let receipt: Receipt = match self.expiry.take() {
+            // On QUIC a reset is accepted until every byte is acknowledged,
+            // so the deadline still holds: the stream moves into a task that
+            // races the receipt against it.
+            Some(expiry) if stream.is_quic() => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let shared = Arc::clone(&self.conn.shared);
+                self.conn.exec.spawn(async move {
+                    let stopped = stream.stopped();
+                    let outcome = tokio::select! {
+                        outcome = stopped => outcome,
+                        () = expiry => {
+                            stream.reset(codes::CANCELED);
+                            shared.expired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            Err(Error::Expired)
+                        }
+                    };
+                    let _ = tx.send(outcome);
+                });
+                Box::pin(async move { rx.await.unwrap_or(Err(Error::Indeterminate)) })
+            }
+            _ => stream.stopped(),
+        };
         Ok(Delivery {
-            stopped: Some(self.stream.stopped()),
+            stopped: Some(receipt),
             conn: Arc::clone(&self.conn),
         })
     }
@@ -427,17 +538,19 @@ impl OutgoingTransfer {
     /// Abandons the transfer, resetting the stream with `CANCELED`.
     pub fn cancel(mut self) {
         self.settled = true;
-        self.stream.reset(codes::CANCELED);
+        self.stream().reset(codes::CANCELED);
     }
 }
 
 impl Drop for OutgoingTransfer {
     fn drop(&mut self) {
-        if !self.settled {
+        if !self.settled
+            && let Some(stream) = self.stream.as_mut()
+        {
             // Dropping without `finish` is an abandoned transfer: reset the
             // stream so the peer discards the partial payload instead of
             // waiting for a FIN that will never come.
-            self.stream.reset(codes::CANCELED);
+            stream.reset(codes::CANCELED);
         }
     }
 }
@@ -448,15 +561,26 @@ impl AsyncWrite for OutgoingTransfer {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        AsyncWrite::poll_write(Pin::new(&mut self.stream), cx, buf)
+        // The deadline is polled first, so a writer blocked on flow control
+        // is woken by it and fails rather than waiting past it.
+        if let Some(expiry) = self.expiry.as_mut()
+            && expiry.as_mut().poll(cx).is_ready()
+        {
+            self.expire();
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                Error::Expired,
+            )));
+        }
+        AsyncWrite::poll_write(Pin::new(self.stream()), cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        AsyncWrite::poll_flush(Pin::new(&mut self.stream), cx)
+        AsyncWrite::poll_flush(Pin::new(self.stream()), cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        AsyncWrite::poll_shutdown(Pin::new(&mut self.stream), cx)
+        AsyncWrite::poll_shutdown(Pin::new(self.stream()), cx)
     }
 }
 

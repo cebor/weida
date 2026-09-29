@@ -49,6 +49,9 @@ pub(crate) use weida_runtime::{CloseBudget, Exec, OwnedReactor};
 pub(crate) struct Shared {
     /// Duplicates suppressed by any connection this runtime owns.
     pub(crate) duplicates: AtomicU64,
+    /// Outgoing transfers this runtime reset because their deadline passed
+    /// ([`crate::OutgoingTransfer::expire_at`]).
+    pub(crate) expired: AtomicU64,
     /// Admission flag and parked receipts of [`Runtime::drain`].
     pub(crate) drain: DrainState,
 }
@@ -233,6 +236,7 @@ impl Runtime {
         // connections it dials, the listener to the connections it accepts.
         let shared = Arc::new(Shared {
             duplicates: AtomicU64::new(0),
+            expired: AtomicU64::new(0),
             drain: DrainState::new(),
         });
         Runtime {
@@ -256,6 +260,14 @@ impl Runtime {
     /// negotiated, because nothing is suppressed without it.
     pub fn suppressed_duplicates(&self) -> u64 {
         self.inner.shared.duplicates.load(Ordering::Relaxed)
+    }
+
+    /// Outgoing transfers reset because their deadline passed before the peer
+    /// acknowledged every byte
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
+    /// §4.3). Counted apart from a cancel, which the wire cannot tell apart.
+    pub fn expired_transfers(&self) -> u64 {
+        self.inner.shared.expired.load(Ordering::Relaxed)
     }
 
     /// Creates an empty messaging namespace.
