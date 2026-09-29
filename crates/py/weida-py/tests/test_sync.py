@@ -7,6 +7,7 @@ thread that requests make progress at the same time.
 """
 
 import threading
+import time
 
 import pytest
 
@@ -261,3 +262,31 @@ def test_a_bus_never_delivers_a_member_its_own_message():
 
     first.shutdown()
     second.shutdown()
+
+
+def test_a_radio_segment_and_datagram_reach_a_dish():
+    """RADIO/DISH with no event loop: one stream segment, one datagram."""
+    server = sync.Runtime(datagrams=True)
+    binding = server.bind("127.0.0.1:0", weida.Identity.generate())
+    radio = binding.radio("/r")
+    client = sync.Runtime(datagrams=True)
+    dish = client.dish(weida.Trust.by_address())
+    dish.join("v")
+    dish.connect(binding.url("/r"))
+    deadline = time.monotonic() + DEADLINE
+    while radio.dish_count() != 1:
+        assert time.monotonic() < deadline, "no join arrived"
+        time.sleep(0.005)
+
+    segment = radio.segment("v")
+    assert segment.write(b"key") == 1
+    assert segment.write(b"frame") == 1
+    assert segment.finish() == 1
+    kind, payload, meta = dish.recv(CAP)
+    assert (kind, payload) == ("segment", b"keyframe")
+    assert (meta.topic, meta.segment) == ("v", 0)
+
+    assert radio.datagram("v", b"voice") == 1
+    assert dish.recv(CAP) == ("datagram", "v", 1, b"voice")
+    client.shutdown()
+    server.shutdown()

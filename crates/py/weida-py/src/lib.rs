@@ -126,6 +126,9 @@ fn weida(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<patterns::PySurveyor>()?;
     module.add_class::<patterns::PyRespondent>()?;
     module.add_class::<patterns::PyBusMember>()?;
+    module.add_class::<patterns::PyRadio>()?;
+    module.add_class::<patterns::PySegment>()?;
+    module.add_class::<patterns::PyDish>()?;
     module.add_class::<streams::PyOutgoingStream>()?;
     module.add_class::<streams::PyIncomingStream>()?;
     module.add_class::<streams::PyReply>()?;
@@ -172,6 +175,9 @@ fn every_name() -> Vec<&'static str> {
         "Survey",
         "Respondent",
         "BusMember",
+        "Radio",
+        "Segment",
+        "Dish",
         "OutgoingStream",
         "IncomingStream",
         "Reply",
@@ -188,4 +194,18 @@ fn every_name() -> Vec<&'static str> {
     names.extend(cursors::NAMED_LEVELS.iter().map(|(name, _)| *name));
     names.extend_from_slice(errors::NAMES);
     names
+}
+
+/// The limits both runtime constructors build: the defaults, with datagram
+/// flows switched on at their documented size when `datagrams` is set.
+pub(crate) fn limits_with(datagrams: bool) -> ::weida::Limits {
+    let defaults = ::weida::Limits::default();
+    if datagrams {
+        ::weida::Limits {
+            datagram_receive_bytes: ::weida::DEFAULT_DATAGRAM_RECEIVE_BYTES,
+            ..defaults
+        }
+    } else {
+        defaults
+    }
 }

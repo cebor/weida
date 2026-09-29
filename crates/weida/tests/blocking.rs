@@ -128,6 +128,69 @@ fn a_published_message_reaches_a_blocking_subscriber() {
     server.shutdown().expect("server shutdown");
 }
 
+/// RADIO/DISH over the facade: one stream segment and one datagram segment,
+/// each whole, and neither call on the radio blocks (0034 §4.6).
+#[test]
+fn a_radio_segment_and_datagram_reach_a_blocking_dish() {
+    let flows = RuntimeConfig {
+        limits: weida::Limits {
+            datagram_receive_bytes: weida::DEFAULT_DATAGRAM_RECEIVE_BYTES,
+            ..weida::Limits::default()
+        },
+        ..RuntimeConfig::default()
+    };
+    let server = Runtime::new(flows.clone()).expect("an owned reactor");
+    let identity = Identity::generate().expect("identity");
+    let fingerprint = identity.fingerprint().expect("fingerprint");
+    let binding = server
+        .bind_quic("127.0.0.1:0".parse().expect("addr"), identity)
+        .expect("bind");
+    let radio = binding.radio("/r").expect("radio");
+
+    let client = Runtime::new(flows).expect("client runtime");
+    let dish = client.dish(Trust::by_address());
+    dish.join("v", None).expect("join");
+    dish.connect(&format!("weida://{fingerprint}@{}/r", binding.local_addr()))
+        .expect("connect");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while radio.dish_count() < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the join never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut segment = radio.segment("v").expect("segment");
+    assert_eq!(segment.write(b"key").expect("write"), 1);
+    assert_eq!(segment.write(b"frame").expect("write"), 1);
+    assert_eq!(segment.finish(), 1);
+    match dish.recv(CAP).expect("recv") {
+        weida::blocking::Delivered::Segment(message) => {
+            assert_eq!(message.payload, b"keyframe");
+            assert_eq!(message.meta.segment, Some(0));
+        }
+        other => panic!("expected a stream segment, got {other:?}"),
+    }
+
+    assert_eq!(radio.datagram("v", b"voice").expect("datagram"), 1);
+    match dish.recv(CAP).expect("recv") {
+        weida::blocking::Delivered::Datagram {
+            topic,
+            segment,
+            payload,
+        } => {
+            assert_eq!(topic, "v");
+            assert_eq!(segment, 1);
+            assert_eq!(payload, b"voice");
+        }
+        other => panic!("expected a datagram segment, got {other:?}"),
+    }
+
+    client.shutdown().expect("client shutdown");
+    server.shutdown().expect("server shutdown");
+}
+
 /// PAIR over the facade, and the one rule a caller gets wrong: the **first**
 /// peer is kept and a second is refused (B-244).
 #[test]

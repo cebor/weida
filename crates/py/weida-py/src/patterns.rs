@@ -1,4 +1,5 @@
-//! PAIR, SURVEY and BUS on the asyncio surface (B-244).
+//! PAIR, SURVEY and BUS on the asyncio surface (B-244), and RADIO/DISH
+//! (B-292).
 //!
 //! The three patterns the library gained after this binding was written. They
 //! are here rather than in [`crate::endpoints`] because they are a slice of
@@ -17,12 +18,18 @@
 //!   carries it and a respondent never learns it; silence is a number.
 //! - **BUS** never delivers a member its own message, and forwards for nobody:
 //!   a bus of *n* members is *n* × (*n* − 1) deliveries.
+//! - **RADIO/DISH** never waits for a dish: `Radio.segment`, `Segment.write`
+//!   and `Radio.datagram` are plain calls, and a dish that falls behind loses
+//!   the old segment, never the new one
+//!   ([0034](../../../../docs/decisions/0034-late-is-lost.md) §4.6).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
-use weida::{BusMember, Paired, Respondent, Runtime, Surveyor, TransferMeta};
+use pyo3::types::PyBytes;
+use weida::{BusMember, Dish, Paired, Radio, Respondent, Runtime, Surveyor, TransferMeta};
 use weida_py_core::{Bridge, payload_of};
 
 use crate::cursors::{PyCursors, PyReporter, reporting_meta};
@@ -366,5 +373,212 @@ impl PyBusMember {
 
     fn __repr__(&self) -> String {
         format!("<weida.BusMember {}>", self.endpoint.path())
+    }
+}
+
+/// `max_age` in seconds, or none.
+fn max_age_of(py: Python<'_>, seconds: Option<f64>) -> PyResult<Option<Duration>> {
+    seconds.map(|s| deadline_of(py, s)).transpose()
+}
+
+/// What a dish receives, as the tuple Python sees:
+/// `("segment", payload, meta)` or `("datagram", topic, segment, payload)`.
+pub(crate) enum Heard {
+    Segment(Vec<u8>, PyIncomingMeta),
+    Datagram(String, u64, Vec<u8>),
+}
+
+impl<'py> IntoPyObject<'py> for Heard {
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match self {
+            Heard::Segment(payload, meta) => {
+                ("segment", PyBytes::new(py, &payload), meta).into_bound_py_any(py)
+            }
+            Heard::Datagram(topic, segment, payload) => {
+                ("datagram", topic, segment, PyBytes::new(py, &payload)).into_bound_py_any(py)
+            }
+        }
+    }
+}
+
+/// `weida.Radio`: segments to every joined dish, dropped rather than waited
+/// for.
+///
+/// Not written by `endpoint!`: nothing a radio does waits, so it holds no
+/// bridge to the event loop.
+#[pyclass(frozen, name = "Radio", module = "weida")]
+pub struct PyRadio {
+    endpoint: Radio,
+    /// Held so the reactor outlives this endpoint.
+    _runtime: Arc<Runtime>,
+}
+
+impl PyRadio {
+    pub(crate) fn new(endpoint: Radio, runtime: Arc<Runtime>) -> PyRadio {
+        PyRadio {
+            endpoint,
+            _runtime: runtime,
+        }
+    }
+}
+
+#[pymethods]
+impl PyRadio {
+    /// The path this radio serves.
+    fn path(&self) -> String {
+        self.endpoint.path().to_owned()
+    }
+
+    /// Opens the next segment on `topic` as one stream per joined dish, and
+    /// resets the previous segment's copies still unacknowledged there.
+    ///
+    /// # Errors
+    ///
+    /// `weida.LimitExceeded` for a topic above 256 bytes.
+    fn segment(&self, py: Python<'_>, topic: &str) -> PyResult<PySegment> {
+        let segment = self
+            .endpoint
+            .segment(topic)
+            .map_err(|e| to_py(py, &errno_of(e)))?;
+        Ok(PySegment {
+            segment: Mutex::new(Some(segment)),
+        })
+    }
+
+    /// Sends `payload` as a one-packet segment on `topic`; returns how many
+    /// dishes it was handed to. Never waits.
+    ///
+    /// # Errors
+    ///
+    /// `weida.LimitExceeded` for a topic above 256 bytes.
+    fn datagram(&self, py: Python<'_>, topic: &str, payload: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let body = payload_of(payload)?;
+        self.endpoint
+            .datagram(topic, body)
+            .map_err(|e| to_py(py, &errno_of(e)))
+    }
+
+    /// Dishes currently joined.
+    fn dish_count(&self) -> usize {
+        self.endpoint.dish_count()
+    }
+
+    /// Copies dropped, over topics and causes.
+    fn dropped(&self) -> u64 {
+        self.endpoint.dropped()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<weida.Radio {}>", self.endpoint.path())
+    }
+}
+
+/// `weida.Segment`: one segment, open on every dish joined when it opened.
+#[pyclass(frozen, name = "Segment", module = "weida")]
+pub struct PySegment {
+    /// `None` after `finish`, which ends the segment once.
+    segment: Mutex<Option<weida::Segment>>,
+}
+
+#[pymethods]
+impl PySegment {
+    /// Hands `chunk` to every copy still open; returns how many that is. A
+    /// dish without room for it loses the segment, counted at the radio.
+    fn write(&self, py: Python<'_>, chunk: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let body = payload_of(chunk)?;
+        let mut guard = self.segment.lock().expect("segment lock poisoned");
+        let Some(segment) = guard.as_mut() else {
+            return Err(to_py(
+                py,
+                &errno_of(weida::Error::Runtime("the segment is finished".into())),
+            ));
+        };
+        segment.write(body).map_err(|e| to_py(py, &errno_of(e)))
+    }
+
+    /// Ends the segment; returns how many copies it ended on.
+    fn finish(&self) -> usize {
+        self.segment
+            .lock()
+            .expect("segment lock poisoned")
+            .take()
+            .map_or(0, weida::Segment::finish)
+    }
+}
+
+endpoint!(
+    PyDish,
+    Dish,
+    "Dish",
+    "`weida.Dish`: joins topics on a radio and receives the newest segment of each."
+);
+
+#[pymethods]
+impl PyDish {
+    /// Dials the radio at `url` and joins every topic joined so far.
+    fn connect<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
+        let endpoint = Arc::clone(&self.endpoint);
+        self.bridge.awaitable(
+            py,
+            async move { endpoint.connect(&url).await.map_err(errno_of) },
+        )
+    }
+
+    /// Joins every topic `filter` matches; `max_age` in seconds is the
+    /// latency budget after which the radio resets this dish's copy.
+    #[pyo3(signature = (filter, max_age=None))]
+    fn join<'py>(
+        &self,
+        py: Python<'py>,
+        filter: String,
+        max_age: Option<f64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let max_age = max_age_of(py, max_age)?;
+        let endpoint = Arc::clone(&self.endpoint);
+        self.bridge.awaitable(py, async move {
+            endpoint.join(&filter, max_age).await.map_err(errno_of)
+        })
+    }
+
+    /// Leaves a filter.
+    fn leave<'py>(&self, py: Python<'py>, filter: String) -> PyResult<Bound<'py, PyAny>> {
+        let endpoint = Arc::clone(&self.endpoint);
+        self.bridge.awaitable(py, async move {
+            endpoint.leave(&filter).await.map_err(errno_of)
+        })
+    }
+
+    /// Waits for the next segment: `("segment", payload, meta)` for a stream
+    /// segment read whole, at most `max_bytes`, or
+    /// `("datagram", topic, segment, payload)` for a datagram segment.
+    fn recv<'py>(&self, py: Python<'py>, max_bytes: usize) -> PyResult<Bound<'py, PyAny>> {
+        let endpoint = Arc::clone(&self.endpoint);
+        self.bridge.awaitable(py, async move {
+            match endpoint.recv().await.map_err(errno_of)? {
+                weida::Received::Segment(transfer) => {
+                    let meta = PyIncomingMeta::of(transfer.meta());
+                    let payload = transfer.collect(max_bytes).await.map_err(errno_of)?;
+                    Ok(Heard::Segment(payload, meta))
+                }
+                weida::Received::Datagram {
+                    topic,
+                    segment,
+                    payload,
+                } => Ok(Heard::Datagram(topic, segment, payload.to_vec())),
+            }
+        })
+    }
+
+    /// Radios connected.
+    fn peer_count(&self) -> usize {
+        self.endpoint.peer_count()
+    }
+
+    fn __repr__(&self) -> String {
+        "<weida.Dish>".to_owned()
     }
 }

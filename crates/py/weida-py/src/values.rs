@@ -180,12 +180,14 @@ pub struct PyIncomingMeta {
     /// The W3C `traceparent` of this transfer, for a caller that propagates a
     /// trace.
     pub traceparent: Option<String>,
+    /// The RADIO segment number, on a segment a dish received.
+    pub segment: Option<u64>,
 }
 
 impl PyIncomingMeta {
     /// The metadata of one arrival, flattened into the Python shape.
     ///
-    /// Eleven of the Rust struct's twelve fields. `tracestate` is the one
+    /// Twelve of the Rust struct's thirteen fields. `tracestate` is the one
     /// that stays behind, because a Python caller gets the `traceparent` and
     /// not the vendor state. The three report fields are here since B-243
     /// added the cursor surface: a caller can act on them.
@@ -202,6 +204,7 @@ impl PyIncomingMeta {
             report_mode: meta.report_mode.to_wire(),
             report_id: meta.report_id,
             traceparent: meta.trace.map(|trace| trace.to_traceparent()),
+            segment: meta.segment,
         }
     }
 }

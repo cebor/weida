@@ -32,7 +32,7 @@ use weida_py_core::Bridge;
 
 use crate::endpoints::{PyPuller, PyPusher, PyReplier, PyRequester};
 use crate::errors::{errno_of, raise, to_py};
-use crate::patterns::{PyBusMember, PyPaired, PyRespondent, PySurveyor};
+use crate::patterns::{PyBusMember, PyDish, PyPaired, PyRadio, PyRespondent, PySurveyor};
 use crate::pubsub::{PyPublisher, PySubscriber};
 use crate::values::{PyIdentity, PyTrust};
 
@@ -47,15 +47,20 @@ pub struct PyRuntime {
 impl PyRuntime {
     /// A runtime with `worker_threads` reactor threads.
     ///
+    /// `datagrams=True` enables datagram flows on this runtime's connections
+    /// (`Limits::datagram_receive_bytes` at its documented 64 KiB), which a
+    /// dish needs for datagram segments; both ends must enable it.
+    ///
     /// # Errors
     ///
     /// `weida.Runtime` when `worker_threads` is `0` or the OS refuses the
     /// threads.
     #[new]
-    #[pyo3(signature = (worker_threads=1))]
-    fn new(py: Python<'_>, worker_threads: usize) -> PyResult<PyRuntime> {
+    #[pyo3(signature = (worker_threads=1, datagrams=false))]
+    fn new(py: Python<'_>, worker_threads: usize, datagrams: bool) -> PyResult<PyRuntime> {
         let config = RuntimeConfig {
             worker_threads,
+            limits: crate::limits_with(datagrams),
             ..RuntimeConfig::default()
         };
         let runtime = raise(py, Runtime::owned(config))?;
@@ -152,6 +157,15 @@ impl PyRuntime {
     fn surveyor(&self, trust: PyTrust) -> PySurveyor {
         PySurveyor::new(
             self.runtime.surveyor(trust.trust.clone()),
+            self.bridge.clone(),
+            Arc::clone(&self.runtime),
+        )
+    }
+
+    /// A dish on this runtime.
+    fn dish(&self, trust: PyTrust) -> PyDish {
+        PyDish::new(
+            self.runtime.dish(trust.trust.clone()),
             self.bridge.clone(),
             Arc::clone(&self.runtime),
         )
@@ -308,6 +322,16 @@ impl PyBinding {
             self.bridge.clone(),
             Arc::clone(&self._runtime),
         ))
+    }
+
+    /// Registers a radio at `path`.
+    ///
+    /// # Errors
+    ///
+    /// As [`PyBinding::replier`].
+    fn radio(&self, py: Python<'_>, path: &str) -> PyResult<PyRadio> {
+        let radio = raise(py, self.listener.radio(path))?;
+        Ok(PyRadio::new(radio, Arc::clone(&self._runtime)))
     }
 
     fn __repr__(&self) -> String {

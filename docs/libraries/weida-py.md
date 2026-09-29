@@ -44,12 +44,12 @@ not estimated:
 
 | Number | Value | Counted from |
 | --- | --- | --- |
-| `#[pyclass]`es | **38** | 23 `add_class` calls in `lib.rs:117-141` plus 15 in `sync.rs:919-936` |
-| `weida.__all__` | **56** names | 30 literals in `lib.rs:150-184` (which include `sync`, `VERSION`, `ALPN`, `WeidaError` and the five cursor names), the five named levels appended at `lib.rs:185`, plus the 21 of `errors::NAMES` |
-| `weida.sync.__all__` | **15** names | the list at `sync.rs:937-957`, one per class registered above it |
-| Exception classes | **22** | the 21 entries of the `failures!` invocation at `errors.rs:72-94`, **plus the base** `WeidaError` (`errors.rs:33`), which is not in that list |
-| Test functions | **32** | 8 in `tests/test_asyncio.py`, 9 in `tests/test_patterns.py`, 8 in `tests/test_sync.py`, 7 in `tests/test_cursors.py` |
-| `IncomingMeta` attributes | **11** of the Rust struct's 12 fields | `values.rs:147-183` against `crates/weida/src/transfer.rs`; `tracestate` is the only one absent (§5) |
+| `#[pyclass]`es | **44** | 26 `add_class` calls in `lib.rs` plus 18 in `sync.rs`'s `install` |
+| `weida.__all__` | **62** names | 33 literals in `every_name` (which include `sync`, `VERSION`, `ALPN`, `WeidaError` and the five cursor names), the five named levels appended after them, plus the 24 of `errors::NAMES` |
+| `weida.sync.__all__` | **18** names | the list in `sync.rs`'s `install`, one per class registered above it |
+| Exception classes | **25** | the 24 entries of the `failures!` invocation in `errors.rs`, **plus the base** `WeidaError` (`errors.rs:33`), which is not in that list |
+| Test functions | **34** | 8 in `tests/test_asyncio.py`, 10 in `tests/test_patterns.py`, 9 in `tests/test_sync.py`, 7 in `tests/test_cursors.py` |
+| `IncomingMeta` attributes | **12** of the Rust struct's 13 fields | `values.rs:147-185` against `crates/weida/src/transfer.rs`; `tracestate` is the only one absent (§5) |
 
 ## 2. How it is built, tested and packaged
 
@@ -97,7 +97,7 @@ interop number. The counts above were counted out of the tree with the sources n
 
 ## 4. The asyncio surface, class by class
 
-Twenty-three classes in `weida` (§1). Every call that waits is a coroutine and the waiting happens
+Twenty-six classes in `weida` (§1). Every call that waits is a coroutine and the waiting happens
 on the reactor with the GIL released; the Rust future starts at the **first `await`**, not at
 the call, so a coroutine that is never awaited does nothing at all
 (`crates/py/weida-py-core/src/bridge.rs:131-153`).
@@ -171,6 +171,23 @@ by **B-244**. `crates/py/weida-py/src/patterns.rs`, and a `weida.Survey` in `val
 | `BusMember::recv()`, `peer_count()`, `dropped()`, `path()` | all four | present — `patterns.rs:263-331`; `dropped` is the fan-out's counted loss, and the test asserts it is `0` for a bus both members read |
 | `BusMember::send_with(meta, body)` as a separate call | — | absent as a name: the binding sets `content_len` and there is no `weida.TransferMeta` to pass, exactly as for `Pusher.send` |
 
+### 4.4a RADIO/DISH
+
+Added on both surfaces by **B-292** ([0034](../decisions/0034-late-is-lost.md) §4.6):
+`crates/py/weida-py/src/patterns.rs` for asyncio, `sync.rs` for `weida.sync`. A runtime that
+carries datagram segments is built with `weida.Runtime(datagrams=True)`, which sets
+`Limits::datagram_receive_bytes` to its documented 64 KiB; both ends need it.
+
+| `crates/weida` | This binding | Verdict |
+| --- | --- | --- |
+| `Listener::radio(path)` | `binding.radio(path)` → `Radio` | present |
+| `Radio::segment(topic)` → `Segment`, `write`, `finish` | `radio.segment(topic)` → `Segment`; `segment.write(chunk)` → `int`; `segment.finish()` → `int` | present, and **none of the three is a coroutine**: a radio never waits for a dish, so the calls are plain on both surfaces |
+| `Radio::datagram(topic, bytes)` | `radio.datagram(topic, payload)` → `int` | present, plain |
+| `Radio::dish_count()`, `dropped()` | both | present; `dropped_on` and `drops` stay Rust-only, as `publisher.dropped_on` does in `sync` |
+| `Runtime::dish(tls)`, `Dish::connect`, `join(filter, max_age)`, `leave`, `recv`, `peer_count` | the same names; `max_age` in seconds as a `float` or `None` | present |
+| `Received::Segment(IncomingTransfer)` / `Received::Datagram { topic, segment, payload }` | `("segment", payload, meta)` / `("datagram", topic, segment, payload)` | present, a tagged tuple, and the segment read whole under the caller's ceiling as every receive here is; `meta.segment` carries the number. Asserted by `test_patterns.py::test_a_radio_segment_and_datagram_reach_a_dish` and its twin in `test_sync.py` |
+| `Peer::open_flow`, `Flow`, `IncomingFlow` | — | absent, for §9.2's reason: the flow is L0, and this binding binds no `Peer` or `Acceptor` |
+
 ### 4.5 The streamed transfer classes
 
 | `crates/weida` | This binding | Verdict |
@@ -239,10 +256,10 @@ is what makes one thread per endpoint the shape it is supposed to be
 (`test_sync.py::test_a_request_is_answered_with_no_event_loop` runs the serving half on a
 `threading.Thread`).
 
-Fifteen classes: `Runtime`, `Binding`, `Requester`, `Pusher`, `Subscriber`, `Replier`,
-`Request`, `Puller`, `Publisher`, `Paired`, `Surveyor`, `Respondent`, `BusMember`, `Cursors`,
-`Reporter` (`sync.rs:919-936`) — every pattern of §4 and the cursor surface of §4.6, because
-B-244 and B-243 added each to both surfaces at once. The value classes are
+Eighteen classes: `Runtime`, `Binding`, `Requester`, `Pusher`, `Subscriber`, `Replier`,
+`Request`, `Puller`, `Publisher`, `Paired`, `Surveyor`, `Respondent`, `BusMember`, `Radio`,
+`Segment`, `Dish`, `Cursors`, `Reporter` — every pattern of §4 and the cursor surface of §4.6,
+because B-244, B-243 and B-292 added each to both surfaces at once. The value classes are
 **shared, not copied** —
 `weida.Trust`, `weida.Identity` and `weida.IncomingMeta` are the same objects on both surfaces
 (`sync.rs:50-52`, `sync.rs:62`) — and so is the whole exception family
@@ -256,7 +273,7 @@ What differs, row by row:
 | `Runtime.drain(seconds)` leaves the runtime usable | `drain` **consumes** the facade's runtime | present as a difference, and it is the facade's: `blocking::Runtime::drain` takes `self` (`crates/weida/src/blocking.rs:157`), so the second call raises `weida.RuntimeFailure` — `sync.rs:186-200`, asserted by `test_sync.py::test_a_runtime_is_shut_down_once` |
 | no `shutdown` | `runtime.shutdown()` | present here and absent there (§3) — `sync.rs:203-209` |
 | `requester.open()`, `pusher.open()`, `publisher.open(topic)`, `puller.recv_stream()`, `subscriber.recv_stream()` | — | absent from `sync`, with the reason at `sync.rs:44-52`: the blocking facade takes whole payloads by design, a synchronous caller that wants to stream wants the asyncio surface or the Rust API, and a `sync` module that invented its own streaming would be inventing a second facade. §9.3 |
-| `OutgoingStream`, `IncomingStream`, `Reply`, `FanOut` | — | absent as classes, following from the row above: none of the thirteen classes `sync.rs` registers is a stream |
+| `OutgoingStream`, `IncomingStream`, `Reply`, `FanOut` | — | absent as classes, following from the row above: none of the eighteen classes `sync.rs` registers is a stream |
 | `publisher.filter_count()` | — | absent: the synchronous publisher has `path`, `publish`, `subscriber_count` and `dropped` (`sync.rs:504-529`), so `test_sync.py:66-72` waits on `subscriber_count` where the asyncio tests wait on `filter_count` |
 | `publisher.dropped_on(topic)` | — | absent: the per-cause breakdown is asyncio-only, and so it is in the facade (`crates/weida/src/blocking.rs:569-606`) |
 | `subscriber.peer_count()` (`pubsub.rs:336-338`) | — | absent: `sync.rs:352-386` gives the synchronous subscriber `connect`, `subscribe`, `unsubscribe` and `recv`, and the facade has no such accessor either (`crates/weida/src/blocking.rs:383-426`) |
@@ -270,7 +287,7 @@ What differs, row by row:
 
 ## 7. The exception family
 
-**22 classes: 21 named failures plus the base**, counted as §1 states. Every failure of the
+**25 classes: 24 named failures plus the base**, counted as §1 states. Every failure of the
 library is a class under `weida.WeidaError`, each instance carrying `errno` and `cause`
 (`errors.rs:1-23`), and the base is what lets a caller catch the family
 (`test_asyncio.py:184-185`).
@@ -278,7 +295,7 @@ library is a class under `weida.WeidaError`, each instance carrying `errno` and 
 | Rust | Python | Verdict |
 | --- | --- | --- |
 | `Error::Runtime` | `weida.RuntimeFailure` | present, and **the one rename**: `weida.Runtime` is the runtime, a module cannot have one name for two things, and the module with the collision silently keeps whichever was added last. So the class is `RuntimeFailure`, its `errno` says the same, and the variant it comes from is written beside it (`errors.rs:45-53`, `72-73`). Both `smoke.py:33-36` and `test_sync.py:119-122` assert that `weida.Runtime` is not a `BaseException` |
-| the other 20 variants of `weida_core::Error` | the same names: `InvalidAddress`, `InvalidEndpointPath`, `InvalidFingerprint`, `AlreadyRegistered`, `NotConnected`, `ConnectionLost`, `Negotiation`, `Protocol`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `NoParkedConnection`, `NoReply`, `Canceled`, `Indeterminate`, `LimitExceeded`, `Tls`, `Untrusted`, `Io`, `Transport` | present — `errors.rs:74-94` |
+| the other 23 variants of `weida_core::Error` | the same names: `InvalidAddress`, `InvalidEndpointPath`, `InvalidFingerprint`, `AlreadyRegistered`, `NotConnected`, `ConnectionLost`, `Negotiation`, `Protocol`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `NoParkedConnection`, `NoReply`, `Canceled`, `Expired`, `Indeterminate`, `LimitExceeded`, `DatagramsUnavailable`, `TooLarge`, `Tls`, `Untrusted`, `Io`, `Transport` | present — `errors.rs:74-97`; the three 0034 added (`Expired`, `DatagramsUnavailable`, `TooLarge`) arrived with it, because the exhaustive match below does not compile without them |
 | a variant added to the library | a **compile error in this file** | present: `name_of` is an exhaustive `match` written by the same macro that writes the name list (`errors.rs:54-70`), so a new variant cannot silently arrive as the base class |
 | `Error::Display` | `cause` | present, and no second vocabulary: the library's own `Display` is the wording, because a binding that rephrased it would be a second one to keep in step (`errors.rs:101-109`) |
 | `Error::is_definite_failure()` keeping `Indeterminate` out of the definite set | `weida.Indeterminate` as a **sibling** of `ConnectionLost`, not a kind of it | present — `errors.rs:18-23`, and it is the one class worth reading twice: the transfer may or may not have arrived, and a caller that treats it as a definite failure is wrong ([FAILURE_MODEL.md](../FAILURE_MODEL.md)) |

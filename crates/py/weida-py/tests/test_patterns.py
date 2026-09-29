@@ -328,3 +328,34 @@ def test_a_bus_message_reaches_every_other_member_and_never_the_sender():
         assert one.dropped() == 0
 
     run(exchange())
+
+
+def test_a_radio_segment_and_datagram_reach_a_dish():
+    """RADIO/DISH from Python: one stream segment and one datagram segment."""
+
+    async def exchange():
+        server = weida.Runtime(datagrams=True)
+        binding = await server.bind("127.0.0.1:0", weida.Identity.generate())
+        radio = binding.radio("/r")
+        client = weida.Runtime(datagrams=True)
+        dish = client.dish(weida.Trust.by_address())
+        await dish.join("v", 0.5)
+        await dish.connect(binding.url("/r"))
+        deadline = asyncio.get_running_loop().time() + DEADLINE
+        while radio.dish_count() != 1:
+            assert asyncio.get_running_loop().time() < deadline, "no join arrived"
+            await asyncio.sleep(0.005)
+
+        segment = radio.segment("v")
+        assert segment.write(b"key") == 1
+        assert segment.write(b"frame") == 1
+        assert segment.finish() == 1
+        kind, payload, meta = await dish.recv(CAP)
+        assert (kind, payload) == ("segment", b"keyframe")
+        assert (meta.topic, meta.segment) == ("v", 0)
+
+        assert radio.datagram("v", b"voice") == 1
+        assert await dish.recv(CAP) == ("datagram", "v", 1, b"voice")
+        assert radio.dropped() == 0
+
+    run(exchange())

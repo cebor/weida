@@ -11,6 +11,10 @@
 //! and BUS — and, since B-243, for the cursor surface of
 //! [0023](../../../docs/decisions/0023-completion-is-a-cursor.md) as well:
 //! [`Cursors`] is a report read by its caller, [`Reporter`] one written by it.
+//! RADIO/DISH of [0034](../../../docs/decisions/0034-late-is-lost.md) is here
+//! too ([`Radio`], [`Dish`]). The datagram **flow** is not: it is L0, and this
+//! facade mirrors the patterns, not `Peer` and `Acceptor`, so a flow stays on
+//! the asynchronous surface — where `Flow::send` never blocks anyway.
 //!
 //! One design question came with SURVEY rather than a translation, and it is
 //! answered in [`Survey`]: a deadline-bounded fan-out of exchanges yields
@@ -145,6 +149,13 @@ impl Runtime {
     pub fn surveyor(&self, trust: impl Into<ClientTls>) -> Surveyor {
         Surveyor {
             endpoint: self.inner.surveyor(trust),
+        }
+    }
+
+    /// A dish on this runtime.
+    pub fn dish(&self, trust: impl Into<ClientTls>) -> Dish {
+        Dish {
+            endpoint: self.inner.dish(trust),
         }
     }
 
@@ -287,6 +298,17 @@ impl Binding {
     pub fn bus(&self, path: &str, trust: impl Into<ClientTls>) -> Result<BusMember, Error> {
         Ok(BusMember {
             endpoint: self.listener.bus(path, trust)?,
+        })
+    }
+
+    /// Registers a radio at `path`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Binding::replier`].
+    pub fn radio(&self, path: &str) -> Result<Radio, Error> {
+        Ok(Radio {
+            endpoint: self.listener.radio(path)?,
         })
     }
 
@@ -1148,6 +1170,164 @@ impl BusMember {
     /// Copies that never reached a member.
     pub fn dropped(&self) -> u64 {
         self.endpoint.dropped()
+    }
+}
+
+/// A radio: segments to every joined dish, dropped rather than waited for
+/// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.6).
+///
+/// Nothing here blocks: a radio never waits for a dish on the asynchronous
+/// surface either, so these are direct calls rather than `block_on`s.
+pub struct Radio {
+    endpoint: crate::Radio,
+}
+
+impl Radio {
+    /// Opens the next segment on `topic`, superseding the previous one's
+    /// copies still unacknowledged there.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Radio::segment`].
+    pub fn segment(&self, topic: &str) -> Result<Segment, Error> {
+        Ok(Segment {
+            inner: self.endpoint.segment(topic)?,
+        })
+    }
+
+    /// Sends a one-packet segment on `topic`; returns how many dishes it was
+    /// handed to.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Radio::datagram`].
+    pub fn datagram(&self, topic: &str, payload: &[u8]) -> Result<usize, Error> {
+        self.endpoint
+            .datagram(topic, bytes::Bytes::copy_from_slice(payload))
+    }
+
+    /// Dishes currently joined.
+    pub fn dish_count(&self) -> usize {
+        self.endpoint.dish_count()
+    }
+
+    /// Copies dropped, over topics and causes.
+    pub fn dropped(&self) -> u64 {
+        self.endpoint.dropped()
+    }
+
+    /// Every topic that lost a copy, with its counts by cause.
+    pub fn drops(&self) -> Vec<crate::TopicDrops> {
+        self.endpoint.drops()
+    }
+
+    /// The asynchronous radio underneath.
+    pub fn endpoint(&self) -> &crate::Radio {
+        &self.endpoint
+    }
+}
+
+/// One segment, open on every dish joined when it opened.
+pub struct Segment {
+    inner: crate::Segment,
+}
+
+impl Segment {
+    /// Hands `chunk` to every copy still open; returns how many that is.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Segment::write`].
+    pub fn write(&mut self, chunk: &[u8]) -> Result<usize, Error> {
+        self.inner.write(bytes::Bytes::copy_from_slice(chunk))
+    }
+
+    /// Ends the segment; returns how many copies it ended on.
+    pub fn finish(self) -> usize {
+        self.inner.finish()
+    }
+}
+
+/// What a dish receives, whole.
+#[derive(Clone, Debug)]
+pub enum Delivered {
+    /// A stream segment; its topic and number are on the message's `meta`.
+    /// Boxed: a message's metadata is several times a datagram's size.
+    Segment(Box<Message>),
+    /// A datagram segment.
+    Datagram {
+        /// The topic it was sent on.
+        topic: String,
+        /// Its segment number on that topic.
+        segment: u64,
+        /// The payload.
+        payload: Vec<u8>,
+    },
+}
+
+/// A dish: joins topics on a radio and receives the newest segment of each.
+pub struct Dish {
+    endpoint: crate::Dish,
+}
+
+dialling!(Dish, crate::Dish);
+
+impl Dish {
+    /// Joins every topic `filter` matches, with a latency budget.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Dish::join`]; plus [`Error::Runtime`] from inside a
+    /// reactor.
+    pub fn join(&self, filter: &str, max_age: Option<Duration>) -> Result<(), Error> {
+        outside_a_reactor()?;
+        drive(self.endpoint.join(filter, max_age))
+    }
+
+    /// Leaves a filter.
+    ///
+    /// # Errors
+    ///
+    /// As [`Dish::join`].
+    pub fn leave(&self, filter: &str) -> Result<(), Error> {
+        outside_a_reactor()?;
+        drive(self.endpoint.leave(filter))
+    }
+
+    /// Waits for the next segment; a stream segment is read whole, at most
+    /// `max_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotConnected`] when the dish is gone,
+    /// [`Error::LimitExceeded`] past the ceiling, [`Error::Canceled`] for a
+    /// segment the radio reset while it was being read, [`Error::Runtime`]
+    /// from inside a reactor.
+    pub fn recv(&self, max_bytes: usize) -> Result<Delivered, Error> {
+        outside_a_reactor()?;
+        drive(async {
+            match self.endpoint.recv().await? {
+                crate::Received::Segment(transfer) => {
+                    let meta = transfer.meta().clone();
+                    let payload = transfer.collect(max_bytes).await?;
+                    Ok(Delivered::Segment(Box::new(Message { payload, meta })))
+                }
+                crate::Received::Datagram {
+                    topic,
+                    segment,
+                    payload,
+                } => Ok(Delivered::Datagram {
+                    topic,
+                    segment,
+                    payload: payload.to_vec(),
+                }),
+            }
+        })
+    }
+
+    /// Connected radios.
+    pub fn peer_count(&self) -> usize {
+        self.endpoint.peer_count()
     }
 }
 

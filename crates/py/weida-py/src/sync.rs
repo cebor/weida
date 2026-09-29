@@ -103,10 +103,11 @@ impl SyncRuntime {
     /// threads, or when this is called from inside a Tokio runtime — which
     /// would deadlock on the first call.
     #[new]
-    #[pyo3(signature = (worker_threads=1))]
-    fn new(py: Python<'_>, worker_threads: usize) -> PyResult<SyncRuntime> {
+    #[pyo3(signature = (worker_threads=1, datagrams=false))]
+    fn new(py: Python<'_>, worker_threads: usize, datagrams: bool) -> PyResult<SyncRuntime> {
         let config = weida::RuntimeConfig {
             worker_threads,
+            limits: crate::limits_with(datagrams),
             ..weida::RuntimeConfig::default()
         };
         let runtime = raise(py, py.detach(|| blocking::Runtime::new(config)))?;
@@ -189,6 +190,17 @@ impl SyncRuntime {
         match guard.as_ref() {
             Some(runtime) => Ok(SyncSurveyor {
                 endpoint: runtime.surveyor(trust.trust.clone()),
+            }),
+            None => spent(py, "runtime"),
+        }
+    }
+
+    /// A dish on this runtime.
+    fn dish(&self, py: Python<'_>, trust: PyTrust) -> PyResult<SyncDish> {
+        let guard = self.runtime.lock().expect("runtime lock poisoned");
+        match guard.as_ref() {
+            Some(runtime) => Ok(SyncDish {
+                endpoint: runtime.dish(trust.trust.clone()),
             }),
             None => spent(py, "runtime"),
         }
@@ -291,6 +303,13 @@ impl SyncBinding {
     fn bus(&self, py: Python<'_>, path: &str, trust: PyTrust) -> PyResult<SyncBusMember> {
         Ok(SyncBusMember {
             endpoint: raise(py, self.binding.bus(path, trust.trust.clone()))?,
+        })
+    }
+
+    /// Registers a radio at `path`.
+    fn radio(&self, py: Python<'_>, path: &str) -> PyResult<SyncRadio> {
+        Ok(SyncRadio {
+            endpoint: raise(py, self.binding.radio(path))?,
         })
     }
 
@@ -802,6 +821,134 @@ impl SyncBusMember {
     }
 }
 
+/// `weida.sync.Radio`: segments to every joined dish. Nothing here blocks.
+#[pyclass(frozen, name = "Radio", module = "weida.sync")]
+pub struct SyncRadio {
+    endpoint: blocking::Radio,
+}
+
+#[pymethods]
+impl SyncRadio {
+    /// Opens the next segment on `topic`, superseding the previous one's
+    /// copies still unacknowledged there.
+    fn segment(&self, py: Python<'_>, topic: &str) -> PyResult<SyncSegment> {
+        Ok(SyncSegment {
+            segment: Mutex::new(Some(raise(py, self.endpoint.segment(topic))?)),
+        })
+    }
+
+    /// Sends `payload` as a one-packet segment on `topic`; returns how many
+    /// dishes it was handed to.
+    fn datagram(&self, py: Python<'_>, topic: &str, payload: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let body = payload_of(payload)?;
+        raise(py, self.endpoint.datagram(topic, &body))
+    }
+
+    /// Dishes currently joined.
+    fn dish_count(&self) -> usize {
+        self.endpoint.dish_count()
+    }
+
+    /// Copies dropped, over topics and causes.
+    fn dropped(&self) -> u64 {
+        self.endpoint.dropped()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<weida.sync.Radio {}>", self.endpoint.endpoint().path())
+    }
+}
+
+/// `weida.sync.Segment`: one segment, written chunk by chunk.
+#[pyclass(frozen, name = "Segment", module = "weida.sync")]
+pub struct SyncSegment {
+    /// `None` after `finish`.
+    segment: Mutex<Option<blocking::Segment>>,
+}
+
+#[pymethods]
+impl SyncSegment {
+    /// Hands `chunk` to every copy still open; returns how many that is.
+    fn write(&self, py: Python<'_>, chunk: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let body = payload_of(chunk)?;
+        let mut guard = self.segment.lock().expect("segment lock poisoned");
+        match guard.as_mut() {
+            Some(segment) => raise(py, segment.write(&body)),
+            None => spent(py, "segment"),
+        }
+    }
+
+    /// Ends the segment; returns how many copies it ended on.
+    fn finish(&self) -> usize {
+        self.segment
+            .lock()
+            .expect("segment lock poisoned")
+            .take()
+            .map_or(0, blocking::Segment::finish)
+    }
+}
+
+/// `weida.sync.Dish`: joins topics and receives the newest segment of each.
+#[pyclass(frozen, name = "Dish", module = "weida.sync")]
+pub struct SyncDish {
+    endpoint: blocking::Dish,
+}
+
+#[pymethods]
+impl SyncDish {
+    /// Dials the radio at `url`.
+    fn connect(&self, py: Python<'_>, url: &str) -> PyResult<()> {
+        raise(py, py.detach(|| self.endpoint.connect(url)))
+    }
+
+    /// Joins every topic `filter` matches; `max_age` in seconds is the
+    /// latency budget after which the radio resets this dish's copy.
+    #[pyo3(signature = (filter, max_age=None))]
+    fn join(&self, py: Python<'_>, filter: &str, max_age: Option<f64>) -> PyResult<()> {
+        let max_age = raise(
+            py,
+            max_age
+                .map(std::time::Duration::try_from_secs_f64)
+                .transpose()
+                .map_err(|e| weida::Error::Runtime(format!("max_age: {e}"))),
+        )?;
+        raise(py, py.detach(|| self.endpoint.join(filter, max_age)))
+    }
+
+    /// Leaves a filter.
+    fn leave(&self, py: Python<'_>, filter: &str) -> PyResult<()> {
+        raise(py, py.detach(|| self.endpoint.leave(filter)))
+    }
+
+    /// Waits for the next segment: `("segment", payload, meta)` for a stream
+    /// segment read whole, at most `max_bytes`, or
+    /// `("datagram", topic, segment, payload)`.
+    fn recv<'py>(&self, py: Python<'py>, max_bytes: usize) -> PyResult<Bound<'py, PyAny>> {
+        let delivered = raise(py, py.detach(|| self.endpoint.recv(max_bytes)))?;
+        match delivered {
+            blocking::Delivered::Segment(message) => {
+                let blocking::Message { payload, meta } = *message;
+                crate::patterns::Heard::Segment(payload, PyIncomingMeta::of(&meta))
+            }
+            blocking::Delivered::Datagram {
+                topic,
+                segment,
+                payload,
+            } => crate::patterns::Heard::Datagram(topic, segment, payload),
+        }
+        .into_pyobject(py)
+    }
+
+    /// Radios connected.
+    fn peer_count(&self) -> usize {
+        self.endpoint.peer_count()
+    }
+
+    fn __repr__(&self) -> String {
+        "<weida.sync.Dish>".to_owned()
+    }
+}
+
 /// `weida.sync.Cursors`: the sender's end of one transfer's report.
 ///
 /// The same three calls the asyncio `weida.Cursors` has, blocking. The loop a
@@ -953,6 +1100,9 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     sync.add_class::<SyncSurveyor>()?;
     sync.add_class::<SyncRespondent>()?;
     sync.add_class::<SyncBusMember>()?;
+    sync.add_class::<SyncRadio>()?;
+    sync.add_class::<SyncSegment>()?;
+    sync.add_class::<SyncDish>()?;
     sync.add_class::<SyncCursors>()?;
     sync.add_class::<SyncReporter>()?;
     sync.add(
@@ -971,6 +1121,9 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
             "Surveyor",
             "Respondent",
             "BusMember",
+            "Radio",
+            "Segment",
+            "Dish",
             "Cursors",
             "Reporter",
         ],
