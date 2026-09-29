@@ -449,6 +449,14 @@ pub(crate) fn transport_config(limits: &Limits, dialling: bool) -> Result<Transp
         (limits.datagram_receive_bytes > 0).then_some(limits.datagram_receive_bytes),
     );
     tc.datagram_send_buffer_size(limits.datagram_send_bytes);
+    let controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> = match limits
+        .congestion
+    {
+        weida_core::Congestion::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
+        weida_core::Congestion::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
+        weida_core::Congestion::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
+    };
+    tc.congestion_controller_factory(controller);
     Ok(tc)
 }
 

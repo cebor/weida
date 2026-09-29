@@ -101,7 +101,7 @@ pub use weida_core::{
     LossCause, PeerIdentity, PipeAddr, Result, StopReason, TraceContext, UnixAddr,
     WindowsPrincipal,
 };
-pub use weida_core::{DEFAULT_DATAGRAM_RECEIVE_BYTES, DEFAULT_PORT};
+pub use weida_core::{Congestion, DEFAULT_DATAGRAM_RECEIVE_BYTES, DEFAULT_PORT};
 pub use weida_protocol::{ALPN, VERSION, codes, filter};
 pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
 // `Delivery` keeps its transfer-receipt meaning at this level, so the

@@ -1555,6 +1555,40 @@ nothing, and only running them says which of the two it is. CI for the fuzz crat
 filed (B-061, whose acceptance keeps the fuzz targets out of the push gate deliberately:
 they need nightly and a time budget).
 
+### Verified results — voice beside bulk (B-289)
+
+What a bulk upload to the same host costs a voice flow, by path and by congestion controller
+([0034](decisions/0034-late-is-lost.md) §6). An in-process UDP shaper sits between one client
+runtime and one server: client to server is a token bucket at **20 Mbit/s** feeding a
+**64 KiB drop-tail** queue, server to client is unshaped. Voice is a flow of 200-byte
+datagrams at 50 Hz, each carrying its send time so the receiver measures one-way latency on
+one clock; bulk is 1 MiB `Pusher` transfers back to back. Voice is measured from second 2 to
+second 20 of each run, after bulk has filled the queue. "Separate paths" is `/voice` and
+`/bulk`, two connections and two controllers; "one path" is `/mixed`, one connection served
+by one `Acceptor`. The controller is set on the client runtime (`Limits::congestion`), so it
+governs both of the client's connections. AMD Ryzen 7 5800X, Linux 7.2.8, rustc 1.98.1,
+release profile, loopback; two runs of the whole probe.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Separate paths, CUBIC | `cargo run --release -p weida --example voice_beside_bulk` | voice p50 **43.0 / 43.9 ms**, p95 **81.6 / 91.7 ms**, p99 122.3 / 133.6 ms, loss 4.10 / 4.60 %; bulk 21 / 21 MiB delivered; 95 / 94 packets dropped at the queue |
+| Separate paths, BBR | same | voice p50 **5.6 / 5.6 ms**, p95 **6.7 / 47.7 ms**, p99 50.0 / 61.5 ms, loss 8.69 / 8.69 %; bulk 21 / 17 MiB; 323 / 602 queue drops |
+| One path, CUBIC | same | voice p50 42.7 / 42.2 ms, p95 49.5 / 49.5 ms, p99 52.9 / 52.8 ms, loss **0.00 / 0.00 %**; bulk 22 / 22 MiB; 84 / 88 queue drops |
+| One path, BBR | same | voice p50 8.8 / 48.5 ms, p95 56.6 / 52.8 ms, p99 59.4 / 60.4 ms, loss 5.39 / 1.90 %; bulk 18 / 23 MiB; 1455 / 5578 queue drops |
+
+**On separate paths BBR cut voice p95 by 92 % and 48 % in the two runs, past the 30 % the
+note set in advance, so 0034 §6 now says a bulk profile that shares a bottleneck with media
+runs `Congestion::Bbr`.** Its price is visible in the same rows: voice loss roughly doubles
+(4-5 % to 9 %) because BBR's probing overflows a 64 KiB queue that CUBIC fills more slowly,
+and the p95 spread between the two BBR runs is sevenfold, which is `quinn`'s own warning that
+its BBR is experimental in numbers. **One path is the other finding**: voice on the bulk
+connection lost nothing under CUBIC, because a datagram outranks every stream in `quinn`'s
+packet assembly (0034 §2.3), but it waits in the sender for the congestion window, so its
+p50 is the queue's ~43 ms either way. The default stays `Cubic`: the note's rule is about
+a bulk profile, and a profile is chosen, not inherited. One named limit: loopback plus a
+userspace shaper is not a residential uplink — the shaper's timer granularity is a
+millisecond, and nothing here models cross traffic or a real modem's buffer.
+
 ---
 
 ## 5. Decisions

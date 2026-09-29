@@ -118,6 +118,26 @@ pub struct Limits {
     /// How long a datagram waits in that ring for its FLOW header before it
     /// is dropped and counted.
     pub flow_early_hold: Duration,
+
+    /// The congestion controller of this profile's QUIC connections. Not a
+    /// bound, but a per-connection choice, which is why it lives here: a
+    /// bulk profile that shares a bottleneck with media may want a different
+    /// controller than a media profile
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §6).
+    pub congestion: Congestion,
+}
+
+/// A QUIC congestion controller, as `quinn` implements them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Congestion {
+    /// CUBIC (RFC 9438), `quinn`'s default: loss-based.
+    #[default]
+    Cubic,
+    /// NewReno (RFC 9002 §7): loss-based, the conservative baseline.
+    NewReno,
+    /// BBR: model-based, reacts to delay rather than waiting for loss.
+    /// `quinn` marks its implementation experimental.
+    Bbr,
 }
 
 /// The documented `Limits::datagram_receive_bytes` for a profile that
@@ -160,6 +180,7 @@ impl Default for Limits {
             flow_queue_bytes: 16_384,
             flow_early_bytes: 4_096,
             flow_early_hold: Duration::from_secs(1),
+            congestion: Congestion::Cubic,
         }
     }
 }
@@ -193,6 +214,7 @@ mod tests {
         assert_eq!(l.flow_queue_bytes, 16 << 10);
         assert_eq!(l.flow_early_bytes, 4 << 10);
         assert_eq!(l.flow_early_hold, Duration::from_secs(1));
+        assert_eq!(l.congestion, Congestion::Cubic);
     }
 
     #[test]

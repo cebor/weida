@@ -1432,6 +1432,7 @@ Per connection (`Limits`):
 | `flow_queue_bytes` | 16 KiB | unread datagram bytes held per inbound flow; a slow consumer loses its oldest datagrams, counted per flow |
 | `flow_early_bytes` | 4 KiB | per-connection ring for datagrams naming an id with no live flow yet (§6.9) |
 | `flow_early_hold` | 1 s | how long a datagram waits in that ring for its FLOW header before it is dropped |
+| `congestion` | `Cubic` | the QUIC congestion controller of this profile's connections: `Cubic`, `NewReno` or `Bbr`. Not a bound and not on the wire; it is here because it is chosen per profile ([decisions/0034](decisions/0034-late-is-lost.md) §6, [IMPLEMENTATION.md](IMPLEMENTATION.md) §4, B-289) |
 
 Per runtime (`RuntimeConfig`):
 

@@ -477,7 +477,11 @@ acceptance: RADIO/DISH in `weida::blocking` (flows stay async-only there, becaus
   upload to the same host run two controllers against one bottleneck queue, and no QUIC priority
   reaches across them; a loss-based controller on the bulk side fills that queue and the voice
   pays for it. Whether a media profile or the bulk profile needs a delay-based controller is
-  B-289's number, not an argument.
+  B-289's number, not an argument. **B-289 measured it** ([IMPLEMENTATION.md](../IMPLEMENTATION.md)
+  §4): at 20 Mbit/s behind a 64 KiB drop-tail queue, BBR on separate paths cut voice p95 by 92 %
+  and 48 % in two runs, past the 30 % set in advance, at the price of about twice the voice
+  loss. So a bulk profile that shares a bottleneck with media runs `Congestion::Bbr`; the
+  default stays `Cubic`.
 - **DSCP marking.** Per-connection marking fits per-path connections; griasdi's open question 2
   is right that a shared socket for hole punching makes it per packet. Both wait for a user.
 - **NAT traversal and client admission.** griasdi's adjacent requirements — a
