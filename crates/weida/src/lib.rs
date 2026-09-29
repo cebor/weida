@@ -86,7 +86,7 @@ pub use endpoint::{
     Push, Pusher, Radio, Rep, Replier, Req, Requester, Respond, Respondent, Sub, Subscriber,
     Survey, SurveyRun, Surveyor, Tune,
 };
-pub use flow::{Flow, FlowInfo, FlowMeta, FlowStats, IncomingFlow};
+pub use flow::{Flow, FlowInfo, FlowMeta, FlowStats, IncomingFlow, PathStats};
 pub use identity::{FilesOptions, IdentityEvent, IdentityEvents, IdentitySource, TrustSource};
 #[cfg(windows)]
 pub use listener::PipeBinding;

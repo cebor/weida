@@ -116,6 +116,29 @@ pub struct FlowStats {
     pub overflow: u64,
 }
 
+/// What the path under a flow looks like now, from `quinn`'s connection
+/// statistics ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
+/// §4.9) — what a jitter buffer or a bitrate controller sizes itself by.
+///
+/// weida's own type, so no `quinn` type is part of the public surface.
+/// `quinn` 0.11 reports no RTT variation, so none is passed through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PathStats {
+    /// Smoothed round-trip time.
+    pub rtt: Duration,
+    /// Congestion window, in bytes.
+    pub cwnd: u64,
+    /// Congestion events the controller has reacted to.
+    pub congestion_events: u64,
+    /// Packets declared lost.
+    pub lost_packets: u64,
+    /// Packets sent.
+    pub sent_packets: u64,
+    /// The largest datagram the connection carries now, prefix included;
+    /// `None` when the peer accepts none.
+    pub max_datagram_size: Option<usize>,
+}
+
 #[derive(Default)]
 struct Counters {
     sent: AtomicU64,
@@ -735,6 +758,12 @@ impl Flow {
         self.counters.snapshot()
     }
 
+    /// The path under this flow, or `None` on a local transport, which has
+    /// no path to measure.
+    pub fn path_stats(&self) -> Option<PathStats> {
+        lock(&self.binding).as_ref()?.conn.conn.path_stats()
+    }
+
     /// Closes the flow with FIN; the receiver sees its end after the
     /// datagrams already delivered. Dropping the flow does the same.
     pub fn close(self) {
@@ -773,6 +802,7 @@ impl fmt::Debug for Flow {
 pub struct IncomingFlow {
     info: FlowInfo,
     inbound: Arc<Inbound>,
+    conn: ConnHandle,
 }
 
 impl IncomingFlow {
@@ -805,6 +835,12 @@ impl IncomingFlow {
     /// This flow's counters.
     pub fn stats(&self) -> FlowStats {
         self.inbound.counters.snapshot()
+    }
+
+    /// The path under this flow, or `None` on a local transport, which has
+    /// no path to measure.
+    pub fn path_stats(&self) -> Option<PathStats> {
+        self.conn.conn.path_stats()
     }
 
     /// Refuses the flow: `STOP_SENDING(REJECTED)`.
@@ -879,6 +915,7 @@ pub(crate) async fn handle_flow(
             peer: ctx.peer.clone(),
         },
         inbound: Arc::clone(&inbound),
+        conn: ConnHandle::clone(ctx),
     };
     match route {
         Some(Route::Raw(queue)) => {

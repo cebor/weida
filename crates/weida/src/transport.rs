@@ -367,6 +367,24 @@ impl Link {
             _ => Err(Error::Unsupported),
         }
     }
+
+    /// The path's statistics on QUIC; `None` on a local transport.
+    pub(crate) fn path_stats(&self) -> Option<crate::PathStats> {
+        match self {
+            Link::Quic(conn) => {
+                let path = conn.stats().path;
+                Some(crate::PathStats {
+                    rtt: path.rtt,
+                    cwnd: path.cwnd,
+                    congestion_events: path.congestion_events,
+                    lost_packets: path.lost_packets,
+                    sent_packets: path.sent_packets,
+                    max_datagram_size: conn.max_datagram_size(),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 impl SendHalf {
