@@ -9,6 +9,11 @@ use std::fmt;
 
 use crate::header::{GuaranteeSet, Hello};
 
+/// Capability code `1`, `datagram`: the sender reads QUIC DATAGRAM frames and
+/// FLOW streams (`docs/PROTOCOL.md` §6.1). A FLOW stream or a datagram is
+/// sent only when both HELLOs list it.
+pub const CAPABILITY_DATAGRAM: u64 = 1;
+
 /// The negotiated parameters of a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Agreed {
@@ -23,6 +28,9 @@ pub struct Agreed {
     /// Between two v0 peers this is [`GuaranteeSet::CORE`], because neither
     /// declares anything and an absent declaration means `core`.
     pub guarantees: GuaranteeSet,
+    /// Both HELLOs listed [`CAPABILITY_DATAGRAM`], so FLOW streams and
+    /// datagrams may be sent on this connection.
+    pub datagrams: bool,
 }
 
 /// Why negotiation failed.
@@ -85,7 +93,8 @@ impl From<NegotiateError> for weida_core::Error {
 ///
 /// The effective version is the maximum of the intersection of the two version
 /// lists. Every capability the peer marks as required must appear in our own
-/// supported set; v0 defines no capability codes, so any requirement fails.
+/// supported set, so a peer requiring a code we did not list fails. The only
+/// code defined is [`CAPABILITY_DATAGRAM`], agreed when both sides list it.
 ///
 /// The guarantee set is the weaker of the two offers, and both sides'
 /// requirements must be reachable by it — there is no downgrade path
@@ -123,6 +132,8 @@ pub fn negotiate(ours: &Hello, theirs: &Hello) -> Result<Agreed, NegotiateError>
         version,
         send_max_header_bytes: theirs.max_header_bytes,
         guarantees,
+        datagrams: ours.capabilities.contains(&CAPABILITY_DATAGRAM)
+            && theirs.capabilities.contains(&CAPABILITY_DATAGRAM),
     })
 }
 
@@ -210,8 +221,18 @@ mod tests {
                 version: 0,
                 send_max_header_bytes: 8192,
                 guarantees: GuaranteeSet::CORE,
+                datagrams: false,
             }
         );
+    }
+
+    #[test]
+    fn datagrams_are_agreed_only_when_both_list_the_code() {
+        let with = hello(&[0], &[CAPABILITY_DATAGRAM], &[], 16384);
+        let without = Hello::v0(16384, 1024);
+        assert!(negotiate(&with, &with).unwrap().datagrams);
+        assert!(!negotiate(&with, &without).unwrap().datagrams);
+        assert!(!negotiate(&without, &with).unwrap().datagrams);
     }
 
     #[test]

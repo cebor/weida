@@ -16,8 +16,9 @@ use weida_protocol::header::{
     Acknowledgement, CursorLevel, GuaranteeSet, HeaderError, OrderingMode, ReportMode, limits,
 };
 use weida_protocol::{
-    CreditHeader, CursorHeader, DataHeader, ErrorHeader, FrameKind, Hello, SubscriptionHeader,
-    decode_cursor_record, encode_cursor_record, encode_frame,
+    CAPABILITY_DATAGRAM, CreditHeader, CursorHeader, DataHeader, ErrorHeader, FlowHeader,
+    FrameKind, Hello, SubscriptionHeader, decode_cursor_record, encode_cursor_record, encode_frame,
+    flow_prefix, split_flow_datagram,
 };
 
 /// Asserts one documented frame, and that its header half decodes back.
@@ -551,4 +552,84 @@ fn a_cursor_record_that_ends_mid_value_asks_for_more_bytes() {
             value: 15
         })
     );
+}
+
+#[test]
+fn golden_flow_frame() {
+    let h = FlowHeader::new("/v", 7);
+    assert_frame(
+        "FLOW",
+        FrameKind::Flow,
+        h.encode(),
+        &[0x57, 0x07, 0x07, 0xA2, 0x00, 0x62, 0x2F, 0x76, 0x01, 0x07],
+    );
+    assert_eq!(FlowHeader::decode(&h.encode()).unwrap(), h);
+}
+
+#[test]
+fn a_flow_header_without_a_flow_id_is_refused() {
+    // `A1 00 62 2F 76`: an endpoint and no key 1. A flow no datagram can
+    // name is not a flow (`docs/PROTOCOL.md` §6.8).
+    assert_eq!(
+        FlowHeader::decode(&[0xA1, 0x00, 0x62, 0x2F, 0x76]),
+        Err(HeaderError::MissingKey(1))
+    );
+}
+
+#[test]
+fn golden_flow_datagram_payload() {
+    // Not a frame: the payload of one QUIC DATAGRAM frame, flow 7, "hi".
+    let (prefix, len) = flow_prefix(7);
+    let mut datagram = prefix[..len].to_vec();
+    datagram.extend_from_slice(b"hi");
+    assert_eq!(datagram, [0x07, 0x68, 0x69]);
+    assert_eq!(split_flow_datagram(&datagram), Some((7, 1)));
+}
+
+#[test]
+fn golden_segment_data_frame() {
+    let h = DataHeader {
+        segment: Some(5),
+        ..DataHeader::addressed("/t")
+    };
+    assert_frame(
+        "DATA segment",
+        FrameKind::Data,
+        h.encode(),
+        &[0x57, 0x01, 0x07, 0xA2, 0x00, 0x62, 0x2F, 0x74, 0x0D, 0x05],
+    );
+    assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
+}
+
+#[test]
+fn golden_subscribe_with_max_age_frame() {
+    let h = SubscriptionHeader {
+        max_age_ms: Some(150),
+        ..SubscriptionHeader::new("/t", "a")
+    };
+    assert_frame(
+        "SUB max_age_ms",
+        FrameKind::Subscribe,
+        h.encode(),
+        &[
+            0x57, 0x03, 0x0B, 0xA3, 0x00, 0x62, 0x2F, 0x74, 0x01, 0x61, 0x61, 0x02, 0x18, 0x96,
+        ],
+    );
+    assert_eq!(SubscriptionHeader::decode(&h.encode()).unwrap(), h);
+}
+
+#[test]
+fn golden_hello_with_datagram_frame() {
+    let mut h = Hello::v0(16384, 1024);
+    h.capabilities = vec![CAPABILITY_DATAGRAM];
+    assert_frame(
+        "HELLO datagram",
+        FrameKind::Hello,
+        h.encode(),
+        &[
+            0x57, 0x00, 0x11, 0xA5, 0x00, 0x81, 0x00, 0x01, 0x19, 0x40, 0x00, 0x02, 0x19, 0x04,
+            0x00, 0x03, 0x81, 0x01, 0x04, 0x80,
+        ],
+    );
+    assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
 }

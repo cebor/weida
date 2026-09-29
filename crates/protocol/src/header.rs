@@ -92,6 +92,9 @@ mod data_key {
     pub const REPORT_ID: u64 = 9;
     pub const REPORT: u64 = 10;
     pub const REPORT_MODE: u64 = 11;
+    // Key 12 (`delivery_attempt`) is reserved in docs/PROTOCOL.md §6.2 and
+    // coded by the slice that writes it.
+    pub const SEGMENT: u64 = 13;
 }
 
 /// ERROR keys.
@@ -104,6 +107,7 @@ mod error_key {
 mod subscription_key {
     pub const ENDPOINT: u64 = 0;
     pub const FILTER: u64 = 1;
+    pub const MAX_AGE_MS: u64 = 2;
 }
 
 /// CREDIT keys.
@@ -116,6 +120,16 @@ mod credit_key {
 /// CURSOR head-frame keys.
 mod cursor_key {
     pub const REPORT_ID: u64 = 0;
+}
+
+/// FLOW keys (`docs/PROTOCOL.md` §6.8).
+mod flow_key {
+    pub const ENDPOINT: u64 = 0;
+    pub const FLOW: u64 = 1;
+    pub const CONTENT_TYPE: u64 = 2;
+    pub const TRACEPARENT: u64 = 3;
+    pub const TRACESTATE: u64 = 4;
+    pub const TOPIC: u64 = 5;
 }
 
 /// The topic filter grammar of `docs/PROTOCOL.md` §6.4.
@@ -1445,6 +1459,14 @@ pub struct DataHeader {
     ///
     /// [`ReportMode::Progress`] is the default and is never written.
     pub report_mode: ReportMode,
+    /// RADIO segment number per `(radio path, topic)`, from 0 (key `13`).
+    ///
+    /// Written by a radio only
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
+    /// §4.6). It is not a `PerProducer` sequence: it is written whatever
+    /// ordering was negotiated, and a dish uses it to discard a segment older
+    /// than the newest it delivered.
+    pub segment: Option<u64>,
 }
 
 impl DataHeader {
@@ -1506,7 +1528,8 @@ impl DataHeader {
             + u64::from(self.achieved.is_some())
             + u64::from(self.report_id.is_some())
             + u64::from(!report.is_empty())
-            + u64::from(self.report_mode != ReportMode::default());
+            + u64::from(self.report_mode != ReportMode::default())
+            + u64::from(self.segment.is_some());
         encode_into_with(out, |e| {
             e.map(count)?;
             if let Some(endpoint) = &self.endpoint {
@@ -1554,6 +1577,9 @@ impl DataHeader {
                 e.u64(data_key::REPORT_MODE)?
                     .u64(self.report_mode.to_wire())?;
             }
+            if let Some(segment) = self.segment {
+                e.u64(data_key::SEGMENT)?.u64(segment)?;
+            }
             Ok(())
         })
     }
@@ -1600,6 +1626,7 @@ impl DataHeader {
                     data_key::REPORT_MODE => {
                         header.report_mode = level(m.u64()?, "report_mode")?;
                     }
+                    data_key::SEGMENT => header.segment = Some(m.u64()?),
                     _ => m.skip()?,
                 }
             }
@@ -1700,6 +1727,11 @@ pub struct SubscriptionHeader {
     /// Topic filter; the empty string matches everything. A decoded header's
     /// filter has passed [`filter::validate`].
     pub filter: String,
+    /// The dish's latency budget in milliseconds (key `2`), meaningful on a
+    /// RADIO path only
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
+    /// §4.6). Encoded only when present.
+    pub max_age_ms: Option<u64>,
 }
 
 impl SubscriptionHeader {
@@ -1708,6 +1740,7 @@ impl SubscriptionHeader {
         SubscriptionHeader {
             endpoint: endpoint.into(),
             filter: filter.into(),
+            max_age_ms: None,
         }
     }
 
@@ -1722,13 +1755,17 @@ impl SubscriptionHeader {
     /// buffer (B-250). The canonical form has one implementation and this is
     /// it; [`Self::encode`] is a wrapper.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
-        // Both keys are required, so neither is elided: an absent filter and an
-        // empty filter would otherwise be indistinguishable on the wire, and
-        // the empty filter is the "everything" subscription.
+        // Keys 0 and 1 are required, so neither is elided: an absent filter
+        // and an empty filter would otherwise be indistinguishable on the
+        // wire, and the empty filter is the "everything" subscription. Key 2
+        // is optional and written only when set.
         encode_into_with(out, |e| {
-            e.map(2)?;
+            e.map(2 + u64::from(self.max_age_ms.is_some()))?;
             e.u64(subscription_key::ENDPOINT)?.str(&self.endpoint)?;
             e.u64(subscription_key::FILTER)?.str(&self.filter)?;
+            if let Some(max_age_ms) = self.max_age_ms {
+                e.u64(subscription_key::MAX_AGE_MS)?.u64(max_age_ms)?;
+            }
             Ok(())
         })
     }
@@ -1738,6 +1775,7 @@ impl SubscriptionHeader {
         let mut d = Decoder::new(bytes);
         let mut endpoint = None;
         let mut filter = None;
+        let mut max_age_ms = None;
         {
             let mut m = MapReader::new(&mut d)?;
             while let Some(key) = m.next_key()? {
@@ -1748,6 +1786,7 @@ impl SubscriptionHeader {
                     subscription_key::FILTER => {
                         filter = Some(m.text(key, limits::MAX_FILTER_BYTES)?)
                     }
+                    subscription_key::MAX_AGE_MS => max_age_ms = Some(m.u64()?),
                     _ => m.skip()?,
                 }
             }
@@ -1764,6 +1803,121 @@ impl SubscriptionHeader {
         Ok(SubscriptionHeader {
             endpoint: endpoint.expect("presence checked above"),
             filter,
+            max_age_ms,
+        })
+    }
+}
+
+/// FLOW header (kind `7`).
+///
+/// The registration of a datagram flow: the stream it opens is the flow's
+/// lifetime, and the flow id prefixes every datagram the flow carries
+/// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.2).
+/// The optional keys reuse DATA's meaning and caps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlowHeader {
+    /// Endpoint path the flow is addressed to (key `0`, required).
+    pub endpoint: String,
+    /// Flow id, chosen by the sender and unique per connection and
+    /// direction (key `1`, required).
+    pub flow: u64,
+    /// Opaque media type label (key `2`).
+    pub content_type: Option<String>,
+    /// W3C Trace Context `traceparent` (key `3`).
+    pub traceparent: Option<String>,
+    /// W3C Trace Context `tracestate` (key `4`).
+    pub tracestate: Option<String>,
+    /// Topic the flow carries (key `5`).
+    pub topic: Option<String>,
+}
+
+impl FlowHeader {
+    /// A header for flow `flow` addressed to `endpoint`, with no optional key.
+    pub fn new(endpoint: impl Into<String>, flow: u64) -> FlowHeader {
+        FlowHeader {
+            endpoint: endpoint.into(),
+            flow,
+            content_type: None,
+            traceparent: None,
+            tracestate: None,
+            topic: None,
+        }
+    }
+
+    /// Encodes the header.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Appends the encoded header to `out`. The canonical form has one
+    /// implementation and this is it; [`Self::encode`] is a wrapper.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        let count = 2
+            + u64::from(self.content_type.is_some())
+            + u64::from(self.traceparent.is_some())
+            + u64::from(self.tracestate.is_some())
+            + u64::from(self.topic.is_some());
+        encode_into_with(out, |e| {
+            e.map(count)?;
+            e.u64(flow_key::ENDPOINT)?.str(&self.endpoint)?;
+            e.u64(flow_key::FLOW)?.u64(self.flow)?;
+            if let Some(ct) = &self.content_type {
+                e.u64(flow_key::CONTENT_TYPE)?.str(ct)?;
+            }
+            if let Some(tp) = &self.traceparent {
+                e.u64(flow_key::TRACEPARENT)?.str(tp)?;
+            }
+            if let Some(ts) = &self.tracestate {
+                e.u64(flow_key::TRACESTATE)?.str(ts)?;
+            }
+            if let Some(topic) = &self.topic {
+                e.u64(flow_key::TOPIC)?.str(topic)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Decodes the header.
+    pub fn decode(bytes: &[u8]) -> Result<FlowHeader, HeaderError> {
+        let mut d = Decoder::new(bytes);
+        let mut endpoint = None;
+        let mut flow = None;
+        let mut content_type = None;
+        let mut traceparent = None;
+        let mut tracestate = None;
+        let mut topic = None;
+        {
+            let mut m = MapReader::new(&mut d)?;
+            while let Some(key) = m.next_key()? {
+                match key {
+                    flow_key::ENDPOINT => endpoint = Some(m.text(key, limits::MAX_ENDPOINT_BYTES)?),
+                    flow_key::FLOW => flow = Some(m.u64()?),
+                    flow_key::CONTENT_TYPE => {
+                        content_type = Some(m.text(key, limits::MAX_CONTENT_TYPE_BYTES)?)
+                    }
+                    flow_key::TRACEPARENT => {
+                        traceparent = Some(m.text(key, limits::MAX_TRACEPARENT_BYTES)?)
+                    }
+                    flow_key::TRACESTATE => {
+                        tracestate = Some(m.text(key, limits::MAX_TRACESTATE_BYTES)?)
+                    }
+                    flow_key::TOPIC => topic = Some(m.text(key, limits::MAX_TOPIC_BYTES)?),
+                    _ => m.skip()?,
+                }
+            }
+            m.require(flow_key::ENDPOINT)?;
+            m.require(flow_key::FLOW)?;
+        }
+        finish(&d)?;
+        Ok(FlowHeader {
+            endpoint: endpoint.expect("presence checked above"),
+            flow: flow.expect("presence checked above"),
+            content_type,
+            traceparent,
+            tracestate,
+            topic,
         })
     }
 }
@@ -2180,6 +2334,7 @@ mod tests {
                 CursorLevel::Application(CursorLevel::APPLICATION_FLOOR),
             ],
             report_mode: ReportMode::FinalOnly,
+            segment: Some(u64::MAX),
         };
         assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
     }
@@ -2212,6 +2367,7 @@ mod tests {
             report_id: Some(1),
             report: vec![CursorLevel::Known(Acknowledgement::Stored)],
             report_mode: ReportMode::FinalOnly,
+            segment: Some(3),
         };
         let bytes = h.encode();
         let mut d = Decoder::new(&bytes);

@@ -13,7 +13,7 @@ use common::{Certs, Server, raw};
 use weida::{Error, Runtime, RuntimeConfig, TransferMeta, codes};
 use weida_protocol::header::{GuaranteeSet, OrderingMode};
 use weida_protocol::{
-    CreditHeader, DataHeader, ErrorHeader, FrameKind, Hello, MAGIC, SubscriptionHeader,
+    CreditHeader, DataHeader, ErrorHeader, FlowHeader, FrameKind, Hello, MAGIC, SubscriptionHeader,
     encode_frame, encode_preamble,
 };
 
@@ -81,6 +81,31 @@ async fn an_unknown_frame_kind_closes_the_connection() {
     // Correct magic, undefined kind 9. Kinds 5..=255 are reserved and are a
     // violation, not a forward-compatibility hook.
     raw::send_raw(&conn, &[MAGIC, 9, 0x00]).await;
+    assert_eq!(
+        within(raw::closed_code(&conn)).await,
+        codes::PROTOCOL_VIOLATION
+    );
+}
+
+#[tokio::test]
+async fn a_flow_from_a_peer_without_the_datagram_capability_closes_the_connection() {
+    // Kind 7 is FLOW, legal only when both HELLOs listed capability code 1.
+    // This peer's HELLO lists nothing (`docs/PROTOCOL.md` §6.1, §3.2).
+    let server = Server::start().await;
+    let _acceptor = server.listener.acceptor("/v").expect("acceptor");
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+    let mut stream = conn.open_uni().await.expect("open uni");
+    stream
+        .write_all(&encode_frame(
+            FrameKind::Flow,
+            &FlowHeader::new("/v", 1).encode(),
+        ))
+        .await
+        .expect("write flow");
     assert_eq!(
         within(raw::closed_code(&conn)).await,
         codes::PROTOCOL_VIOLATION

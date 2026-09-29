@@ -42,6 +42,15 @@ pub enum FrameKind {
     /// ([decisions/0024](../../../docs/decisions/0024-three-families-one-back-channel.md)
     /// §4.4).
     Cursor,
+    /// A datagram flow's registration; header-only on QUIC, held open until
+    /// FIN.
+    ///
+    /// The stream is the flow's lifetime: FIN closes it, `RESET_STREAM`
+    /// abandons it, `STOP_SENDING` refuses it. The units travel as QUIC
+    /// DATAGRAM frames prefixed with the flow id, and on a local transport as
+    /// length-prefixed records on this stream
+    /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.2).
+    Flow,
 }
 
 impl FrameKind {
@@ -55,6 +64,7 @@ impl FrameKind {
             FrameKind::Unsubscribe => 4,
             FrameKind::Credit => 5,
             FrameKind::Cursor => 6,
+            FrameKind::Flow => 7,
         }
     }
 
@@ -70,6 +80,7 @@ impl FrameKind {
             4 => Some(FrameKind::Unsubscribe),
             5 => Some(FrameKind::Credit),
             6 => Some(FrameKind::Cursor),
+            7 => Some(FrameKind::Flow),
             _ => None,
         }
     }
@@ -90,6 +101,7 @@ impl fmt::Display for FrameKind {
             FrameKind::Unsubscribe => "UNSUBSCRIBE",
             FrameKind::Credit => "CREDIT",
             FrameKind::Cursor => "CURSOR",
+            FrameKind::Flow => "FLOW",
         };
         f.write_str(s)
     }
@@ -226,12 +238,13 @@ mod tests {
             (FrameKind::Unsubscribe, 4),
             (FrameKind::Credit, 5),
             (FrameKind::Cursor, 6),
+            (FrameKind::Flow, 7),
         ];
         for (kind, code) in all {
             assert_eq!(kind.to_u8(), code);
             assert_eq!(FrameKind::from_u8(code), Some(kind));
         }
-        for code in 7u8..=255 {
+        for code in 8u8..=255 {
             assert_eq!(FrameKind::from_u8(code), None, "kind {code}");
         }
     }
@@ -246,6 +259,7 @@ mod tests {
             FrameKind::Unsubscribe,
             FrameKind::Credit,
             FrameKind::Cursor,
+            FrameKind::Flow,
         ] {
             assert!(!k.has_payload(), "{k}");
         }
@@ -275,6 +289,9 @@ mod tests {
             (FrameKind::Error, 0x02),
             (FrameKind::Subscribe, 0x03),
             (FrameKind::Unsubscribe, 0x04),
+            (FrameKind::Credit, 0x05),
+            (FrameKind::Cursor, 0x06),
+            (FrameKind::Flow, 0x07),
         ] {
             for header_len in [0usize, 3, 5, 9, 11, 16, 18] {
                 let frame = encode_frame(kind, &vec![0; header_len]);
@@ -311,12 +328,13 @@ mod tests {
 
     #[test]
     fn unknown_kind_is_a_violation() {
-        // Kind `7` is the first free one: `5` became CREDIT with the L2 queue
-        // (`docs/decisions/0018-minimal-broker.md` §4.6) and `6` became
-        // CURSOR with the cursor stream
-        // (`docs/decisions/0024-three-families-one-back-channel.md` §4.4).
-        let err = parse_preamble(&[MAGIC, 0x07, 0x00], CAP).unwrap_err();
-        assert_eq!(err, PreambleError::UnknownKind(7));
+        // Kind `8` is the first free one: `5` became CREDIT with the L2 queue
+        // (`docs/decisions/0018-minimal-broker.md` §4.6), `6` became CURSOR
+        // with the cursor stream
+        // (`docs/decisions/0024-three-families-one-back-channel.md` §4.4) and
+        // `7` became FLOW (`docs/decisions/0034-late-is-lost.md` §4.2).
+        let err = parse_preamble(&[MAGIC, 0x08, 0x00], CAP).unwrap_err();
+        assert_eq!(err, PreambleError::UnknownKind(8));
         assert!(err.is_violation());
     }
 

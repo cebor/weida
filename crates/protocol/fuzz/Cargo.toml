@@ -85,3 +85,10 @@ path = "fuzz_targets/error.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "flow"
+path = "fuzz_targets/flow.rs"
+test = false
+doc = false
+bench = false

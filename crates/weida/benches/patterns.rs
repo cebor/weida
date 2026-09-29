@@ -420,6 +420,7 @@ fn wire_bytes(endpoint: &str, meta: &TransferMeta, payload: usize) -> usize {
         report_id: None,
         report: Vec::new(),
         report_mode: ReportMode::default(),
+        segment: None,
     };
     encode_frame(FrameKind::Data, &header.encode()).len() + payload
 }

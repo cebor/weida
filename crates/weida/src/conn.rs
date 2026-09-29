@@ -526,6 +526,9 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
             drop(send);
             handle_cursor(ctx, recv, &header).await
         }
+        // No profile lists capability `1` yet, so a FLOW is always from a
+        // peer that sends what was never agreed (`docs/PROTOCOL.md` §6.1).
+        FrameKind::Flow => violation(ctx, "FLOW without the datagram capability"),
         FrameKind::Data => {
             let decoded = match DataHeader::decode(&header) {
                 Ok(h) => h,
@@ -746,6 +749,7 @@ async fn handle_stream(
         FrameKind::Unsubscribe => handle_subscription(ctx, &header, false).await,
         FrameKind::Credit => handle_credit(ctx, &header).await,
         FrameKind::Cursor => handle_cursor(ctx, stream, &header).await,
+        FrameKind::Flow => violation(ctx, "FLOW without the datagram capability"),
     }
 }
 

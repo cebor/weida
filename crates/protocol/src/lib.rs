@@ -11,21 +11,23 @@
 //! the unit tests.
 
 pub mod codes;
+pub mod datagram;
 pub mod frame;
 pub mod header;
 pub mod negotiate;
 pub mod varint;
 
+pub use datagram::{LOCAL_MAX_DATAGRAM, flow_prefix, split_flow_datagram};
 pub use frame::{
     FrameKind, MAGIC, MAX_PREAMBLE_LEN, Preamble, PreambleError, encode_frame, encode_preamble,
     parse_preamble, preamble_bytes,
 };
 pub use header::{
-    CreditHeader, CursorHeader, CursorLevel, DataHeader, ErrorHeader, HeaderError, Hello,
-    ReportMode, SubscriptionHeader, decode_cursor_record, encode_cursor_record, filter,
+    CreditHeader, CursorHeader, CursorLevel, DataHeader, ErrorHeader, FlowHeader, HeaderError,
+    Hello, ReportMode, SubscriptionHeader, decode_cursor_record, encode_cursor_record, filter,
     limits as header_limits,
 };
-pub use negotiate::{Agreed, NegotiateError, negotiate};
+pub use negotiate::{Agreed, CAPABILITY_DATAGRAM, NegotiateError, negotiate};
 pub use varint::{VarintError, decode_varint, encode_varint, varint_len};
 
 /// Wire protocol version implemented by this crate (experimental).

@@ -17,7 +17,8 @@
 use weida_core::{ErrorCode, TraceContext};
 use weida_protocol::header::{Acknowledgement, CursorLevel, ReportMode, limits};
 use weida_protocol::{
-    CreditHeader, DataHeader, ErrorHeader, Hello, SubscriptionHeader, encode_frame, parse_preamble,
+    CreditHeader, DataHeader, ErrorHeader, FlowHeader, Hello, SubscriptionHeader, encode_frame,
+    parse_preamble,
 };
 
 const ITERATIONS: usize = 100_000;
@@ -140,6 +141,7 @@ fn fuzz_smoke_data_header_from_valid_bytes() {
                 CursorLevel::Application(CursorLevel::APPLICATION_FLOOR),
             ],
             report_mode: ReportMode::FinalOnly,
+            segment: Some(u64::MAX),
         },
     ];
     let mut accepted = 0usize;
@@ -286,7 +288,14 @@ fn fuzz_smoke_data_header_roundtrip() {
 #[test]
 fn fuzz_smoke_subscribe() {
     let mut rng = Rng::new(0x7a5b_3c1d_9e0f_2468);
-    let seed = SubscriptionHeader::new("/md", "px.").encode();
+    let seeds = [
+        SubscriptionHeader::new("/md", "px.").encode(),
+        SubscriptionHeader {
+            max_age_ms: Some(150),
+            ..SubscriptionHeader::new("/r", "v")
+        }
+        .encode(),
+    ];
     let mut accepted = 0usize;
     for i in 0..ITERATIONS {
         // Alternate between free-form bytes and bit-flipped valid headers: the
@@ -294,7 +303,7 @@ fn fuzz_smoke_subscribe() {
         let input = if i % 2 == 0 {
             rng.bytes(48)
         } else {
-            let mut buf = seed.clone();
+            let mut buf = seeds[i % 4 / 2].clone();
             for _ in 0..=rng.below(3) {
                 rng.flip_bit(&mut buf);
             }
@@ -351,6 +360,52 @@ fn fuzz_smoke_credit() {
         );
     }
     assert!(accepted > 0, "no credit header ever decoded");
+    assert!(
+        accepted < ITERATIONS,
+        "the decoder accepted every input; it is too permissive"
+    );
+}
+
+#[test]
+fn fuzz_smoke_flow() {
+    let mut rng = Rng::new(0x0007_f10e_0034_0007);
+    let mut full = FlowHeader::new("/voice", 7);
+    full.content_type = Some("audio/opus".into());
+    full.traceparent = Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into());
+    full.tracestate = Some("a=1".into());
+    full.topic = Some("room.1".into());
+    let seeds = [FlowHeader::new("/v", 7).encode(), full.encode()];
+    let mut accepted = 0usize;
+    for i in 0..ITERATIONS {
+        let input = if i % 2 == 0 {
+            rng.bytes(48)
+        } else {
+            let mut buf = seeds[i % 4 / 2].clone();
+            for _ in 0..=rng.below(3) {
+                rng.flip_bit(&mut buf);
+            }
+            buf
+        };
+        let Ok(header) = FlowHeader::decode(&input) else {
+            continue;
+        };
+        accepted += 1;
+        assert!(header.endpoint.len() <= limits::MAX_ENDPOINT_BYTES);
+        for (value, max) in [
+            (&header.content_type, limits::MAX_CONTENT_TYPE_BYTES),
+            (&header.traceparent, limits::MAX_TRACEPARENT_BYTES),
+            (&header.tracestate, limits::MAX_TRACESTATE_BYTES),
+            (&header.topic, limits::MAX_TOPIC_BYTES),
+        ] {
+            assert!(value.as_ref().is_none_or(|v| v.len() <= max));
+        }
+        assert_eq!(
+            FlowHeader::decode(&header.encode()).as_ref(),
+            Ok(&header),
+            "decoding is not idempotent for {input:?}"
+        );
+    }
+    assert!(accepted > 0, "no flow header ever decoded");
     assert!(
         accepted < ITERATIONS,
         "the decoder accepted every input; it is too permissive"
@@ -443,5 +498,6 @@ fn arbitrary_data_header(rng: &mut Rng) -> DataHeader {
             ReportMode::Progress
         },
         report,
+        segment: (rng.below(2) == 0).then(|| rng.next_u64()),
     }
 }
