@@ -222,6 +222,12 @@ impl Binding {
         self.binding.local_addr()
     }
 
+    /// Closes every live connection this binding holds from `peer`; see
+    /// [`crate::Binding::disconnect`]. Returns how many it closed.
+    pub fn disconnect(&self, peer: crate::Fingerprint) -> usize {
+        self.binding.disconnect(peer)
+    }
+
     /// Registers a replier at `path`.
     ///
     /// # Errors

@@ -349,15 +349,18 @@ impl Listener {
         let local_addr = endpoint.local_addr().map_err(Error::Io)?;
         self.inner.runtime.track_endpoint(endpoint.clone());
 
+        let peers = Arc::new(PeerConns::default());
         exec.spawn(accept_connections(
             endpoint.clone(),
             Arc::clone(&self.inner),
+            Arc::clone(&peers),
         ));
 
         tracing::info!(%local_addr, "quic binding listening");
         Ok(Binding {
             endpoint,
             local_addr,
+            peers,
         })
     }
 
@@ -628,6 +631,7 @@ impl std::fmt::Debug for Listener {
 pub struct Binding {
     endpoint: quinn::Endpoint,
     local_addr: SocketAddr,
+    peers: Arc<PeerConns>,
 }
 
 impl Binding {
@@ -640,6 +644,21 @@ impl Binding {
     pub async fn close(&self) {
         self.endpoint.close(shutdown_code(), b"binding closed");
         self.endpoint.wait_idle().await;
+    }
+
+    /// Closes every live connection this binding holds from `peer`, with
+    /// `REJECTED` and the reason `disconnected by the application`, and
+    /// returns how many it closed
+    /// ([decisions/0035](../../../docs/decisions/0035-keys-proved-not-judged.md)
+    /// §4.4).
+    ///
+    /// **Not a ban.** The dialler sees
+    /// [`LossCause::PeerClosed`](crate::LossCause::PeerClosed) and redials
+    /// under its own [`ReconnectPolicy`](crate::ReconnectPolicy); keeping a
+    /// peer out is refusing its arrivals and joins. An anonymous client
+    /// cannot be named, so it cannot be disconnected here.
+    pub fn disconnect(&self, peer: Fingerprint) -> usize {
+        self.peers.disconnect(&peer)
     }
 }
 
@@ -912,7 +931,8 @@ fn shutdown_code() -> VarInt {
     VarInt::from_u32(codes::SHUTDOWN as u32)
 }
 
-/// Live connections per proved peer identity, for `max_connections_per_peer`.
+/// Live connections per proved peer identity, for `max_connections_per_peer`
+/// and [`Binding::disconnect`].
 ///
 /// Keyed by the fingerprint a peer proved in the handshake, because that is
 /// the only thing that binds two connections into one peer
@@ -920,41 +940,71 @@ fn shutdown_code() -> VarInt {
 /// nothing is not counted here at all: two anonymous connections cannot be
 /// shown to be one peer, so counting them together would refuse strangers for
 /// each other's traffic. They remain bounded by `max_connections`.
+///
+/// The table holds the connection handles rather than a count, so a binding
+/// can close one peer's connections; it is bounded by `max_connections`, as
+/// the count was.
 #[derive(Default)]
-struct PeerCounts(std::sync::Mutex<HashMap<Fingerprint, usize>>);
+struct PeerConns(std::sync::Mutex<HashMap<Fingerprint, Vec<quinn::Connection>>>);
 
-impl PeerCounts {
-    /// Counts one more connection for `peer` and reports whether it fits.
+impl PeerConns {
+    /// Records one more connection for `peer` and reports whether it fits.
     ///
-    /// The count is taken before the connection is served and released when
+    /// The entry is taken before the connection is served and released when
     /// it closes, so what is bounded is *live* connections rather than dials
     /// over time.
-    fn admit(&self, peer: Option<Fingerprint>, max: usize) -> bool {
+    fn admit(&self, peer: Option<Fingerprint>, conn: &quinn::Connection, max: usize) -> bool {
         let Some(peer) = peer else {
             return true;
         };
-        let mut counts = self.0.lock().expect("peer count poisoned");
-        let count = counts.entry(peer).or_insert(0);
-        if *count >= max {
+        let mut conns = self.0.lock().expect("peer table poisoned");
+        let held = conns.entry(peer).or_default();
+        if held.len() >= max {
             return false;
         }
-        *count += 1;
+        held.push(conn.clone());
         true
     }
 
-    fn release(&self, peer: Option<Fingerprint>) {
+    fn release(&self, peer: Option<Fingerprint>, conn_id: usize) {
         let Some(peer) = peer else {
             return;
         };
-        let mut counts = self.0.lock().expect("peer count poisoned");
-        if let Some(count) = counts.get_mut(&peer) {
-            *count -= 1;
-            // The table is keyed by remote input, so an entry that counts
+        let mut conns = self.0.lock().expect("peer table poisoned");
+        if let Some(held) = conns.get_mut(&peer) {
+            held.retain(|c| c.stable_id() != conn_id);
+            // The table is keyed by remote input, so an entry that holds
             // nothing is removed rather than left behind.
-            if *count == 0 {
-                counts.remove(&peer);
+            if held.is_empty() {
+                conns.remove(&peer);
             }
         }
+    }
+
+    /// Closes every live connection of `peer`; entries leave through
+    /// [`PeerConns::release`] as each accept task sees its connection close.
+    fn disconnect(&self, peer: &Fingerprint) -> usize {
+        let held = self
+            .0
+            .lock()
+            .expect("peer table poisoned")
+            .get(peer)
+            .cloned()
+            .unwrap_or_default();
+        for conn in &held {
+            conn.close(
+                VarInt::from_u32(codes::REJECTED as u32),
+                b"disconnected by the application",
+            );
+        }
+        held.len()
+    }
+}
+
+impl std::fmt::Debug for PeerConns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let peers = self.0.lock().map_or(0, |conns| conns.len());
+        f.debug_struct("PeerConns").field("peers", &peers).finish()
     }
 }
 
@@ -965,7 +1015,11 @@ impl PeerCounts {
 /// decides the limits and whose executor runs the connections. Holding the
 /// listener for as long as a binding accepts is the honest lifetime — a
 /// binding without its namespace serves nothing.
-async fn accept_connections(endpoint: quinn::Endpoint, listener: Arc<ListenerInner>) {
+async fn accept_connections(
+    endpoint: quinn::Endpoint,
+    listener: Arc<ListenerInner>,
+    peers: Arc<PeerConns>,
+) {
     let config = &listener.runtime.config;
     let limits = config.limits;
     let max_connections = config.max_connections;
@@ -976,7 +1030,6 @@ async fn accept_connections(endpoint: quinn::Endpoint, listener: Arc<ListenerInn
     let namespace = Arc::clone(&listener.namespace);
     let subs = Arc::clone(&listener.subs);
     let live = Arc::new(AtomicUsize::new(0));
-    let peers = Arc::new(PeerCounts::default());
     while let Some(incoming) = endpoint.accept().await {
         // A draining runtime admits nothing new: the handshake is refused
         // outright rather than accepted and then closed
@@ -1019,7 +1072,7 @@ async fn accept_connections(endpoint: quinn::Endpoint, listener: Arc<ListenerInn
                     // the only bound
                     // (`docs/decisions/0002-control-and-bulk-separation.md` §7).
                     let peer = crate::tls::peer_fingerprint(&conn);
-                    if !peers.admit(peer, max_connections_per_peer) {
+                    if !peers.admit(peer, &conn, max_connections_per_peer) {
                         tracing::warn!(
                             %remote,
                             max = max_connections_per_peer,
@@ -1048,7 +1101,7 @@ async fn accept_connections(endpoint: quinn::Endpoint, listener: Arc<ListenerInn
                         // registry.
                         subs.remove_connection(conn_id);
                         crate::conn::drop_consumers(&ctx).await;
-                        peers.release(peer);
+                        peers.release(peer, conn_id);
                         tracing::debug!(%remote, %reason, "connection closed");
                     }
                 }

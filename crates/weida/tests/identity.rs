@@ -381,6 +381,85 @@ async fn a_binding_that_requires_any_key_proves_it_and_judges_nothing() {
     runtime.shutdown().await;
 }
 
+/// The next `Lost` on `events`, skipping the `Connected` that came first.
+async fn lost(events: &mut weida::PeerEvents) -> weida::LossCause {
+    within(async {
+        loop {
+            match events.recv().await.expect("event stream open") {
+                weida::PeerEvent::Lost { cause, .. } => return cause,
+                weida::PeerEvent::Connected { .. } => {}
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+    })
+    .await
+}
+
+/// Claim: a binding can close every connection of one proved key, and of no
+/// other, which is the requirement's open question 2
+/// ([0035](../../../docs/decisions/0035-keys-proved-not-judged.md) §4.4).
+/// The dialler sees the peer close; the application did not have to track a
+/// connection.
+#[tokio::test]
+async fn disconnect_closes_every_connection_of_one_peer_and_no_other() {
+    let identity = Identity::generate().expect("identity");
+    let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+    let listener = runtime.listener();
+    let binding = listener
+        .bind_quic(
+            "127.0.0.1:0".parse().expect("loopback"),
+            ServerTls::new(identity.clone()).require_client(ClientTrust::AnyKey),
+        )
+        .await
+        .expect("bind");
+    let url = |path: &str| {
+        format!(
+            "weida://{}@127.0.0.1:{}{path}",
+            identity.fingerprint().expect("fingerprint"),
+            binding.local_addr().port()
+        )
+    };
+    spawn_echo(listener.replier("/a").expect("replier a"));
+    spawn_echo(listener.replier("/b").expect("replier b"));
+
+    let client = Runtime::new(RuntimeConfig::default()).expect("client");
+    let a_id = Identity::generate().expect("a");
+    let a_fp = a_id.fingerprint().expect("fingerprint a");
+    let a_tls = ClientTls::new(Trust::by_address()).with_identity(a_id);
+    // One peer, two paths: two connections.
+    let a_on_a = client.requester(a_tls.clone());
+    let a_on_b = client.requester(a_tls);
+    let b_on_a = client.requester(
+        ClientTls::new(Trust::by_address()).with_identity(Identity::generate().expect("b")),
+    );
+    let mut a_events = [a_on_a.events(), a_on_b.events()];
+    within(a_on_a.connect(&url("/a"))).await.expect("a on /a");
+    within(a_on_b.connect(&url("/b"))).await.expect("a on /b");
+    within(b_on_a.connect(&url("/a"))).await.expect("b on /a");
+    for requester in [&a_on_a, &a_on_b, &b_on_a] {
+        assert_eq!(roundtrip(requester).await, b"ping");
+    }
+
+    assert_eq!(binding.disconnect(a_fp), 2);
+    for events in &mut a_events {
+        assert_eq!(lost(events).await, weida::LossCause::PeerClosed);
+    }
+    assert_eq!(
+        roundtrip(&b_on_a).await,
+        b"ping",
+        "another key is untouched"
+    );
+
+    let unknown = Identity::generate()
+        .expect("unknown")
+        .fingerprint()
+        .expect("fingerprint");
+    assert_eq!(binding.disconnect(unknown), 0);
+
+    client.shutdown().await;
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn an_anonymous_client_is_seen_as_nobody() {
     let server = Server::start().await;
