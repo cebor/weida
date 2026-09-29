@@ -26,7 +26,7 @@ kind: code | size: 90 | status: done 7edfa6d | needs: [B-282]
 acceptance: [0034](decisions/0034-late-is-lost.md) §4.4: B-282's flow scenario passes over QUIC, in process, over `AF_UNIX` and over named pipes in `crates/weida/tests/transports.rs`, with the datagrams carried on the FLOW stream as `varint length || bytes` records behind a drop-oldest writer ring.
 
 ### B-284 — Expiry and priority on an outgoing transfer
-kind: code | size: 60 | status: ready | needs: []
+kind: code | size: 60 | status: done 162b641 | needs: []
 acceptance: [0034](decisions/0034-late-is-lost.md) §4.3: `OutgoingTransfer::expire_at` resets an unacknowledged stream with `CANCELED` at the deadline, on QUIC **including after `finish`**, and until `finish` on the local transports; the sender sees `Error::Expired`, which is not a definite failure, and the reader sees `Canceled`, never EOF; `Runtime::expired_transfers` counts expiries; `set_priority` passes `quinn`'s priority to the stream and is a documented no-op locally. Test: a transfer whose reader is stalled past its deadline fails with `Expired` and the counter says so. No priority test, because it would test `quinn`'s scheduler.
 
 ### B-285 — RADIO/DISH with stream segments
