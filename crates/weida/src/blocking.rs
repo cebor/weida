@@ -462,8 +462,8 @@ fn outside_a_reactor() -> Result<(), Error> {
     }
 }
 
-/// Writes the endpoint accessor and the connect call every dialling wrapper
-/// has.
+/// Writes the endpoint accessor, the connect call and the connection
+/// statistics every dialling wrapper has.
 macro_rules! dialling {
     ($name:ident, $inner:ty) => {
         impl $name {
@@ -477,6 +477,12 @@ macro_rules! dialling {
             pub fn connect(&self, url: &str) -> Result<(), Error> {
                 outside_a_reactor()?;
                 drive(self.endpoint.connect(url))
+            }
+
+            /// One record per live connection, labelled by the URL as
+            /// dialled; see [`crate::Peer::connection_stats`]. Never blocks.
+            pub fn connection_stats(&self) -> Vec<crate::ConnectionStats> {
+                self.endpoint.connection_stats()
             }
 
             /// The asynchronous endpoint underneath, for the streaming

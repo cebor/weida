@@ -1098,6 +1098,12 @@ impl Dish {
         self.state().peer.peer_count()
     }
 
+    /// One record per live connection to a radio, labelled by the URL as
+    /// dialled; see [`crate::Peer::connection_stats`].
+    pub fn connection_stats(&self) -> Vec<crate::ConnectionStats> {
+        self.state().peer.connection_stats()
+    }
+
     /// The event stream of this dish's addresses; see [`Peer::events`].
     pub fn events(&self) -> PeerEvents {
         self.state().peer.events()

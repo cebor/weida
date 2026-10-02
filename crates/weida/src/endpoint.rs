@@ -205,6 +205,12 @@ impl Requester {
         self.state.peer.peer_count()
     }
 
+    /// One record per live connection, labelled by the URL as dialled; see
+    /// [`Peer::connection_stats`].
+    pub fn connection_stats(&self) -> Vec<crate::ConnectionStats> {
+        self.state.peer.connection_stats()
+    }
+
     /// The event stream of this requester's addresses; see [`Peer::events`].
     pub fn events(&self) -> PeerEvents {
         self.state.peer.events()
@@ -308,6 +314,12 @@ impl Pusher {
     /// Number of connected peers.
     pub fn peer_count(&self) -> usize {
         self.state.peer.peer_count()
+    }
+
+    /// One record per live connection, labelled by the URL as dialled; see
+    /// [`Peer::connection_stats`].
+    pub fn connection_stats(&self) -> Vec<crate::ConnectionStats> {
+        self.state.peer.connection_stats()
     }
 
     /// The event stream of this pusher's addresses; see [`Peer::events`].
@@ -628,6 +640,12 @@ impl Subscriber {
         self.state.peer.peer_count()
     }
 
+    /// One record per live connection, labelled by the URL as dialled; see
+    /// [`Peer::connection_stats`].
+    pub fn connection_stats(&self) -> Vec<crate::ConnectionStats> {
+        self.state.peer.connection_stats()
+    }
+
     /// The event stream of this subscriber's addresses; see [`Peer::events`].
     pub fn events(&self) -> PeerEvents {
         self.state.peer.events()
@@ -917,6 +935,16 @@ impl Paired {
         self.state.peer.as_ref().map_or(0, Peer::peer_count)
     }
 
+    /// The dialling side's connection, labelled by the URL as dialled; see
+    /// [`Peer::connection_stats`]. Empty on a bound pair, which dialled
+    /// nothing.
+    pub fn connection_stats(&self) -> Vec<crate::ConnectionStats> {
+        self.state
+            .peer
+            .as_ref()
+            .map_or_else(Vec::new, Peer::connection_stats)
+    }
+
     /// The event stream of a dialling pair's address; see [`Peer::events`].
     /// A bound pair dials nothing and reports nothing: `None`.
     pub fn events(&self) -> Option<PeerEvents> {
@@ -1040,6 +1068,12 @@ impl Surveyor {
     /// Number of connected respondents.
     pub fn peer_count(&self) -> usize {
         self.state.peer.peer_count()
+    }
+
+    /// One record per live connection, labelled by the URL as dialled; see
+    /// [`Peer::connection_stats`].
+    pub fn connection_stats(&self) -> Vec<crate::ConnectionStats> {
+        self.state.peer.connection_stats()
     }
 
     /// Asks every connected respondent, and collects answers until
@@ -1374,6 +1408,12 @@ impl BusMember {
     /// Number of members this one has joined.
     pub fn peer_count(&self) -> usize {
         self.state.peer.peer_count()
+    }
+
+    /// One record per member this one has dialled and is connected to,
+    /// labelled by the URL as dialled; see [`Peer::connection_stats`].
+    pub fn connection_stats(&self) -> Vec<crate::ConnectionStats> {
+        self.state.peer.connection_stats()
     }
 
     /// Sends `body` to every **other** member, returning how many it reached.

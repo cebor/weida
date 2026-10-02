@@ -95,6 +95,9 @@ pub(crate) struct ConnCtx {
     /// ring, bounded by `max_flows`, `flow_queue_bytes` and
     /// `flow_early_bytes` ([`crate::flow`]).
     pub flows: crate::flow::FlowTable,
+    /// When this connection was established: after the QUIC handshake, before
+    /// HELLO. What [`crate::ConnectionStats::age`] counts from.
+    pub established: std::time::Instant,
     agreed: watch::Receiver<Option<Agreed>>,
 }
 
@@ -143,6 +146,7 @@ impl ConnCtx {
             shared,
             flows: crate::flow::FlowTable::new(&limits),
             agreed: agreed_rx,
+            established: std::time::Instant::now(),
         });
 
         // Once per connection, never per message: a drain collects the

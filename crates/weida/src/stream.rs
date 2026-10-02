@@ -66,6 +66,8 @@ struct Slot {
     url: Arc<str>,
     path: Arc<str>,
     state: SlotState,
+    /// Successful redials of this address; the first dial is not one.
+    redials: u64,
     /// Ends the slot's redial task when the slot is disconnected.
     stop: Arc<Notify>,
 }
@@ -230,10 +232,49 @@ impl PeerShared {
             .collect()
     }
 
+    /// One record per live slot, in dial order
+    /// ([decisions/0036](../../../docs/decisions/0036-connection-statistics.md)
+    /// §4.2). The slot list is collected under its mutex and `quinn`'s
+    /// counters are read after it is released.
+    fn connection_stats(&self) -> Vec<crate::ConnectionStats> {
+        let live: Vec<(Arc<str>, u64, ConnHandle)> = self
+            .slots
+            .lock()
+            .expect("peer list poisoned")
+            .iter()
+            .filter_map(|slot| match &slot.state {
+                SlotState::Live(conn) if conn.conn.close_reason().is_none() => {
+                    Some((Arc::clone(&slot.url), slot.redials, ConnHandle::clone(conn)))
+                }
+                _ => None,
+            })
+            .collect();
+        live.into_iter()
+            .map(|(url, redials, conn)| crate::ConnectionStats {
+                url,
+                age: conn.established.elapsed(),
+                redials,
+                transport: conn.conn.transport_stats(),
+            })
+            .collect()
+    }
+
     fn set_state(&self, id: u64, state: SlotState) {
         let mut slots = self.slots.lock().expect("peer list poisoned");
         if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
             slot.state = state;
+        }
+        drop(slots);
+        self.changed.notify_waiters();
+    }
+
+    /// Makes slot `id` live on the connection a redial produced, and counts
+    /// the redial.
+    fn redialled(&self, id: u64, conn: ConnHandle) {
+        let mut slots = self.slots.lock().expect("peer list poisoned");
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.id == id) {
+            slot.state = SlotState::Live(conn);
+            slot.redials += 1;
         }
         drop(slots);
         self.changed.notify_waiters();
@@ -422,6 +463,18 @@ impl Peer {
         self.shared.slots.lock().expect("peer list poisoned").len()
     }
 
+    /// One record per live connection of this peer, labelled by the URL as
+    /// it was dialled; empty when none is live
+    /// ([decisions/0036](../../../docs/decisions/0036-connection-statistics.md)).
+    ///
+    /// Synchronous and cheap: it reads counters `quinn` already keeps. A
+    /// connection the pool shares with another endpoint that dialled the same
+    /// URL on the same terms is reported by both, with the same transport
+    /// numbers; `url` and `redials` are this endpoint's own.
+    pub fn connection_stats(&self) -> Vec<crate::ConnectionStats> {
+        self.shared.connection_stats()
+    }
+
     /// The event stream of this peer's addresses.
     pub fn events(&self) -> PeerEvents {
         PeerEvents::new(self.shared.events.subscribe())
@@ -558,6 +611,7 @@ impl Peer {
                 url: Arc::clone(&url),
                 path: Arc::clone(&path),
                 state: SlotState::Live(ConnHandle::clone(&conn)),
+                redials: 0,
                 stop: Arc::clone(&stop),
             });
         }
@@ -724,7 +778,7 @@ async fn watch_slot(
             }
         };
         let Some(shared) = weak.upgrade() else { return };
-        shared.set_state(id, SlotState::Live(ConnHandle::clone(&conn)));
+        shared.redialled(id, ConnHandle::clone(&conn));
         shared.emit(PeerEvent::Connected {
             url: Arc::clone(&url),
             peer: conn.peer.clone(),
