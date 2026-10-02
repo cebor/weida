@@ -191,7 +191,7 @@ async fn a_redial_is_counted_and_restarts_the_age() {
     let certs = Certs::generate();
     let first = Restartable::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
     let addr = first.addr;
-    let _puller = first.listener.puller("/jobs").expect("puller");
+    let puller = first.listener.puller("/jobs").expect("puller");
 
     let client = Runtime::new(RuntimeConfig {
         reconnect: ReconnectPolicy {
@@ -217,7 +217,7 @@ async fn a_redial_is_counted_and_restarts_the_age() {
     let old_age = old[0].age;
     assert!(old_age >= Duration::from_millis(300));
 
-    drop(_puller);
+    drop(puller);
     first.stop().await;
     assert!(matches!(
         next_transition(&mut events).await,
