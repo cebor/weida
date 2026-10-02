@@ -5,15 +5,15 @@ Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
 ### B-298 — Connection statistics types and the quinn floor
-kind: code | size: 45 | status: ready | needs: []
+kind: code | size: 45 | status: done 5f13941 | needs: []
 acceptance: [0036](decisions/0036-connection-statistics.md) §4.1: `crates/weida/src/stats.rs` holds `PathStats` (now `#[non_exhaustive]`, plus `min_rtt`, `lost_bytes`, `current_mtu`), `UdpCounts`, `TransportStats` and `ConnectionStats`, re-exported from the crate root; `Link::transport_stats` fills `TransportStats` from one `quinn` `stats()` call, `None` locally, and `Flow::path_stats`/`IncomingFlow::path_stats` read its `path`; the workspace requires `quinn = "0.11.12"`. §4.4's `statistics_types_carry_no_address` compiles only with every field of every statistics type named and bounded by `NoAddress`.
 
 ### B-299 — `connection_stats` on every dialling handle
-kind: code | size: 60 | status: ready | needs: [B-298]
+kind: code | size: 60 | status: done 1f3b2a7 | needs: [B-298]
 acceptance: [0036](decisions/0036-connection-statistics.md) §4.2, §4.3: `Peer::connection_stats` and the same method on `Requester`, `Pusher`, `Subscriber`, `Paired`, `Surveyor`, `BusMember`, `Dish` and their `weida::blocking` twins; one entry per live slot, labelled by the URL as given; `age` from `ConnCtx`'s birth instant, `redials` per slot. Tests in `crates/weida/tests/stats.rs`: empty before `connect` and after `disconnect`; over QUIC, `transport` is `Some` with `rtt > 0`, `current_mtu >= 1200`, tx and rx bytes growing across a round trip, and no resolved address in the record's `Debug` text for a dial by name; over a local transport `transport` is `None` and `age` grows; after a server restart `redials == 1` and `age` restarted.
 
 ### B-300 — Documents for 0036
-kind: spec | size: 30 | status: ready | needs: [B-298, B-299]
+kind: spec | size: 30 | status: done 9287372 | needs: [B-298, B-299]
 acceptance: [0036](decisions/0036-connection-statistics.md) §5's edits; no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says path statistics are reachable through a flow only or lists `PathStats` without its three new fields.
 
 ### B-301 — PROTOCOL: capability `2` and frame kind `8` REPORT
