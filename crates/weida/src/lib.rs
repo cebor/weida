@@ -71,6 +71,7 @@ mod pubsub;
 mod radio;
 mod reconnect;
 mod runtime;
+mod stats;
 mod stream;
 mod tls;
 mod transfer;
@@ -88,7 +89,7 @@ pub use endpoint::{
     Push, Pusher, Radio, Rep, Replier, Req, Requester, Respond, Respondent, Sub, Subscriber,
     Survey, SurveyRun, Surveyor, Tune,
 };
-pub use flow::{Flow, FlowInfo, FlowMeta, FlowStats, IncomingFlow, PathStats};
+pub use flow::{Flow, FlowInfo, FlowMeta, FlowStats, IncomingFlow};
 pub use identity::{
     FilesOptions, IdentityEvent, IdentityEvents, IdentitySource, PeerChain, TrustSource,
 };
@@ -113,6 +114,7 @@ pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
 // documents use for it.
 pub use reconnect::{GiveUp, OutboxFull, PeerEvent, PeerEvents, ReconnectPolicy};
 pub use runtime::Runtime;
+pub use stats::{ConnectionStats, PathStats, TransportStats, UdpCounts};
 pub use stream::{Acceptor, Consumer, ConsumerId, CreditGrant, Incoming, Peer};
 pub use transfer::{
     Delivery, IncomingMeta, IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream,

@@ -38,6 +38,7 @@ use weida_protocol::{
     flow_prefix, split_flow_datagram, varint,
 };
 
+use crate::PathStats;
 use crate::conn::{ConnHandle, Wanted, refusal_for, violation};
 use crate::listener::Route;
 use crate::stream::{Incoming, PeerShared};
@@ -119,29 +120,6 @@ pub struct FlowStats {
     /// Arrived datagrams dropped, oldest first, because the consumer had
     /// `flow_queue_bytes` unread.
     pub overflow: u64,
-}
-
-/// What the path under a flow looks like now, from `quinn`'s connection
-/// statistics ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
-/// §4.9) — what a jitter buffer or a bitrate controller sizes itself by.
-///
-/// weida's own type, so no `quinn` type is part of the public surface.
-/// `quinn` 0.11 reports no RTT variation, so none is passed through.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PathStats {
-    /// Smoothed round-trip time.
-    pub rtt: Duration,
-    /// Congestion window, in bytes.
-    pub cwnd: u64,
-    /// Congestion events the controller has reacted to.
-    pub congestion_events: u64,
-    /// Packets declared lost.
-    pub lost_packets: u64,
-    /// Packets sent.
-    pub sent_packets: u64,
-    /// The largest datagram the connection carries now, prefix included;
-    /// `None` when the peer accepts none.
-    pub max_datagram_size: Option<usize>,
 }
 
 #[derive(Default)]
@@ -862,7 +840,13 @@ impl Flow {
     /// The path under this flow, or `None` on a local transport, which has
     /// no path to measure.
     pub fn path_stats(&self) -> Option<PathStats> {
-        lock(&self.binding).as_ref()?.conn.conn.path_stats()
+        let path = lock(&self.binding)
+            .as_ref()?
+            .conn
+            .conn
+            .transport_stats()?
+            .path;
+        Some(path)
     }
 
     /// Closes the flow with FIN; the receiver sees its end after the
@@ -941,7 +925,7 @@ impl IncomingFlow {
     /// The path under this flow, or `None` on a local transport, which has
     /// no path to measure.
     pub fn path_stats(&self) -> Option<PathStats> {
-        self.conn.conn.path_stats()
+        self.conn.conn.transport_stats().map(|t| t.path)
     }
 
     /// Refuses the flow: `STOP_SENDING(REJECTED)`.

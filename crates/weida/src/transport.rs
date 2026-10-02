@@ -384,20 +384,11 @@ impl Link {
         }
     }
 
-    /// The path's statistics on QUIC; `None` on a local transport.
-    pub(crate) fn path_stats(&self) -> Option<crate::PathStats> {
+    /// The connection's transport statistics on QUIC; `None` on a local
+    /// transport, which has no path to measure.
+    pub(crate) fn transport_stats(&self) -> Option<crate::TransportStats> {
         match self {
-            Link::Quic(conn) => {
-                let path = conn.stats().path;
-                Some(crate::PathStats {
-                    rtt: path.rtt,
-                    cwnd: path.cwnd,
-                    congestion_events: path.congestion_events,
-                    lost_packets: path.lost_packets,
-                    sent_packets: path.sent_packets,
-                    max_datagram_size: conn.max_datagram_size(),
-                })
-            }
+            Link::Quic(conn) => Some(crate::TransportStats::of(conn)),
             _ => None,
         }
     }
