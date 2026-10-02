@@ -4,6 +4,31 @@ Maintained by the loop of [LOOP.md](LOOP.md). Ordered by priority; `ready` items
 Statuses: `ready`, `in_progress`, `done <hash>`, `blocked: <reason>`, `parked`,
 `dropped: <reason>`. Ids are monotonic and never reused.
 
+### B-298 — Connection statistics types and the quinn floor
+kind: code | size: 45 | status: ready | needs: []
+acceptance: [0036](decisions/0036-connection-statistics.md) §4.1: `crates/weida/src/stats.rs` holds `PathStats` (now `#[non_exhaustive]`, plus `min_rtt`, `lost_bytes`, `current_mtu`), `UdpCounts`, `TransportStats` and `ConnectionStats`, re-exported from the crate root; `Link::transport_stats` fills `TransportStats` from one `quinn` `stats()` call, `None` locally, and `Flow::path_stats`/`IncomingFlow::path_stats` read its `path`; the workspace requires `quinn = "0.11.12"`. §4.4's `statistics_types_carry_no_address` compiles only with every field of every statistics type named and bounded by `NoAddress`.
+
+### B-299 — `connection_stats` on every dialling handle
+kind: code | size: 60 | status: ready | needs: [B-298]
+acceptance: [0036](decisions/0036-connection-statistics.md) §4.2, §4.3: `Peer::connection_stats` and the same method on `Requester`, `Pusher`, `Subscriber`, `Paired`, `Surveyor`, `BusMember`, `Dish` and their `weida::blocking` twins; one entry per live slot, labelled by the URL as given; `age` from `ConnCtx`'s birth instant, `redials` per slot. Tests in `crates/weida/tests/stats.rs`: empty before `connect` and after `disconnect`; over QUIC, `transport` is `Some` with `rtt > 0`, `current_mtu >= 1200`, tx and rx bytes growing across a round trip, and no resolved address in the record's `Debug` text for a dial by name; over a local transport `transport` is `None` and `age` grows; after a server restart `redials == 1` and `age` restarted.
+
+### B-300 — Documents for 0036
+kind: spec | size: 30 | status: ready | needs: [B-298, B-299]
+acceptance: [0036](decisions/0036-connection-statistics.md) §5's edits; no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says path statistics are reachable through a flow only or lists `PathStats` without its three new fields.
+
+### B-301 — PROTOCOL: capability `2` and frame kind `8` REPORT
+kind: spec | size: 45 | status: ready | needs: [B-300]
+acceptance: [0036](decisions/0036-connection-statistics.md) §4.5 in [PROTOCOL.md](PROTOCOL.md): code `2` `path_report` in §6.1's table with the both-listed rule, kind `8` in §4 and §4.1, a §6.10 REPORT with the head frame, the record keys, the 256-byte cap, the fixed 2 s interval and the four violations, `Limits::path_report` in §10, kind `9` named as the first free number; `weida-protocol` encodes and decodes the head frame and a record, with golden vectors and the `roundtrip` fuzz target extended.
+note: decided now, built after B-298..B-300 by the owner's choice (requirement priority 3).
+
+### B-302 — The remote view on the connection
+kind: code | size: 90 | status: ready | needs: [B-301]
+acceptance: [0036](decisions/0036-connection-statistics.md) §4.5: with `Limits::path_report` on both sides each side sends one REPORT stream and a record every 2 s; the receiver keeps the latest record in one slot and `ConnectionStats::remote` returns it with its age; off on either side, nothing is sent and `remote` is `None`; each violation closes with `PROTOCOL_VIOLATION`, tested against a hand-written peer stream. INVARIANTS names the slot as fixed-size.
+
+### B-303 — Python: connection statistics
+kind: code | size: 45 | status: ready | needs: [B-299]
+acceptance: [0036](decisions/0036-connection-statistics.md) §4.8: `connection_stats()` on every dialling class of both Python surfaces returns `weida.ConnectionStats` values (url, age seconds, redials, transport as a value with path, tx, rx, or `None`); a test over QUIC loopback asserts a positive RTT and `None` over `weida+inproc`; [libraries/weida-py.md](libraries/weida-py.md) moves the row from absent to present.
+
 ### B-293 — A binding that proves client keys and judges none
 kind: code | size: 45 | status: done e467a68 | needs: []
 acceptance: `ServerTls::require_client(ClientTrust::AnyKey)` ([0035](decisions/0035-keys-proved-not-judged.md) §4.1) requires a client certificate, verifies the TLS 1.3 handshake signature, and judges nothing else; the peer is `PeerIdentity::Key` of the leaf's SPKI fingerprint. `ClientTrust::Trusted(TrustSource)` keeps today's meaning and the empty-trust refusal, and existing `require_client(Trust::…)` calls compile unchanged. A chain above `MAX_PEER_CHAIN_CERTS` (8) or `MAX_PEER_CHAIN_BYTES` (32 KiB) fails an `AnyKey` handshake. Tests: `tls::tests::any_key_bounds_the_chain_it_keeps`, and `a_binding_that_requires_any_key_proves_it_and_judges_nothing` in `crates/weida/tests/identity.rs` — an anonymous client fails with `Error::Tls`, two generated keys are admitted as two distinct peers, and a device leaf signed by a user key is admitted as its own fingerprint (open question 1).
