@@ -21,8 +21,8 @@ def metadata() -> None:
     """The wheel's own metadata, read from the installed distribution."""
     distribution = importlib.metadata.distribution("weida")
     assert distribution.metadata["Name"] == "weida", distribution.metadata["Name"]
-    # PEP 440 spelling of the crate's `0.1.0-alpha.2`, converted by maturin.
-    assert distribution.version == "0.1.0a2", distribution.version
+    # PEP 440 spelling of the crate's `0.1.0-alpha.3`, converted by maturin.
+    assert distribution.version == "0.1.0a3", distribution.version
     print(f"weida {distribution.version} installed as a wheel")
 
 
