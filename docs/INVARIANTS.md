@@ -231,6 +231,17 @@ that no local address can look authenticated [0010 §4.8], and what binds a loca
 several connections together is a group token *plus* those same credentials, never the
 token alone ([decisions/0012](decisions/0012-local-connection-grouping.md) §4.2).
 
+**No statistics type carries an address**
+([decisions/0036](decisions/0036-connection-statistics.md) §4.4). `PathStats`, `FlowStats`,
+`UdpCounts`, `TransportStats` and `ConnectionStats` describe a connection by the URL the
+application dialled and by numbers, and by nothing else: no socket address, remote or local,
+resolved or observed, so a statistics screen built on them cannot show an address the
+application did not write. It is checked at compile time by
+`stats::tests::statistics_types_carry_no_address` in `crates/weida/src/stats.rs`, which names
+every field of every one of these types and bounds each by a marker trait that no address type
+implements: a new field does not compile until it is named there, and an address-typed one not
+until someone writes the implementation a review exists to refuse.
+
 Invariants deferred with their subsystems: brokerless/brokered API parity, broker cluster
 as one logical broker, Raft scope, stream-oriented payload replication, and adapter
 guarantee honesty. None of the v0 code may be shaped in a way that forecloses them. The

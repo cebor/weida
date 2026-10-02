@@ -211,7 +211,9 @@ is why it is negotiated rather than default ([GUARANTEES.md](GUARANTEES.md) §3)
   else is restored — the peer kept nothing ([decisions/0008](decisions/0008-session-identity.md)
   §4.5), and what was published during the gap is gone. Every transition is reported on the
   endpoint's `PeerEvent` stream ([decisions/0031](decisions/0031-transparent-redial-and-the-sender-outbox.md)
-  §4.8).
+  §4.8), and every dialling endpoint's `connection_stats()` counts the redials per address and
+  restarts the connection's `age` on each, so a reconnect is visible to an application that
+  subscribed to no events ([decisions/0036](decisions/0036-connection-statistics.md) §4.3).
 - **`open` waits, `NotConnected` means never connected.** With every slot down, `open` waits
   for the next live connection, bounded by `RuntimeConfig::send_timeout`; an endpoint that was
   never told an address still fails at once with `Error::NotConnected`.
@@ -672,7 +674,10 @@ the flow has ended, the error that ended it: the acceptor's refusal (`IncomingFl
 `Unsupported`, `LimitExceeded` past `max_flows`, or `ConnectionLost`. The receiver holds each
 flow's unread datagrams in a drop-oldest ring of `flow_queue_bytes`, so a slow consumer loses
 its oldest and stalls nobody; `FlowStats` counts both ends and `PathStats` passes the path's
-RTT, window and loss through. A flow opened through a dialling `Peer` survives a redial:
+RTT, window and loss through. `PathStats` is the connection's, not the flow's: every dialling
+endpoint reads it for each live connection through `connection_stats()`, with the UDP traffic in
+both directions, no flow needed ([decisions/0036](decisions/0036-connection-statistics.md)).
+A flow opened through a dialling `Peer` survives a redial:
 sends while no connection is live are dropped and counted `not_live`, never queued, and the
 flow is registered again on the new connection. On the local transports the FLOW stream carries
 the datagrams itself, at most 1200 bytes each.

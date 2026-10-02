@@ -104,7 +104,7 @@ two entry points, and both layers share the transfer handles they hand out:
 
 | Type | What it is |
 | --- | --- |
-| `Peer` | the dialling side: `open()` a one-way transfer, `open_bi()` an exchange |
+| `Peer` | the dialling side: `open()` a one-way transfer, `open_bi()` an exchange; `connection_stats()` reads each live connection's path and traffic |
 | `Acceptor` | the bound side: one path, both stream kinds, one queue |
 | `Incoming` | what an `Acceptor` yields: `Stream(..)`, `Exchange(..)` or `Flow(..)` |
 | `OutgoingTransfer` | the write half; `finish()` yields a `Delivery` |
@@ -112,7 +112,8 @@ two entry points, and both layers share the transfer handles they hand out:
 | `IncomingTransfer` | the read half plus the metadata that described it |
 | `IncomingRequest` | an accepted exchange: the body plus the reply half it owes |
 | `ReplyStream` | the requester's half of an exchange; dropping it cancels the reply |
-| `Flow` / `IncomingFlow` | a datagram flow's two ends: `send` never waits, `recv` yields the oldest datagram still held; `FlowStats` and `PathStats` say what was lost and what the path looks like |
+| `Flow` / `IncomingFlow` | a datagram flow's two ends: `send` never waits, `recv` yields the oldest datagram still held; `FlowStats` says what was lost and `PathStats` what the path looks like |
+| `ConnectionStats` | one live connection of a dialling endpoint, labelled by the URL as dialled: `age`, `redials`, and `TransportStats { path, tx, rx }` on QUIC; no address in it ([decisions/0036](decisions/0036-connection-statistics.md)) |
 
 ### L1 — patterns
 
@@ -1233,6 +1234,7 @@ pub struct Peer;                                             // dialling side; m
 impl Peer {
     pub async fn connect(&self, url: &str) -> Result<(), Error>;   // pooled per (authority, ClientTls, address pin)
     pub fn peer_count(&self) -> usize;                             // live peers only
+    pub fn connection_stats(&self) -> Vec<ConnectionStats>;        // one per live slot, by URL [0036]
     pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error>;  // one-way transfer
     pub async fn open_bi(&self, meta: TransferMeta)
         -> Result<(OutgoingTransfer, ReplyStream), Error>;                            // exchange
@@ -1251,6 +1253,7 @@ pub type Publisher = Endpoint<Pub>; pub type Subscriber = Endpoint<Sub>;
 impl Requester {                                             // multi-peer: connects append; open() round-robins
     pub async fn connect(&self, url: &str) -> Result<(), Error>;   // weida://[sha256:<hex>@]host:port/path
     pub fn peer_count(&self) -> usize;
+    pub fn connection_stats(&self) -> Vec<ConnectionStats>;        // on every dialling endpoint
     pub async fn open(&self, meta: TransferMeta) -> Result<(OutgoingTransfer, ReplyStream), Error>;
     pub async fn request(&self, body: &[u8]) -> Result<IncomingTransfer, Error>;   // open+write+finish+recv
     pub async fn request_with(&self, meta: TransferMeta, body: &[u8])
@@ -1353,7 +1356,14 @@ Type by type:
 - **`Peer`** — the L0 dialling side: a set of connections, the terms they were authenticated
   on (`ClientTls`, plus whatever each address named), and the two open calls. `peer_count`
   reports live peers only — a closed connection leaves the set when the next `connect()` adds
-  a live one. Every dialling pattern is this plus a selection policy and some vocabulary.
+  a live one. `connection_stats` returns one record per live connection, labelled by the URL
+  as dialled. Every dialling pattern is this plus a selection policy and some vocabulary.
+- **`ConnectionStats`** — a dialling endpoint's view of one live connection: the URL as
+  dialled, `age` (since the connection was established, so a redial resets it), `redials` of
+  that address, and `transport: Option<TransportStats>` — `PathStats` (smoothed and minimum
+  RTT, window, congestion events, lost packets and bytes, sent packets, MTU, datagram size)
+  plus `UdpCounts` sent and received — `None` on a local transport. No statistics type carries
+  a socket address ([decisions/0036](decisions/0036-connection-statistics.md) §4.4).
 - **`Acceptor`** — the L0 bound side: one path, both stream kinds, one queue. Where a
   `Replier` accepts only exchanges and a `Puller` only one-way transfers, an `Acceptor` takes
   whatever arrives and lets the application decide.

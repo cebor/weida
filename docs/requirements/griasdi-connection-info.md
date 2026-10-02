@@ -38,6 +38,22 @@ Everything under "What weida provides today" was read from the weida source at
 commit `6dcb64b`; file and line references are given so a reader can check
 rather than trust. Everything under "Proposal" is design, not fact.
 
+**Answered by [decisions/0036](../decisions/0036-connection-statistics.md) (accepted; items 1, 2
+and 4 shipped in `5f13941` and `1f3b2a7`).** Item 1 is `connection_stats()` on `Peer`,
+`Requester`, `Pusher`, `Subscriber`, `Paired`, `Surveyor`, `BusMember` and `Dish` and their
+`weida::blocking` twins: one `ConnectionStats { url, age, redials, transport }` per live
+connection, labelled by the URL as dialled. Item 2 differs from the proposal in one place:
+`path`, `tx` and `rx` sit together in `transport: Option<TransportStats>`, `None` on a local
+transport, so an empty vector still means "no live connection". `PathStats` gained `min_rtt`,
+`lost_bytes` and `current_mtu`; `min_rtt` needed `quinn` 0.11.12 as the workspace floor,
+because the lock held `quinn-proto` 0.11.17, which has no `min_rtt`. Item 4 is
+`stats::tests::statistics_types_carry_no_address` and an [INVARIANTS.md](../INVARIANTS.md)
+entry. Item 3, the remote view, is decided — capability code `2` `path_report`, frame kind `8`
+REPORT, one record every 2 s, latest kept — and built later as B-301 and B-302. Open questions:
+1 do without, `min_rtt` gives the floor; 2 a capability code; 3 not built, `TransportStats` is
+the unit a bound side would reuse; 4 each handle reports a shared connection, with its own
+`url` and `redials`.
+
 ## What griasdi needs
 
 | Need | Shape |

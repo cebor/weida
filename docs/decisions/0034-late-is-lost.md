@@ -369,6 +369,9 @@ large, discarded before send (local transports), not live, received, dropped on 
 passed through. These are weida's structs filled from `quinn`'s `Connection::stats`; no `quinn`
 type appears in a public signature, which is the encapsulation
 [0021](0021-consensus-openraft.md) applies to openraft and weida already applies to `quinn`.
+**Amended by [0036](0036-connection-statistics.md):** `PathStats` is now non-exhaustive, carries
+`min_rtt`, `lost_bytes` and `current_mtu` as well, and is readable without a flow through every
+dialling endpoint's `connection_stats()`.
 
 ### 4.10 A redial re-opens flows; a gap loses what was sent into it
 

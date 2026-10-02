@@ -1696,6 +1696,15 @@ inside `weida-protocol`; the wire bytes and the golden vectors do not change eit
 | Peer binding | compare against the peer's **live** connections, refuse a mismatch with `Error::Untrusted(fp)` | The fingerprint is the only thing that binds a peer's connections ([decisions/0008](decisions/0008-session-identity.md) §4.2), and dialling a second path is dialling the same peer. Live connections rather than a remembered value, because a peer is this peer only while a connection to it lives: once the last one is gone, a replacement server with a new key is a new peer and nothing should still be objecting to it. Proved by swapping a raw server's identity between two handshakes on one socket — the load-balancer case, which two `quinn` endpoints cannot reproduce because they cannot share a port. |
 | `max_connections_per_peer` | 64, counted per proved fingerprint, released on close | One connection per path lets the dialling side choose the count, so `max_connections` alone would let one peer fill a binding. 64 is the number B-011 measured (~50 MiB of transport state across both ends for 64 connections to one peer) and a sixteenth of the default `max_connections`. Anonymous connections are not counted together: two of them cannot be shown to be one peer, so counting them as one would refuse strangers for each other's traffic. |
 
+### Connection statistics decisions (B-298, B-299)
+
+| Decision | Value | Rationale |
+| --- | --- | --- |
+| `quinn` floor | `quinn = "0.11.12"` in the workspace, locked at `quinn` 0.11.12 / `quinn-proto` 0.11.19 | `PathStats::min_rtt` exists only from `quinn-proto` 0.11.18, and the lock held 0.11.17; 0.11.12 is the first `quinn` whose manifest requires 0.11.18, so the floor is stated where a resolver reads it rather than left to whatever a lock file happens to hold ([decisions/0036](decisions/0036-connection-statistics.md) §2.1). |
+| Where statistics are read | `connection_stats()` on `Peer` and every dialling endpoint and blocking twin, one record per **live slot** | A slot is what the application dialled and what outlives a connection, so its URL is the label and its redial count is the address's. A connection the pool shares between two endpoints is reported by both, with the same transport counters (0036 §4.6). The slot list is collected under its `std` mutex and `quinn`'s counters are read after it is released, so no `quinn` lock nests inside it. |
+| Local transports | `transport: None`, `age` and `redials` still reported | No path to measure, and an empty vector has to keep meaning "no live connection" (0036 §3, option E). |
+| `age` clock | `std::time::Instant` taken in `ConnCtx::spawn` | One instant per connection, after the QUIC handshake and before HELLO; a paused Tokio clock in a test does not stop it. |
+
 ---
 
 ## 6. Known debt and deferred work
