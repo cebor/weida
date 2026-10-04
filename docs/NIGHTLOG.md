@@ -5,15 +5,6 @@ first, then the numbers, then the chronology.
 
 ## Review needed
 
-**0037 is provisional and waits for you and cebor** (2026-10-04, main `05a6b8e`, documents
-only). [decisions/0037](decisions/0037-layered-segments.md) answers
-[requirements/griasdi-video.md](requirements/griasdi-video.md): the segment as an L0 unit that a
-radio fans out and a dialling `Peer` sends, ordered layers inside a segment cut from the top,
-a dish's `max_layer`, layer-major priority, the draft PR's finish grace, and per-dish drops at a
-radio. B-304 to B-312 are `parked` until it is accepted; once it is, tuco86/weida#2 is
-superseded by B-304 (its radio fixes and tests) and B-307 (its `Peer::segment`), and its
-Windows `current_account_sid` commit needs its own home.
-
 **0034 is built, B-279 to B-292, and three things want your eye** (2026-09-29, main
 `59f79f6`, gate green after every item). **(1) Two proposals wait in the site repositories**:
 `weida.doodleshnookie.net/docs/requirements/weida-late-is-lost.md` (untracked, that directory
@@ -461,3 +452,4 @@ sharing a bottleneck with media; the default stays `Cubic`. Recorded in IMPLEMEN
 2026-10-02T14:51Z | B-298 | done 5f13941 | `crates/weida/src/stats.rs`: `PathStats` (non-exhaustive, plus `min_rtt`, `lost_bytes`, `current_mtu`), `UdpCounts`, `TransportStats`, `ConnectionStats`; `Link::transport_stats` replaces `Link::path_stats` and copies one `quinn` `stats()` call; `Flow`/`IncomingFlow::path_stats` read its `path`. Workspace `quinn = "0.11.12"`, lock 0.11.12 / quinn-proto 0.11.19. `statistics_types_carry_no_address` names every field of the five statistics types against a `NoAddress` marker | next B-299
 2026-10-02T14:51Z | B-299 | done 1f3b2a7 | `connection_stats()` on `Peer`, `Requester`, `Pusher`, `Subscriber`, `Paired` (empty when bound), `Surveyor`, `BusMember`, `Dish`, and on every blocking dialling wrapper through the `dialling!` macro; `ConnCtx::established` gives `age`, `Slot::redials` counts in `PeerShared::redialled`. `tests/stats.rs`: a dial by `localhost` reports rtt/min_rtt/MTU, tx and rx grow by a 64 KiB echo, no `127.0.0.1`/`::1` in the Debug text, empty after `disconnect`; inproc has `transport: None` and a growing age; a restarted server gives `redials == 1` and a fresh age. A throwaway example printed rtt 290 µs, min_rtt 156 µs, current_mtu 1452, tx 76 datagrams / 92 KB and was deleted. Gate green: fmt, clippy (workspace, no-default-features, five feature runs), workspace tests, ten doc runs | next B-300
 2026-10-02T14:52Z | B-300 | done 9287372 | 0036 in ARCHITECTURE (L0 table, API sketch, `Peer` and `ConnectionStats` entries), PATTERNS (redial bullet, §1.12 flow paragraph), INVARIANTS (no address in a statistics type, with the test), IMPLEMENTATION §5 (quinn floor, per-slot records, local transports, the clock), 0034 §4.9 amended, weida-py.md (absent row and §10 row, B-303), the requirement points at 5f13941/1f3b2a7. Sweep: PathStats lists outside decisions/, BACKLOG, NIGHTLOG and the requirement's dated snapshot carry the new fields | next B-301
+2026-10-04T18:18Z | — | 0037 accepted | the owner accepted 0037; B-304..B-312 ready; tuco86/weida#2's radio commits 7ce78c2 and 402afd3 go into B-304, its Peer::segment into B-307, its Windows commit 5e6ee45 is not taken | next B-304

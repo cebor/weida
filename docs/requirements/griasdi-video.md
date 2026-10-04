@@ -26,7 +26,7 @@ reader can check rather than trust. The griasdi side was read from its branch
 `6dcb64b`. Everything under "Proposal" is design, not fact.
 
 **Answered by [decisions/0037](../decisions/0037-layered-segments.md)
-(provisional; items parked).** Priority (gap 1 below) is 0037 §4.4, the uplink
+(accepted; built as B-304 to B-312).** Priority (gap 1 below) is 0037 §4.4, the uplink
 (gap 2) is §4.2, path statistics (gap 3) were already answered by
 [0036](../decisions/0036-connection-statistics.md)'s `connection_stats()`, the
 per-dish signal (gap 4) is §4.6, and layers (the fifth ask) are §4.3.
