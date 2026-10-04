@@ -26,7 +26,7 @@ kind: code | size: 90 | status: done 84ba8a2 | needs: [B-301]
 acceptance: [0036](decisions/0036-connection-statistics.md) §4.5: with `Limits::path_report` on both sides each side sends one REPORT stream and a record every 2 s; the receiver keeps the latest record in one slot and `ConnectionStats::remote` returns it with its age; off on either side, nothing is sent and `remote` is `None`; each violation closes with `PROTOCOL_VIOLATION`, tested against a hand-written peer stream. INVARIANTS names the slot as fixed-size.
 
 ### B-303 — Python: connection statistics
-kind: code | size: 45 | status: ready | needs: [B-299]
+kind: code | size: 45 | status: done d12df25 | needs: [B-299]
 acceptance: [0036](decisions/0036-connection-statistics.md) §4.8: `connection_stats()` on every dialling class of both Python surfaces returns `weida.ConnectionStats` values (url, age seconds, redials, transport as a value with path, tx, rx, or `None`); a test over QUIC loopback asserts a positive RTT and `None` over `weida+inproc`; [libraries/weida-py.md](libraries/weida-py.md) moves the row from absent to present.
 
 ### B-304 — Supersession that keeps finished copies whole
