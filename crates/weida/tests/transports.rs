@@ -288,6 +288,19 @@ async fn pair_over_unix() {
     pair_both_directions(&Harness::start(Transport::Unix).await).await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_second_binding_of_a_live_socket_is_refused() {
+    let h = Harness::start(Transport::Unix).await;
+    let path = h.socket_path().expect("a unix harness has a socket");
+    let refused = h.listener.bind_unix(path);
+    assert!(
+        matches!(refused, Err(weida::Error::AddressInUse(_))),
+        "{refused:?}"
+    );
+    req_rep_echo(&h).await;
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn pair_over_pipe() {

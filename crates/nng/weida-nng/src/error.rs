@@ -216,11 +216,12 @@ impl std::error::Error for Error {}
 /// `NNG_ESTATE`/`NNG_EMSGSIZE`/`NNG_ECLOSED` is not weida's vocabulary and
 /// never will be.
 ///
-/// Only four of weida's outcomes can reach this crate, because only four
+/// Only five of weida's outcomes can reach this crate, because only these
 /// calls do: the reactor constructors report [`weida_core::Error::Runtime`],
 /// the name registry reports [`weida_core::Error::InvalidAddress`] and
-/// [`weida_core::Error::AlreadyRegistered`], and the `AF_UNIX` helpers report
-/// [`weida_core::Error::Io`]. Anything else becomes `NNG_ESYSERR` carrying
+/// [`weida_core::Error::AlreadyRegistered`], the `AF_UNIX` helpers report
+/// [`weida_core::Error::Io`], and a bind of an address another listener
+/// holds reports [`weida_core::Error::AddressInUse`]. Anything else becomes `NNG_ESYSERR` carrying
 /// weida's own text: no outcome is dropped on the floor, and a variant that
 /// starts arriving says so in the message rather than hiding.
 impl From<weida_core::Error> for Error {
@@ -234,6 +235,7 @@ impl From<weida_core::Error> for Error {
             weida_core::Error::AlreadyRegistered => {
                 Error::EADDRINUSE(Cow::Borrowed("the address is already bound"))
             }
+            weida_core::Error::AddressInUse(why) => Error::EADDRINUSE(Cow::Owned(why)),
             weida_core::Error::Io(io) => Error::from(io),
             other => Error::ESYSERR(Cow::Owned(other.to_string())),
         }

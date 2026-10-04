@@ -26,6 +26,9 @@ pub enum Error {
     InvalidFingerprint(String),
     /// An endpoint path is already registered on this listener.
     AlreadyRegistered,
+    /// A local address another live listener holds: a socket that accepts
+    /// connections, or a pipe name that exists.
+    AddressInUse(String),
     /// The endpoint has no usable peer connection.
     NotConnected,
     /// The connection was lost before the local transfer reached FIN; the
@@ -139,6 +142,7 @@ impl fmt::Display for Error {
                 write!(f, "invalid fingerprint: expected sha256:<64 hex digits>, got {m:?}")
             }
             Error::AlreadyRegistered => f.write_str("endpoint path already registered"),
+            Error::AddressInUse(m) => write!(f, "address in use: {m}"),
             Error::NotConnected => f.write_str("endpoint is not connected to any peer"),
             Error::ConnectionLost(cause) => {
                 write!(f, "connection lost before the transfer completed: {cause}")
@@ -326,6 +330,7 @@ mod tests {
             Error::InvalidAddress("x".into()),
             Error::InvalidEndpointPath,
             Error::AlreadyRegistered,
+            Error::AddressInUse("x".into()),
             Error::NotConnected,
             Error::ConnectionLost(LossCause::IdleTimeout),
             Error::Negotiation("x".into()),
