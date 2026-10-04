@@ -737,10 +737,13 @@ impl Segment {
         let copies = std::mem::take(&mut self.copies);
         let mut finished = 0;
         for copy in copies {
-            // Before the item: a successor opened right after this sees it.
-            copy.ctl.finished.store(true, Ordering::Release);
             match copy.tx.try_send(SegItem::Finish) {
-                Ok(()) => finished += 1,
+                Ok(()) => {
+                    // Stored before the successor can open: the caller opens
+                    // it only after `finish` returns.
+                    copy.ctl.finished.store(true, Ordering::Release);
+                    finished += 1;
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     self.drops.record(&self.topic, DropCause::SubscriberQueue);
                 }

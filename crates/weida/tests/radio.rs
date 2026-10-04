@@ -229,6 +229,36 @@ async fn a_segment_finished_right_before_its_successor_still_arrives_whole() {
     runtime.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_segment_whose_finish_found_a_full_queue_is_superseded_at_once() {
+    // The copy's queue is full when the segment finishes, so its FIN is
+    // never queued: the copy is unfinished, and its successor resets it
+    // before it sends anything. The dish is healthy, so only that rule can
+    // supersede the copy.
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = server.client_runtime();
+    let dish = joined(&server, &runtime, "v", None).await;
+    dishes(&radio, 1).await;
+
+    // No await from here on: the copy's task has not taken a chunk yet.
+    let mut first = radio.segment("v").expect("segment");
+    for _ in 0..64 {
+        first.write(vec![0x42; 1024]).expect("write");
+    }
+    assert_eq!(first.finish(), 0);
+    let mut second = radio.segment("v").expect("segment");
+    second.write(vec![0x42; 1024]).expect("write");
+    second.finish();
+
+    let received = segment_of(within(dish.recv()).await.expect("recv"));
+    assert_eq!(received.meta().segment, Some(1));
+    let drops = radio.dropped_on("v").expect("drops on v");
+    assert_eq!(drops.subscriber_queue, 1, "{drops:?}");
+    assert_eq!(drops.superseded, 1, "{drops:?}");
+    runtime.shutdown().await;
+}
+
 // --- segments from a dialling peer ---------------------------------------------
 
 fn stream_of(incoming: Incoming) -> weida::IncomingTransfer {
