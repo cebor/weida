@@ -65,6 +65,9 @@ pub mod limits {
     pub const MAX_REPORT_LEVELS: usize = 16;
     /// Nesting depth allowed when skipping an unknown field.
     pub const MAX_SKIP_DEPTH: usize = 8;
+    /// Highest segment layer (`docs/PROTOCOL.md` §6.2 key `14`, §6.4 key
+    /// `3`).
+    pub const MAX_LAYER: u8 = 15;
 }
 
 /// HELLO keys.
@@ -95,6 +98,7 @@ mod data_key {
     // Key 12 (`delivery_attempt`) is reserved in docs/PROTOCOL.md §6.2 and
     // coded by the slice that writes it.
     pub const SEGMENT: u64 = 13;
+    pub const LAYER: u64 = 14;
 }
 
 /// ERROR keys.
@@ -108,6 +112,7 @@ mod subscription_key {
     pub const ENDPOINT: u64 = 0;
     pub const FILTER: u64 = 1;
     pub const MAX_AGE_MS: u64 = 2;
+    pub const MAX_LAYER: u64 = 3;
 }
 
 /// CREDIT keys.
@@ -783,6 +788,15 @@ fn level<T: WireLevel>(value: u64, dimension: &'static str) -> Result<T, HeaderE
     T::from_wire_value(value).ok_or(HeaderError::UnknownLevel { dimension, value })
 }
 
+/// Maps a wire value to a segment layer, refusing one above
+/// [`limits::MAX_LAYER`] with `reason`.
+fn layer(value: u64, reason: &'static str) -> Result<u8, HeaderError> {
+    u8::try_from(value)
+        .ok()
+        .filter(|layer| *layer <= limits::MAX_LAYER)
+        .ok_or(HeaderError::InvalidLayer(reason))
+}
+
 /// Lets [`level`] work for every dimension enum without a macro per call.
 trait WireLevel: Sized {
     fn from_wire_value(value: u64) -> Option<Self>;
@@ -863,6 +877,10 @@ pub enum HeaderError {
     /// there are too many of them, or the order and its id disagree
     /// (`docs/PROTOCOL.md` §6.2, keys `9`-`11`).
     InvalidReport(&'static str),
+    /// A segment layer is above [`limits::MAX_LAYER`], or a DATA header
+    /// carries key `14` without key `13` (`docs/PROTOCOL.md` §6.2 key `14`,
+    /// §6.4 key `3`).
+    InvalidLayer(&'static str),
 }
 
 impl std::fmt::Display for HeaderError {
@@ -896,6 +914,7 @@ impl std::fmt::Display for HeaderError {
             HeaderError::InvalidGuarantees(why) => write!(f, "invalid guarantee set: {why}"),
             HeaderError::InvalidFilter(why) => write!(f, "invalid topic filter: {why}"),
             HeaderError::InvalidReport(reason) => write!(f, "invalid report: {reason}"),
+            HeaderError::InvalidLayer(reason) => write!(f, "invalid layer: {reason}"),
         }
     }
 }
@@ -1459,14 +1478,21 @@ pub struct DataHeader {
     ///
     /// [`ReportMode::Progress`] is the default and is never written.
     pub report_mode: ReportMode,
-    /// RADIO segment number per `(radio path, topic)`, from 0 (key `13`).
+    /// Segment number per `(sender, path, topic)`, from 0 (key `13`).
     ///
-    /// Written by a radio only
+    /// Written by a radio or by `Peer::segment`
     /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
-    /// §4.6). It is not a `PerProducer` sequence: it is written whatever
+    /// §4.6, [decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+    /// §4.2). It is not a `PerProducer` sequence: it is written whatever
     /// ordering was negotiated, and a dish uses it to discard a segment older
     /// than the newest it delivered.
     pub segment: Option<u64>,
+    /// Segment layer, `0..=15` (key `14`); absent means 0; written only
+    /// beside `segment`
+    /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+    /// §4.3). The encoder writes what it is given, so a sender passes `None`
+    /// for layer 0.
+    pub layer: Option<u8>,
 }
 
 impl DataHeader {
@@ -1529,7 +1555,8 @@ impl DataHeader {
             + u64::from(self.report_id.is_some())
             + u64::from(!report.is_empty())
             + u64::from(self.report_mode != ReportMode::default())
-            + u64::from(self.segment.is_some());
+            + u64::from(self.segment.is_some())
+            + u64::from(self.layer.is_some());
         encode_into_with(out, |e| {
             e.map(count)?;
             if let Some(endpoint) = &self.endpoint {
@@ -1580,6 +1607,9 @@ impl DataHeader {
             if let Some(segment) = self.segment {
                 e.u64(data_key::SEGMENT)?.u64(segment)?;
             }
+            if let Some(layer) = self.layer {
+                e.u64(data_key::LAYER)?.u64(u64::from(layer))?;
+            }
             Ok(())
         })
     }
@@ -1627,11 +1657,17 @@ impl DataHeader {
                         header.report_mode = level(m.u64()?, "report_mode")?;
                     }
                     data_key::SEGMENT => header.segment = Some(m.u64()?),
+                    data_key::LAYER => header.layer = Some(layer(m.u64()?, "layer above 15")?),
                     _ => m.skip()?,
                 }
             }
         }
         finish(&d)?;
+        // A layer belongs to a segment: key 14 alone names a layer of
+        // nothing.
+        if header.layer.is_some() && header.segment.is_none() {
+            return Err(HeaderError::InvalidLayer("layer without segment"));
+        }
         // Keys 9 and 10 are one statement in two halves: an order with no
         // stream to report on, or a stream with nothing to report, names a
         // report nobody can serve.
@@ -1730,8 +1766,12 @@ pub struct SubscriptionHeader {
     /// The dish's latency budget in milliseconds (key `2`), meaningful on a
     /// RADIO path only
     /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
-    /// §4.6). Encoded only when present.
     pub max_age_ms: Option<u64>,
+    /// The highest layer the dish wants (key `3`), `0..=15`, meaningful on a
+    /// RADIO path only; absent means no cap
+    /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+    /// §4.3). Encoded only when present.
+    pub max_layer: Option<u8>,
 }
 
 impl SubscriptionHeader {
@@ -1741,6 +1781,7 @@ impl SubscriptionHeader {
             endpoint: endpoint.into(),
             filter: filter.into(),
             max_age_ms: None,
+            max_layer: None,
         }
     }
 
@@ -1757,14 +1798,18 @@ impl SubscriptionHeader {
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         // Keys 0 and 1 are required, so neither is elided: an absent filter
         // and an empty filter would otherwise be indistinguishable on the
-        // wire, and the empty filter is the "everything" subscription. Key 2
-        // is optional and written only when set.
+        // wire, and the empty filter is the "everything" subscription. Keys 2
+        // and 3 are optional and written only when set.
         encode_into_with(out, |e| {
-            e.map(2 + u64::from(self.max_age_ms.is_some()))?;
+            e.map(2 + u64::from(self.max_age_ms.is_some()) + u64::from(self.max_layer.is_some()))?;
             e.u64(subscription_key::ENDPOINT)?.str(&self.endpoint)?;
             e.u64(subscription_key::FILTER)?.str(&self.filter)?;
             if let Some(max_age_ms) = self.max_age_ms {
                 e.u64(subscription_key::MAX_AGE_MS)?.u64(max_age_ms)?;
+            }
+            if let Some(max_layer) = self.max_layer {
+                e.u64(subscription_key::MAX_LAYER)?
+                    .u64(u64::from(max_layer))?;
             }
             Ok(())
         })
@@ -1776,6 +1821,7 @@ impl SubscriptionHeader {
         let mut endpoint = None;
         let mut filter = None;
         let mut max_age_ms = None;
+        let mut max_layer = None;
         {
             let mut m = MapReader::new(&mut d)?;
             while let Some(key) = m.next_key()? {
@@ -1787,6 +1833,9 @@ impl SubscriptionHeader {
                         filter = Some(m.text(key, limits::MAX_FILTER_BYTES)?)
                     }
                     subscription_key::MAX_AGE_MS => max_age_ms = Some(m.u64()?),
+                    subscription_key::MAX_LAYER => {
+                        max_layer = Some(layer(m.u64()?, "max_layer above 15")?);
+                    }
                     _ => m.skip()?,
                 }
             }
@@ -1804,6 +1853,7 @@ impl SubscriptionHeader {
             endpoint: endpoint.expect("presence checked above"),
             filter,
             max_age_ms,
+            max_layer,
         })
     }
 }
@@ -2335,6 +2385,7 @@ mod tests {
             ],
             report_mode: ReportMode::FinalOnly,
             segment: Some(u64::MAX),
+            layer: Some(limits::MAX_LAYER),
         };
         assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
     }
@@ -2368,6 +2419,7 @@ mod tests {
             report: vec![CursorLevel::Known(Acknowledgement::Stored)],
             report_mode: ReportMode::FinalOnly,
             segment: Some(3),
+            layer: Some(2),
         };
         let bytes = h.encode();
         let mut d = Decoder::new(&bytes);

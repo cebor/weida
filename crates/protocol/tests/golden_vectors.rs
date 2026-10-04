@@ -619,6 +619,59 @@ fn golden_subscribe_with_max_age_frame() {
 }
 
 #[test]
+fn golden_layered_segment_data_frame() {
+    let h = DataHeader {
+        segment: Some(5),
+        layer: Some(2),
+        ..DataHeader::addressed("/t")
+    };
+    assert_frame(
+        "DATA layered segment",
+        FrameKind::Data,
+        h.encode(),
+        &[
+            0x57, 0x01, 0x09, 0xA3, 0x00, 0x62, 0x2F, 0x74, 0x0D, 0x05, 0x0E, 0x02,
+        ],
+    );
+    assert_eq!(DataHeader::decode(&h.encode()).unwrap(), h);
+}
+
+#[test]
+fn golden_subscribe_with_max_layer_frame() {
+    let h = SubscriptionHeader {
+        max_layer: Some(1),
+        ..SubscriptionHeader::new("/t", "a")
+    };
+    assert_frame(
+        "SUB max_layer",
+        FrameKind::Subscribe,
+        h.encode(),
+        &[
+            0x57, 0x03, 0x0A, 0xA3, 0x00, 0x62, 0x2F, 0x74, 0x01, 0x61, 0x61, 0x03, 0x01,
+        ],
+    );
+    assert_eq!(SubscriptionHeader::decode(&h.encode()).unwrap(), h);
+}
+
+#[test]
+fn a_layer_above_fifteen_or_without_a_segment_is_a_violation() {
+    // `docs/PROTOCOL.md` §8's three layer violations, each a header that
+    // closes the connection with `PROTOCOL_VIOLATION`.
+    assert_eq!(
+        DataHeader::decode(&[0xA2, 0x0D, 0x05, 0x0E, 0x10]),
+        Err(HeaderError::InvalidLayer("layer above 15"))
+    );
+    assert_eq!(
+        DataHeader::decode(&[0xA1, 0x0E, 0x01]),
+        Err(HeaderError::InvalidLayer("layer without segment"))
+    );
+    assert_eq!(
+        SubscriptionHeader::decode(&[0xA3, 0x00, 0x62, 0x2F, 0x74, 0x01, 0x61, 0x61, 0x03, 0x10]),
+        Err(HeaderError::InvalidLayer("max_layer above 15"))
+    );
+}
+
+#[test]
 fn golden_hello_with_datagram_frame() {
     let mut h = Hello::v0(16384, 1024);
     h.capabilities = vec![CAPABILITY_DATAGRAM];

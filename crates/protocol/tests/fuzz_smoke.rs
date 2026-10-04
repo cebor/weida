@@ -142,6 +142,7 @@ fn fuzz_smoke_data_header_from_valid_bytes() {
             ],
             report_mode: ReportMode::FinalOnly,
             segment: Some(u64::MAX),
+            layer: Some(15),
         },
     ];
     let mut accepted = 0usize;
@@ -292,6 +293,11 @@ fn fuzz_smoke_subscribe() {
         SubscriptionHeader::new("/md", "px.").encode(),
         SubscriptionHeader {
             max_age_ms: Some(150),
+            ..SubscriptionHeader::new("/r", "v")
+        }
+        .encode(),
+        SubscriptionHeader {
+            max_layer: Some(15),
             ..SubscriptionHeader::new("/r", "v")
         }
         .encode(),
@@ -455,7 +461,7 @@ fn arbitrary_data_header(rng: &mut Rng) -> DataHeader {
             .map(|i| CursorLevel::Application(CursorLevel::APPLICATION_FLOOR + i))
             .collect(),
     };
-    DataHeader {
+    let mut header = DataHeader {
         endpoint: text(rng, limits::MAX_ENDPOINT_BYTES),
         content_len: if rng.below(2) == 0 {
             Some(rng.next_u64())
@@ -499,5 +505,12 @@ fn arbitrary_data_header(rng: &mut Rng) -> DataHeader {
         },
         report,
         segment: (rng.below(2) == 0).then(|| rng.next_u64()),
+        layer: None,
+    };
+    // Key 14 travels only beside key 13: a layer of no segment is a header
+    // §6.2 rejects.
+    if header.segment.is_some() && rng.below(2) == 0 {
+        header.layer = Some(rng.below(16) as u8);
     }
+    header
 }

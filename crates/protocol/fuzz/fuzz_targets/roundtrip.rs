@@ -41,8 +41,10 @@ struct ArbHeader {
     report: Option<ArbReport>,
     /// Key `11`. `false` is `Progress`, the default the encoder never writes.
     report_final_only: bool,
-    /// Key `13`, a RADIO segment number.
+    /// Key `13`, a segment number.
     segment: Option<u64>,
+    /// Key `14`, generated only beside key `13` and taken modulo 16.
+    layer: Option<u8>,
 }
 
 /// An ordered report: the id of key `9` and one seed per level of key `10`.
@@ -127,6 +129,7 @@ fuzz_target!(|input: ArbHeader| {
             ReportMode::Progress
         },
         segment: input.segment,
+        layer: input.segment.and(input.layer.map(|l| l % 16)),
     };
 
     let bytes = header.encode();

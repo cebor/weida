@@ -319,9 +319,10 @@ pub(crate) fn data_header(
         report_id,
         report: meta.report.clone(),
         report_mode: meta.report_mode,
-        // Key 13 is written by a radio only, which sets it on the header it
-        // builds from this one.
+        // Keys 13 and 14 are written by a segment copy, which builds its own
+        // header.
         segment: None,
+        layer: None,
     };
     Ok((header, trace))
 }

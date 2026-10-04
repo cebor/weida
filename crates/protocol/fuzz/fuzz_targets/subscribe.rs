@@ -21,6 +21,7 @@ fuzz_target!(|data: &[u8]| {
 
     assert!(header.endpoint.len() <= limits::MAX_ENDPOINT_BYTES);
     assert!(header.filter.len() <= limits::MAX_FILTER_BYTES);
+    assert!(header.max_layer.is_none_or(|l| l <= limits::MAX_LAYER));
 
     let reencoded = header.encode();
     assert_eq!(SubscriptionHeader::decode(&reencoded).as_ref(), Ok(&header));

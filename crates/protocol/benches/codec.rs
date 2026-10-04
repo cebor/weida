@@ -33,6 +33,7 @@ fn full_request() -> DataHeader {
         report: Vec::new(),
         report_mode: ReportMode::Progress,
         segment: None,
+        layer: None,
     }
 }
 
