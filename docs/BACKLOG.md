@@ -62,7 +62,7 @@ kind: code | size: 60 | status: done 8c718e4 | needs: [B-308]
 acceptance: an example in B-290's shape — a `Peer::segment` uplink writing three layers, an acceptor, a `Radio::segment` that follows upstream per [0037](decisions/0037-layered-segments.md) §4.8 and §4.11 — asserted by a test: a dish with `max_layer = 0` receives layer 0 of every segment and nothing else, and an uncapped dish receives all three; a [GUIDE.md](GUIDE.md) section "quality without re-encoding".
 
 ### B-311 — Layered segments in `weida::blocking` and `weida-py`
-kind: code | size: 60 | status: ready | needs: [B-308, B-309]
+kind: code | size: 60 | status: done 8def210 | needs: [B-308, B-309]
 acceptance: the `weida::blocking` twins of `SegmentTerms` (with `follows_upstream`), `JoinTerms`, `write_layer`, `finish_layer` and `dish_drops`, and both Python surfaces; one layered round trip per Python surface.
 
 ### B-312 — Documents for 0037
