@@ -66,7 +66,7 @@ kind: code | size: 60 | status: done 8def210 | needs: [B-308, B-309]
 acceptance: the `weida::blocking` twins of `SegmentTerms` (with `follows_upstream`), `JoinTerms`, `write_layer`, `finish_layer` and `dish_drops`, and both Python surfaces; one layered round trip per Python surface.
 
 ### B-312 — Documents for 0037
-kind: spec | size: 45 | status: ready | needs: [B-304, B-307, B-308, B-309, B-314]
+kind: spec | size: 45 | status: done 82c0731 | needs: [B-304, B-307, B-308, B-309, B-314]
 acceptance: [0037](decisions/0037-layered-segments.md) §5's edits, and §4.11's three rules in PATTERNS §6.4, GUARANTEES §6 and INVARIANTS (`segments_out` and `segments_in` per connection, each bounded by `max_sequence_scopes`); no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says key `13` is written by a radio only, or that a dialling side cannot send a segment; [requirements/griasdi-video.md](requirements/griasdi-video.md) points at what shipped.
 
 ### B-313 — ARCHITECTURE names a `PeerSet` that no longer exists
