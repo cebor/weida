@@ -1136,3 +1136,96 @@ async fn installing_an_admission_screens_joins_already_recorded() {
 fn server_client() -> Runtime {
     Runtime::new(RuntimeConfig::default()).expect("client runtime")
 }
+
+// --- per-dish drops ---------------------------------------------------------------
+
+#[tokio::test]
+async fn dish_drops_names_the_dish_that_lost_and_forgets_it_when_it_leaves() {
+    const CHUNK: usize = 16 * 1024;
+    let server = Keyed::start(Limits {
+        subscriber_buffer_bytes: 256 * 1024,
+        ..Limits::default()
+    })
+    .await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let reading_rt = server_client();
+    let (reading, reading_peer) = server.dish(&reading_rt, "v").await;
+    let stalled_rt = Runtime::new(RuntimeConfig {
+        limits: Limits {
+            stream_receive_window: 64 * 1024,
+            ..Limits::default()
+        },
+        ..RuntimeConfig::default()
+    })
+    .expect("stalled runtime");
+    let (_stalled, stalled_peer) = server.dish(&stalled_rt, "v").await;
+    dishes(&radio, 2).await;
+
+    // The reading dish reports every byte it has read; the stalled one
+    // never reads, so its copy holds 64 KiB in flight and the rest queued.
+    let (read_tx, mut read_rx) = mpsc::unbounded_channel();
+    let reader = tokio::spawn(async move {
+        let mut transfer = segment_of(within(reading.recv()).await.expect("recv"));
+        let mut buf = vec![0u8; CHUNK];
+        let mut total = 0;
+        loop {
+            let n = within(transfer.read(&mut buf)).await.expect("read");
+            if n == 0 {
+                // The dish goes back with the count: dropping it would
+                // leave the radio.
+                return (reading, total);
+            }
+            total += n;
+            let _ = read_tx.send(total);
+        }
+    });
+    let mut segment = radio
+        .segment("v", SegmentTerms::default())
+        .expect("segment");
+    let mut read = 0;
+    for written in 1..=24 {
+        assert!(segment.write(vec![0x42; CHUNK]).expect("write") >= 1);
+        while read < written * CHUNK {
+            read = within(read_rx.recv()).await.expect("the reader reports");
+        }
+    }
+    segment.finish();
+    let (_reading, total) = within(reader).await.expect("reader");
+    assert_eq!(total, 24 * CHUNK);
+
+    let records = radio.dish_drops();
+    assert_eq!(records.len(), 2, "{records:?}");
+    let of = |peer: &PeerIdentity| {
+        records
+            .iter()
+            .find(|r| r.peer.as_ref() == Some(peer))
+            .expect("a record per dish")
+            .clone()
+    };
+    let stalled = of(&stalled_peer);
+    assert_eq!(stalled.subscriber_budget, 1, "{stalled:?}");
+    let kept = of(&reading_peer);
+    assert_eq!(
+        [
+            kept.subscriber_budget,
+            kept.subscriber_queue,
+            kept.superseded,
+            kept.expired,
+            kept.too_large,
+            kept.no_datagrams,
+            kept.layers_cut,
+        ],
+        [0; 7],
+        "{kept:?}"
+    );
+
+    stalled_rt.shutdown().await;
+    within(async {
+        while radio.dish_drops().len() != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(radio.dish_drops()[0].peer, Some(reading_peer));
+    reading_rt.shutdown().await;
+}

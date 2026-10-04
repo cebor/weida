@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use bytes::Bytes;
 use tokio::sync::mpsc::OwnedPermit;
 use tokio::sync::{Semaphore, mpsc};
-use weida_core::{Error, Limits, TraceContext};
+use weida_core::{Error, Limits, PeerIdentity, TraceContext};
 use weida_protocol::header::OrderingMode;
 use weida_protocol::{DataHeader, filter};
 
@@ -165,9 +165,38 @@ impl TopicDrops {
     }
 }
 
+/// What a radio dropped toward one joined dish connection, summed over
+/// topics ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+/// §4.6).
+///
+/// One record per joined dish connection, removed when that connection
+/// closes, so [`crate::Radio::dish_drops`] holds at most `max_connections`.
+/// A copy that found no parked connection is counted per topic only.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DishDrops {
+    /// The key or principal the dish's connection proved; `None` when it is
+    /// anonymous.
+    pub peer: Option<PeerIdentity>,
+    /// Copies dropped for an exhausted byte budget.
+    pub subscriber_budget: u64,
+    /// Copies dropped for a full queue.
+    pub subscriber_queue: u64,
+    /// Copies reset because a newer segment opened on their topic.
+    pub superseded: u64,
+    /// Copies reset because the `max_age` passed.
+    pub expired: u64,
+    /// Datagram segments larger than the dish's connection carries.
+    pub too_large: u64,
+    /// Datagram segments for a dish that carries no datagrams.
+    pub no_datagrams: u64,
+    /// Segment copies that lost layers above 0 and kept layer 0.
+    pub layers_cut: u64,
+}
+
 /// One counter per cause.
 #[derive(Default)]
-struct Causes {
+pub(crate) struct Causes {
     budget: AtomicU64,
     queue: AtomicU64,
     no_parked: AtomicU64,
@@ -179,7 +208,7 @@ struct Causes {
 }
 
 impl Causes {
-    fn record(&self, cause: DropCause) {
+    pub(crate) fn record(&self, cause: DropCause) {
         let counter = match cause {
             DropCause::SubscriberBudget => &self.budget,
             DropCause::SubscriberQueue => &self.queue,
@@ -199,6 +228,20 @@ impl Causes {
             subscriber_budget: self.budget.load(Ordering::Relaxed),
             subscriber_queue: self.queue.load(Ordering::Relaxed),
             no_parked_connection: self.no_parked.load(Ordering::Relaxed),
+            superseded: self.superseded.load(Ordering::Relaxed),
+            expired: self.expired.load(Ordering::Relaxed),
+            too_large: self.too_large.load(Ordering::Relaxed),
+            no_datagrams: self.no_datagrams.load(Ordering::Relaxed),
+            layers_cut: self.layers_cut.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The counters as one dish's record.
+    pub(crate) fn dish_snapshot(&self, peer: Option<PeerIdentity>) -> DishDrops {
+        DishDrops {
+            peer,
+            subscriber_budget: self.budget.load(Ordering::Relaxed),
+            subscriber_queue: self.queue.load(Ordering::Relaxed),
             superseded: self.superseded.load(Ordering::Relaxed),
             expired: self.expired.load(Ordering::Relaxed),
             too_large: self.too_large.load(Ordering::Relaxed),

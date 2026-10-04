@@ -28,7 +28,7 @@ use crate::endpoint::{Dish, Radio, send_subscription};
 use crate::flow::{Flow, FlowMeta, IncomingFlow, open_flow_on};
 use crate::identity::PeerChain;
 use crate::listener::{Namespace, Route};
-use crate::pubsub::{DropCause, DropTable, TopicDrops};
+use crate::pubsub::{Causes, DishDrops, DropCause, DropTable, TopicDrops};
 use crate::reconnect::PeerEvents;
 use crate::runtime::RuntimeInner;
 use crate::segment::{CopyTarget, Segment, SegmentTerms, SegmentTopics, open_segment};
@@ -116,6 +116,10 @@ struct DishEntry {
     /// One datagram flow per topic, opened lazily on the connection the join
     /// arrived on; bounded by the topics the dish's filters match.
     flows: Arc<Mutex<HashMap<Arc<str>, FlowSlot>>>,
+    /// What this dish connection lost, over topics
+    /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+    /// §4.6); goes with the entry when the connection closes.
+    drops: Arc<Causes>,
 }
 
 /// A dish's datagram flow for one topic.
@@ -249,6 +253,7 @@ impl RadioHub {
                     filters: HashMap::new(),
                     budget: Arc::new(Semaphore::new(self.limits.subscriber_buffer_bytes)),
                     flows: Arc::new(Mutex::new(HashMap::new())),
+                    drops: Arc::new(Causes::default()),
                 });
                 dishes.len() - 1
             }
@@ -415,6 +420,7 @@ impl Radio {
                     budget: Arc::clone(&entry.budget),
                     max_age: joined.max_age,
                     max_layer: joined.max_layer,
+                    dish: Some(Arc::clone(&entry.drops)),
                 })
             })
             .collect();
@@ -460,27 +466,29 @@ impl Radio {
                 continue;
             }
             if !entry.conn.agreed_now().is_some_and(|a| a.datagrams) {
-                hub.drops.record(&topic, DropCause::NoDatagrams);
+                record(&hub.drops, &entry.drops, &topic, DropCause::NoDatagrams);
                 continue;
             }
             let mut flows = lock(&entry.flows);
             match flows.get_mut(&topic) {
                 Some(FlowSlot::Open(flow)) => match flow.send(body.clone()) {
                     Ok(()) => handed += 1,
-                    Err(Error::TooLarge { .. }) => hub.drops.record(&topic, DropCause::TooLarge),
+                    Err(Error::TooLarge { .. }) => {
+                        record(&hub.drops, &entry.drops, &topic, DropCause::TooLarge);
+                    }
                     Err(Error::DatagramsUnavailable) => {
-                        hub.drops.record(&topic, DropCause::NoDatagrams);
+                        record(&hub.drops, &entry.drops, &topic, DropCause::NoDatagrams);
                     }
                     // The flow ended — refused, released or its connection
                     // gone. This datagram is lost; the next one reopens.
                     Err(_) => {
                         flows.remove(&topic);
-                        hub.drops.record(&topic, DropCause::SubscriberQueue);
+                        record(&hub.drops, &entry.drops, &topic, DropCause::SubscriberQueue);
                     }
                 },
                 Some(FlowSlot::Opening(pending)) => {
                     if pending.replace(body.clone()).is_some() {
-                        hub.drops.record(&topic, DropCause::SubscriberQueue);
+                        record(&hub.drops, &entry.drops, &topic, DropCause::SubscriberQueue);
                     }
                     handed += 1;
                 }
@@ -492,6 +500,7 @@ impl Radio {
                         Arc::clone(&topic),
                         Arc::clone(&entry.flows),
                         Arc::clone(&hub.drops),
+                        Arc::clone(&entry.drops),
                     ));
                     handed += 1;
                 }
@@ -558,6 +567,26 @@ impl Radio {
     pub fn evict(&self, peer: &PeerIdentity, filter: &str) -> usize {
         self.hub().evict(peer, filter)
     }
+
+    /// What each joined dish connection lost, summed over topics: one
+    /// record per connection, gone when the connection closes, so at most
+    /// `Limits::max_connections`
+    /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+    /// §4.6). A copy that found no parked connection is counted per topic
+    /// only.
+    pub fn dish_drops(&self) -> Vec<DishDrops> {
+        self.hub()
+            .dishes()
+            .iter()
+            .map(|d| d.drops.dish_snapshot(d.conn.peer.clone()))
+            .collect()
+    }
+}
+
+/// Counts one drop on the topic and on the dish's record.
+fn record(drops: &DropTable, dish: &Causes, topic: &Arc<str>, cause: DropCause) {
+    drops.record(topic, cause);
+    dish.record(cause);
 }
 
 /// Opens a dish's datagram flow for one topic and sends the datagram that
@@ -568,6 +597,7 @@ async fn open_datagram_flow(
     topic: Arc<str>,
     flows: Arc<Mutex<HashMap<Arc<str>, FlowSlot>>>,
     drops: Arc<DropTable>,
+    dish: Arc<Causes>,
 ) {
     let meta = FlowMeta::default().with_topic(topic.as_ref());
     let opened = open_flow_on(&conn, &path, &meta).await;
@@ -584,8 +614,10 @@ async fn open_datagram_flow(
             {
                 match flow.send(body) {
                     Ok(()) => {}
-                    Err(Error::TooLarge { .. }) => drops.record(&topic, DropCause::TooLarge),
-                    Err(_) => drops.record(&topic, DropCause::SubscriberQueue),
+                    Err(Error::TooLarge { .. }) => {
+                        record(&drops, &dish, &topic, DropCause::TooLarge);
+                    }
+                    Err(_) => record(&drops, &dish, &topic, DropCause::SubscriberQueue),
                 }
             }
             *slot = FlowSlot::Open(flow);
@@ -596,7 +628,7 @@ async fn open_datagram_flow(
                     Error::DatagramsUnavailable => DropCause::NoDatagrams,
                     _ => DropCause::SubscriberQueue,
                 };
-                drops.record(&topic, cause);
+                record(&drops, &dish, &topic, cause);
             }
         }
     }

@@ -45,7 +45,7 @@ use weida_core::Error;
 use weida_protocol::{DataHeader, codes};
 
 use crate::conn::ConnHandle;
-use crate::pubsub::{DropCause, DropTable};
+use crate::pubsub::{Causes, DropCause, DropTable};
 use crate::transfer::write_data_preamble;
 use crate::transport::SendHalf;
 
@@ -212,10 +212,10 @@ impl CopyCtl {
         };
         if from == 0 {
             if !self.lost_counted.swap(true, Ordering::AcqRel) {
-                spec.drops.record(&spec.topic, cause);
+                spec.record(cause);
             }
         } else if !self.cut_counted.swap(true, Ordering::AcqRel) {
-            spec.drops.record(&spec.topic, DropCause::LayersCut);
+            spec.record(DropCause::LayersCut);
         }
     }
 }
@@ -438,11 +438,24 @@ struct CopySpec {
     /// segment's open.
     deadline: Option<Instant>,
     drops: Arc<DropTable>,
+    /// The receiving dish's own record, for a radio copy
+    /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+    /// §4.6); `None` for a `Peer::segment` copy.
+    dish: Option<Arc<Causes>>,
 }
 
 impl CopySpec {
     fn expired(&self) -> bool {
         self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+
+    /// Counts one drop on the topic, and on the dish's record when there
+    /// is one.
+    fn record(&self, cause: DropCause) {
+        self.drops.record(&self.topic, cause);
+        if let Some(dish) = &self.dish {
+            dish.record(cause);
+        }
     }
 }
 
@@ -529,6 +542,8 @@ pub(crate) struct CopyTarget {
     pub(crate) max_age: Option<Duration>,
     /// The highest layer the receiver wants; `None` for every layer.
     pub(crate) max_layer: Option<u8>,
+    /// The receiving dish's record; `None` for a `Peer::segment` copy.
+    pub(crate) dish: Option<Arc<Causes>>,
 }
 
 /// Opens segment `number` on `topic` toward every target, under `terms`.
@@ -566,6 +581,7 @@ pub(crate) fn open_segment(
                 priority: terms.priority,
                 deadline: max_age.and_then(|age| opened.checked_add(age)),
                 drops: Arc::clone(drops),
+                dish: target.dish,
             }),
             ctl,
             cap: target.max_layer.unwrap_or(MAX_SEGMENT_LAYERS - 1),

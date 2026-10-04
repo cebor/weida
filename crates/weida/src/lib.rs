@@ -100,7 +100,7 @@ pub use listener::PipeBinding;
 pub use listener::UnixBinding;
 pub use listener::{Binding, Listener, LocalBinding};
 pub use ordering::Gap;
-pub use pubsub::{FanOut, TopicDrops};
+pub use pubsub::{DishDrops, FanOut, TopicDrops};
 pub use radio::{Join, JoinTerms, Received};
 pub use weida_core::{
     Address, EndpointAddr, Error, ErrorCode, Fingerprint, InprocAddr, Limits, LocalPrincipal,
