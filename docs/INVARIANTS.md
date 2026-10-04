@@ -240,7 +240,7 @@ token alone ([decisions/0012](decisions/0012-local-connection-grouping.md) §4.2
 
 **No statistics type carries an address**
 ([decisions/0036](decisions/0036-connection-statistics.md) §4.4). `PathStats`, `FlowStats`,
-`UdpCounts`, `TransportStats` and `ConnectionStats` describe a connection by the URL the
+`UdpCounts`, `TransportStats`, `RemoteStats` and `ConnectionStats` describe a connection by the URL the
 application dialled and by numbers, and by nothing else: no socket address, remote or local,
 resolved or observed, so a statistics screen built on them cannot show an address the
 application did not write. It is checked at compile time by
@@ -248,6 +248,15 @@ application did not write. It is checked at compile time by
 every field of every one of these types and bounds each by a marker trait that no address type
 implements: a new field does not compile until it is named there, and an address-typed one not
 until someone writes the implementation a review exists to refuse.
+
+**The remote view is one fixed-size slot per connection**
+([decisions/0036](decisions/0036-connection-statistics.md) §4.5, [PROTOCOL.md](PROTOCOL.md)
+§6.10). A peer that agreed capability code `2` sends one REPORT stream, and the receiver keeps
+only its latest record — twelve numbers and an arrival instant — replacing the one before, so
+a peer's sending rate costs reads and never memory. The read buffer holds at most one partial
+record and one read, because a record above 256 bytes is refused by its length prefix before
+any of it is read, and a second REPORT stream on the connection is a violation rather than a
+second slot.
 
 Invariants deferred with their subsystems: brokerless/brokered API parity, broker cluster
 as one logical broker, Raft scope, stream-oriented payload replication, and adapter

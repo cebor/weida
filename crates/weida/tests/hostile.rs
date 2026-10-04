@@ -497,6 +497,96 @@ async fn bidi_request_to_an_unknown_path_is_refused_with_unknown_endpoint() {
     assert!(conn.close_reason().is_none());
 }
 
+// --- path reports (`docs/PROTOCOL.md` §6.10) ------------------------------
+
+/// A raw peer whose HELLO lists capability code `2`, against a server whose
+/// profile does (`reporting`) or does not ask for path reports.
+async fn reporting_peer(reporting: bool) -> (Server, quinn::Connection) {
+    let server = Server::start_with(weida::Limits {
+        path_report: reporting,
+        ..weida::Limits::default()
+    })
+    .await;
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "127.0.0.1").expect("connect"))
+        .await
+        .expect("handshake");
+    let hello = Hello {
+        capabilities: vec![weida_protocol::CAPABILITY_PATH_REPORT],
+        ..Hello::v0(16 * 1024, 1024)
+    };
+    raw::send_frame(&conn, FrameKind::Hello, &hello.encode()).await;
+    (server, conn)
+}
+
+/// Opens a REPORT stream and writes its head frame and then `records`.
+async fn report_stream(conn: &quinn::Connection, records: &[u8]) -> quinn::SendStream {
+    let mut stream = conn.open_uni().await.expect("open uni");
+    let mut bytes = encode_frame(FrameKind::Report, &weida_protocol::ReportHead.encode());
+    bytes.extend_from_slice(records);
+    stream.write_all(&bytes).await.expect("write report");
+    stream
+}
+
+#[tokio::test]
+async fn a_report_without_the_agreed_capability_closes_the_connection() {
+    // The peer lists code 2, the server does not: nothing was agreed.
+    let (_server, conn) = reporting_peer(false).await;
+    let _stream = report_stream(&conn, &[]).await;
+    assert_eq!(
+        within(raw::closed_code(&conn)).await,
+        codes::PROTOCOL_VIOLATION
+    );
+}
+
+#[tokio::test]
+async fn a_second_report_stream_closes_the_connection() {
+    let (_server, conn) = reporting_peer(true).await;
+    let _first = report_stream(&conn, &[]).await;
+    let _second = report_stream(&conn, &[]).await;
+    assert_eq!(
+        within(raw::closed_code(&conn)).await,
+        codes::PROTOCOL_VIOLATION
+    );
+}
+
+#[tokio::test]
+async fn a_report_record_above_256_bytes_closes_the_connection() {
+    let (_server, conn) = reporting_peer(true).await;
+    // `41 01` is a length of 257.
+    let _stream = report_stream(&conn, &[0x41, 0x01]).await;
+    assert_eq!(
+        within(raw::closed_code(&conn)).await,
+        codes::PROTOCOL_VIOLATION
+    );
+}
+
+#[tokio::test]
+async fn a_report_record_cut_at_fin_closes_the_connection() {
+    let (_server, conn) = reporting_peer(true).await;
+    let mut stream = report_stream(&conn, &[0x0D, 0xA3, 0x00, 0x19]).await;
+    stream.finish().expect("finish");
+    assert_eq!(
+        within(raw::closed_code(&conn)).await,
+        codes::PROTOCOL_VIOLATION
+    );
+}
+
+#[tokio::test]
+async fn a_whole_report_record_keeps_the_connection() {
+    // The control case: the same stream with a whole record and FIN is
+    // legal, so the violations above are the record rules and nothing else.
+    let (_server, conn) = reporting_peer(true).await;
+    let record = [
+        0x0D, 0xA3, 0x00, 0x19, 0x61, 0xA8, 0x02, 0x19, 0x2E, 0xE0, 0x07, 0x19, 0x04, 0xB0,
+    ];
+    let mut stream = report_stream(&conn, &record).await;
+    stream.finish().expect("finish");
+    within(stream.stopped()).await.expect("acknowledged");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(conn.close_reason().is_none(), "the connection must survive");
+}
+
 // --- hostile server against our client ----------------------------------
 
 /// Spawns a raw server that runs `behaviour` for its first connection.

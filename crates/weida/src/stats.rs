@@ -68,6 +68,40 @@ pub struct TransportStats {
     pub rx: UdpCounts,
 }
 
+/// The peer's view of the path under a connection, from its latest REPORT
+/// record ([decisions/0036](../../../docs/decisions/0036-connection-statistics.md)
+/// §4.5).
+///
+/// The peer's `lost_packets` and `lost_bytes` are its packets lost on the way
+/// to this side: this side's download loss, which only the sender's QUIC
+/// stack can see. A number the peer did not send reads 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RemoteStats {
+    /// The peer's smoothed round-trip time.
+    pub rtt: Duration,
+    /// The smallest round-trip time the peer has seen.
+    pub min_rtt: Duration,
+    /// The peer's congestion window, in bytes.
+    pub cwnd: u64,
+    /// Congestion events the peer's controller reacted to.
+    pub congestion_events: u64,
+    /// Packets the peer sent and declared lost.
+    pub lost_packets: u64,
+    /// Bytes the peer sent and declared lost.
+    pub lost_bytes: u64,
+    /// Packets the peer sent.
+    pub sent_packets: u64,
+    /// The largest UDP payload the path carries now, as the peer sees it.
+    pub current_mtu: u16,
+    /// What the peer sent.
+    pub tx: UdpCounts,
+    /// What the peer received.
+    pub rx: UdpCounts,
+    /// How long ago the record arrived; the peer sends one every 2 s.
+    pub age: Duration,
+}
+
 /// One live connection of a dialling handle, labelled by the address the
 /// application dialled (0036 §4.1).
 ///
@@ -90,6 +124,10 @@ pub struct ConnectionStats {
     /// The transport's numbers; `None` on a local transport, which has no
     /// path to measure.
     pub transport: Option<TransportStats>,
+    /// The peer's view of the path, from its latest record; `None` until the
+    /// first one arrives, on a local transport, and when either side's
+    /// `Limits::path_report` is off (0036 §4.5).
+    pub remote: Option<RemoteStats>,
 }
 
 impl TransportStats {
@@ -136,6 +174,7 @@ mod tests {
     impl NoAddress for PathStats {}
     impl NoAddress for UdpCounts {}
     impl NoAddress for TransportStats {}
+    impl NoAddress for RemoteStats {}
     impl<T: NoAddress> NoAddress for Option<T> {}
 
     fn allowed<T: NoAddress>(_: &T) {}
@@ -177,17 +216,45 @@ mod tests {
             allowed(tx);
             allowed(rx);
         }
+        fn remote(s: &RemoteStats) {
+            let RemoteStats {
+                rtt,
+                min_rtt,
+                cwnd,
+                congestion_events,
+                lost_packets,
+                lost_bytes,
+                sent_packets,
+                current_mtu,
+                tx,
+                rx,
+                age,
+            } = s;
+            allowed(rtt);
+            allowed(min_rtt);
+            allowed(cwnd);
+            allowed(congestion_events);
+            allowed(lost_packets);
+            allowed(lost_bytes);
+            allowed(sent_packets);
+            allowed(current_mtu);
+            allowed(tx);
+            allowed(rx);
+            allowed(age);
+        }
         fn connection(s: &ConnectionStats) {
             let ConnectionStats {
                 url,
                 age,
                 redials,
                 transport,
+                remote,
             } = s;
             allowed(url);
             allowed(age);
             allowed(redials);
             allowed(transport);
+            allowed(remote);
         }
         fn flow(s: &FlowStats) {
             let FlowStats {
@@ -225,11 +292,26 @@ mod tests {
         path(&path_stats);
         udp(&transport_stats.tx);
         transport(&transport_stats);
+        let remote_stats = RemoteStats {
+            rtt: Duration::from_millis(20),
+            min_rtt: Duration::from_millis(18),
+            cwnd: 12_000,
+            congestion_events: 0,
+            lost_packets: 0,
+            lost_bytes: 0,
+            sent_packets: 10,
+            current_mtu: 1200,
+            tx: UdpCounts::default(),
+            rx: UdpCounts::default(),
+            age: Duration::ZERO,
+        };
+        remote(&remote_stats);
         connection(&ConnectionStats {
             url: Arc::from("weida://example.org:4433/voice"),
             age: Duration::ZERO,
             redials: 0,
             transport: Some(transport_stats),
+            remote: Some(remote_stats),
         });
         flow(&FlowStats::default());
     }

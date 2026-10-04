@@ -17,9 +17,9 @@ use tokio::sync::{mpsc, watch};
 use weida_core::{Error, ErrorCode, Limits, LossCause, PeerIdentity};
 use weida_protocol::header::{GuaranteeSet, MAX_CURSOR_RECORD_LEN};
 use weida_protocol::{
-    Agreed, CAPABILITY_DATAGRAM, CreditHeader, CursorHeader, DataHeader, ErrorHeader, FrameKind,
-    Hello, MAX_PREAMBLE_LEN, Preamble, PreambleError, SubscriptionHeader, codes,
-    decode_cursor_record, encode_frame, negotiate, parse_preamble,
+    Agreed, CAPABILITY_DATAGRAM, CAPABILITY_PATH_REPORT, CreditHeader, CursorHeader, DataHeader,
+    ErrorHeader, FrameKind, Hello, MAX_PREAMBLE_LEN, Preamble, PreambleError, SubscriptionHeader,
+    codes, decode_cursor_record, encode_frame, negotiate, parse_preamble,
 };
 
 use crate::cursor::CursorSet;
@@ -108,6 +108,10 @@ pub(crate) struct ConnCtx {
     /// to dishes and every other receiver alike: what a stale segment is
     /// checked against; at most `max_sequence_scopes` entries (0037 §4.11).
     pub segments_in: crate::segment::Newest,
+    /// The peer's latest path record and whether its REPORT stream was seen:
+    /// one fixed-size slot ([decisions/0036](../../../docs/decisions/0036-connection-statistics.md)
+    /// §4.5).
+    pub remote: crate::report::RemoteSlot,
     agreed: watch::Receiver<Option<Agreed>>,
 }
 
@@ -159,6 +163,7 @@ impl ConnCtx {
             established: std::time::Instant::now(),
             segments_out: crate::segment::SegmentNumbers::new(limits.max_sequence_scopes),
             segments_in: crate::segment::Newest::new(limits.max_sequence_scopes),
+            remote: crate::report::RemoteSlot::default(),
         });
 
         // Once per connection, never per message: a drain collects the
@@ -423,18 +428,21 @@ pub(crate) async fn write_control(
 /// Offered and required are the same set: a peer that offers less fails the
 /// handshake, which is what lets the rest of the code treat the local set as
 /// the effective one (`docs/PROTOCOL.md` §2.3 step 6).
-fn hello_for(limits: Limits, guarantees: GuaranteeSet) -> Hello {
+fn hello_for(limits: Limits, guarantees: GuaranteeSet, quic: bool) -> Hello {
     let declaration = (!guarantees.is_core()).then_some(guarantees);
+    // Capability `1` exactly when the profile enables flows, and `2` when it
+    // asks for path reports on a QUIC connection (`docs/PROTOCOL.md` §6.1).
+    let mut capabilities = Vec::new();
+    if limits.datagram_receive_bytes > 0 {
+        capabilities.push(CAPABILITY_DATAGRAM);
+    }
+    if limits.path_report && quic {
+        capabilities.push(CAPABILITY_PATH_REPORT);
+    }
     Hello {
         guarantees_offered: declaration,
         guarantees_required: declaration,
-        // Capability `1` exactly when the profile enables flows
-        // (`docs/PROTOCOL.md` §6.1).
-        capabilities: if limits.datagram_receive_bytes > 0 {
-            vec![CAPABILITY_DATAGRAM]
-        } else {
-            Vec::new()
-        },
+        capabilities,
         ..Hello::v0(
             limits.max_header_bytes,
             u64::from(limits.max_concurrent_uni_streams),
@@ -444,7 +452,7 @@ fn hello_for(limits: Limits, guarantees: GuaranteeSet) -> Hello {
 
 /// Sends our HELLO, declaring the configured guarantee set.
 async fn send_hello(ctx: ConnHandle, limits: Limits, guarantees: GuaranteeSet) {
-    let hello = hello_for(limits, guarantees);
+    let hello = hello_for(limits, guarantees, ctx.conn.is_quic());
     if let Err(e) = write_control(&ctx.conn, FrameKind::Hello, &hello.encode()).await {
         tracing::debug!(error = %e, "failed to send HELLO");
     }
@@ -806,9 +814,7 @@ async fn handle_stream(
         FrameKind::Credit => handle_credit(ctx, &header).await,
         FrameKind::Cursor => handle_cursor(ctx, stream, &header).await,
         FrameKind::Flow => crate::flow::handle_flow(ctx, stream, &header).await,
-        // This side lists no capability code 2 yet, so a REPORT stream is
-        // one the peer was not entitled to send (`docs/PROTOCOL.md` §6.10).
-        FrameKind::Report => violation(ctx, "REPORT without agreed capability 2"),
+        FrameKind::Report => crate::report::receive_reports(ctx, stream, &header).await,
     }
 }
 
@@ -989,7 +995,7 @@ fn handle_hello(
         Ok(h) => h,
         Err(e) => return violation(ctx, &e.to_string()),
     };
-    let ours = hello_for(ctx.limits, ctx.guarantees);
+    let ours = hello_for(ctx.limits, ctx.guarantees, ctx.conn.is_quic());
     match negotiate(&ours, &theirs) {
         Ok(agreed) => {
             tracing::debug!(
@@ -998,6 +1004,10 @@ fn handle_hello(
                 "negotiated"
             );
             let _ = agreed_tx.send(Some(agreed));
+            if agreed.path_report {
+                ctx.exec
+                    .spawn(crate::report::send_reports(ConnHandle::clone(ctx)));
+            }
             Ok(())
         }
         Err(e) => {

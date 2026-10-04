@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::{Certs, Restartable, Server};
 use tokio::time::timeout;
-use weida::{PeerEvent, PeerEvents, ReconnectPolicy, Runtime, RuntimeConfig, TransferMeta};
+use weida::{Limits, PeerEvent, PeerEvents, ReconnectPolicy, Runtime, RuntimeConfig, TransferMeta};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -203,4 +203,87 @@ async fn a_redial_is_counted_and_restarts_the_age() {
     );
 
     client.shutdown().await;
+}
+
+fn reporting() -> Limits {
+    Limits {
+        path_report: true,
+        ..Limits::default()
+    }
+}
+
+/// Claim: with `path_report` on both sides, a dialling handle reads the
+/// peer's view of the path — the peer's losses are this side's download loss
+/// — and a record arrives at once, then every 2 s (0036 §4.5).
+#[tokio::test]
+async fn both_sides_reporting_give_the_dialling_side_the_peers_view() {
+    let server = Server::start_with(reporting()).await;
+    let client = server.client_runtime_with(reporting());
+    let peer = client.peer(server.trust());
+    // Dialled by name, so the only label holds no address either.
+    let url = format!("weida://localhost:{}/any", server.addr.port());
+    within(peer.connect(&url)).await.expect("connect");
+
+    let remote = within(async {
+        loop {
+            if let Some(remote) = peer.connection_stats()[0].remote {
+                return remote;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(remote.rtt > Duration::ZERO, "{remote:?}");
+    assert!(remote.current_mtu >= 1200, "{remote:?}");
+    assert!(
+        remote.tx.datagrams > 0 && remote.rx.datagrams > 0,
+        "{remote:?}"
+    );
+    assert!(remote.age < Duration::from_secs(3), "{remote:?}");
+    assert!(
+        !format!("{:?}", peer.connection_stats()).contains("127.0.0.1"),
+        "no address in the remote view either"
+    );
+    client.shutdown().await;
+}
+
+/// Claim: reports flow only when both sides ask, and never on a local
+/// transport, which has no path.
+#[tokio::test]
+async fn the_remote_view_needs_both_sides_and_quic() {
+    // The server asks, the client does not: nothing is agreed.
+    let server = Server::start_with(reporting()).await;
+    let client = server.client_runtime();
+    let peer = client.peer(server.trust());
+    within(peer.connect(&server.url("/any")))
+        .await
+        .expect("connect");
+    // A record would arrive at once after the HELLOs; give it the time.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(peer.connection_stats()[0].remote, None);
+    client.shutdown().await;
+
+    // Both ask, in process: a local transport never lists the code.
+    let bus = format!("weida-report-{}", std::process::id());
+    let local = Runtime::new(RuntimeConfig {
+        limits: reporting(),
+        ..RuntimeConfig::default()
+    })
+    .expect("server runtime");
+    let listener = local.listener();
+    let _binding = listener.bind_inproc(&bus).expect("bind inproc");
+    let _puller = listener.puller("/jobs").expect("puller");
+    let dialler = Runtime::new(RuntimeConfig {
+        limits: reporting(),
+        ..RuntimeConfig::default()
+    })
+    .expect("client runtime");
+    let pusher = dialler.pusher(weida::Trust::by_address());
+    within(pusher.connect(&format!("weida+inproc://{bus}/jobs")))
+        .await
+        .expect("connect");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(pusher.connection_stats()[0].remote, None);
+    dialler.shutdown().await;
+    local.shutdown().await;
 }

@@ -104,6 +104,13 @@ pub struct Limits {
     /// flow on a local transport; beyond it the oldest queued one is
     /// discarded. Bounds what this side holds for a peer that reads slowly.
     pub datagram_send_bytes: usize,
+    /// Whether this side lists capability code `2` on a QUIC connection, so
+    /// that when the peer lists it too each side sends the other its view of
+    /// the path every 2 s and keeps the peer's latest record, read as
+    /// `ConnectionStats::remote`
+    /// ([decisions/0036](../../../docs/decisions/0036-connection-statistics.md)
+    /// §4.5). Off by default; a local transport never lists it.
+    pub path_report: bool,
     /// Inbound flows one connection may hold live. Each is a FLOW stream the
     /// peer opened and a ring this side keeps; a FLOW beyond it is stopped
     /// with `LIMIT_EXCEEDED`.
@@ -176,6 +183,7 @@ impl Default for Limits {
             max_dedup_entries: 4096,
             datagram_receive_bytes: 0,
             datagram_send_bytes: 65_536,
+            path_report: false,
             max_flows: 64,
             flow_queue_bytes: 16_384,
             flow_early_bytes: 4_096,

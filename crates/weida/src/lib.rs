@@ -70,6 +70,7 @@ mod pool;
 mod pubsub;
 mod radio;
 mod reconnect;
+mod report;
 mod runtime;
 mod segment;
 mod stats;
@@ -116,7 +117,7 @@ pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
 pub use reconnect::{GiveUp, OutboxFull, PeerEvent, PeerEvents, ReconnectPolicy};
 pub use runtime::Runtime;
 pub use segment::{MAX_SEGMENT_LAYERS, Segment, SegmentTerms};
-pub use stats::{ConnectionStats, PathStats, TransportStats, UdpCounts};
+pub use stats::{ConnectionStats, PathStats, RemoteStats, TransportStats, UdpCounts};
 pub use stream::{Acceptor, Consumer, ConsumerId, CreditGrant, Incoming, Peer};
 pub use transfer::{
     Delivery, IncomingMeta, IncomingRequest, IncomingTransfer, OutgoingTransfer, ReplyStream,

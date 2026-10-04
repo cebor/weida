@@ -266,6 +266,7 @@ impl PeerShared {
                 age: conn.established.elapsed(),
                 redials,
                 transport: conn.conn.transport_stats(),
+                remote: conn.remote.latest(),
             })
             .collect()
     }
