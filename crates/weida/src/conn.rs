@@ -1217,10 +1217,10 @@ async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
                 e.0.refuse(Refusal::UNKNOWN.stop);
             }
         }
-        // A segment: the dish discards one older than the newest it
-        // delivered on the topic, and never blocks the connection on a full
-        // queue (0034 §4.6).
-        Some(Route::Dish(route)) => crate::radio::deliver_segment(&route, transfer),
+        // A segment: the dish discards one not newer than the newest
+        // delivered on this connection, path and topic, and never blocks the
+        // connection on a full queue (0034 §4.6).
+        Some(Route::Dish(route)) => crate::radio::deliver_segment(ctx, path, &route, transfer),
         // `refusal_for` above already refused these.
         Some(Route::Request(_) | Route::Pub | Route::Radio(_)) | None => {
             unreachable!("refusal_for refuses every route that cannot serve a one-way transfer")

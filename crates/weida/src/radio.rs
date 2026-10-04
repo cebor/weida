@@ -1093,9 +1093,9 @@ fn acked(ctl: &CopyCtl, receipt: Result<Option<u64>, Error>) -> Option<Stop> {
 }
 
 /// Moves a radio's datagram segments from one flow into its dish's queue:
-/// stale ones against the newest delivered on the topic are discarded, and a
-/// full queue discards rather than waits.
-pub(crate) async fn pump_flow(route: DishRoute, flow: IncomingFlow) {
+/// stale ones against the newest delivered on the connection, path and topic
+/// are discarded, and a full queue discards rather than waits.
+pub(crate) async fn pump_flow(ctx: ConnHandle, route: DishRoute, flow: IncomingFlow) {
     let Some(topic) = flow.info().topic.clone() else {
         // A radio names its topic; a flow without one is not a segment.
         return;
@@ -1105,7 +1105,10 @@ pub(crate) async fn pump_flow(route: DishRoute, flow: IncomingFlow) {
             route.shared.overflow.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        if !route.shared.fresh(&topic, segment) {
+        if !ctx
+            .segments_in
+            .fresh(&flow.info().endpoint, &topic, segment)
+        {
             route.shared.stale.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -1150,35 +1153,11 @@ pub enum Received {
     },
 }
 
-/// The dish's per-topic memory of the newest segment it delivered, and its
-/// counters.
+/// A dish's counters. Which segment is stale is the connection's to know
+/// (`ConnCtx::segments_in`): a redial starts over.
 pub(crate) struct DishShared {
-    newest: Mutex<HashMap<String, u64>>,
     stale: AtomicU64,
     overflow: AtomicU64,
-    max_topics: usize,
-}
-
-impl DishShared {
-    /// `true` when `segment` is newer than every segment delivered on
-    /// `topic`, which it then becomes. At the table's cap an untracked topic
-    /// is always fresh: the check needs memory, and memory is bounded.
-    fn fresh(&self, topic: &str, segment: u64) -> bool {
-        let mut newest = lock(&self.newest);
-        match newest.get_mut(topic) {
-            Some(last) if segment <= *last => false,
-            Some(last) => {
-                *last = segment;
-                true
-            }
-            None => {
-                if newest.len() < self.max_topics {
-                    newest.insert(topic.to_owned(), segment);
-                }
-                true
-            }
-        }
-    }
 }
 
 /// A dish's route on its connection's namespace.
@@ -1189,15 +1168,20 @@ pub(crate) struct DishRoute {
 }
 
 /// Delivers one arrived stream segment to its dish, or discards it: stale
-/// against the newest delivered on its topic, or with the dish's queue full.
-/// Never blocks the connection.
-pub(crate) fn deliver_segment(route: &DishRoute, transfer: IncomingTransfer) {
+/// against the newest delivered on its connection, path and topic, or with
+/// the dish's queue full. Never blocks the connection.
+pub(crate) fn deliver_segment(
+    ctx: &ConnHandle,
+    path: &str,
+    route: &DishRoute,
+    transfer: IncomingTransfer,
+) {
     let meta = transfer.meta();
     let (Some(topic), Some(segment)) = (meta.topic.as_deref(), meta.segment) else {
         transfer.refuse(codes::UNSUPPORTED);
         return;
     };
-    if !route.shared.fresh(topic, segment) {
+    if !ctx.segments_in.fresh(path, topic, segment) {
         route.shared.stale.fetch_add(1, Ordering::Relaxed);
         transfer.refuse(codes::CANCELED);
         return;
@@ -1270,10 +1254,8 @@ impl DishState {
         let (queue_tx, queue) = mpsc::channel(depth);
         let joins = Arc::new(Mutex::new(HashMap::new()));
         let shared = Arc::new(DishShared {
-            newest: Mutex::new(HashMap::new()),
             stale: AtomicU64::new(0),
             overflow: AtomicU64::new(0),
-            max_topics: runtime.config.limits.max_sequence_scopes,
         });
         let attach = DishAttach {
             joins: Arc::clone(&joins),
@@ -1293,7 +1275,8 @@ impl DishState {
 
 impl Dish {
     /// Connects to a radio at `url` and joins every topic joined so far. A
-    /// redial joins again: what was sent in between is gone.
+    /// redial joins again: what was sent in between is gone, and the numbers
+    /// start over on the new connection.
     pub async fn connect(&self, url: &str) -> Result<(), Error> {
         self.state().peer.connect(url).await
     }
@@ -1352,7 +1335,7 @@ impl Dish {
     }
 
     /// Segments discarded on arrival because a newer one on the same topic
-    /// had already been delivered.
+    /// had already been delivered on this connection.
     pub fn stale(&self) -> u64 {
         self.state().shared.stale.load(Ordering::Relaxed)
     }

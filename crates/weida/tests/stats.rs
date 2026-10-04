@@ -4,14 +4,11 @@
 
 mod common;
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::{Certs, Server};
+use common::{Certs, Restartable, Server};
 use tokio::time::timeout;
-use weida::{
-    Binding, Listener, PeerEvent, PeerEvents, ReconnectPolicy, Runtime, RuntimeConfig, TransferMeta,
-};
+use weida::{PeerEvent, PeerEvents, ReconnectPolicy, Runtime, RuntimeConfig, TransferMeta};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -142,45 +139,6 @@ async fn a_local_connection_has_an_age_and_no_transport() {
 
     client.shutdown().await;
     server.shutdown().await;
-}
-
-/// A QUIC server that is stopped and started again on the same port.
-struct Restartable {
-    _runtime: Runtime,
-    listener: Listener,
-    binding: Binding,
-    addr: SocketAddr,
-}
-
-impl Restartable {
-    async fn start(certs: &Certs, addr: SocketAddr) -> Restartable {
-        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
-        let listener = runtime.listener();
-        // A restart re-binds the port the old server just released; the OS
-        // may still be handing it back, so the bind is retried briefly.
-        let binding = within(async {
-            loop {
-                match listener.bind_quic(addr, certs.server_tls()).await {
-                    Ok(binding) => break binding,
-                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-                }
-            }
-        })
-        .await;
-        let addr = binding.local_addr();
-        Restartable {
-            _runtime: runtime,
-            listener,
-            binding,
-            addr,
-        }
-    }
-
-    /// Closes the binding and lets the address go, the way a process exit
-    /// would: the runtime goes with it.
-    async fn stop(self) {
-        self.binding.close().await;
-    }
 }
 
 /// Claim: a transparent redial is counted on the address, and the age

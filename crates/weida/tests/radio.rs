@@ -259,6 +259,50 @@ async fn a_segment_whose_finish_found_a_full_queue_is_superseded_at_once() {
     runtime.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_dish_redialled_to_a_restarted_radio_takes_its_numbers_from_zero() {
+    let certs = Certs::generate();
+    let first = common::Restartable::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let addr = first.addr;
+    let radio = first.listener.radio("/r").expect("radio");
+    let client = Runtime::new(RuntimeConfig {
+        reconnect: weida::ReconnectPolicy {
+            initial: Duration::from_millis(5),
+            max: Duration::from_millis(50),
+            jitter: false,
+            ..weida::ReconnectPolicy::default()
+        },
+        ..RuntimeConfig::default()
+    })
+    .expect("client runtime");
+    let dish = client.dish(certs.client_tls());
+    within(dish.join("v", None)).await.expect("join");
+    within(dish.connect(&format!("weida://127.0.0.1:{}/r", addr.port())))
+        .await
+        .expect("connect");
+    dishes(&radio, 1).await;
+    for n in 0..3u64 {
+        send(&radio, "v", 1, 100);
+        let received = segment_of(within(dish.recv()).await.expect("recv"));
+        assert_eq!(received.meta().segment, Some(n));
+        within(received.collect(4096))
+            .await
+            .expect("a whole segment");
+    }
+
+    drop(radio);
+    first.stop().await;
+    let second = common::Restartable::start(&certs, addr).await;
+    let radio = second.listener.radio("/r").expect("radio");
+    // The redial sends the join again.
+    dishes(&radio, 1).await;
+    send(&radio, "v", 1, 100);
+    let received = segment_of(within(dish.recv()).await.expect("recv"));
+    assert_eq!(received.meta().segment, Some(0));
+    assert_eq!(dish.stale(), 0);
+    client.shutdown().await;
+}
+
 // --- segments from a dialling peer ---------------------------------------------
 
 fn stream_of(incoming: Incoming) -> weida::IncomingTransfer {

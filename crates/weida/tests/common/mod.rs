@@ -474,6 +474,46 @@ impl Harness {
     }
 }
 
+/// A QUIC server that is stopped and started again on the same port.
+pub struct Restartable {
+    _runtime: Runtime,
+    pub listener: Listener,
+    pub binding: Binding,
+    pub addr: SocketAddr,
+}
+
+impl Restartable {
+    pub async fn start(certs: &Certs, addr: SocketAddr) -> Restartable {
+        let runtime = Runtime::new(RuntimeConfig::default()).expect("runtime");
+        let listener = runtime.listener();
+        // A restart re-binds the port the old server just released; the OS
+        // may still be handing it back, so the bind is retried briefly.
+        let binding = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match listener.bind_quic(addr, certs.server_tls()).await {
+                    Ok(binding) => break binding,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("the port is free again");
+        let addr = binding.local_addr();
+        Restartable {
+            _runtime: runtime,
+            listener,
+            binding,
+            addr,
+        }
+    }
+
+    /// Closes the binding and lets the address go, the way a process exit
+    /// would: the runtime goes with it.
+    pub async fn stop(self) {
+        self.binding.close().await;
+    }
+}
+
 /// Raw wire-protocol peers.
 ///
 /// These speak `weida-protocol` over bare `quinn` so the hostile-peer suite can
