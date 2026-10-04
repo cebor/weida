@@ -22,7 +22,7 @@ acceptance: [0036](decisions/0036-connection-statistics.md) §4.5 in [PROTOCOL.m
 note: decided now, built after B-298..B-300 by the owner's choice (requirement priority 3).
 
 ### B-302 — The remote view on the connection
-kind: code | size: 90 | status: ready | needs: [B-301]
+kind: code | size: 90 | status: done 84ba8a2 | needs: [B-301]
 acceptance: [0036](decisions/0036-connection-statistics.md) §4.5: with `Limits::path_report` on both sides each side sends one REPORT stream and a record every 2 s; the receiver keeps the latest record in one slot and `ConnectionStats::remote` returns it with its age; off on either side, nothing is sent and `remote` is `None`; each violation closes with `PROTOCOL_VIOLATION`, tested against a hand-written peer stream. INVARIANTS names the slot as fixed-size.
 
 ### B-303 — Python: connection statistics
