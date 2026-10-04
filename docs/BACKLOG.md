@@ -34,7 +34,7 @@ kind: code | size: 60 | status: done 9c92b10 | needs: []
 acceptance: [0037](decisions/0037-layered-segments.md) §4.5 in `crates/weida/src/radio.rs`, taken from tuco86/weida#2's two radio commits (`7ce78c2`, `402afd3`) and rebased on main with the grace read from `Link::transport_stats().map(|t| t.path)`. The PR's tests pass in `crates/weida/tests/radio.rs` with `common::delay_proxy`: `a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole` and `a_segment_finished_right_before_its_successor_still_arrives_whole`; `a_stalled_dish_loses_old_segments_while_a_fast_one_gets_every_one` still passes.
 
 ### B-305 — PROTOCOL: DATA key 14 `layer`, SUBSCRIBE key 3 `max_layer`
-kind: spec | size: 45 | status: ready | needs: []
+kind: spec | size: 45 | status: done 7094fc7 | needs: []
 acceptance: [PROTOCOL.md](PROTOCOL.md) §6.2 and §6.4 rows per [0037](decisions/0037-layered-segments.md) §4.3; key `13`'s row says "written by a radio or by `Peer::segment`"; golden vectors for a segment DATA header with `layer = 2` and a SUBSCRIBE with `max_layer = 1`; the violations for a value above 15 and for key `14` without key `13`.
 
 ### B-306 — The codec for `layer` and `max_layer`
