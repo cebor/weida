@@ -65,6 +65,10 @@ acceptance: the `weida::blocking` twins of `SegmentTerms`, `JoinTerms`, `write_l
 kind: spec | size: 45 | status: ready | needs: [B-304, B-307, B-308, B-309]
 acceptance: [0037](decisions/0037-layered-segments.md) §5's edits; no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says key `13` is written by a radio only, or that a dialling side cannot send a segment; [requirements/griasdi-video.md](requirements/griasdi-video.md) points at what shipped.
 
+### B-313 — ARCHITECTURE names a `PeerSet` that no longer exists
+kind: spec | size: 15 | status: ready | needs: []
+acceptance: [ARCHITECTURE.md](ARCHITECTURE.md) lines 852 and 1003 name `PeerSet` "inside a `Peer`" and "in `stream.rs`"; 76cbb28 (the redial) replaced it with `PeerShared`'s slots. Both passages name what holds the dialled peers today (`PeerShared` in `crates/weida/src/stream.rs`), and `git grep -n PeerSet -- docs ':!docs/decisions' ':!docs/research' ':!docs/BACKLOG.md' ':!docs/NIGHTLOG.md'` prints nothing.
+
 ### B-293 — A binding that proves client keys and judges none
 kind: code | size: 45 | status: done e467a68 | needs: []
 acceptance: `ServerTls::require_client(ClientTrust::AnyKey)` ([0035](decisions/0035-keys-proved-not-judged.md) §4.1) requires a client certificate, verifies the TLS 1.3 handshake signature, and judges nothing else; the peer is `PeerIdentity::Key` of the leaf's SPKI fingerprint. `ClientTrust::Trusted(TrustSource)` keeps today's meaning and the empty-trust refusal, and existing `require_client(Trust::…)` calls compile unchanged. A chain above `MAX_PEER_CHAIN_CERTS` (8) or `MAX_PEER_CHAIN_BYTES` (32 KiB) fails an `AnyKey` handshake. Tests: `tls::tests::any_key_bounds_the_chain_it_keeps`, and `a_binding_that_requires_any_key_proves_it_and_judges_nothing` in `crates/weida/tests/identity.rs` — an anonymous client fails with `Error::Tls`, two generated keys are admitted as two distinct peers, and a device leaf signed by a user key is admitted as its own fingerprint (open question 1).
