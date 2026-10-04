@@ -1302,15 +1302,16 @@ pub struct Dish {
 dialling!(Dish, crate::Dish);
 
 impl Dish {
-    /// Joins every topic `filter` matches, with a latency budget.
+    /// Joins every topic `filter` matches, under `terms` (a latency budget
+    /// and a layer cap).
     ///
     /// # Errors
     ///
     /// As [`crate::Dish::join`]; plus [`Error::Runtime`] from inside a
     /// reactor.
-    pub fn join(&self, filter: &str, max_age: Option<Duration>) -> Result<(), Error> {
+    pub fn join(&self, filter: &str, terms: crate::JoinTerms) -> Result<(), Error> {
         outside_a_reactor()?;
-        drive(self.endpoint.join(filter, max_age))
+        drive(self.endpoint.join(filter, terms))
     }
 
     /// Leaves a filter.

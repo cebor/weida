@@ -568,6 +568,7 @@ impl Peer {
             path,
             budget: Arc::clone(&shared.segment_budget),
             max_age: None,
+            max_layer: None,
         };
         Ok(open_segment(
             &shared.segment_topics,

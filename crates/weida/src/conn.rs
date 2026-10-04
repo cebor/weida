@@ -849,9 +849,13 @@ async fn handle_subscription(
     // per-connection `max_subscriptions` as every other subscription.
     if let Some(Route::Radio(hub)) = ctx.namespace.lookup(&header.endpoint) {
         if subscribe {
-            let joined = hub.join(ctx, header.filter, header.max_age_ms, || {
-                subs.reserve(conn_id)
-            });
+            let joined = hub.join(
+                ctx,
+                header.filter,
+                header.max_age_ms,
+                header.max_layer,
+                || subs.reserve(conn_id),
+            );
             if joined.is_err() {
                 return too_many_subscriptions(ctx);
             }
@@ -1175,7 +1179,9 @@ async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
     if !matches!(route, Some(Route::Dish(_)))
         && let (Some(topic), Some(segment)) =
             (transfer.meta().topic.as_deref(), transfer.meta().segment)
-        && !ctx.segments_in.fresh(path, topic, segment)
+        && !ctx
+            .segments_in
+            .fresh(path, topic, segment, transfer.meta().layer.unwrap_or(0))
     {
         tracing::debug!(
             path,

@@ -24,8 +24,8 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use weida::{
-    DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Error, FlowMeta, Identity, Incoming, Limits, Radio,
-    Received, Runtime, RuntimeConfig, SegmentTerms, Trust,
+    DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Error, FlowMeta, Identity, Incoming, JoinTerms, Limits,
+    Radio, Received, Runtime, RuntimeConfig, SegmentTerms, Trust,
 };
 
 /// A runtime, its listener and the port it serves on, kept alive together.
@@ -98,7 +98,7 @@ pub async fn dish(url: &str, filter: &str, limits: Limits) -> Result<(Runtime, D
         ..RuntimeConfig::default()
     })?;
     let dish = runtime.dish(Trust::by_address());
-    dish.join(filter, None).await?;
+    dish.join(filter, JoinTerms::default()).await?;
     dish.connect(url).await?;
     Ok((runtime, dish))
 }
@@ -248,7 +248,7 @@ pub async fn sfu() -> Result<Sfu, Error> {
     let downstream = relay.listener.radio("/relay")?;
     let watching = downstream.clone();
     let upstream = relay.runtime.dish(Trust::by_address());
-    upstream.join("room.video", None).await?;
+    upstream.join("room.video", JoinTerms::default()).await?;
     upstream.connect(&sfu.url("/room")).await?;
     joined(&room, 3).await;
 

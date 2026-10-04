@@ -568,7 +568,7 @@ impl Attach for SubAttach {
                 .cloned()
                 .collect();
             for filter in filters {
-                send_subscription(conn, FrameKind::Subscribe, path, &filter, None).await?;
+                send_subscription(conn, FrameKind::Subscribe, path, &filter, None, None).await?;
             }
             Ok(())
         })
@@ -761,7 +761,7 @@ impl Subscriber {
 
     async fn broadcast(&self, kind: FrameKind, filter: &str) -> Result<(), Error> {
         for (conn, path) in self.state.peer.live_peers() {
-            send_subscription(&conn, kind, &path, filter, None).await?;
+            send_subscription(&conn, kind, &path, filter, None, None).await?;
         }
         Ok(())
     }
@@ -773,9 +773,11 @@ pub(crate) async fn send_subscription(
     path: &str,
     filter: &str,
     max_age_ms: Option<u64>,
+    max_layer: Option<u8>,
 ) -> Result<(), Error> {
     let header = SubscriptionHeader {
         max_age_ms,
+        max_layer,
         ..SubscriptionHeader::new(path, filter)
     }
     .encode();

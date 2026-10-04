@@ -149,7 +149,7 @@ fn a_radio_segment_and_datagram_reach_a_blocking_dish() {
 
     let client = Runtime::new(flows).expect("client runtime");
     let dish = client.dish(Trust::by_address());
-    dish.join("v", None).expect("join");
+    dish.join("v", weida::JoinTerms::default()).expect("join");
     dish.connect(&format!("weida://{fingerprint}@{}/r", binding.local_addr()))
         .expect("connect");
     let deadline = std::time::Instant::now() + Duration::from_secs(15);

@@ -538,10 +538,10 @@ impl PyDish {
         filter: String,
         max_age: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let max_age = max_age_of(py, max_age)?;
+        let terms = join_terms(max_age_of(py, max_age)?);
         let endpoint = Arc::clone(&self.endpoint);
         self.bridge.awaitable(py, async move {
-            endpoint.join(&filter, max_age).await.map_err(errno_of)
+            endpoint.join(&filter, terms).await.map_err(errno_of)
         })
     }
 
@@ -581,5 +581,13 @@ impl PyDish {
 
     fn __repr__(&self) -> String {
         "<weida.Dish>".to_owned()
+    }
+}
+
+/// The join terms of a dish's latency budget.
+pub(crate) fn join_terms(max_age: Option<std::time::Duration>) -> weida::JoinTerms {
+    match max_age {
+        Some(age) => weida::JoinTerms::default().with_max_age(age),
+        None => weida::JoinTerms::default(),
     }
 }

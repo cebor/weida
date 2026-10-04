@@ -70,14 +70,47 @@ impl<'a> Join<'a> {
 /// A radio's admission policy: `true` records the join.
 type Admission = Arc<dyn Fn(&Join<'_>) -> bool + Send + Sync>;
 
+/// What a dish asks for when it joins a filter
+/// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+/// §4.3).
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JoinTerms {
+    /// The dish's latency budget: a copy still unfinished or unacknowledged
+    /// this long after its segment opened is reset at the radio. With
+    /// several matching filters the smallest applies.
+    pub max_age: Option<Duration>,
+    /// The highest layer the dish wants, `0..=15`; layers above it are
+    /// never opened for this dish, and that is not a drop. With several
+    /// matching filters the largest applies, and a filter without a cap
+    /// means no cap.
+    pub max_layer: Option<u8>,
+}
+
+impl JoinTerms {
+    /// Sets the latency budget.
+    #[must_use]
+    pub fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = Some(max_age);
+        self
+    }
+
+    /// Caps the layers the dish is sent.
+    #[must_use]
+    pub fn with_max_layer(mut self, max_layer: u8) -> Self {
+        self.max_layer = Some(max_layer);
+        self
+    }
+}
+
 // --- radio side ---------------------------------------------------------------
 
 /// One joined dish: a connection and the filters it joined with.
 struct DishEntry {
     conn: ConnHandle,
     conn_id: usize,
-    /// Filter to `max_age`.
-    filters: HashMap<String, Option<Duration>>,
+    /// Filter to what the dish asked for with it.
+    filters: HashMap<String, JoinTerms>,
     /// Chunk bytes this dish's copies may hold unwritten, over all topics.
     budget: Arc<Semaphore>,
     /// One datagram flow per topic, opened lazily on the connection the join
@@ -94,20 +127,28 @@ enum FlowSlot {
 }
 
 impl DishEntry {
-    /// The dish's latency budget for `topic`: the smallest `max_age` among
-    /// the matching filters that carry one. `None` for no match at all.
-    fn matching(&self, topic: &str) -> Option<Option<Duration>> {
-        let mut matched = false;
-        let mut max_age: Option<Duration> = None;
-        for (f, age) in &self.filters {
-            if filter::matches(topic, f) {
-                matched = true;
-                if let Some(age) = age {
-                    max_age = Some(max_age.map_or(*age, |m| m.min(*age)));
-                }
+    /// What the dish asked for on `topic`, combined over the matching
+    /// filters: the smallest `max_age` among those that carry one, and the
+    /// largest `max_layer`, none if any matching filter has none. `None` for
+    /// no match at all.
+    fn matching(&self, topic: &str) -> Option<JoinTerms> {
+        let mut combined: Option<JoinTerms> = None;
+        for (f, terms) in &self.filters {
+            if !filter::matches(topic, f) {
+                continue;
             }
+            combined = Some(match combined {
+                None => terms.clone(),
+                Some(seen) => JoinTerms {
+                    max_age: match (seen.max_age, terms.max_age) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    },
+                    max_layer: seen.max_layer.zip(terms.max_layer).map(|(a, b)| a.max(b)),
+                },
+            });
         }
-        matched.then_some(max_age)
+        combined
     }
 
     /// Withdraws `filter` and releases its `max_subscriptions` slot; `false`
@@ -161,7 +202,7 @@ impl RadioHub {
 
     /// Records a join. `reserve` counts a new filter against the
     /// connection's `max_subscriptions` and runs only for a filter the dish
-    /// did not already hold; a repeated join updates its `max_age`.
+    /// did not already hold; a repeated join replaces its terms.
     ///
     /// The admission, when there is one, decides first, every time: a
     /// refusal records nothing, reserves nothing and is silence
@@ -173,10 +214,14 @@ impl RadioHub {
         ctx: &ConnHandle,
         filter: String,
         max_age_ms: Option<u64>,
+        max_layer: Option<u8>,
         reserve: impl FnOnce() -> Result<(), Error>,
     ) -> Result<(), Error> {
         let conn_id = ctx.conn.stable_id();
-        let max_age = max_age_ms.map(Duration::from_millis);
+        let terms = JoinTerms {
+            max_age: max_age_ms.map(Duration::from_millis),
+            max_layer,
+        };
         let mut dishes = loop {
             let (generation, admit) = {
                 let admission = lock(&self.admission);
@@ -209,8 +254,8 @@ impl RadioHub {
             }
         };
         let entry = &mut dishes[index];
-        if let Some(age) = entry.filters.get_mut(&filter) {
-            *age = max_age;
+        if let Some(held) = entry.filters.get_mut(&filter) {
+            *held = terms;
             return Ok(());
         }
         if let Err(e) = reserve() {
@@ -219,7 +264,7 @@ impl RadioHub {
             }
             return Err(e);
         }
-        entry.filters.insert(filter, max_age);
+        entry.filters.insert(filter, terms);
         Ok(())
     }
 
@@ -364,11 +409,12 @@ impl Radio {
             .dishes()
             .iter()
             .filter_map(|entry| {
-                entry.matching(&topic).map(|max_age| CopyTarget {
+                entry.matching(&topic).map(|joined| CopyTarget {
                     conn: ConnHandle::clone(&entry.conn),
                     path: Arc::clone(&hub.path),
                     budget: Arc::clone(&entry.budget),
-                    max_age,
+                    max_age: joined.max_age,
+                    max_layer: joined.max_layer,
                 })
             })
             .collect();
@@ -571,7 +617,7 @@ pub(crate) async fn pump_flow(ctx: ConnHandle, route: DishRoute, flow: IncomingF
         };
         if !ctx
             .segments_in
-            .fresh(&flow.info().endpoint, &topic, segment)
+            .fresh(&flow.info().endpoint, &topic, segment, 0)
         {
             route.shared.stale.fetch_add(1, Ordering::Relaxed);
             continue;
@@ -636,7 +682,10 @@ pub(crate) fn deliver_segment(
         transfer.refuse(codes::UNSUPPORTED);
         return;
     };
-    if !ctx.segments_in.fresh(path, topic, segment) {
+    if !ctx
+        .segments_in
+        .fresh(path, topic, segment, meta.layer.unwrap_or(0))
+    {
         route.shared.stale.fetch_add(1, Ordering::Relaxed);
         transfer.refuse(codes::CANCELED);
         return;
@@ -652,7 +701,7 @@ pub(crate) fn deliver_segment(
 /// What a dish does on every connection it gets: fill the reverse pool
 /// where the transport needs one, claim its path, and re-send its joins.
 struct DishAttach {
-    joins: Arc<Mutex<HashMap<String, Option<Duration>>>>,
+    joins: Arc<Mutex<HashMap<String, JoinTerms>>>,
     route: DishRoute,
 }
 
@@ -673,17 +722,18 @@ impl Attach for DishAttach {
                 conn.exec
                     .spawn(async move { maintaining.conn.maintain_reverse().await });
             }
-            let joins: Vec<(String, Option<Duration>)> = lock(&self.joins)
+            let joins: Vec<(String, JoinTerms)> = lock(&self.joins)
                 .iter()
-                .map(|(f, age)| (f.clone(), *age))
+                .map(|(f, terms)| (f.clone(), terms.clone()))
                 .collect();
-            for (filter, max_age) in joins {
+            for (filter, terms) in joins {
                 send_subscription(
                     conn,
                     FrameKind::Subscribe,
                     path,
                     &filter,
-                    max_age.map(millis),
+                    terms.max_age.map(millis),
+                    terms.max_layer,
                 )
                 .await?;
             }
@@ -699,7 +749,7 @@ fn millis(age: Duration) -> u64 {
 /// State of a dish.
 pub struct DishState {
     peer: Peer,
-    joins: Arc<Mutex<HashMap<String, Option<Duration>>>>,
+    joins: Arc<Mutex<HashMap<String, JoinTerms>>>,
     queue: tokio::sync::Mutex<mpsc::Receiver<Received>>,
     shared: Arc<DishShared>,
 }
@@ -752,20 +802,36 @@ impl Dish {
         self.state().peer.events()
     }
 
-    /// Joins every topic `filter` matches, with the latency budget `max_age`:
-    /// a copy the radio cannot get acknowledged within it, on the radio's
-    /// clock from the segment's open, is reset and counted. The filter
-    /// grammar is Pub/Sub's. Joining a filter again updates its `max_age`.
-    pub async fn join(&self, filter: &str, max_age: Option<Duration>) -> Result<(), Error> {
+    /// Joins every topic `filter` matches, under `terms`
+    /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+    /// §4.3): a copy the radio cannot get acknowledged within
+    /// `terms.max_age`, on the radio's clock from the segment's open, is
+    /// reset and counted, and layers above `terms.max_layer` are never sent
+    /// to this dish. The filter grammar is Pub/Sub's. Joining a filter again
+    /// replaces its terms.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::LimitExceeded`] for a `max_layer` above 15; the filter
+    /// grammar's error for an invalid filter; a send error from a live
+    /// connection.
+    pub async fn join(&self, filter: &str, terms: JoinTerms) -> Result<(), Error> {
+        if terms
+            .max_layer
+            .is_some_and(|l| l >= crate::segment::MAX_SEGMENT_LAYERS)
+        {
+            return Err(Error::LimitExceeded);
+        }
         weida_protocol::filter::validate(filter)?;
-        lock(&self.state().joins).insert(filter.to_owned(), max_age);
+        lock(&self.state().joins).insert(filter.to_owned(), terms.clone());
         for (conn, path) in self.state().peer.live_peers() {
             send_subscription(
                 &conn,
                 FrameKind::Subscribe,
                 &path,
                 filter,
-                max_age.map(millis),
+                terms.max_age.map(millis),
+                terms.max_layer,
             )
             .await?;
         }
@@ -778,7 +844,7 @@ impl Dish {
             return Ok(());
         }
         for (conn, path) in self.state().peer.live_peers() {
-            send_subscription(&conn, FrameKind::Unsubscribe, &path, filter, None).await?;
+            send_subscription(&conn, FrameKind::Unsubscribe, &path, filter, None, None).await?;
         }
         Ok(())
     }

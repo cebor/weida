@@ -90,11 +90,14 @@ struct SubEntry {
 /// The first three are fan-out's: two are the subscriber not keeping up, the
 /// third is the *local* transport having no connection to carry the copy
 /// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
-/// §4.4). The other four are RADIO's
+/// §4.4). The next four are RADIO's
 /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.6):
-/// a copy reset because its successor opened, because the dish's `max_age`
+/// a copy reset because its successor opened, because the `max_age`
 /// passed, a datagram too large for the dish's connection, and a dish whose
-/// connection carries no datagrams.
+/// connection carries no datagrams. The last is a segment copy that lost its
+/// upper layers and kept layer 0
+/// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+/// §4.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum DropCause {
     /// The subscriber's byte budget (`Limits::subscriber_buffer_bytes`) had
@@ -114,9 +117,14 @@ pub(crate) enum DropCause {
     TooLarge,
     /// The dish's connection did not agree the datagram capability.
     NoDatagrams,
+    /// A segment copy lost layers above 0 and kept layer 0
+    /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+    /// §4.3).
+    LayersCut,
 }
 
 /// What a publisher dropped on one topic, by cause.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopicDrops {
     /// The topic the dropped copies were published on.
@@ -135,6 +143,12 @@ pub struct TopicDrops {
     pub too_large: u64,
     /// RADIO datagram segments for a dish that carries no datagrams.
     pub no_datagrams: u64,
+    /// Segment copies that lost layers above 0 and kept layer 0; at most one
+    /// per copy and segment
+    /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+    /// §4.3). A copy that later loses layer 0 too counts here and under
+    /// that loss's cause.
+    pub layers_cut: u64,
 }
 
 impl TopicDrops {
@@ -147,6 +161,7 @@ impl TopicDrops {
             + self.expired
             + self.too_large
             + self.no_datagrams
+            + self.layers_cut
     }
 }
 
@@ -160,6 +175,7 @@ struct Causes {
     expired: AtomicU64,
     too_large: AtomicU64,
     no_datagrams: AtomicU64,
+    layers_cut: AtomicU64,
 }
 
 impl Causes {
@@ -172,6 +188,7 @@ impl Causes {
             DropCause::Expired => &self.expired,
             DropCause::TooLarge => &self.too_large,
             DropCause::NoDatagrams => &self.no_datagrams,
+            DropCause::LayersCut => &self.layers_cut,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -186,6 +203,7 @@ impl Causes {
             expired: self.expired.load(Ordering::Relaxed),
             too_large: self.too_large.load(Ordering::Relaxed),
             no_datagrams: self.no_datagrams.load(Ordering::Relaxed),
+            layers_cut: self.layers_cut.load(Ordering::Relaxed),
         }
     }
 }

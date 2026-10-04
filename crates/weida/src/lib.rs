@@ -101,7 +101,7 @@ pub use listener::UnixBinding;
 pub use listener::{Binding, Listener, LocalBinding};
 pub use ordering::Gap;
 pub use pubsub::{FanOut, TopicDrops};
-pub use radio::{Join, Received};
+pub use radio::{Join, JoinTerms, Received};
 pub use weida_core::{
     Address, EndpointAddr, Error, ErrorCode, Fingerprint, InprocAddr, Limits, LocalPrincipal,
     LossCause, PeerIdentity, PipeAddr, Result, StopReason, TraceContext, UnixAddr,
@@ -115,7 +115,7 @@ pub use weida_runtime::{Resolved, Resolver, SharedResolver, SystemResolver};
 // documents use for it.
 pub use reconnect::{GiveUp, OutboxFull, PeerEvent, PeerEvents, ReconnectPolicy};
 pub use runtime::Runtime;
-pub use segment::{Segment, SegmentTerms};
+pub use segment::{MAX_SEGMENT_LAYERS, Segment, SegmentTerms};
 pub use stats::{ConnectionStats, PathStats, TransportStats, UdpCounts};
 pub use stream::{Acceptor, Consumer, ConsumerId, CreditGrant, Incoming, Peer};
 pub use transfer::{

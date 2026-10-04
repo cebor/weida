@@ -207,11 +207,16 @@ pub struct IncomingMeta {
     /// the CURSOR stream a reporter opens, and it is the sender's number, not
     /// ours.
     pub report_id: Option<u64>,
-    /// The RADIO segment number (DATA key `13`), when a radio sent this
-    /// transfer as a stream segment
+    /// The segment number (DATA key `13`), when a radio or a
+    /// `Peer::segment` sent this transfer as a stream segment
     /// ([decisions/0034](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0034-late-is-lost.md)
     /// §4.6).
     pub segment: Option<u64>,
+    /// The segment's layer (DATA key `14`): `Some` exactly when
+    /// [`IncomingMeta::segment`] is, and `Some(0)` when key `14` was absent
+    /// ([decisions/0037](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0037-layered-segments.md)
+    /// §4.3).
+    pub layer: Option<u8>,
 }
 
 impl IncomingMeta {
@@ -239,6 +244,7 @@ impl IncomingMeta {
             report_mode: header.report_mode,
             report_id: header.report_id,
             segment: header.segment,
+            layer: header.segment.map(|_| header.layer.unwrap_or(0)),
         }
     }
 

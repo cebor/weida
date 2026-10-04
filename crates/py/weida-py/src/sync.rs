@@ -916,7 +916,8 @@ impl SyncDish {
                 .transpose()
                 .map_err(|e| weida::Error::Runtime(format!("max_age: {e}"))),
         )?;
-        raise(py, py.detach(|| self.endpoint.join(filter, max_age)))
+        let terms = crate::patterns::join_terms(max_age);
+        raise(py, py.detach(|| self.endpoint.join(filter, terms)))
     }
 
     /// Leaves a filter.

@@ -3,37 +3,44 @@
 //!
 //! A **segment** is a unit whose parts may depend on each other and on
 //! nothing earlier — a voice frame, a raw preview frame, a video GOP. It is
-//! numbered per `(sender, path, topic)` in DATA key `13`, and every copy of
-//! it is one uni stream toward one receiver. The machinery here is shared by
-//! [`crate::Radio::segment`], one copy per joined dish, and
+//! numbered per `(sender, path, topic)` in DATA key `13`. The machinery here
+//! is shared by [`crate::Radio::segment`], one copy per joined dish, and
 //! [`crate::Peer::segment`], one copy toward the bound path the peer dialled.
-//! Three things drop a copy, and each is counted per topic and cause:
 //!
-//! * **supersession** — opening segment *n+1* resets at once every copy of
+//! A segment carries **layers** `0..MAX_SEGMENT_LAYERS`, ordered by
+//! dependency: layer *k* may depend on layers below it and never above
+//! (§4.3). Each `(copy, layer)` is its own uni stream, opened on that layer's
+//! first chunk, with its own writer task and queue of [`COPY_QUEUE`] chunks;
+//! the byte budget is per copy. Every cut removes a suffix of the layers, so
+//! what a receiver gets is a prefix a decoder can use:
+//!
+//! * **the cut rule** — a copy without room for a chunk of layer *k* first
+//!   cuts its layers above *k*, whose queued bytes return to the budget at
+//!   once; still without room, in the budget or in layer *k*'s queue, it cuts
+//!   *k* and above. Layer 0 cut means the copy lost the segment;
+//! * **supersession** — opening segment *n+1* resets at once every layer of
 //!   segment *n* on that topic whose writer had not finished it, or whose
-//!   queued chunks the transport does not take at once; a finished copy gets
-//!   the time its path needs, `rtt + 50 ms + rtt * bytes / cwnd`, and is
-//!   reset only if still unacknowledged then. A copy that follows upstream
+//!   queued chunks the transport does not take at once, and every layer
+//!   above it; a finished layer gets the time its path needs,
+//!   `rtt + 50 ms + rtt * bytes / cwnd`, and is reset only if still
+//!   unacknowledged then. A copy that follows upstream
 //!   ([`SegmentTerms::follows_upstream`]) is treated as finished until a
 //!   write has to wait. No other topic's copies are touched;
 //! * **expiry** — the smaller of the sender's and the receiver's `max_age`,
-//!   on the sender's clock from the segment's open;
-//! * **the budget** — `subscriber_buffer_bytes` of chunks a copy may hold
-//!   unwritten (per dish at a radio, per `Peer` for `Peer::segment`), and a
-//!   queue of [`COPY_QUEUE`] chunks.
+//!   on the sender's clock from the segment's open.
 //!
-//! Nothing here ever waits for a receiver: [`Segment::write`] is
-//! synchronous.
+//! Each copy counts at most once in `TopicDrops::layers_cut` and at most once
+//! under a whole-segment cause. Nothing here ever waits for a receiver:
+//! [`Segment::write_layer`] is synchronous.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{Notify, Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use weida_core::Error;
 use weida_protocol::{DataHeader, codes};
 
@@ -42,9 +49,15 @@ use crate::pubsub::{DropCause, DropTable};
 use crate::transfer::write_data_preamble;
 use crate::transport::SendHalf;
 
-/// Chunks one copy may hold queued for its writer task. The real bound is
-/// the receiver's byte budget; this keeps the channel from growing on tiny
-/// chunks.
+/// How many layers a stream segment can carry: `0..=15`, the cap of DATA
+/// key `14`
+/// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+/// §4.3).
+pub const MAX_SEGMENT_LAYERS: u8 = 16;
+
+/// Chunks one copy's layer may hold queued for its writer task. The real
+/// bound is the receiver's byte budget; this keeps the channel from growing
+/// on tiny chunks.
 pub(crate) const COPY_QUEUE: usize = 64;
 
 /// What a finished copy waits beyond one round trip before a successor
@@ -94,11 +107,12 @@ pub struct SegmentTerms {
     /// transports.
     pub priority: i16,
     /// The writer relays a segment its upstream is still streaming: the
-    /// successor takes a copy only where a write has to wait, and otherwise
-    /// the copy keeps taking chunks and gets a finished copy's grace once it
-    /// is finished
+    /// successor takes a copy's layer only where a write has to wait, and
+    /// otherwise the layer keeps taking chunks and gets a finished layer's
+    /// grace once it is finished
     /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
-    /// §4.11). Dropping the segment unfinished still resets every copy.
+    /// §4.11). Dropping the segment unfinished still resets every
+    /// unfinished layer.
     pub follows_upstream: bool,
 }
 
@@ -126,43 +140,82 @@ impl SegmentTerms {
     }
 }
 
-/// One copy's control: how its segment's successor or its end reach it.
-#[derive(Default)]
+/// One copy's control, shared by the [`Segment`] and every layer task of
+/// the copy: how its segment's successor, a cut or its end reach it.
 pub(crate) struct CopyCtl {
-    superseded: AtomicBool,
-    acked: AtomicBool,
-    ended: AtomicBool,
-    /// The writer finished the segment: every chunk of it is queued.
-    finished: AtomicBool,
-    /// Bytes queued for this copy, all chunks together.
+    superseded: watch::Sender<bool>,
+    /// The lowest cut layer; [`MAX_SEGMENT_LAYERS`] while nothing is cut.
+    /// It only ever goes down.
+    cut_from: watch::Sender<u8>,
+    /// Bytes queued for this copy over all its layers: what the finish
+    /// grace has to carry.
     total: AtomicU64,
-    /// Supersession treats the copy as finished until a write has to wait
+    /// The segment's handle plus one per running layer task: a copy with
+    /// none left has nothing a successor could supersede.
+    handles: AtomicUsize,
+    /// Supersession treats a layer as finished until a write has to wait
     /// ([`SegmentTerms::follows_upstream`]).
     follows_upstream: bool,
-    notify: Notify,
+    /// The copy already counted in `layers_cut`.
+    cut_counted: AtomicBool,
+    /// The copy already counted under a whole-segment cause.
+    lost_counted: AtomicBool,
 }
 
 impl CopyCtl {
-    fn supersede(&self) {
-        if !self.acked.load(Ordering::Acquire) {
-            self.superseded.store(true, Ordering::Release);
-            self.notify.notify_one();
+    fn new(follows_upstream: bool) -> CopyCtl {
+        CopyCtl {
+            superseded: watch::Sender::new(false),
+            cut_from: watch::Sender::new(MAX_SEGMENT_LAYERS),
+            total: AtomicU64::new(0),
+            handles: AtomicUsize::new(1),
+            follows_upstream,
+            cut_counted: AtomicBool::new(false),
+            lost_counted: AtomicBool::new(false),
         }
     }
 
-    fn live(&self) -> bool {
-        !self.ended.load(Ordering::Acquire)
+    fn supersede(&self) {
+        self.superseded.send_replace(true);
     }
 
-    async fn superseded(&self) {
-        loop {
-            let notified = self.notify.notified();
-            if self.superseded.load(Ordering::Acquire) {
-                return;
+    fn live(&self) -> bool {
+        self.handles.load(Ordering::Acquire) > 0
+    }
+
+    fn is_superseded(&self) -> bool {
+        *self.superseded.borrow()
+    }
+
+    fn cut_now(&self) -> u8 {
+        *self.cut_from.borrow()
+    }
+
+    /// Cuts layers `from` and above. Counted at most once per copy for a
+    /// cut that starts above layer 0 (`layers_cut`) and at most once for the
+    /// loss of layer 0 (under `cause`); `None` counts nothing, for a
+    /// receiver that refused or left. A layer already cut stays as it was.
+    fn cut(&self, from: u8, cause: Option<DropCause>, spec: &CopySpec) {
+        let lowered = self.cut_from.send_if_modified(|cut| {
+            if from < *cut {
+                *cut = from;
+                true
+            } else {
+                false
             }
-            // `notify_one` leaves a permit when nobody waits, so a
-            // supersession between the check and this await is not lost.
-            notified.await;
+        });
+        if !lowered {
+            return;
+        }
+        let Some(cause) = cause else {
+            return;
+        };
+        if from == 0 {
+            if !self.lost_counted.swap(true, Ordering::AcqRel) {
+                spec.drops.record(&spec.topic, cause);
+            }
+        } else if !self.cut_counted.swap(true, Ordering::AcqRel) {
+            spec.drops.record(&spec.topic, DropCause::LayersCut);
         }
     }
 }
@@ -194,9 +247,8 @@ impl SegmentTopics {
     }
 
     /// Takes the next number on `topic` and supersedes every copy of the
-    /// previous segment there that is not yet acknowledged. Fails with
-    /// [`Error::LimitExceeded`] when `max_scopes` topics all have a copy in
-    /// flight.
+    /// previous segment there. Fails with [`Error::LimitExceeded`] when
+    /// `max_scopes` topics all have a copy in flight.
     pub(crate) fn next(&self, topic: &Arc<str>) -> Result<u64, Error> {
         let mut guard = lock(&self.topics);
         let (topics, floor) = &mut *guard;
@@ -250,16 +302,19 @@ impl SegmentTopics {
     }
 }
 
-/// The newest number per path, per topic.
-type PerPath = HashMap<Arc<str>, HashMap<Arc<str>, u64>>;
+/// The newest segment per path, per topic: its number and the layers of it
+/// delivered, one bit each.
+type PerPath = HashMap<Arc<str>, HashMap<Arc<str>, (u64, u16)>>;
 
-/// The newest segment delivered per `(path, topic)` on one connection: what
-/// every receiver — a dish, an acceptor, a transfer endpoint, a pair —
-/// checks an arriving segment against
+/// The newest segment delivered per `(path, topic)` on one connection, with
+/// the layers of it already delivered: what every receiver — a dish, an
+/// acceptor, a transfer endpoint, a pair — checks an arriving segment
+/// against
 /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
-/// §4.11). A redial is a new connection and starts over.
+/// §4.3, §4.11). A redial is a new connection and starts over.
 pub(crate) struct Newest {
-    /// Per path, per topic, the newest number; and the entries in total.
+    /// Per path, per topic, the newest number and its layer mask; and the
+    /// entries in total.
     table: Mutex<(PerPath, usize)>,
     max: usize,
 }
@@ -273,29 +328,35 @@ impl Newest {
         }
     }
 
-    /// `true` when `segment` is newer than every segment delivered on
-    /// (`path`, `topic`), which it then becomes. At the table's cap an
-    /// untracked key is always fresh: the check needs memory, and memory is
-    /// bounded.
-    pub(crate) fn fresh(&self, path: &str, topic: &str, segment: u64) -> bool {
+    /// `true` when layer `layer` of `segment` is fresh on (`path`,
+    /// `topic`): the segment is newer than the newest delivered there, or it
+    /// is the newest and this layer of it was not delivered yet. A fresh
+    /// arrival is recorded. At the table's cap an untracked key is always
+    /// fresh: the check needs memory, and memory is bounded.
+    pub(crate) fn fresh(&self, path: &str, topic: &str, segment: u64, layer: u8) -> bool {
+        let bit = 1u16 << (layer % MAX_SEGMENT_LAYERS);
         let mut guard = lock(&self.table);
         let (paths, count) = &mut *guard;
-        if let Some(last) = paths.get_mut(path).and_then(|t| t.get_mut(topic)) {
-            if segment <= *last {
-                return false;
+        if let Some((last, mask)) = paths.get_mut(path).and_then(|t| t.get_mut(topic)) {
+            if segment > *last {
+                (*last, *mask) = (segment, bit);
+                return true;
             }
-            *last = segment;
-            return true;
+            if segment == *last && *mask & bit == 0 {
+                *mask |= bit;
+                return true;
+            }
+            return false;
         }
         if *count < self.max {
             match paths.get_mut(path) {
                 Some(topics) => {
-                    topics.insert(Arc::from(topic), segment);
+                    topics.insert(Arc::from(topic), (segment, bit));
                 }
                 None => {
                     paths.insert(
                         Arc::from(path),
-                        HashMap::from([(Arc::from(topic), segment)]),
+                        HashMap::from([(Arc::from(topic), (segment, bit))]),
                     );
                 }
             }
@@ -360,17 +421,102 @@ impl SegmentNumbers {
     }
 }
 
-/// What a copy's writer task is told.
+/// What a layer's writer task is told.
 enum SegItem {
     Chunk(Bytes),
     Finish,
 }
 
+/// What every layer task of one copy shares: where it goes and what it is.
+struct CopySpec {
+    conn: ConnHandle,
+    path: Arc<str>,
+    topic: Arc<str>,
+    number: u64,
+    priority: i16,
+    /// The smaller of the sender's and the receiver's `max_age`, from the
+    /// segment's open.
+    deadline: Option<Instant>,
+    drops: Arc<DropTable>,
+}
+
+impl CopySpec {
+    fn expired(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+}
+
+/// The sending side of one layer of one copy.
+struct LayerTx {
+    tx: mpsc::Sender<SegItem>,
+    /// Bytes queued and not yet written: what a Segment-side cut returns to
+    /// the budget.
+    queued: Arc<AtomicU64>,
+    /// The writer finished this layer: every chunk of it is queued.
+    finished: Arc<AtomicBool>,
+}
+
 /// The sending side of one copy, kept by the [`Segment`].
 struct CopyTx {
-    tx: mpsc::Sender<SegItem>,
-    budget: Arc<Semaphore>,
+    spec: Arc<CopySpec>,
     ctl: Arc<CopyCtl>,
+    /// The highest layer the receiver wants.
+    cap: u8,
+    /// Chunk bytes this receiver's copies may hold unwritten.
+    budget: Arc<Semaphore>,
+    layers: [Option<LayerTx>; MAX_SEGMENT_LAYERS as usize],
+}
+
+impl CopyTx {
+    /// Cuts layers `from` and above on the segment's side: the cut is
+    /// recorded, and their queued bytes go back to the budget at once.
+    fn cut(&mut self, from: u8, cause: DropCause) {
+        self.ctl.cut(from, Some(cause), &self.spec);
+        for slot in &mut self.layers[usize::from(from)..] {
+            if let Some(layer) = slot.take() {
+                let queued = layer.queued.swap(0, Ordering::AcqRel);
+                self.budget
+                    .add_permits(usize::try_from(queued).unwrap_or(usize::MAX));
+            }
+        }
+    }
+
+    /// Whether an uncut layer above `layer` is open, whose queued bytes a
+    /// cut could free.
+    fn upper_open(&self, layer: u8) -> bool {
+        let cut = usize::from(self.ctl.cut_now());
+        self.layers[usize::from(layer) + 1..cut.max(usize::from(layer) + 1)]
+            .iter()
+            .any(Option::is_some)
+    }
+
+    /// Opens layer `layer`: its writer task starts and opens its stream.
+    fn open(&mut self, layer: u8) {
+        let (tx, rx) = mpsc::channel(COPY_QUEUE);
+        let queued = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        self.ctl.handles.fetch_add(1, Ordering::AcqRel);
+        self.spec.conn.exec.spawn(layer_copy(
+            Arc::clone(&self.spec),
+            Arc::clone(&self.ctl),
+            layer,
+            rx,
+            Arc::clone(&queued),
+            Arc::clone(&finished),
+            Arc::clone(&self.budget),
+        ));
+        self.layers[usize::from(layer)] = Some(LayerTx {
+            tx,
+            queued,
+            finished,
+        });
+    }
+}
+
+impl Drop for CopyTx {
+    fn drop(&mut self) {
+        self.ctl.handles.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Where one copy of a segment goes.
@@ -381,13 +527,15 @@ pub(crate) struct CopyTarget {
     pub(crate) budget: Arc<Semaphore>,
     /// The receiver's own latency budget; `None` for a `Peer::segment` copy.
     pub(crate) max_age: Option<Duration>,
+    /// The highest layer the receiver wants; `None` for every layer.
+    pub(crate) max_layer: Option<u8>,
 }
 
 /// Opens segment `number` on `topic` toward every target, under `terms`.
 ///
 /// The caller took `number` and superseded the previous segment on `topics`
 /// already; the copies are tracked there so the next segment supersedes
-/// them.
+/// them. No stream opens here: each layer's opens on its first chunk.
 pub(crate) fn open_segment(
     topics: &SegmentTopics,
     drops: &Arc<DropTable>,
@@ -396,13 +544,10 @@ pub(crate) fn open_segment(
     terms: &SegmentTerms,
     targets: Vec<CopyTarget>,
 ) -> Segment {
+    let opened = Instant::now();
     let mut copies = Vec::with_capacity(targets.len());
     for target in targets {
-        let (tx, rx) = mpsc::channel(COPY_QUEUE);
-        let ctl = Arc::new(CopyCtl {
-            follows_upstream: terms.follows_upstream,
-            ..CopyCtl::default()
-        });
+        let ctl = Arc::new(CopyCtl::new(terms.follows_upstream));
         topics.track(&topic, &ctl);
         // Expiry is the smaller of the sender's and the receiver's budget,
         // MOQT's "smaller non-zero value"
@@ -412,47 +557,42 @@ pub(crate) fn open_segment(
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        let deadline = max_age.map(|age| Box::pin(target.conn.exec.sleep(age)));
-        let exec = target.conn.exec.clone();
-        exec.spawn(segment_copy(
-            target.conn,
-            Copy {
+        copies.push(CopyTx {
+            spec: Arc::new(CopySpec {
+                conn: target.conn,
                 path: target.path,
                 topic: Arc::clone(&topic),
                 number,
                 priority: terms.priority,
-                ctl: Arc::clone(&ctl),
-                budget: Arc::clone(&target.budget),
+                deadline: max_age.and_then(|age| opened.checked_add(age)),
                 drops: Arc::clone(drops),
-            },
-            rx,
-            deadline,
-        ));
-        copies.push(CopyTx {
-            tx,
-            budget: target.budget,
+            }),
             ctl,
+            cap: target.max_layer.unwrap_or(MAX_SEGMENT_LAYERS - 1),
+            budget: target.budget,
+            layers: Default::default(),
         });
     }
     Segment {
         number,
         topic,
         copies,
-        drops: Arc::clone(drops),
+        finished: 0,
     }
 }
 
 /// One segment, open on every receiver it was opened toward.
 ///
-/// [`Segment::write`] never waits: a receiver without room for a chunk loses
-/// the segment, counted. Dropping a segment without [`Segment::finish`]
-/// resets every copy, so no receiver mistakes a partial segment for a whole
-/// one.
+/// [`Segment::write_layer`] never waits: a receiver without room for a chunk
+/// loses that layer and every layer above it, counted, and loses the
+/// segment if the layer is 0. Dropping a segment resets every layer not yet
+/// finished, so no receiver mistakes a partial layer for a whole one.
 pub struct Segment {
     number: u64,
     topic: Arc<str>,
     copies: Vec<CopyTx>,
-    drops: Arc<DropTable>,
+    /// The layers [`Segment::finish_layer`] was called on, one bit each.
+    finished: u16,
 }
 
 impl Segment {
@@ -466,61 +606,146 @@ impl Segment {
         &self.topic
     }
 
-    /// Hands `chunk` to every copy still open; returns how many that is.
+    /// Hands `chunk` to layer 0 of every copy still open; returns how many
+    /// copies took it. See [`Segment::write_layer`].
     ///
-    /// A copy whose receiver has no budget or queue room left for the chunk
-    /// is dropped and counted, and its receiver loses this segment. Fails
-    /// with [`Error::LimitExceeded`] for a chunk above 4 GiB, which no
-    /// budget can account.
+    /// # Errors
+    ///
+    /// As [`Segment::write_layer`].
     pub fn write(&mut self, chunk: impl Into<Bytes>) -> Result<usize, Error> {
-        let chunk = chunk.into();
-        let len = u32::try_from(chunk.len()).map_err(|_| Error::LimitExceeded)?;
-        let (topic, drops) = (&self.topic, &self.drops);
-        self.copies.retain(|copy| {
-            let Ok(permit) = copy.budget.try_acquire_many(len) else {
-                drops.record(topic, DropCause::SubscriberBudget);
-                return false;
-            };
-            match copy.tx.try_send(SegItem::Chunk(chunk.clone())) {
-                Ok(()) => {
-                    // Given back by the writer once the bytes are written.
-                    permit.forget();
-                    copy.ctl.total.fetch_add(u64::from(len), Ordering::AcqRel);
-                    true
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    drops.record(topic, DropCause::SubscriberQueue);
-                    false
-                }
-                // The copy already ended — superseded or expired — and its
-                // task counted why.
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
-            }
-        });
-        Ok(self.copies.len())
+        self.write_layer(0, chunk)
     }
 
-    /// Ends the segment on every copy still open; returns how many that is.
-    pub fn finish(mut self) -> usize {
-        let copies = std::mem::take(&mut self.copies);
-        let mut finished = 0;
-        for copy in copies {
-            match copy.tx.try_send(SegItem::Finish) {
+    /// Hands `chunk` to layer `layer` of every copy that wants it; returns
+    /// how many copies took it.
+    ///
+    /// A copy whose receiver capped its layers below `layer` is skipped, and
+    /// that is not a drop. A copy without room cuts by the cut rule: its
+    /// layers above `layer` first, then `layer` and above
+    /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+    /// §4.3). A layer opened after the successor segment opened, or after
+    /// the deadline, is cut at once. Never waits.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::LimitExceeded`] for a layer of 16 or above, or a chunk above
+    /// 4 GiB, which no budget can account; [`Error::Runtime`] for a layer
+    /// [`Segment::finish_layer`] already finished.
+    pub fn write_layer(&mut self, layer: u8, chunk: impl Into<Bytes>) -> Result<usize, Error> {
+        if layer >= MAX_SEGMENT_LAYERS {
+            return Err(Error::LimitExceeded);
+        }
+        let chunk = chunk.into();
+        let len = u32::try_from(chunk.len()).map_err(|_| Error::LimitExceeded)?;
+        if self.finished & (1 << layer) != 0 {
+            return Err(Error::Runtime(format!(
+                "layer {layer} of segment {} is finished",
+                self.number
+            )));
+        }
+        let index = usize::from(layer);
+        let mut took = 0;
+        for copy in &mut self.copies {
+            if layer > copy.cap || copy.ctl.cut_now() <= layer {
+                continue;
+            }
+            if copy.layers[index].is_none() {
+                if copy.ctl.is_superseded() && !copy.ctl.follows_upstream {
+                    copy.cut(layer, DropCause::Superseded);
+                    continue;
+                }
+                if copy.spec.expired() {
+                    copy.cut(layer, DropCause::Expired);
+                    continue;
+                }
+            }
+            let permit = match Arc::clone(&copy.budget).try_acquire_many_owned(len) {
+                Ok(permit) => permit,
+                Err(_) => {
+                    // The cut rule: the layers above give their room first.
+                    if copy.upper_open(layer) {
+                        copy.cut(layer + 1, DropCause::SubscriberBudget);
+                    }
+                    match Arc::clone(&copy.budget).try_acquire_many_owned(len) {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            copy.cut(layer, DropCause::SubscriberBudget);
+                            continue;
+                        }
+                    }
+                }
+            };
+            if copy.layers[index].is_none() {
+                copy.open(layer);
+            }
+            let Some(tx) = copy.layers[index].as_ref() else {
+                continue;
+            };
+            match tx.tx.try_send(SegItem::Chunk(chunk.clone())) {
                 Ok(()) => {
-                    // Stored before the successor can open: the caller opens
-                    // it only after `finish` returns. A FIN that found the
-                    // queue full leaves the copy unfinished, so its successor
-                    // resets it at once.
-                    copy.ctl.finished.store(true, Ordering::Release);
-                    finished += 1;
+                    // Given back by the writer once the bytes are written,
+                    // or by a cut that takes them first.
+                    permit.forget();
+                    tx.queued.fetch_add(u64::from(len), Ordering::AcqRel);
+                    copy.ctl.total.fetch_add(u64::from(len), Ordering::AcqRel);
+                    took += 1;
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.drops.record(&self.topic, DropCause::SubscriberQueue);
+                    drop(permit);
+                    copy.cut(layer, DropCause::SubscriberQueue);
+                }
+                // The layer's task already ended and cut what it had to.
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
+        }
+        self.copies.retain(|copy| copy.ctl.cut_now() > 0);
+        Ok(took)
+    }
+
+    /// Ends layer `layer` on every copy that has it open and uncut; a layer
+    /// of 16 or above is ignored. A later write to it is an error.
+    pub fn finish_layer(&mut self, layer: u8) {
+        if layer >= MAX_SEGMENT_LAYERS {
+            return;
+        }
+        self.finished |= 1 << layer;
+        let index = usize::from(layer);
+        for copy in &mut self.copies {
+            if copy.ctl.cut_now() <= layer {
+                continue;
+            }
+            let Some(tx) = copy.layers[index].as_ref() else {
+                continue;
+            };
+            match tx.tx.try_send(SegItem::Finish) {
+                // Stored once the FIN is queued: a FIN that found the queue
+                // full leaves the layer unfinished, and it is cut.
+                Ok(()) => tx.finished.store(true, Ordering::Release),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    copy.cut(layer, DropCause::SubscriberQueue);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {}
             }
         }
-        finished
+        self.copies.retain(|copy| copy.ctl.cut_now() > 0);
+    }
+
+    /// Ends every layer still open; returns how many copies still hold
+    /// layer 0.
+    pub fn finish(mut self) -> usize {
+        let opened = self.copies.iter().fold(0u16, |mask, copy| {
+            copy.layers
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.is_some())
+                .fold(mask, |mask, (layer, _)| mask | (1 << layer))
+        });
+        for layer in 0..MAX_SEGMENT_LAYERS {
+            if opened & (1 << layer) != 0 && self.finished & (1 << layer) == 0 {
+                self.finish_layer(layer);
+            }
+        }
+        self.copies.len()
     }
 }
 
@@ -534,187 +759,234 @@ impl fmt::Debug for Segment {
     }
 }
 
-/// What a copy's task needs besides its channel and deadline.
-struct Copy {
-    path: Arc<str>,
-    topic: Arc<str>,
-    number: u64,
-    priority: i16,
-    ctl: Arc<CopyCtl>,
-    budget: Arc<Semaphore>,
-    drops: Arc<DropTable>,
-}
-
-/// How a copy's race ended.
-enum Stop {
-    Superseded,
-    Expired,
-}
-
-async fn expiry(deadline: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
-    match deadline {
-        Some(sleep) => sleep.as_mut().await,
-        None => std::future::pending().await,
+/// Returns `len` bytes of a layer's queue to the budget, at most what is
+/// still counted as queued: a Segment-side cut may have returned them
+/// already, and a byte goes back exactly once.
+fn release(queued: &AtomicU64, len: usize, budget: &Semaphore) {
+    let len = u64::try_from(len).unwrap_or(u64::MAX);
+    let mut before = queued.load(Ordering::Acquire);
+    while let Err(seen) = queued.compare_exchange_weak(
+        before,
+        before.saturating_sub(len),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        before = seen;
+    }
+    let returned = before.min(len);
+    if returned > 0 {
+        budget.add_permits(usize::try_from(returned).unwrap_or(usize::MAX));
     }
 }
 
-/// Resolves when the copy is superseded while its writer is still writing
-/// the segment: such a copy is reset at once. A copy whose writer finished
-/// before the successor opened, and one that follows upstream, go on: see
-/// [`run_copy`].
-async fn superseded_unfinished(ctl: &CopyCtl) {
-    ctl.superseded().await;
-    if ctl.follows_upstream || ctl.finished.load(Ordering::Acquire) {
+/// Resolves once layer `layer` or one below it is cut.
+async fn cut_reached(ctl: &CopyCtl, layer: u8) {
+    let mut cut = ctl.cut_from.subscribe();
+    let _ = cut.wait_for(|cut| *cut <= layer).await;
+}
+
+/// Resolves once the copy's segment is superseded.
+async fn superseded(ctl: &CopyCtl) {
+    let mut superseded = ctl.superseded.subscribe();
+    let _ = superseded.wait_for(|s| *s).await;
+}
+
+/// Resolves when the copy is superseded while this layer's writer is still
+/// writing it: such a layer is reset at once. A layer finished before the
+/// successor opened, and a copy that follows upstream, go on: see
+/// [`run_layer`].
+async fn superseded_unfinished(ctl: &CopyCtl, finished: &AtomicBool) {
+    superseded(ctl).await;
+    if ctl.follows_upstream || finished.load(Ordering::Acquire) {
         std::future::pending::<()>().await;
     }
 }
 
-/// Resolves when a copy past its FIN has had its grace after supersession:
-/// the time its path needs to carry its bytes at the congestion window, one
-/// round trip for the receipt and [`SUPERSEDE_SLACK`].
-async fn finish_grace_over(ctl: &CopyCtl, conn: &ConnHandle) {
-    ctl.superseded().await;
-    let wait = conn
+/// Resolves at the copy's deadline, or never.
+async fn expiry(spec: &CopySpec) {
+    match spec.deadline {
+        Some(deadline) => {
+            spec.conn
+                .exec
+                .sleep(deadline.saturating_duration_since(Instant::now()))
+                .await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves when a layer past its FIN has had its grace after supersession:
+/// the time its path needs to carry the copy's bytes at the congestion
+/// window, one round trip for the receipt and [`SUPERSEDE_SLACK`].
+async fn finish_grace_over(ctl: &CopyCtl, spec: &CopySpec) {
+    superseded(ctl).await;
+    let wait = spec
+        .conn
         .conn
         .transport_stats()
         .map(|t| t.path)
         .map_or(Duration::ZERO, |p| {
             finish_grace(p.rtt, p.cwnd, ctl.total.load(Ordering::Acquire))
         });
-    conn.exec.sleep(wait).await;
+    spec.conn.exec.sleep(wait).await;
 }
 
-/// Writes one receiver's copy of one segment, racing every step against
-/// supersession and the deadline.
-async fn segment_copy(
-    conn: ConnHandle,
-    copy: Copy,
+/// Writes one layer of one copy, racing every step against cuts,
+/// supersession and the deadline; on exit, the chunks never written go back
+/// to the budget.
+async fn layer_copy(
+    spec: Arc<CopySpec>,
+    ctl: Arc<CopyCtl>,
+    layer: u8,
     mut rx: mpsc::Receiver<SegItem>,
-    mut deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    queued: Arc<AtomicU64>,
+    finished: Arc<AtomicBool>,
+    budget: Arc<Semaphore>,
 ) {
-    let stop = run_copy(&conn, &copy, &mut rx, &mut deadline).await;
-    match stop {
-        Some(Stop::Superseded) => copy.drops.record(&copy.topic, DropCause::Superseded),
-        Some(Stop::Expired) => copy.drops.record(&copy.topic, DropCause::Expired),
-        None => {}
-    }
-    copy.ctl.ended.store(true, Ordering::Release);
-    // Chunks still queued were charged to the budget and will never be
-    // written: give their bytes back.
+    run_layer(&spec, &ctl, layer, &mut rx, &queued, &finished, &budget).await;
     rx.close();
     while let Ok(item) = rx.try_recv() {
         if let SegItem::Chunk(chunk) = item {
-            copy.budget.add_permits(chunk.len());
+            release(&queued, chunk.len(), &budget);
         }
     }
+    ctl.handles.fetch_sub(1, Ordering::AcqRel);
 }
 
-/// Opens and writes one copy. Supersession takes a copy whose segment the
-/// writer had not finished at once. A copy whose writer finished first, or
-/// that follows upstream, is not stalled merely because its successor
-/// opened: it hands its chunks to the transport if the transport takes them
-/// at once — a write the receiver's flow control holds back means a stalled
-/// receiver, and the copy is reset — and once its FIN is written it gets
-/// [`finish_grace_over`] before the reset.
-async fn run_copy(
-    conn: &ConnHandle,
-    copy: &Copy,
+/// Opens and writes one layer. Supersession takes a layer the writer had not
+/// finished at once. A layer the writer finished first, or of a copy that
+/// follows upstream, is not stalled merely because its successor opened: it
+/// hands its chunks to the transport if the transport takes them at once —
+/// a write the receiver's flow control holds back means a stalled receiver,
+/// and the layer is reset — and once its FIN is written it gets
+/// [`finish_grace_over`] before the reset. Every reset cuts the layers
+/// above too.
+async fn run_layer(
+    spec: &CopySpec,
+    ctl: &CopyCtl,
+    layer: u8,
     rx: &mut mpsc::Receiver<SegItem>,
-    deadline: &mut Option<Pin<Box<tokio::time::Sleep>>>,
-) -> Option<Stop> {
-    let ctl = &copy.ctl;
+    queued: &AtomicU64,
+    finished: &AtomicBool,
+    budget: &Semaphore,
+) {
     let opened = tokio::select! {
         biased;
-        () = superseded_unfinished(ctl) => return Some(Stop::Superseded),
-        () = expiry(deadline) => return Some(Stop::Expired),
-        opened = open_copy(conn, copy) => opened,
+        () = cut_reached(ctl, layer) => return,
+        () = superseded_unfinished(ctl, finished) => {
+            ctl.cut(layer, Some(DropCause::Superseded), spec);
+            return;
+        }
+        () = expiry(spec) => {
+            ctl.cut(layer, Some(DropCause::Expired), spec);
+            return;
+        }
+        opened = open_layer(spec, layer) => opened,
     };
     let mut stream = match opened {
         Ok(stream) => stream,
         Err(Error::NoParkedConnection) => {
-            copy.drops
-                .record(&copy.topic, DropCause::NoParkedConnection);
-            return None;
+            ctl.cut(layer, Some(DropCause::NoParkedConnection), spec);
+            return;
         }
         Err(e) => {
-            tracing::debug!(error = %e, "a segment copy could not be opened");
-            return None;
+            tracing::debug!(error = %e, layer, "a segment layer could not be opened");
+            ctl.cut(layer, None, spec);
+            return;
         }
     };
     loop {
         let item = tokio::select! {
             biased;
-            () = superseded_unfinished(ctl) => return reset(&mut stream, Stop::Superseded),
-            () = expiry(deadline) => return reset(&mut stream, Stop::Expired),
+            () = cut_reached(ctl, layer) => {
+                stream.reset(codes::CANCELED);
+                return;
+            }
+            () = superseded_unfinished(ctl, finished) => {
+                stream.reset(codes::CANCELED);
+                ctl.cut(layer, Some(DropCause::Superseded), spec);
+                return;
+            }
+            () = expiry(spec) => {
+                stream.reset(codes::CANCELED);
+                ctl.cut(layer, Some(DropCause::Expired), spec);
+                return;
+            }
             item = rx.recv() => item,
         };
         match item {
             Some(SegItem::Chunk(chunk)) => {
-                // The write first: supersession only takes a write that
-                // has to wait.
+                // The write first: supersession only takes a write that has
+                // to wait.
                 let written = tokio::select! {
                     biased;
                     written = stream.write_all(&chunk) => Ok(written),
-                    () = ctl.superseded() => Err(Stop::Superseded),
-                    () = expiry(deadline) => Err(Stop::Expired),
+                    () = cut_reached(ctl, layer) => Err(None),
+                    () = superseded(ctl) => Err(Some(DropCause::Superseded)),
+                    () = expiry(spec) => Err(Some(DropCause::Expired)),
                 };
-                copy.budget.add_permits(chunk.len());
+                release(queued, chunk.len(), budget);
                 match written {
                     Ok(Ok(())) => {}
                     // The receiver refused the stream or went away.
-                    Ok(Err(_)) => return None,
-                    Err(stop) => return reset(&mut stream, stop),
+                    Ok(Err(_)) => {
+                        ctl.cut(layer, None, spec);
+                        return;
+                    }
+                    Err(cause) => {
+                        stream.reset(codes::CANCELED);
+                        if let Some(cause) = cause {
+                            ctl.cut(layer, Some(cause), spec);
+                        }
+                        return;
+                    }
                 }
             }
             Some(SegItem::Finish) => {
                 if stream.finish().is_err() {
-                    return None;
+                    ctl.cut(layer, None, spec);
+                    return;
                 }
-                // Until the receiver's transport holds every byte, the copy
-                // can still be superseded or expire: a reset is accepted
-                // after FIN until then.
-                return tokio::select! {
+                // Until the receiver's transport holds every byte, the layer
+                // can still be cut, superseded or expire: a reset is
+                // accepted after FIN until then.
+                tokio::select! {
                     biased;
-                    () = expiry(deadline) => reset(&mut stream, Stop::Expired),
-                    receipt = stream.stopped() => acked(ctl, receipt),
-                    () = finish_grace_over(ctl, conn) => reset(&mut stream, Stop::Superseded),
-                };
+                    () = cut_reached(ctl, layer) => stream.reset(codes::CANCELED),
+                    () = expiry(spec) => {
+                        stream.reset(codes::CANCELED);
+                        ctl.cut(layer, Some(DropCause::Expired), spec);
+                    }
+                    _ = stream.stopped() => {}
+                    () = finish_grace_over(ctl, spec) => {
+                        stream.reset(codes::CANCELED);
+                        ctl.cut(layer, Some(DropCause::Superseded), spec);
+                    }
+                }
+                return;
             }
-            // The segment was dropped unfinished, or this copy was dropped
-            // for its budget or queue, which the writer already counted.
+            // The segment was dropped without finishing this layer.
             None => {
                 stream.reset(codes::CANCELED);
-                return None;
+                return;
             }
         }
     }
 }
 
-fn reset(stream: &mut SendHalf, stop: Stop) -> Option<Stop> {
-    stream.reset(codes::CANCELED);
-    Some(stop)
-}
-
-/// Records a finished copy's receipt: delivered means acknowledged, which no
-/// successor supersedes any more.
-fn acked(ctl: &CopyCtl, receipt: Result<Option<u64>, Error>) -> Option<Stop> {
-    if matches!(receipt, Ok(None)) {
-        ctl.acked.store(true, Ordering::Release);
-    }
-    None
-}
-
-/// Opens one copy's stream: the DATA header names the path, the topic and
-/// the segment number, and the stream gets its layer-major priority before
-/// any byte is queued, the only time `quinn` guarantees it takes effect.
-async fn open_copy(conn: &ConnHandle, copy: &Copy) -> Result<SendHalf, Error> {
+/// Opens one layer's stream: the DATA header names the path, the topic, the
+/// segment number and, above layer 0, the layer (key `14`); the stream gets
+/// its layer-major priority before any byte is queued, the only time
+/// `quinn` guarantees it takes effect.
+async fn open_layer(spec: &CopySpec, layer: u8) -> Result<SendHalf, Error> {
     let header = DataHeader {
-        topic: Some(copy.topic.to_string()),
-        segment: Some(copy.number),
-        ..DataHeader::addressed(copy.path.as_ref())
+        topic: Some(spec.topic.to_string()),
+        segment: Some(spec.number),
+        layer: (layer > 0).then_some(layer),
+        ..DataHeader::addressed(spec.path.as_ref())
     };
-    let mut stream = conn.open_uni().await?;
-    stream.set_priority(copy_priority(0, copy.priority));
+    let mut stream = spec.conn.open_uni().await?;
+    stream.set_priority(copy_priority(layer, spec.priority));
     write_data_preamble(&mut stream, &header).await?;
     Ok(stream)
 }

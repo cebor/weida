@@ -18,7 +18,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use weida::{
     ClientTls, ClientTrust, DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Error, Identity, Incoming,
-    Limits, PeerIdentity, Radio, Received, Runtime, RuntimeConfig, SegmentTerms, Trust,
+    JoinTerms, Limits, PeerIdentity, Radio, Received, Runtime, RuntimeConfig, SegmentTerms, Trust,
 };
 
 /// Generous ceiling: every assertion below should settle well inside it.
@@ -39,14 +39,9 @@ fn stalling(server: &Server) -> Runtime {
     })
 }
 
-async fn joined(
-    server: &Server,
-    runtime: &Runtime,
-    filter: &str,
-    max_age: Option<Duration>,
-) -> Dish {
+async fn joined(server: &Server, runtime: &Runtime, filter: &str, terms: JoinTerms) -> Dish {
     let dish = runtime.dish(server.trust());
-    within(dish.join(filter, max_age)).await.expect("join");
+    within(dish.join(filter, terms)).await.expect("join");
     within(dish.connect(&server.url("/r")))
         .await
         .expect("connect");
@@ -86,9 +81,9 @@ async fn a_stalled_dish_loses_old_segments_while_a_fast_one_gets_every_one() {
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
     let fast_rt = server.client_runtime();
-    let fast = joined(&server, &fast_rt, "v", None).await;
+    let fast = joined(&server, &fast_rt, "v", JoinTerms::default()).await;
     let stalled_rt = stalling(&server);
-    let stalled = joined(&server, &stalled_rt, "v", None).await;
+    let stalled = joined(&server, &stalled_rt, "v", JoinTerms::default()).await;
     dishes(&radio, 2).await;
 
     const SEGMENT: usize = 256 * 1024;
@@ -145,7 +140,9 @@ async fn a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole() {
     let front = common::delay_proxy(server.addr, Duration::from_millis(100)).await;
     let runtime = server.client_runtime();
     let dish = runtime.dish(server.trust());
-    within(dish.join("v", None)).await.expect("join");
+    within(dish.join("v", JoinTerms::default()))
+        .await
+        .expect("join");
     within(dish.connect(&format!("weida://127.0.0.1:{}/r", front.port())))
         .await
         .expect("connect");
@@ -212,7 +209,7 @@ async fn a_segment_finished_right_before_its_successor_still_arrives_whole() {
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
     let runtime = server.client_runtime();
-    let dish = joined(&server, &runtime, "v", None).await;
+    let dish = joined(&server, &runtime, "v", JoinTerms::default()).await;
     dishes(&radio, 1).await;
 
     const SEGMENTS: u64 = 5;
@@ -236,15 +233,15 @@ async fn a_segment_finished_right_before_its_successor_still_arrives_whole() {
 }
 
 #[tokio::test]
-async fn a_segment_whose_finish_found_a_full_queue_is_superseded_at_once() {
+async fn a_segment_whose_finish_found_a_full_queue_is_cut_at_once() {
     // The copy's queue is full when the segment finishes, so its FIN is
-    // never queued: the copy is unfinished, and its successor resets it
-    // before it sends anything. The dish is healthy, so only that rule can
-    // supersede the copy.
+    // never queued: the copy loses the segment there and then, before it
+    // sends anything, and counts once, under the full queue. The dish is
+    // healthy, so only that rule can cut the copy.
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
     let runtime = server.client_runtime();
-    let dish = joined(&server, &runtime, "v", None).await;
+    let dish = joined(&server, &runtime, "v", JoinTerms::default()).await;
     dishes(&radio, 1).await;
 
     // No await from here on: the copy's task has not taken a chunk yet.
@@ -265,7 +262,7 @@ async fn a_segment_whose_finish_found_a_full_queue_is_superseded_at_once() {
     assert_eq!(received.meta().segment, Some(1));
     let drops = radio.dropped_on("v").expect("drops on v");
     assert_eq!(drops.subscriber_queue, 1, "{drops:?}");
-    assert_eq!(drops.superseded, 1, "{drops:?}");
+    assert_eq!(drops.superseded, 0, "{drops:?}");
     runtime.shutdown().await;
 }
 
@@ -276,7 +273,7 @@ async fn a_segment_following_upstream_keeps_its_copy_while_its_successor_opens()
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
     let runtime = server.client_runtime();
-    let dish = joined(&server, &runtime, "v", None).await;
+    let dish = joined(&server, &runtime, "v", JoinTerms::default()).await;
     dishes(&radio, 1).await;
 
     let relayed = SegmentTerms::default().with_follows_upstream(true);
@@ -312,7 +309,7 @@ async fn a_segment_following_upstream_still_resets_a_stalled_dish() {
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
     let runtime = stalling(&server);
-    let _dish = joined(&server, &runtime, "v", None).await;
+    let _dish = joined(&server, &runtime, "v", JoinTerms::default()).await;
     dishes(&radio, 1).await;
 
     // Four windows of a segment the dish never reads, left unfinished.
@@ -450,6 +447,235 @@ async fn two_peers_on_one_connection_number_one_sequence() {
     client.shutdown().await;
 }
 
+// --- layers ---------------------------------------------------------------------
+
+/// A server whose radio gives each dish 256 KiB of unwritten chunks.
+async fn small_budget() -> Server {
+    Server::start_with(Limits {
+        subscriber_buffer_bytes: 256 * 1024,
+        ..Limits::default()
+    })
+    .await
+}
+
+/// Every segment the dish receives until it is quiet for 300 ms, each read
+/// to its end: `(layer, Ok(body))` for a whole layer, `(layer, Err)` for one
+/// that was reset.
+async fn layers_heard(dish: &Dish) -> Vec<(u8, Result<Vec<u8>, Error>)> {
+    let mut heard = Vec::new();
+    while let Ok(Ok(received)) = tokio::time::timeout(Duration::from_millis(300), dish.recv()).await
+    {
+        let transfer = segment_of(received);
+        let layer = transfer.meta().layer.expect("a segment has a layer");
+        let body = within(transfer.collect(1 << 20)).await.map(|b| b.to_vec());
+        heard.push((layer, body));
+    }
+    heard
+}
+
+#[tokio::test]
+async fn a_dish_short_of_budget_keeps_layer_zero_whole_while_upper_layers_are_cut() {
+    let server = small_budget().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = stalling(&server);
+    let dish = joined(&server, &runtime, "v", JoinTerms::default()).await;
+    dishes(&radio, 1).await;
+
+    // No await while writing: nothing is written yet, so the budget holds
+    // every queued byte. 12 x 16 KiB of layer 1 fits beside layer 0's 1 KiB;
+    // the 160 KiB of layer 0 that follows only fits once layer 1 is cut.
+    let mut segment = radio
+        .segment("v", SegmentTerms::default())
+        .expect("segment");
+    assert_eq!(segment.write_layer(0, vec![0; 1024]).expect("write"), 1);
+    for _ in 0..12 {
+        assert_eq!(
+            segment.write_layer(1, vec![1; 16 * 1024]).expect("write"),
+            1
+        );
+    }
+    assert_eq!(
+        segment.write_layer(0, vec![0; 160 * 1024]).expect("write"),
+        1
+    );
+    segment.finish();
+
+    let heard = layers_heard(&dish).await;
+    let base: Vec<_> = heard.iter().filter(|(layer, _)| *layer == 0).collect();
+    assert_eq!(base.len(), 1, "{heard:?}");
+    let body = base[0].1.as_ref().expect("layer 0 whole");
+    assert_eq!(body.len(), 1024 + 160 * 1024);
+    for (layer, body) in &heard {
+        if *layer == 1 {
+            assert!(matches!(body, Err(Error::Canceled)), "{body:?}");
+        }
+    }
+    let drops = radio.dropped_on("v").expect("drops on v");
+    assert_eq!(drops.layers_cut, 1, "{drops:?}");
+    assert_eq!(drops.subscriber_budget, 0, "{drops:?}");
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_dish_capped_at_layer_zero_is_never_sent_layer_one() {
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = server.client_runtime();
+    let dish = joined(
+        &server,
+        &runtime,
+        "v",
+        JoinTerms::default().with_max_layer(0),
+    )
+    .await;
+    dishes(&radio, 1).await;
+
+    let mut segment = radio
+        .segment("v", SegmentTerms::default())
+        .expect("segment");
+    assert_eq!(segment.write_layer(0, vec![0; 1024]).expect("write"), 1);
+    assert_eq!(segment.write_layer(1, vec![1; 1024]).expect("write"), 0);
+    assert_eq!(segment.finish(), 1);
+
+    let heard = layers_heard(&dish).await;
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(heard[0].0, 0);
+    assert_eq!(heard[0].1.as_ref().expect("whole").len(), 1024);
+    assert_eq!(radio.dropped_on("v"), None, "a cap is not a drop");
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_layer_cut_also_cuts_every_higher_layer_of_that_segment() {
+    let server = small_budget().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = stalling(&server);
+    let dish = joined(&server, &runtime, "v", JoinTerms::default()).await;
+    dishes(&radio, 1).await;
+
+    let mut segment = radio
+        .segment("v", SegmentTerms::default())
+        .expect("segment");
+    for layer in 0..3 {
+        assert_eq!(
+            segment
+                .write_layer(layer, vec![layer; 1024])
+                .expect("write"),
+            1
+        );
+    }
+    // Larger than the whole budget: layer 2 goes first, then layer 1.
+    assert_eq!(
+        segment.write_layer(1, vec![1; 300 * 1024]).expect("write"),
+        0
+    );
+    assert_eq!(segment.write_layer(2, vec![2; 1024]).expect("write"), 0);
+    assert_eq!(segment.write_layer(0, vec![0; 1024]).expect("write"), 1);
+    segment.finish();
+
+    let drops = radio.dropped_on("v").expect("drops on v");
+    assert_eq!(drops.layers_cut, 1, "{drops:?}");
+    assert_eq!(drops.subscriber_budget, 0, "{drops:?}");
+    let heard = layers_heard(&dish).await;
+    for (layer, body) in &heard {
+        match layer {
+            0 => assert_eq!(body.as_ref().expect("layer 0 whole").len(), 2048),
+            _ => assert!(matches!(body, Err(Error::Canceled)), "{layer}: {body:?}"),
+        }
+    }
+    assert_eq!(heard.iter().filter(|(layer, _)| *layer == 0).count(), 1);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_receiver_delivers_each_layer_of_a_segment_once() {
+    use common::raw;
+    use weida::codes;
+    use weida_protocol::{DataHeader, FrameKind, encode_frame};
+
+    let server = Server::start().await;
+    let acceptor = server.listener.acceptor("/up").expect("acceptor");
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "localhost").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    async fn send(conn: &quinn::Connection, segment: u64, layer: u8) -> quinn::SendStream {
+        let header = DataHeader {
+            topic: Some("t".into()),
+            segment: Some(segment),
+            layer: (layer > 0).then_some(layer),
+            ..DataHeader::addressed("/up")
+        };
+        let mut stream = conn.open_uni().await.expect("open uni");
+        stream
+            .write_all(&encode_frame(FrameKind::Data, &header.encode()))
+            .await
+            .expect("write header");
+        stream.write_all(b"body").await.expect("write body");
+        stream
+    }
+    let canceled = Ok(Some(
+        quinn::VarInt::from_u64(codes::CANCELED).expect("varint"),
+    ));
+
+    // Each layer of segment 5 once, then layer 1 again and segment 4.
+    let mut fresh = Vec::new();
+    for layer in [0, 1] {
+        let mut stream = send(&conn, 5, layer).await;
+        stream.finish().expect("finish");
+        let transfer = stream_of(within(acceptor.accept()).await.expect("accept"));
+        fresh.push((transfer.meta().segment, transfer.meta().layer));
+        fresh.sort_unstable();
+        drop(stream);
+    }
+    assert_eq!(fresh, vec![(Some(5), Some(0)), (Some(5), Some(1))]);
+    for (segment, layer) in [(5, 1), (4, 0), (5, 0)] {
+        let stale = send(&conn, segment, layer).await;
+        assert_eq!(within(stale.stopped()).await, canceled, "{segment}/{layer}");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), acceptor.accept())
+            .await
+            .is_err(),
+        "a stale layer reached the acceptor"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_segment_carries_its_layers_to_the_acceptor() {
+    let server = Server::start().await;
+    let acceptor = server.listener.acceptor("/up").expect("acceptor");
+    let client = server.client_runtime();
+    let peer = client.peer(server.trust());
+    within(peer.connect(&server.url("/up")))
+        .await
+        .expect("connect");
+
+    let mut segment = within(peer.segment("t", SegmentTerms::default()))
+        .await
+        .expect("segment");
+    assert_eq!(segment.write_layer(0, b"base".to_vec()).expect("write"), 1);
+    assert_eq!(segment.write_layer(1, b"more".to_vec()).expect("write"), 1);
+    assert_eq!(segment.finish(), 1);
+
+    let mut layers = Vec::new();
+    for _ in 0..2 {
+        let transfer = stream_of(within(acceptor.accept()).await.expect("accept"));
+        assert_eq!(transfer.meta().segment, Some(0));
+        let layer = transfer.meta().layer;
+        let body = within(transfer.collect(4096)).await.expect("a whole layer");
+        layers.push((layer, body.to_vec()));
+    }
+    layers.sort_unstable();
+    assert_eq!(
+        layers,
+        vec![(Some(0), b"base".to_vec()), (Some(1), b"more".to_vec())]
+    );
+    client.shutdown().await;
+}
+
 // --- freshness per connection ---------------------------------------------------
 
 #[tokio::test]
@@ -469,7 +695,9 @@ async fn a_dish_redialled_to_a_restarted_radio_takes_its_numbers_from_zero() {
     })
     .expect("client runtime");
     let dish = client.dish(certs.client_tls());
-    within(dish.join("v", None)).await.expect("join");
+    within(dish.join("v", JoinTerms::default()))
+        .await
+        .expect("join");
     within(dish.connect(&format!("weida://127.0.0.1:{}/r", addr.port())))
         .await
         .expect("connect");
@@ -552,7 +780,7 @@ async fn a_segment_supersedes_only_its_own_topic() {
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
     let runtime = stalling(&server);
-    let dish = joined(&server, &runtime, "", None).await;
+    let dish = joined(&server, &runtime, "", JoinTerms::default()).await;
     dishes(&radio, 1).await;
 
     // 256 KiB on `a` cannot be acknowledged through a 64 KiB window the dish
@@ -584,7 +812,7 @@ async fn a_joiner_receives_the_next_segment_and_nothing_earlier() {
         send(&radio, "v", 1, 1024);
     }
     let runtime = server.client_runtime();
-    let dish = joined(&server, &runtime, "v", None).await;
+    let dish = joined(&server, &runtime, "v", JoinTerms::default()).await;
     dishes(&radio, 1).await;
     send(&radio, "v", 1, 1024);
 
@@ -606,9 +834,15 @@ async fn a_dish_max_age_expires_its_copy() {
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");
     let stalled_rt = stalling(&server);
-    let _stalled = joined(&server, &stalled_rt, "v", Some(Duration::from_millis(200))).await;
+    let _stalled = joined(
+        &server,
+        &stalled_rt,
+        "v",
+        JoinTerms::default().with_max_age(Duration::from_millis(200)),
+    )
+    .await;
     let draining_rt = server.client_runtime();
-    let draining = joined(&server, &draining_rt, "v", None).await;
+    let draining = joined(&server, &draining_rt, "v", JoinTerms::default()).await;
     dishes(&radio, 2).await;
 
     const SEGMENT: usize = 4 << 20;
@@ -672,9 +906,9 @@ async fn a_datagram_segment_reaches_every_joined_dish() {
     let server = Server::start_with(with_datagrams()).await;
     let radio = server.listener.radio("/r").expect("radio");
     let first_rt = server.client_runtime_with(with_datagrams());
-    let first = joined(&server, &first_rt, "voice", None).await;
+    let first = joined(&server, &first_rt, "voice", JoinTerms::default()).await;
     let second_rt = server.client_runtime_with(with_datagrams());
-    let second = joined(&server, &second_rt, "voice", None).await;
+    let second = joined(&server, &second_rt, "voice", JoinTerms::default()).await;
     dishes(&radio, 2).await;
 
     let readers = tokio::spawn(async move {
@@ -700,7 +934,7 @@ async fn a_dish_without_datagrams_is_a_named_drop() {
     let server = Server::start_with(with_datagrams()).await;
     let radio = server.listener.radio("/r").expect("radio");
     let runtime = server.client_runtime();
-    let dish = joined(&server, &runtime, "voice", None).await;
+    let dish = joined(&server, &runtime, "voice", JoinTerms::default()).await;
     dishes(&radio, 1).await;
 
     assert_eq!(radio.datagram("voice", vec![0x33; 150]).expect("send"), 0);
@@ -720,7 +954,7 @@ async fn a_datagram_larger_than_the_dish_carries_is_counted_too_large() {
     let server = Server::start_with(with_datagrams()).await;
     let radio = server.listener.radio("/r").expect("radio");
     let runtime = server.client_runtime_with(with_datagrams());
-    let dish = joined(&server, &runtime, "voice", None).await;
+    let dish = joined(&server, &runtime, "voice", JoinTerms::default()).await;
     dishes(&radio, 1).await;
 
     // The first one opens the flow; the rest meet the open flow directly.
@@ -790,7 +1024,9 @@ impl Keyed {
         let id = Identity::generate().expect("identity");
         let peer = PeerIdentity::Key(id.fingerprint().expect("fingerprint"));
         let dish = runtime.dish(ClientTls::new(Trust::by_address()).with_identity(id));
-        within(dish.join(filter, None)).await.expect("join");
+        within(dish.join(filter, JoinTerms::default()))
+            .await
+            .expect("join");
         within(dish.connect(&self.url)).await.expect("connect");
         (dish, peer)
     }
@@ -858,7 +1094,7 @@ async fn evict_withdraws_a_join_and_frees_its_subscription_slot() {
     send(&radio, "room.a", 1, 1024);
     assert!(!hears(&dish).await, "an evicted join receives nothing");
 
-    within(dish.join("room.b", None))
+    within(dish.join("room.b", JoinTerms::default()))
         .await
         .expect("join room.b");
     dishes(&radio, 1).await;

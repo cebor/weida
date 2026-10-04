@@ -381,6 +381,7 @@ mod tests {
             report_mode: weida::ReportMode::default(),
             report_id: None,
             segment: None,
+            layer: None,
         }
     }
 
