@@ -17,7 +17,7 @@ kind: spec | size: 30 | status: done 9287372 | needs: [B-298, B-299]
 acceptance: [0036](decisions/0036-connection-statistics.md) §5's edits; no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says path statistics are reachable through a flow only or lists `PathStats` without its three new fields.
 
 ### B-301 — PROTOCOL: capability `2` and frame kind `8` REPORT
-kind: spec | size: 45 | status: ready | needs: [B-300]
+kind: spec | size: 45 | status: done dc1bb28 | needs: [B-300]
 acceptance: [0036](decisions/0036-connection-statistics.md) §4.5 in [PROTOCOL.md](PROTOCOL.md): code `2` `path_report` in §6.1's table with the both-listed rule, kind `8` in §4 and §4.1, a §6.10 REPORT with the head frame, the record keys, the 256-byte cap, the fixed 2 s interval and the four violations, `Limits::path_report` in §10, kind `9` named as the first free number; `weida-protocol` encodes and decodes the head frame and a record, with golden vectors and the `roundtrip` fuzz target extended.
 note: decided now, built after B-298..B-300 by the owner's choice (requirement priority 3).
 
