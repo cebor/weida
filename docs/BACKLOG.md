@@ -50,7 +50,7 @@ kind: code | size: 45 | status: done 11bcfcb | needs: [B-307]
 acceptance: [0037](decisions/0037-layered-segments.md) §4.11: `ConnCtx::segments_in` keeps the newest segment per `(path, topic)`, at most `max_sequence_scopes` entries; a dish checks stream and datagram segments against it and keeps only its counters; the dispatcher refuses a stale stream segment with `CANCELED` before it reaches an acceptor, a transfer endpoint or a pair. Tests in `crates/weida/tests/radio.rs`: `a_dish_redialled_to_a_restarted_radio_takes_its_numbers_from_zero` (with `common::Restartable`, moved from `tests/stats.rs`) and `an_acceptor_refuses_a_segment_older_than_one_it_delivered`.
 
 ### B-308 — Layers inside a segment
-kind: code | size: 90 | status: ready | needs: [B-306, B-307, B-314]
+kind: code | size: 90 | status: done cfb75c8 | needs: [B-306, B-307, B-314]
 acceptance: [0037](decisions/0037-layered-segments.md) §4.3 and §4.11: `write_layer`, `finish_layer`, lazy per-`(copy, layer)` streams with their own queues, the cut rule including the release of upper layers' queued bytes, `TopicDrops::layers_cut` with `TopicDrops` made `#[non_exhaustive]`, `JoinTerms` replacing `join`'s `max_age` parameter at every caller, the largest-cap rule, per-layer freshness in B-314's per-connection table, and `IncomingMeta::layer`. Tests in `crates/weida/tests/radio.rs`: `a_dish_short_of_budget_keeps_layer_zero_whole_while_upper_layers_are_cut`, `a_dish_capped_at_layer_zero_is_never_sent_layer_one`, `a_layer_cut_also_cuts_every_higher_layer_of_that_segment`, `a_receiver_delivers_each_layer_of_a_segment_once`, `a_peer_segment_carries_its_layers_to_the_acceptor`.
 
 ### B-309 — Per-dish drops at a radio
