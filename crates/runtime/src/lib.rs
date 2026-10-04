@@ -85,4 +85,4 @@ pub use pipe::{BoundPipe, client_principal, connect_pipe, current_account_sid, s
 pub use registry::NameRegistry;
 pub use resolve::{Resolved, Resolver, SharedResolver, SystemResolver};
 #[cfg(unix)]
-pub use unix::{BoundUnixSocket, peer_credentials};
+pub use unix::{BoundUnixSocket, current_principal, peer_credentials};

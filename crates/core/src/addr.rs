@@ -278,24 +278,30 @@ pub const SCHEME_UNIX: &str = "weida+unix";
 /// `docs/research/ipc.md` §1.1, §2.1, §6.1).
 pub const MAX_SOCKET_PATH_BYTES: usize = if cfg!(target_os = "macos") { 104 } else { 107 };
 
-/// A parsed `weida+unix://<percent-encoded-socket-path>/<path>` address.
+/// A parsed `weida+unix://[self@]<percent-encoded-socket-path>/<path>`
+/// address.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnixAddr {
     /// Filesystem path of the socket, **decoded**.
     pub socket: String,
     /// Opaque endpoint identifier, starting with `/`.
     pub path: String,
+    /// The userinfo `self`: a dial accepts only a listener the kernel
+    /// attributes to the dialling process's own account.
+    pub same_account: bool,
 }
 
 impl UnixAddr {
-    /// Parses `weida+unix://<percent-encoded-socket-path>/<path>`.
+    /// Parses `weida+unix://[self@]<percent-encoded-socket-path>/<path>`.
     ///
     /// The socket path is percent-encoded because it contains the same
     /// separator the endpoint path uses, and it is validated against this
-    /// platform's `sun_path` budget **after** decoding [0010 §4.8]. The
-    /// `sha256:…@` userinfo form is refused: there is no key to pin on a
-    /// local transport, and an address that looks like it authenticates but
-    /// does not is worse than one that plainly does not.
+    /// platform's `sun_path` budget **after** decoding [0010 §4.8]. The only
+    /// userinfo is `self`, which pins the dialler's own account: the kernel
+    /// proves the listener's account at connect, so the address
+    /// authenticates what it says. The `sha256:…@` form is refused: there is
+    /// no key to pin on a local transport, and an address that looks like it
+    /// authenticates but does not is worse than one that plainly does not.
     pub fn parse(input: &str) -> Result<UnixAddr, Error> {
         let invalid = |m: &str| Error::InvalidAddress(format!("{m}: {input:?}"));
         let rest = input
@@ -307,9 +313,7 @@ impl UnixAddr {
             Some(i) => rest.split_at(i),
             None => return Err(invalid("missing endpoint path")),
         };
-        if authority.contains('@') {
-            return Err(invalid("a local address carries no fingerprint"));
-        }
+        let (same_account, authority) = local_userinfo(authority, &invalid)?;
         let socket = percent_decode(authority).ok_or_else(|| invalid("invalid percent escape"))?;
         if socket.is_empty() {
             return Err(invalid("empty socket path"));
@@ -330,6 +334,7 @@ impl UnixAddr {
         Ok(UnixAddr {
             socket,
             path: path.to_owned(),
+            same_account,
         })
     }
 }
@@ -337,6 +342,9 @@ impl UnixAddr {
 impl fmt::Display for UnixAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{SCHEME_UNIX}://")?;
+        if self.same_account {
+            f.write_str("self@")?;
+        }
         for byte in self.socket.bytes() {
             match byte {
                 b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
@@ -366,23 +374,26 @@ pub const MAX_PIPE_NAME_BYTES: usize = 256;
 /// `PIPE_REJECT_REMOTE_CLIENTS` [0010 §4.8].
 pub const PIPE_NAMESPACE: &str = r"\\.\pipe\";
 
-/// A parsed `weida+pipe://<pipe-name>/<path>` address.
+/// A parsed `weida+pipe://[self@]<pipe-name>/<path>` address.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipeAddr {
     /// The pipe's name **without** the `\\.\pipe\` prefix.
     pub name: String,
     /// Opaque endpoint identifier, starting with `/`.
     pub path: String,
+    /// The userinfo `self`: a dial accepts only a pipe whose server runs as
+    /// the dialling process's own account. Meaningless for a bind.
+    pub same_account: bool,
 }
 
 impl PipeAddr {
-    /// Parses `weida+pipe://<pipe-name>/<path>`.
+    /// Parses `weida+pipe://[self@]<pipe-name>/<path>`.
     ///
     /// The name is everything up to the first `/`, so it cannot contain the
     /// endpoint separator; a backslash is refused too, because in the pipe
     /// namespace it is the path separator and would let an address name
-    /// something outside `\\.\pipe\`. The `sha256:…@` userinfo form is
-    /// refused for the same reason as on every local transport: there is no
+    /// something outside `\\.\pipe\`. The only userinfo is `self`, as on
+    /// every local transport; the `sha256:…@` form is refused: there is no
     /// key to pin [0010 §4.8].
     pub fn parse(input: &str) -> Result<PipeAddr, Error> {
         let invalid = |m: &str| Error::InvalidAddress(format!("{m}: {input:?}"));
@@ -395,9 +406,7 @@ impl PipeAddr {
             Some(i) => rest.split_at(i),
             None => return Err(invalid("missing endpoint path")),
         };
-        if name.contains('@') {
-            return Err(invalid("a local address carries no fingerprint"));
-        }
+        let (same_account, name) = local_userinfo(name, &invalid)?;
         if name.is_empty() || name.len() > MAX_PIPE_NAME_BYTES {
             return Err(invalid(&format!(
                 "pipe name must be 1..={MAX_PIPE_NAME_BYTES} bytes"
@@ -411,6 +420,7 @@ impl PipeAddr {
         Ok(PipeAddr {
             name: name.to_owned(),
             path: path.to_owned(),
+            same_account,
         })
     }
 
@@ -422,7 +432,24 @@ impl PipeAddr {
 
 impl fmt::Display for PipeAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{SCHEME_PIPE}://{}{}", self.name, self.path)
+        let pin = if self.same_account { "self@" } else { "" };
+        write!(f, "{SCHEME_PIPE}://{pin}{}{}", self.name, self.path)
+    }
+}
+
+/// Splits a local address's authority at its userinfo: `self@` pins the
+/// dialler's own account, and every other userinfo is refused.
+fn local_userinfo<'a>(
+    authority: &'a str,
+    invalid: &dyn Fn(&str) -> Error,
+) -> Result<(bool, &'a str), Error> {
+    let mut parts = authority.split('@');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(host), None, _) => Ok((false, host)),
+        (Some("self"), Some(rest), None) => Ok((true, rest)),
+        _ => Err(invalid(
+            "a local address pins no key; its only userinfo is `self`",
+        )),
     }
 }
 
@@ -640,9 +667,44 @@ mod tests {
             "weida+unix://%2/jobs",
             "weida+unix:///jobs",
             "weida+unix://%2Ftmp%2Fs",
+            // `self` is the only userinfo, and only once.
+            "weida+unix://other@%2Ftmp%2Fs/jobs",
+            "weida+unix://self@self@%2Ftmp%2Fs/jobs",
         ] {
             assert!(
                 UnixAddr::parse(case).is_err(),
+                "expected rejection of {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_address_pins_its_own_account_with_self() {
+        let unix = UnixAddr::parse("weida+unix://self@%2Ftmp%2Fs/jobs").expect("parse");
+        assert!(unix.same_account);
+        assert_eq!(unix.socket, "/tmp/s");
+        assert_eq!(unix.to_string(), "weida+unix://self@%2Ftmp%2Fs/jobs");
+        assert_eq!(UnixAddr::parse(&unix.to_string()).expect("reparse"), unix);
+        assert!(
+            !UnixAddr::parse("weida+unix://%2Ftmp%2Fs/jobs")
+                .expect("parse")
+                .same_account
+        );
+
+        let pipe = PipeAddr::parse("weida+pipe://self@weida-jobs/jobs").expect("parse");
+        assert!(pipe.same_account);
+        assert_eq!(pipe.name, "weida-jobs");
+        assert_eq!(pipe.to_string(), "weida+pipe://self@weida-jobs/jobs");
+        assert_eq!(PipeAddr::parse(&pipe.to_string()).expect("reparse"), pipe);
+
+        for case in [
+            "weida+unix://sha256:0000000000000000000000000000000000000000000000000000000000000000@%2Ftmp%2Fs/jobs",
+            "weida+unix://other@%2Ftmp%2Fs/jobs",
+            "weida+pipe://other@x/jobs",
+            "weida+inproc://self@b/x",
+        ] {
+            assert!(
+                Address::parse(case).is_err(),
                 "expected rejection of {case:?}"
             );
         }
@@ -675,6 +737,9 @@ mod tests {
             "weida+pipe:///jobs",
             "weida+pipe://a\u{1}b/jobs",
             "weida+pipe://x",
+            // `self` is the only userinfo, and only once.
+            "weida+pipe://other@x/jobs",
+            "weida+pipe://self@self@x/jobs",
         ] {
             assert!(
                 PipeAddr::parse(case).is_err(),

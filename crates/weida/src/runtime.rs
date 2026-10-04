@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use quinn::VarInt;
-use weida_core::{EndpointAddr, Error};
+use weida_core::{EndpointAddr, Error, PeerIdentity};
 use weida_protocol::codes;
 
 use crate::config::{ClientTls, RuntimeConfig};
@@ -125,18 +125,27 @@ impl RuntimeInner {
     /// ([decisions/0012](../../../docs/decisions/0012-local-connection-grouping.md)
     /// §4.1, §4.2).
     #[cfg(unix)]
-    pub(crate) async fn connect_unix(&self, socket: &str) -> Result<ConnHandle, Error> {
+    pub(crate) async fn connect_unix(
+        &self,
+        addr: &weida_core::UnixAddr,
+    ) -> Result<ConnHandle, Error> {
         let link = crate::grouped::dial::<crate::unix::UnixLocal>(
             crate::unix::UnixEndpoint {
-                path: std::path::PathBuf::from(socket),
+                path: std::path::PathBuf::from(&addr.socket),
                 exec: self.exec.clone(),
             },
             self.config.limits.max_local_streams,
             self.config.limits.max_parked_reverse,
         )
         .await?;
+        let link = Link::Unix(Box::new(link));
+        if addr.same_account {
+            // Before HELLO: nothing goes to another account's endpoint.
+            let own = PeerIdentity::Local(weida_runtime::current_principal(&self.exec)?);
+            check_same_account(link.peer(), &own)?;
+        }
         let handle = ConnCtx::spawn(
-            Link::Unix(Box::new(link)),
+            link,
             self.config.limits,
             Arc::new(crate::listener::Namespace::new()),
             None,
@@ -164,8 +173,17 @@ impl RuntimeInner {
             self.config.limits.max_parked_reverse,
         )
         .await?;
+        let link = Link::Pipe(Box::new(link));
+        if addr.same_account {
+            // Before HELLO: nothing goes to another account's endpoint.
+            let own = PeerIdentity::Windows(weida_core::WindowsPrincipal {
+                sid: weida_runtime::current_account_sid()?,
+                pid: None,
+            });
+            check_same_account(link.peer(), &own)?;
+        }
         let handle = ConnCtx::spawn(
-            Link::Pipe(Box::new(link)),
+            link,
             self.config.limits,
             Arc::new(crate::listener::Namespace::new()),
             None,
@@ -181,6 +199,29 @@ impl RuntimeInner {
     pub(crate) fn shared(&self) -> Arc<Shared> {
         Arc::clone(&self.shared)
     }
+}
+
+/// Whether a local peer the kernel proved runs as the account `own`
+/// describes: the uid on `AF_UNIX`, the SID on a named pipe, and nothing for
+/// any other pairing. The pid is an observation and never compared.
+pub(crate) fn same_account(peer: Option<&PeerIdentity>, own: &PeerIdentity) -> bool {
+    match (peer, own) {
+        (Some(PeerIdentity::Local(peer)), PeerIdentity::Local(own)) => peer.uid == own.uid,
+        (Some(PeerIdentity::Windows(peer)), PeerIdentity::Windows(own)) => peer.sid == own.sid,
+        _ => false,
+    }
+}
+
+/// [`same_account`] as the error a `self@` dial fails with.
+#[cfg(any(unix, windows))]
+fn check_same_account(peer: Option<PeerIdentity>, own: &PeerIdentity) -> Result<(), Error> {
+    if same_account(peer.as_ref(), own) {
+        return Ok(());
+    }
+    Err(peer.map_or_else(
+        || Error::Transport("the local peer proved no principal".into()),
+        Error::UntrustedPrincipal,
+    ))
 }
 
 /// A process-level execution and resource container.
@@ -510,6 +551,40 @@ mod tests {
     /// under it must fail before any packet is sent.
     fn no_trust() -> ClientTls {
         ClientTls::new(Trust::by_address())
+    }
+
+    #[test]
+    fn same_account_compares_uid_or_sid_and_nothing_else() {
+        use weida_core::{LocalPrincipal, WindowsPrincipal};
+        let local = |uid, pid| PeerIdentity::Local(LocalPrincipal { uid, gid: 100, pid });
+        let windows = |sid: &str, pid| {
+            PeerIdentity::Windows(WindowsPrincipal {
+                sid: sid.into(),
+                pid,
+            })
+        };
+        // The account decides; the pid and the group are observations.
+        assert!(same_account(
+            Some(&local(1000, Some(7))),
+            &local(1000, None)
+        ));
+        assert!(!same_account(Some(&local(1001, None)), &local(1000, None)));
+        assert!(same_account(
+            Some(&windows("S-1-5-21-1", Some(7))),
+            &windows("S-1-5-21-1", None)
+        ));
+        assert!(!same_account(
+            Some(&windows("S-1-5-21-2", None)),
+            &windows("S-1-5-21-1", None)
+        ));
+        // No principal, or one of another kind, is never the same account.
+        assert!(!same_account(None, &local(1000, None)));
+        assert!(!same_account(
+            Some(&windows("S-1-5-21-1", None)),
+            &local(1000, None)
+        ));
+        let key = PeerIdentity::Key(weida_core::Fingerprint::from_bytes([0; 32]));
+        assert!(!same_account(Some(&key), &local(1000, None)));
     }
 
     #[test]

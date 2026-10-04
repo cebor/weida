@@ -177,6 +177,16 @@ pub fn peer_credentials(stream: &UnixStream) -> Result<LocalPrincipal, Error> {
     })
 }
 
+/// The principal the kernel attributes to this process: the credentials of
+/// one end of a socket pair it creates, the answer [`peer_credentials`]
+/// gives about this process to its peers. What a dial that pins its own
+/// account compares the listener's credentials with.
+pub fn current_principal(exec: &crate::Exec) -> Result<LocalPrincipal, Error> {
+    let _guard = exec.enter();
+    let (a, _b) = UnixStream::pair().map_err(Error::Io)?;
+    peer_credentials(&a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
