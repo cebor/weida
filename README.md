@@ -10,10 +10,11 @@ primitives are unidirectional and bidirectional streams and datagram flows with 
 guarantees QUIC gives — ordered bytes within a stream, none across streams, flow control, a
 transport delivery receipt, and cancellation by reset. **L1** is the ZeroMQ/nanomsg pattern
 family as thin wrappers over L0: Req/Rep, Push/Pull, Pub/Sub, PAIR, SURVEY and BUS — the whole
-nanomsg set — and RADIO/DISH for lossy fan-out of segments; only RADIO/DISH adds wire
-vocabulary (DATA key 13, SUBSCRIBE key 2). **L2** is a RabbitMQ-analog broker,
-`weida-broker`: queues at endpoint paths, publisher confirms, and an absolute per-subscription
-credit. Consumer acknowledgement and redelivery are the slice still to come.
+nanomsg set — and RADIO/DISH for lossy fan-out of segments; only RADIO/DISH and
+`Peer::segment` write the wire vocabulary it adds (DATA key 13, SUBSCRIBE key 2). **L2** is a
+RabbitMQ-analog broker, `weida-broker`: queues at endpoint paths, publisher confirms, and an
+absolute per-subscription credit. Consumer acknowledgement and redelivery are the slice still
+to come.
 
 A completion is a **cursor**, not a verdict: a level plus an **absolute byte offset**, reported
 on a unidirectional stream of its own that never shares a stream with payload. So a Push

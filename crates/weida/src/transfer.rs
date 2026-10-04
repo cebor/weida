@@ -207,8 +207,8 @@ pub struct IncomingMeta {
     /// the CURSOR stream a reporter opens, and it is the sender's number, not
     /// ours.
     pub report_id: Option<u64>,
-    /// The RADIO segment number (DATA key `13`), when a radio sent this
-    /// transfer as a stream segment
+    /// The segment number (DATA key `13`), when a radio or a dialling
+    /// peer's `Peer::segment` sent this transfer as a stream segment
     /// ([decisions/0034](https://git.doodleshnookie.net/tuco86/weida/blob/main/docs/decisions/0034-late-is-lost.md)
     /// §4.6).
     pub segment: Option<u64>,

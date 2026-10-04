@@ -80,7 +80,7 @@ is refused too, with "this library speaks tcp, ipc and inproc".
 | Transport | Verdict |
 | --- | --- |
 | `tcp://` | present — wildcard, IP literal and name forms kept apart; `ZMQ_LAST_ENDPOINT` readable after a wildcard bind; `DEFAULT_MAX_RESOLVED_ADDRESSES` = 8 caps what a name may expand to |
-| `ipc://` | present on Unix — `AF_UNIX` with unlink-then-bind, an explicit mode, a socket-type check before unlinking, the 113-octet Linux path budget (`MAX_IPC_ENDPOINT_BYTES`), and peer credentials available to authorization; the endpoint-stealing hazard is documented rather than papered over |
+| `ipc://` | present on Unix — `AF_UNIX` with libzmq's unlink-then-bind (`BoundUnixSocket::bind_stealing`: a live node is replaced), an explicit mode, a socket-type check before unlinking, the 113-octet Linux path budget (`MAX_IPC_ENDPOINT_BYTES`), and peer credentials available to authorization; the endpoint-stealing hazard is documented rather than papered over |
 | `inproc://` | present — context-scoped namespace, libzmq's 256-character budget (`MAX_INPROC_NAME_BYTES`), connect-before-bind working as libzmq 4.0 fixed it, and two contexts in one process never meeting |
 | `pgm://`, `epgm://` | refused with a reason: reliable multicast is out of scope until a user asks. What is missing: the multicast family, the datagram-alignment offset field and subscriber-side filtering |
 | `udp://` | refused with a reason: the multicast/datagram family is out of scope. What is missing: RADIO/DISH, which is the only pattern libzmq allows on it |

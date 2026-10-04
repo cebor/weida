@@ -288,6 +288,32 @@ frame, a raw preview frame, a video GOP. It is MOQT's group and HLS's segment, a
 | Delivery | `BestEffort`; a lost segment is a gap in the segment numbers the dish sees, and the radio counts it per topic and cause: budget, superseded, expired, too large for the dish's datagram size, no datagram capability | |
 | Late joiner | receives the next segment; nothing is retained for it | |
 
+**Amended (zoagn):** four changes to the table above.
+
+- *A finished copy gets its grace.* Supersession resets at once a copy whose writer has not
+  finished the segment. A copy whose writer finished (every chunk and the FIN queued) is whole
+  on the radio's side and is not stalled merely because its successor opened: it first hands
+  the chunks still queued to the transport, **write first** — a write the dish's flow control
+  holds back means a stalled dish and resets the copy at once — and once its FIN is written it
+  gets a **grace** before the reset: the time the path needs to carry its bytes at the
+  congestion window (`sent / cwnd × rtt`), one round trip for the receipt and 50 ms. Behind a
+  slow path a back-to-back stream, one GOP per segment, would otherwise lose every segment
+  whose receipt is a round trip away. A copy counts as finished only when its FIN is queued; a
+  full queue leaves it unfinished and superseded at once.
+- *A relay follows its upstream.* `Radio::relay_segment` opens segment *n+1* where segment *n*
+  may still be streaming in from upstream. The successor resets a copy of *n* only where a
+  write is held back; otherwise the copy keeps taking chunks and gets the grace after its FIN.
+  Dropping the relay's segment unfinished still resets every copy.
+- *A dialling peer sends segments.* `Peer::segment` is the same unit toward a bound path, over
+  one stream per segment to the next peer. It is numbered per **(connection, path, topic)** by
+  the dialling connection, so two `Peer`s on one pooled connection continue one sequence
+  instead of restarting it.
+- *Staleness is per connection, at every receiver.* A dish and an acceptor each keep the newest
+  number delivered per (path, topic) on a connection. A segment not newer is discarded at the
+  dish, and refused with `CANCELED` at the acceptor, before delivery. A new connection starts
+  over — the radio numbers per `(radio, topic)` in one process, and a restarted radio is a new
+  connection — so no incarnation id is needed.
+
 Five rules a caller can get wrong:
 
 1. **Supersession holds nothing.** It discards bytes that are already in flight — the

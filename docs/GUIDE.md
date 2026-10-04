@@ -594,10 +594,11 @@ fast dish received segments [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]; the stalled dish los
 ```
 
 **Opening segment *n+1* resets every copy of segment *n* on that topic that is still
-unacknowledged**, and nothing else. The stalled dish's copy never finishes, so each new frame
-resets the old one: it holds at most the newest segment, which is the only one worth showing.
-The fast dish acknowledged each frame before the next existed, so supersession never reaches
-it. Nothing was held to send instead — supersession discards bytes that are already in
+unacknowledged: at once if the radio had not finished it, otherwise after its path had the
+time to carry it** — and nothing else. The stalled dish's copy never finishes, so each new
+frame resets the old one: it holds at most the newest segment, which is the only one worth
+showing. The fast dish acknowledged each frame before the next existed, so supersession never
+reaches it. Nothing was held to send instead — supersession discards bytes that are already in
 flight, which is why it costs the radio no memory — and a dish that joins late starts at the
 next segment, because a segment is the only point a decoder can start from.
 
@@ -618,7 +619,9 @@ while let Ok(Incoming::Flow(mic)) = mics.accept().await {
 
 A microphone is a flow into the SFU, and every frame goes back out as a one-packet segment on
 the radio. A relay is the same program with a dish on one side: it reads each upstream stream
-segment chunk by chunk and writes the chunks into a downstream segment as they arrive. The
+segment chunk by chunk and writes the chunks into a downstream segment as they arrive, opened
+with `Radio::relay_segment` because the upstream may still be streaming segment *n* when
+segment *n+1* opens, and a copy that still takes chunks must not be reset for that. The
 program speaks 100 frames of noise and pushes five 64 KiB video segments through the relay:
 
 ```text

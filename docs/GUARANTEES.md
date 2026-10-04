@@ -536,7 +536,7 @@ name a level that is decided and specified but not yet implemented.
 | Push/Pull | `BestEffort` | optional transport receipt | `None` |
 | Pub/Sub | `BestEffort`, with per-subscriber drop | none | `None` |
 | Pub/Sub over a local **socket** transport | `BestEffort`, with a second drop cause: the subscriber's reverse pool | none | `None` |
-| RADIO/DISH | `BestEffort`, with supersession and per-dish expiry ([decisions/0034](decisions/0034-late-is-lost.md) §4.6) | none | per topic, segments never go backwards at a dish |
+| RADIO/DISH | `BestEffort`, with supersession and per-dish expiry ([decisions/0034](decisions/0034-late-is-lost.md) §4.6) | none | per connection and topic, segments never go backwards at a dish or an acceptor; a new connection starts over |
 | flow | `BestEffort` per datagram ([decisions/0034](decisions/0034-late-is-lost.md) §4.2) | none | none |
 
 Three points deserve emphasis, because each is easy to assume otherwise:

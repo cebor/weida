@@ -8,15 +8,18 @@
 //! Three things drop a copy, and each is counted per topic and cause:
 //!
 //! * **supersession** — opening segment *n+1* resets every copy of segment
-//!   *n* on that topic that is still unacknowledged, and no other topic's;
+//!   *n* on that topic that is still unacknowledged: at once if the radio had
+//!   not finished it, otherwise after its path had the time to carry it (the
+//!   finish grace), and no other topic's;
 //! * **expiry** — a dish's `max_age`, on the radio's clock from the segment's
 //!   open;
 //! * **the dish's budget** — `subscriber_buffer_bytes` of chunks a copy may
 //!   hold unwritten, and a queue of [`COPY_QUEUE`] chunks.
 //!
 //! Nothing here ever waits for a dish: [`Segment::write`] is synchronous.
-//! The dish in turn discards a segment older than the newest it delivered
-//! on the topic and never blocks its connection on a full queue.
+//! The dish in turn discards a segment not newer than the newest it delivered
+//! on the topic on that connection and never blocks its connection on a full
+//! queue.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -226,14 +229,17 @@ impl SegmentTopics {
         }
     }
 
-    /// Resets every unacknowledged copy of the previous segment on `topic`
-    /// without taking a number: the sender numbers elsewhere.
+    /// Supersedes the previous segment on `topic` without taking a number:
+    /// the sender numbers elsewhere (see [`SegmentTopics::next`]).
     pub(crate) fn supersede(&self, topic: &Arc<str>) -> Result<(), Error> {
         self.next(topic).map(drop)
     }
 
-    /// Takes the next number on `topic` and resets every unacknowledged copy
-    /// of the previous segment there.
+    /// Takes the next number on `topic` and supersedes the previous
+    /// segment there: every copy not yet acknowledged is flagged, and
+    /// [`run_copy`] resets it at once if its writer had not finished, or
+    /// after the finish grace if it had (a relay's copy follows its upstream
+    /// instead).
     pub(crate) fn next(&self, topic: &Arc<str>) -> Result<u64, Error> {
         let mut guard = lock(&self.topics);
         let (topics, floor) = &mut *guard;
@@ -606,7 +612,11 @@ impl Radio {
     }
 
     /// Opens segment *n+1* on `topic` as one stream per joined dish, and
-    /// resets every copy of segment *n* on that topic still unacknowledged.
+    /// resets every copy of segment *n* on that topic still unacknowledged:
+    /// at once if the radio had not finished it, otherwise after its path had
+    /// the time to carry it (a copy whose writer finished first hands its
+    /// queued chunks over if the transport takes them at once, and waits the
+    /// finish grace after its FIN).
     ///
     /// The dish set is fixed here: a dish that joins while the segment is in
     /// flight receives the next one. Zero dishes is not an error. Fails with

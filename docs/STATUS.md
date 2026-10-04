@@ -218,7 +218,7 @@ writer per member — without one a single member that stops reading blocks the 
 datagram flow is L0's third carrier; `expire_at` and `set_priority` stop a stream on time;
 RADIO/DISH fans segments out with supersession and per-dish expiry. Of all the patterns it is
 the one that adds wire vocabulary — DATA key `13` and SUBSCRIBE key `2` — while the six above
-still add none.
+still add none; `Peer::segment` writes key `13` toward a bound path too.
 
 
 ## 3. Progress by the numbers

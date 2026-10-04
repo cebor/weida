@@ -434,7 +434,9 @@ impl PyRadio {
     }
 
     /// Opens the next segment on `topic` as one stream per joined dish, and
-    /// resets the previous segment's copies still unacknowledged there.
+    /// resets the previous segment's copies still unacknowledged there: at
+    /// once if the radio had not finished them, otherwise after their path
+    /// had the time to carry them.
     ///
     /// # Errors
     ///

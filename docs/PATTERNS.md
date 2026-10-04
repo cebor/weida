@@ -697,7 +697,7 @@ The three patterns [ARCHITECTURE.md](ARCHITECTURE.md) §6b mapped and nobody had
 one ZeroMQ named for lossy fan-out. The first three are built and added **no wire
 vocabulary**: a `Paired` talks to a bare `Peer` and `Acceptor` on the same path, a
 `Respondent`'s route is byte-for-byte a replier's, a `BusMember`'s is a puller's. RADIO/DISH
-adds two keys, DATA `13` and SUBSCRIBE `2` (§6.4). Router/Dealer stay emergent (§2); connecting
+adds two keys, DATA `13` and SUBSCRIBE `2` (§6.4); `Peer::segment` writes key `13` too, toward a bound path. Router/Dealer stay emergent (§2); connecting
 publishers and binding pushers stay recorded deferrals.
 
 ### 6.1 PAIR
@@ -840,12 +840,13 @@ raw preview frame, a video GOP — and it is the join point. `Listener::radio` b
 | Topics | Pub/Sub's namespace and filter grammar, unchanged — ZeroMQ's "group" is weida's topic | |
 | Outgoing routing | every dish whose filter matches, one copy each; the dish set is fixed when a segment opens | — |
 | Carrier | a stream segment: one uni DATA stream per dish, numbered in DATA key `13`; a datagram segment: a flow per `(dish, topic)`, opened lazily on the connection the join arrived on, its payload `varint segment` + bytes | |
-| Supersession | opening segment *n+1* on a topic **resets every copy of segment *n* on that topic still unacknowledged**, with `CANCELED`, and no other topic's. A copy whose segment was finished before *n+1* opened is whole on the radio's side: it still hands its queued chunks to the transport if the transport takes them at once (a write the dish's flow control holds back is a stalled dish, reset at once), and after its FIN it gets the time its path needs to carry its bytes at the congestion window plus one round trip and 50 ms | a segment not newer than the newest it delivered on that topic is discarded on arrival, so segments never go backwards |
+| Supersession | opening segment *n+1* on a topic **resets every copy of segment *n* on that topic still unacknowledged**, with `CANCELED`, and no other topic's. A copy whose segment was finished before *n+1* opened is whole on the radio's side: it still hands its queued chunks to the transport if the transport takes them at once (a write the dish's flow control holds back is a stalled dish, reset at once), and after its FIN it gets the time its path needs to carry its bytes at the congestion window plus one round trip and 50 ms; a copy counts as finished only when its FIN is queued | a segment not newer than the newest it delivered on that topic **on this connection** is discarded on arrival, so segments never go backwards, and a redial starts over |
 | Expiry | per dish: its `max_age` on the radio's clock from the segment's open; the smallest among the dish's matching filters applies | states `max_age` when it joins (SUBSCRIBE key `2`) |
 | Backpressure | never blocks: `write` hands a chunk to every copy with room in its dish's `subscriber_buffer_bytes` and its 64-chunk queue, and a copy without room loses the segment | a full receive queue discards on arrival and never blocks the connection |
 | Delivery | `BestEffort`; a lost segment is a gap in the numbers the dish sees, counted per topic and cause in `dropped_on`: budget, queue, no parked connection, superseded, expired, too large, no datagrams | `stale()` and `overflow()` count the dish's own discards |
 | Late joiner | receives the next segment; nothing is retained for it | |
-| From a dialling peer | `Peer::segment(topic, max_age)` opens one copy toward the bound path it dialled — an uplink into a relay that is itself a radio. Numbering, supersession with the finish grace, `max_age` and the never-blocking `write` are the radio's, budgeted by the peer's `subscriber_buffer_bytes`; `Peer::segment_drops(topic)` counts the losses | the bound side's `Acceptor` receives `Incoming::Stream` with `topic` and `segment` set |
+| From a dialling peer | `Peer::segment(topic, max_age)` opens one copy toward the bound path it dialled — an uplink into a relay that is itself a radio. Supersession with the finish grace, `max_age` and the never-blocking `write` are the radio's, budgeted by the peer's `subscriber_buffer_bytes`; `Peer::segment_drops(topic)` counts the losses. Numbering is per (connection, path, topic), so peers sharing a pooled connection continue one sequence | the bound side's `Acceptor` receives `Incoming::Stream` with `topic` and `segment` set; the acceptor refuses a stale one with `CANCELED`, on the same per-connection table a dish uses |
+| Relay | `Radio::relay_segment(topic)` opens segment *n+1* where segment *n* may still be streaming in from upstream: the successor resets a copy of *n* only where the dish's flow control holds a write back, otherwise the copy keeps taking chunks and gets the post-FIN grace; dropping it unfinished still resets every copy | — |
 
 Five rules a caller can get wrong. **Supersession holds nothing**: it discards bytes already in
 flight, which is why it is not the coalescer [0016](decisions/0016-conflation.md) §4.2 refused.
@@ -884,7 +885,13 @@ name, which is one more reason an SFU's binding requires `ClientTrust::AnyKey`.
 `evict_withdraws_a_join_and_frees_its_subscription_slot`,
 `installing_an_admission_screens_joins_already_recorded`,
 `a_peer_segment_reaches_an_acceptor_with_its_number`,
-`a_peer_segment_supersedes_the_previous_one_on_its_topic`
+`a_peer_segment_supersedes_the_previous_one_on_its_topic`,
+`a_segment_whose_finish_found_a_full_queue_is_superseded_at_once`,
+`a_dish_redialled_to_a_restarted_radio_takes_its_numbers_from_zero`,
+`a_relay_segment_keeps_its_copy_while_its_successor_opens`,
+`a_relay_segment_still_resets_a_stalled_dish`,
+`two_peers_on_one_connection_number_one_sequence`,
+`an_acceptor_refuses_a_segment_older_than_one_it_delivered`
 (`crates/weida/tests/radio.rs`).*
 
 ---

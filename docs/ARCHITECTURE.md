@@ -104,7 +104,7 @@ two entry points, and both layers share the transfer handles they hand out:
 
 | Type | What it is |
 | --- | --- |
-| `Peer` | the dialling side: `open()` a one-way transfer, `open_bi()` an exchange; `connection_stats()` reads each live connection's path and traffic |
+| `Peer` | the dialling side: `open()` a one-way transfer, `open_bi()` an exchange, `segment()` a numbered segment toward a bound path; `connection_stats()` reads each live connection's path and traffic |
 | `Acceptor` | the bound side: one path, both stream kinds, one queue |
 | `Incoming` | what an `Acceptor` yields: `Stream(..)`, `Exchange(..)` or `Flow(..)` |
 | `OutgoingTransfer` | the write half; `finish()` yields a `Delivery` |
@@ -416,6 +416,8 @@ weida never falls back from one to another on its own
 weida+inproc://<bus>/<path>            in-process, one bus name per process
 weida+unix://<percent-encoded>/<path>  AF_UNIX SOCK_STREAM, Linux and macOS
 weida+pipe://<name>/<path>             \\.\pipe\<name>, Windows, never a UNC path
+weida+unix://self@<percent-encoded>/<path>   the same, pinned to the dialler's own account
+weida+pipe://self@<name>/<path>              the same, pinned to the dialler's own account
 ```
 
 The endpoint path keeps every rule above: opaque, leading `/`, 1..=512 bytes. What changes is
@@ -436,6 +438,12 @@ the authority, and each form has one validation rule that is not optional:
 no TLS handshake to prove one; who may connect is stated in the binding's configuration as
 accepted local principals. An address that looks authenticated and is not would be worse than
 one that plainly is not [0010 §4.8].
+
+**The one userinfo a local address takes is `self`** (`weida+unix` and `weida+pipe`; inproc
+takes none). It pins the dialler's own account: after the connection is made and before HELLO,
+the kernel's answer for the peer — its uid or SID — is compared with this process's, and a
+mismatch fails with `UntrustedPrincipal` having sent nothing past the control byte. A redial
+keeps the address and so the pin. It is a dial-side statement: a bind address refuses it.
 
 ---
 
@@ -535,8 +543,9 @@ background-shutdown discipline; `CloseBudget`, a finite budget the phases of one
 share; `NameRegistry<T>`, an in-process namespace of bound names under a byte budget,
 generic over what a bound name hands its acceptor; on unix `BoundUnixSocket`, which
 carries the `AF_UNIX` bind hygiene of [0010](decisions/0010-local-transport.md) §4.5
-(`sun_path` budget, socket-type check, unlink-then-bind, explicit `0600`, node removed on
-drop), plus `peer_credentials`; and on Windows `BoundPipe`, which creates the instances of
+(`sun_path` budget, socket-type check, a stale node unlinked and a live one refused with
+`AddressInUse`, explicit `0600`, node removed on drop; `bind_stealing` keeps libzmq's
+replace-a-live-node rule for `weida-zmq`), plus `peer_credentials`; and on Windows `BoundPipe`, which creates the instances of
 a named pipe with an owner-only DACL, `PIPE_REJECT_REMOTE_CLIENTS` and the first-instance
 flag, `connect_pipe`, which waits out `ERROR_PIPE_BUSY` on the runtime's timer, and
 `client_principal` / `server_principal`. Dependencies: `weida-core` for one error
@@ -1207,7 +1216,8 @@ impl Listener {
     // credentials, bus name ≤ 256 B and unique in the process [0010 §4.1, §4.8].
     pub fn bind_inproc(&self, bus: &str) -> Result<LocalBinding, Error>;
     // AF_UNIX, Unix only: SOCK_STREAM on a path the caller's directory protects,
-    // mode 0600 set explicitly, unlink-then-bind [0010 §4.5, 0012 §4.1].
+    // mode 0600 set explicitly, a stale node unlinked before the bind and a live
+    // one refused with `Error::AddressInUse` [0010 §4.5, 0012 §4.1].
     #[cfg(unix)]
     pub fn bind_unix(&self, path: impl AsRef<Path>) -> Result<UnixBinding, Error>;
     pub fn replier(&self, path: &str) -> Result<Replier, Error>;   // Error::InvalidEndpointPath / AlreadyRegistered
@@ -1238,6 +1248,8 @@ impl Peer {
     pub async fn open(&self, meta: TransferMeta) -> Result<OutgoingTransfer, Error>;  // one-way transfer
     pub async fn open_bi(&self, meta: TransferMeta)
         -> Result<(OutgoingTransfer, ReplyStream), Error>;                            // exchange
+    pub async fn segment(&self, topic: &str, max_age: Option<Duration>) -> Result<Segment, Error>; // numbered uplink to a bound path
+    pub fn segment_drops(&self, topic: &str) -> Option<TopicDrops>;                   // what `segment` lost
 }
 pub enum Incoming { Stream(IncomingTransfer), Exchange(IncomingRequest) }
 pub struct Acceptor;                                         // bound side; one path, both stream kinds
@@ -1354,8 +1366,10 @@ Type by type:
   tests learn an ephemeral port, and `disconnect(fingerprint)`, which closes every live
   connection of one proved key with `REJECTED` — the dialler redials, so it is not a ban.
 - **`Peer`** — the L0 dialling side: a set of connections, the terms they were authenticated
-  on (`ClientTls`, plus whatever each address named), and the two open calls. `peer_count`
-  reports live peers only — a closed connection leaves the set when the next `connect()` adds
+  on (`ClientTls`, plus whatever each address named), and the two open calls.
+  `segment` is a third: a RADIO-style segment toward a bound path, numbered per (connection,
+  path, topic) by the connection so that every `Peer` sharing it continues one sequence.
+  `peer_count` reports live peers only — a closed connection leaves the set when the next `connect()` adds
   a live one. `connection_stats` returns one record per live connection, labelled by the URL
   as dialled. Every dialling pattern is this plus a selection policy and some vocabulary.
 - **`ConnectionStats`** — a dialling endpoint's view of one live connection: the URL as

@@ -539,10 +539,14 @@ impl Peer {
     /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
     /// §4.6), from the dialling side toward a bound path.
     ///
-    /// The DATA header carries `topic` and the segment number (keys `12`
+    /// The DATA header carries `topic` and the segment number (keys `5`
     /// and `13`), so the bound side reads them from
     /// [`crate::IncomingMeta::topic`] and [`crate::IncomingMeta::segment`].
-    /// `max_age` resets the copy once it is that old, unfinished or
+    /// The number comes from the connection the segment goes out on, per
+    /// path and topic, so every `Peer` sharing a pooled connection continues
+    /// one sequence; the bound side refuses a segment not newer than the
+    /// newest it delivered on that connection, path and topic with
+    /// `CANCELED`. `max_age` resets the copy once it is that old, unfinished or
     /// unacknowledged. [`crate::Segment::write`] never waits: a copy without
     /// room for a chunk — `Limits::subscriber_buffer_bytes` over all of this
     /// peer's segments — is lost, counted in [`Peer::segment_drops`].

@@ -1196,7 +1196,8 @@ pub struct Radio {
 
 impl Radio {
     /// Opens the next segment on `topic`, superseding the previous one's
-    /// copies still unacknowledged there.
+    /// copies still unacknowledged there: at once if the radio had not
+    /// finished them, otherwise after their path had the time to carry them.
     ///
     /// # Errors
     ///

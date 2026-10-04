@@ -80,12 +80,17 @@ opened; `flow_queue_bytes` (16 KiB) bounds the unread datagrams of one flow, cha
 per-entry overhead so a flood of empty datagrams is bounded by the same cap; `flow_early_bytes`
 (4 KiB) and `flow_early_hold` (1 s) bound the one per-connection ring a peer can fill with
 datagrams for ids it never registered; a local flow's record is refused above 1200 bytes, so a
-reader's reassembly buffer is a constant. On the dish side the `newest` table that discards stale
-segments holds at most `max_sequence_scopes` topics — an untracked topic is simply never stale —
-and its queue is `endpoint_queue` deep and discards rather than blocks. On the radio side the
+reader's reassembly buffer is a constant. Every connection keeps one stale-check table (the newest segment
+delivered per path and topic, which discards a stale segment at a dish or an acceptor) and one
+numbering table (the segments a dialling `Peer` sends over it), each holding at most
+`max_sequence_scopes` entries: an untracked key in the stale-check table is simply never stale,
+and the numbering table evicts an entry at its cap and resumes above every number it reached. A
+dish's queue is `endpoint_queue` deep and discards rather than blocks. On the radio side the
 topic table is capped at `max_sequence_scopes` too and evicts only a topic with no copy in
 flight, a copy holds at most 64 queued chunks, and a dish's chunks are charged against
-`subscriber_buffer_bytes` exactly as a subscriber's are.
+`subscriber_buffer_bytes` exactly as a subscriber's are. A `Peer` that sends segments keeps the
+same three bounds: a supersession table capped at `max_sequence_scopes` topics, a `DropTable`
+of the same cap, and one `subscriber_buffer_bytes` budget over all its segments.
 
 **The chain a peer presented is inside it with a cap of its own**
 ([decisions/0035](decisions/0035-keys-proved-not-judged.md) §4.2). A connection keeps the
