@@ -21,6 +21,7 @@
 //! consumer's to mark.
 
 use std::ffi::OsString;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer};
@@ -148,6 +149,17 @@ pub fn server_principal(client: &NamedPipeClient) -> Result<WindowsPrincipal, Er
         .map_err(Error::Io)
 }
 
+/// The account SID of this process.
+///
+/// What a process compares with [`WindowsPrincipal::sid`] of a pipe peer
+/// ([`client_principal`], [`server_principal`]) to learn that the peer runs
+/// as the same account.
+pub fn current_account_sid() -> Result<Arc<str>, Error> {
+    weida_winpipe::current_user_sid()
+        .map(Into::into)
+        .map_err(Error::Io)
+}
+
 fn into_principal(peer: weida_winpipe::PipePeer) -> WindowsPrincipal {
     WindowsPrincipal {
         sid: peer.sid.into(),
@@ -164,8 +176,8 @@ mod tests {
         format!(r"\\.\pipe\weida-runtime-{}-{tag}", std::process::id())
     }
 
-    /// Claim: both ends learn the same account, which is this process's,
-    /// and the server learns it only after the client wrote.
+    /// Claim: both ends learn the same account, which is this process's
+    /// (`current_account_sid`), and the server learns it only after the client wrote.
     #[tokio::test]
     async fn both_ends_name_this_process() {
         let exec = Exec::current().expect("runtime");
@@ -183,6 +195,10 @@ mod tests {
         let client_seen_by_server = client_principal(&server).expect("token");
 
         assert_eq!(client_seen_by_server.sid, server_seen_by_client.sid);
+        assert_eq!(
+            server_seen_by_client.sid,
+            current_account_sid().expect("own sid")
+        );
         assert_eq!(client_seen_by_server.pid, Some(std::process::id()));
         assert_eq!(server_seen_by_client.pid, Some(std::process::id()));
     }

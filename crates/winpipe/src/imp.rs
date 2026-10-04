@@ -150,6 +150,15 @@ pub fn is_pipe_busy(error: &io::Error) -> bool {
     error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
 }
 
+/// The account SID this process runs as, in string form.
+///
+/// The same SID [`OwnerOnlyDacl::for_current_user`] puts on a pipe it
+/// creates, so a process can compare it with the SID a pipe peer is
+/// attributed (`PipePeer::sid`).
+pub fn current_user_sid() -> io::Result<String> {
+    Token::of_process()?.user_sid()
+}
+
 /// Who connected to `server`, by the kernel's account.
 ///
 /// Reads the client's token SID through `ImpersonateNamedPipeClient`,
