@@ -24,7 +24,7 @@ use weida_py_core::{Bridge, payload_of, py_bytes};
 use crate::cursors::{PyCursors, PyReporter, reporting_meta};
 use crate::errors::errno_of;
 use crate::streams::{PyIncomingStream, PyOutgoingStream, PyReply};
-use crate::values::PyIncomingMeta;
+use crate::values::{PyConnectionStats, PyIncomingMeta};
 
 /// Writes the wrapper, its constructor and the `connect` a dialling endpoint
 /// has.
@@ -84,6 +84,12 @@ impl PyRequester {
             py,
             async move { endpoint.connect(&url).await.map_err(errno_of) },
         )
+    }
+
+    /// One `weida.ConnectionStats` per live connection, labelled by the URL
+    /// as dialled; empty when none is live. Synchronous and cheap.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
     }
 
     /// Sends `payload` and returns the reply, at most `max_reply_bytes`.
@@ -162,6 +168,12 @@ impl PyPusher {
             py,
             async move { endpoint.connect(&url).await.map_err(errno_of) },
         )
+    }
+
+    /// One `weida.ConnectionStats` per live connection; see
+    /// `Requester.connection_stats`.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
     }
 
     /// Sends `payload` and waits for the peer's **transport** to acknowledge

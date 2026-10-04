@@ -274,6 +274,12 @@ impl PySubscriber {
         })
     }
 
+    /// One `weida.ConnectionStats` per live connection; see
+    /// `Requester.connection_stats`.
+    fn connection_stats(&self) -> Vec<crate::values::PyConnectionStats> {
+        crate::values::PyConnectionStats::all(&self.subscriber.connection_stats())
+    }
+
     /// Subscribes to `filter`; the empty filter takes every topic.
     ///
     /// The grammar is the segmented one of

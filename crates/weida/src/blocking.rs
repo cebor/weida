@@ -176,7 +176,27 @@ impl Runtime {
         outside_a_reactor()?;
         let listener = self.inner.listener();
         let binding = drive(listener.bind_quic(addr, tls))?;
-        Ok(Binding { listener, binding })
+        Ok(Binding {
+            listener,
+            kind: BindingKind::Quic(binding),
+        })
+    }
+
+    /// Binds an in-process bus; a client in this process dials
+    /// `weida+inproc://<bus>/<path>`.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Listener::bind_inproc`]; plus [`Error::Runtime`] from
+    /// inside a reactor.
+    pub fn bind_inproc(&self, bus: &str) -> Result<Binding, Error> {
+        outside_a_reactor()?;
+        let listener = self.inner.listener();
+        let binding = listener.bind_inproc(bus)?;
+        Ok(Binding {
+            listener,
+            kind: BindingKind::Inproc(binding),
+        })
     }
 
     /// The runtime's limits, as configured.
@@ -210,22 +230,44 @@ impl Runtime {
     }
 }
 
-/// A bound QUIC socket and the endpoints registered on it.
+/// A bound QUIC socket or in-process bus, and the endpoints registered on it.
 pub struct Binding {
     listener: crate::Listener,
-    binding: crate::Binding,
+    kind: BindingKind,
+}
+
+/// What a [`Binding`] holds bound.
+enum BindingKind {
+    Quic(crate::Binding),
+    Inproc(crate::LocalBinding),
 }
 
 impl Binding {
-    /// The address the socket is bound to, with the port the kernel chose.
-    pub fn local_addr(&self) -> std::net::SocketAddr {
-        self.binding.local_addr()
+    /// The address the socket is bound to, with the port the kernel chose;
+    /// `None` for an in-process bus.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        match &self.kind {
+            BindingKind::Quic(binding) => Some(binding.local_addr()),
+            BindingKind::Inproc(_) => None,
+        }
+    }
+
+    /// The bus an in-process binding answers on; `None` for QUIC.
+    pub fn inproc_bus(&self) -> Option<&str> {
+        match &self.kind {
+            BindingKind::Quic(_) => None,
+            BindingKind::Inproc(binding) => Some(binding.bus()),
+        }
     }
 
     /// Closes every live connection this binding holds from `peer`; see
-    /// [`crate::Binding::disconnect`]. Returns how many it closed.
+    /// [`crate::Binding::disconnect`]. Returns how many it closed; an
+    /// in-process bus proves no fingerprint, so there it is always 0.
     pub fn disconnect(&self, peer: crate::Fingerprint) -> usize {
-        self.binding.disconnect(peer)
+        match &self.kind {
+            BindingKind::Quic(binding) => binding.disconnect(peer),
+            BindingKind::Inproc(_) => 0,
+        }
     }
 
     /// Registers a replier at `path`.

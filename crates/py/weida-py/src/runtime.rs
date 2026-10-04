@@ -50,17 +50,25 @@ impl PyRuntime {
     /// `datagrams=True` enables datagram flows on this runtime's connections
     /// (`Limits::datagram_receive_bytes` at its documented 64 KiB), which a
     /// dish needs for datagram segments; both ends must enable it.
+    /// `path_report=True` sends this side's view of each QUIC path to the
+    /// peer every 2 s, and reads the peer's as `ConnectionStats.remote`;
+    /// both ends must enable it too.
     ///
     /// # Errors
     ///
     /// `weida.Runtime` when `worker_threads` is `0` or the OS refuses the
     /// threads.
     #[new]
-    #[pyo3(signature = (worker_threads=1, datagrams=false))]
-    fn new(py: Python<'_>, worker_threads: usize, datagrams: bool) -> PyResult<PyRuntime> {
+    #[pyo3(signature = (worker_threads=1, datagrams=false, path_report=false))]
+    fn new(
+        py: Python<'_>,
+        worker_threads: usize,
+        datagrams: bool,
+        path_report: bool,
+    ) -> PyResult<PyRuntime> {
         let config = RuntimeConfig {
             worker_threads,
-            limits: crate::limits_with(datagrams),
+            limits: crate::limits_with(datagrams, path_report),
             ..RuntimeConfig::default()
         };
         let runtime = raise(py, Runtime::owned(config))?;
@@ -103,14 +111,42 @@ impl PyRuntime {
                 .fingerprint()
                 .map_err(errno_of)?
                 .to_string();
+            let local = binding.local_addr();
             Ok(PyBinding {
                 _runtime: runtime,
                 listener,
-                local: binding.local_addr(),
-                fingerprint,
-                _binding: Arc::new(binding),
+                local: local.to_string(),
+                fingerprint: Some(fingerprint.clone()),
+                url_base: format!("weida://{fingerprint}@{local}"),
+                _bound: Held::Quic {
+                    _binding: Arc::new(binding),
+                },
                 bridge,
             })
+        })
+    }
+
+    /// Binds an in-process bus, which a client **in this process** dials as
+    /// `weida+inproc://<bus>/<path>`; no socket and no identity.
+    ///
+    /// # Errors
+    ///
+    /// `weida.AlreadyRegistered` when the bus is taken in this process.
+    fn bind_inproc(&self, py: Python<'_>, bus: &str) -> PyResult<PyBinding> {
+        let listener = self.runtime.listener();
+        let binding = listener
+            .bind_inproc(bus)
+            .map_err(|e| to_py(py, &errno_of(e)))?;
+        Ok(PyBinding {
+            _runtime: Arc::clone(&self.runtime),
+            listener,
+            local: bus.to_owned(),
+            fingerprint: None,
+            url_base: format!("weida+inproc://{bus}"),
+            _bound: Held::Inproc {
+                _binding: Arc::new(binding),
+            },
+            bridge: self.bridge.clone(),
         })
     }
 
@@ -200,35 +236,48 @@ impl PyRuntime {
     }
 }
 
-/// `weida.Binding`: a bound QUIC socket, and the endpoints registered on it.
+/// What a [`PyBinding`] keeps bound; dropping it unbinds.
+enum Held {
+    Quic { _binding: Arc<weida::Binding> },
+    Inproc { _binding: Arc<weida::LocalBinding> },
+}
+
+/// `weida.Binding`: a bound QUIC socket or in-process bus, and the endpoints
+/// registered on it.
 #[pyclass(frozen, name = "Binding", module = "weida")]
 pub struct PyBinding {
     /// Held so the runtime outlives every endpoint taken from this binding.
     _runtime: Arc<Runtime>,
-    /// Held so the socket stays bound: dropping the binding unbinds it.
-    _binding: Arc<weida::Binding>,
+    /// Held so the socket or bus stays bound.
+    _bound: Held,
     listener: weida::Listener,
-    local: std::net::SocketAddr,
-    fingerprint: String,
+    /// The socket address with the port the kernel chose, or the bus name.
+    local: String,
+    /// The fingerprint a client pins; `None` on an in-process bus.
+    fingerprint: Option<String>,
+    /// What a client's URL starts with, before the path.
+    url_base: String,
     bridge: Bridge,
 }
 
 #[pymethods]
 impl PyBinding {
-    /// The address the socket is bound to, with the port the kernel chose.
-    fn local_addr(&self) -> String {
-        self.local.to_string()
+    /// The address the socket is bound to, with the port the kernel chose;
+    /// the bus name for an in-process binding.
+    fn local_addr(&self) -> &str {
+        &self.local
     }
 
-    /// The fingerprint a client pins, in the `sha256:…` text form.
-    fn fingerprint(&self) -> &str {
-        &self.fingerprint
+    /// The fingerprint a client pins, in the `sha256:…` text form; `None`
+    /// for an in-process binding, which the process itself vouches for.
+    fn fingerprint(&self) -> Option<&str> {
+        self.fingerprint.as_deref()
     }
 
-    /// The address a client dials for `path`: the fingerprint, the socket and
-    /// the path, which is the whole of a client's configuration.
+    /// The address a client dials for `path`, which is the whole of a
+    /// client's configuration.
     fn url(&self, path: &str) -> String {
-        format!("weida://{}@{}{path}", self.fingerprint, self.local)
+        format!("{}{path}", self.url_base)
     }
 
     /// Registers a replier at `path`.

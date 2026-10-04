@@ -31,7 +31,10 @@ fn served(path: &str) -> (Runtime, weida::blocking::Binding, String) {
     let binding = runtime
         .bind_quic("127.0.0.1:0".parse().expect("addr"), identity)
         .expect("bind");
-    let url = format!("weida://{fingerprint}@{}{path}", binding.local_addr());
+    let url = format!(
+        "weida://{fingerprint}@{}{path}",
+        binding.local_addr().expect("a QUIC binding")
+    );
     (runtime, binding, url)
 }
 
@@ -150,8 +153,11 @@ fn a_radio_segment_and_datagram_reach_a_blocking_dish() {
     let client = Runtime::new(flows).expect("client runtime");
     let dish = client.dish(Trust::by_address());
     dish.join("v", weida::JoinTerms::default()).expect("join");
-    dish.connect(&format!("weida://{fingerprint}@{}/r", binding.local_addr()))
-        .expect("connect");
+    dish.connect(&format!(
+        "weida://{fingerprint}@{}/r",
+        binding.local_addr().expect("a QUIC binding")
+    ))
+    .expect("connect");
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while radio.dish_count() < 1 {
         assert!(

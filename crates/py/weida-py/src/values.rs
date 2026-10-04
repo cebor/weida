@@ -10,7 +10,10 @@ use std::path::PathBuf;
 
 use pyo3::prelude::*;
 use pyo3::types::PyType;
-use weida::{DishDrops, Fingerprint, Identity, IncomingMeta, Trust};
+use weida::{
+    ConnectionStats, DishDrops, Fingerprint, Identity, IncomingMeta, PathStats, RemoteStats,
+    TransportStats, Trust, UdpCounts,
+};
 
 use crate::errors::raise;
 
@@ -343,6 +346,256 @@ impl PyDishDrops {
             self.too_large,
             self.no_datagrams,
             self.layers_cut
+        )
+    }
+}
+
+/// `weida.UdpCounts`: UDP datagrams and the bytes in them, one direction of
+/// one connection.
+#[pyclass(
+    frozen,
+    get_all,
+    skip_from_py_object,
+    name = "UdpCounts",
+    module = "weida"
+)]
+#[derive(Clone)]
+pub struct PyUdpCounts {
+    /// UDP datagrams.
+    pub datagrams: u64,
+    /// Bytes in them.
+    pub bytes: u64,
+}
+
+impl PyUdpCounts {
+    fn of(counts: &UdpCounts) -> PyUdpCounts {
+        PyUdpCounts {
+            datagrams: counts.datagrams,
+            bytes: counts.bytes,
+        }
+    }
+}
+
+#[pymethods]
+impl PyUdpCounts {
+    fn __repr__(&self) -> String {
+        format!(
+            "<weida.UdpCounts datagrams={} bytes={}>",
+            self.datagrams, self.bytes
+        )
+    }
+}
+
+/// `weida.PathStats`: the QUIC path under a connection now. Times are
+/// seconds as `float`.
+#[pyclass(
+    frozen,
+    get_all,
+    skip_from_py_object,
+    name = "PathStats",
+    module = "weida"
+)]
+#[derive(Clone)]
+pub struct PyPathStats {
+    /// Smoothed round-trip time, seconds.
+    pub rtt: f64,
+    /// The smallest round-trip time seen, seconds.
+    pub min_rtt: f64,
+    /// Congestion window, bytes.
+    pub cwnd: u64,
+    /// Congestion events the controller reacted to.
+    pub congestion_events: u64,
+    /// Packets this side sent and declared lost.
+    pub lost_packets: u64,
+    /// Bytes this side sent and declared lost.
+    pub lost_bytes: u64,
+    /// Packets this side sent.
+    pub sent_packets: u64,
+    /// The largest UDP payload the path carries now.
+    pub current_mtu: u16,
+    /// The largest datagram the connection carries now; `None` when the peer
+    /// accepts none.
+    pub max_datagram_size: Option<usize>,
+}
+
+#[pymethods]
+impl PyPathStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "<weida.PathStats rtt={:.6} cwnd={} lost_packets={} current_mtu={}>",
+            self.rtt, self.cwnd, self.lost_packets, self.current_mtu
+        )
+    }
+}
+
+/// `weida.TransportStats`: the transport's view of one QUIC connection.
+#[pyclass(
+    frozen,
+    get_all,
+    skip_from_py_object,
+    name = "TransportStats",
+    module = "weida"
+)]
+#[derive(Clone)]
+pub struct PyTransportStats {
+    /// The path.
+    pub path: PyPathStats,
+    /// What this side sent.
+    pub tx: PyUdpCounts,
+    /// What this side received.
+    pub rx: PyUdpCounts,
+}
+
+impl PyTransportStats {
+    fn of(stats: &TransportStats) -> PyTransportStats {
+        let path: &PathStats = &stats.path;
+        PyTransportStats {
+            path: PyPathStats {
+                rtt: path.rtt.as_secs_f64(),
+                min_rtt: path.min_rtt.as_secs_f64(),
+                cwnd: path.cwnd,
+                congestion_events: path.congestion_events,
+                lost_packets: path.lost_packets,
+                lost_bytes: path.lost_bytes,
+                sent_packets: path.sent_packets,
+                current_mtu: path.current_mtu,
+                max_datagram_size: path.max_datagram_size,
+            },
+            tx: PyUdpCounts::of(&stats.tx),
+            rx: PyUdpCounts::of(&stats.rx),
+        }
+    }
+}
+
+#[pymethods]
+impl PyTransportStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "<weida.TransportStats rtt={:.6} tx_bytes={} rx_bytes={}>",
+            self.path.rtt, self.tx.bytes, self.rx.bytes
+        )
+    }
+}
+
+/// `weida.RemoteStats`: the peer's view of the path, from its latest report
+/// ([0036](../../../../docs/decisions/0036-connection-statistics.md) §4.5).
+/// Its losses are this side's download loss. Times are seconds.
+#[pyclass(
+    frozen,
+    get_all,
+    skip_from_py_object,
+    name = "RemoteStats",
+    module = "weida"
+)]
+#[derive(Clone)]
+pub struct PyRemoteStats {
+    /// The peer's smoothed round-trip time, seconds.
+    pub rtt: f64,
+    /// The smallest round-trip time the peer has seen, seconds.
+    pub min_rtt: f64,
+    /// The peer's congestion window, bytes.
+    pub cwnd: u64,
+    /// Congestion events the peer's controller reacted to.
+    pub congestion_events: u64,
+    /// Packets the peer sent and declared lost.
+    pub lost_packets: u64,
+    /// Bytes the peer sent and declared lost.
+    pub lost_bytes: u64,
+    /// Packets the peer sent.
+    pub sent_packets: u64,
+    /// The largest UDP payload the path carries, as the peer sees it.
+    pub current_mtu: u16,
+    /// What the peer sent.
+    pub tx: PyUdpCounts,
+    /// What the peer received.
+    pub rx: PyUdpCounts,
+    /// Seconds since the record arrived.
+    pub age: f64,
+}
+
+impl PyRemoteStats {
+    fn of(stats: &RemoteStats) -> PyRemoteStats {
+        PyRemoteStats {
+            rtt: stats.rtt.as_secs_f64(),
+            min_rtt: stats.min_rtt.as_secs_f64(),
+            cwnd: stats.cwnd,
+            congestion_events: stats.congestion_events,
+            lost_packets: stats.lost_packets,
+            lost_bytes: stats.lost_bytes,
+            sent_packets: stats.sent_packets,
+            current_mtu: stats.current_mtu,
+            tx: PyUdpCounts::of(&stats.tx),
+            rx: PyUdpCounts::of(&stats.rx),
+            age: stats.age.as_secs_f64(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyRemoteStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "<weida.RemoteStats rtt={:.6} lost_packets={} age={:.3}>",
+            self.rtt, self.lost_packets, self.age
+        )
+    }
+}
+
+/// `weida.ConnectionStats`: one live connection of a dialling class,
+/// labelled by the URL as dialled
+/// ([0036](../../../../docs/decisions/0036-connection-statistics.md)).
+/// No field carries an address.
+#[pyclass(
+    frozen,
+    get_all,
+    skip_from_py_object,
+    name = "ConnectionStats",
+    module = "weida"
+)]
+#[derive(Clone)]
+pub struct PyConnectionStats {
+    /// The URL exactly as given to `connect`.
+    pub url: String,
+    /// Seconds the current connection has been up; a redial starts again.
+    pub age: f64,
+    /// Successful transparent redials of this address.
+    pub redials: u64,
+    /// The transport's numbers; `None` on a local transport.
+    pub transport: Option<PyTransportStats>,
+    /// The peer's view of the path; `None` unless both sides set
+    /// `path_report` on a QUIC connection and a record arrived.
+    pub remote: Option<PyRemoteStats>,
+}
+
+impl PyConnectionStats {
+    /// Every record of a dialling handle, flattened into the Python shape.
+    pub fn all(stats: &[ConnectionStats]) -> Vec<PyConnectionStats> {
+        stats
+            .iter()
+            .map(|s| PyConnectionStats {
+                url: s.url.to_string(),
+                age: s.age.as_secs_f64(),
+                redials: s.redials,
+                transport: s.transport.as_ref().map(PyTransportStats::of),
+                remote: s.remote.as_ref().map(PyRemoteStats::of),
+            })
+            .collect()
+    }
+}
+
+#[pymethods]
+impl PyConnectionStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "<weida.ConnectionStats url={:?} age={:.3} redials={} transport={}>",
+            self.url,
+            self.age,
+            self.redials,
+            if self.transport.is_some() {
+                "quic"
+            } else {
+                "local"
+            }
         )
     }
 }

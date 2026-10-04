@@ -207,3 +207,42 @@ def test_a_drain_reports_what_it_achieved():
         assert delivered >= 0
 
     run(exchange())
+
+
+def test_connection_stats_over_quic_and_in_process():
+    """A dialling class reads its own link: an RTT over QUIC, with the peer's
+    view when both runtimes report; no transport in process."""
+
+    async def exchange():
+        server = weida.Runtime(path_report=True)
+        binding = await server.bind("127.0.0.1:0", weida.Identity.generate())
+        binding.puller("/jobs")
+        client = weida.Runtime(path_report=True)
+        pusher = client.pusher(weida.Trust.by_address())
+        assert pusher.connection_stats() == []
+        url = binding.url("/jobs")
+        await pusher.connect(url)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + DEADLINE
+        while (stats := pusher.connection_stats()[0]).remote is None:
+            assert loop.time() < deadline, "no remote record arrived"
+            await asyncio.sleep(0.01)
+        assert stats.url == url
+        assert stats.redials == 0
+        assert stats.transport.path.rtt > 0
+        assert stats.transport.path.current_mtu >= 1200
+        assert stats.transport.tx.datagrams > 0
+        assert stats.remote.rtt > 0
+
+        local = weida.Runtime()
+        bus = local.bind_inproc("weida-py-stats")
+        bus.puller("/jobs")
+        assert bus.fingerprint() is None
+        dialler = local.pusher(weida.Trust.by_address())
+        await dialler.connect(bus.url("/jobs"))
+        [record] = dialler.connection_stats()
+        assert record.url == "weida+inproc://weida-py-stats/jobs"
+        assert record.transport is None
+        assert record.remote is None
+
+    run(exchange())

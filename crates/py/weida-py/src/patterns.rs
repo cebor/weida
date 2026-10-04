@@ -35,7 +35,7 @@ use weida_py_core::{Bridge, payload_of};
 use crate::cursors::{PyCursors, PyReporter, reporting_meta};
 use crate::endpoints::{PyRequest, endpoint};
 use crate::errors::{errno_of, to_py};
-use crate::values::{PyDishDrops, PyIncomingMeta, PySurvey};
+use crate::values::{PyConnectionStats, PyDishDrops, PyIncomingMeta, PySurvey};
 
 /// Turns a Python float of seconds into a deadline, or says why not.
 ///
@@ -78,6 +78,12 @@ impl PyPaired {
             py,
             async move { endpoint.connect(&url).await.map_err(errno_of) },
         )
+    }
+
+    /// One `weida.ConnectionStats` per live connection; empty on a bound
+    /// pair, which dialled nothing. See `Requester.connection_stats`.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
     }
 
     /// Peers connected: `0` or `1`.
@@ -186,6 +192,12 @@ impl PySurveyor {
             py,
             async move { endpoint.connect(&url).await.map_err(errno_of) },
         )
+    }
+
+    /// One `weida.ConnectionStats` per live connection; see
+    /// `Requester.connection_stats`.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
     }
 
     /// Respondents currently connected.
@@ -316,6 +328,12 @@ impl PyBusMember {
             py,
             async move { endpoint.connect(&url).await.map_err(errno_of) },
         )
+    }
+
+    /// One `weida.ConnectionStats` per live connection; see
+    /// `Requester.connection_stats`.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
     }
 
     /// Members this one has joined.
@@ -575,6 +593,12 @@ impl PyDish {
             py,
             async move { endpoint.connect(&url).await.map_err(errno_of) },
         )
+    }
+
+    /// One `weida.ConnectionStats` per live connection to a radio; see
+    /// `Requester.connection_stats`.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
     }
 
     /// Joins every topic `filter` matches; `max_age` in seconds is the

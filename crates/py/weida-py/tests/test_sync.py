@@ -324,3 +324,28 @@ def test_a_layered_segment_reaches_a_dish_layer_by_layer():
     assert drops[0].layers_cut == 0
     client.shutdown()
     server.shutdown()
+
+
+def test_connection_stats_over_quic_and_in_process():
+    """The same reading with no event loop."""
+    server = sync.Runtime()
+    binding = server.bind("127.0.0.1:0", weida.Identity.generate())
+    binding.puller("/jobs")
+    client = sync.Runtime()
+    pusher = client.pusher(weida.Trust.by_address())
+    assert pusher.connection_stats() == []
+    pusher.connect(binding.url("/jobs"))
+    [stats] = pusher.connection_stats()
+    assert stats.transport.path.rtt > 0
+    assert stats.remote is None, "neither runtime asked for reports"
+
+    local = sync.Runtime()
+    bus = local.bind_inproc("weida-py-sync-stats")
+    bus.puller("/jobs")
+    dialler = local.pusher(weida.Trust.by_address())
+    dialler.connect(bus.url("/jobs"))
+    [record] = dialler.connection_stats()
+    assert record.transport is None
+    client.shutdown()
+    server.shutdown()
+    local.shutdown()

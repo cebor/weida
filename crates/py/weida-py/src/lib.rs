@@ -115,6 +115,11 @@ fn weida(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<values::PyIncomingMeta>()?;
     module.add_class::<values::PySurvey>()?;
     module.add_class::<values::PyDishDrops>()?;
+    module.add_class::<values::PyConnectionStats>()?;
+    module.add_class::<values::PyTransportStats>()?;
+    module.add_class::<values::PyPathStats>()?;
+    module.add_class::<values::PyUdpCounts>()?;
+    module.add_class::<values::PyRemoteStats>()?;
     module.add_class::<endpoints::PyRequester>()?;
     module.add_class::<endpoints::PyReplier>()?;
     module.add_class::<endpoints::PyRequest>()?;
@@ -179,6 +184,12 @@ fn every_name() -> Vec<&'static str> {
         "Radio",
         "Segment",
         "Dish",
+        "DishDrops",
+        "ConnectionStats",
+        "TransportStats",
+        "PathStats",
+        "UdpCounts",
+        "RemoteStats",
         "OutgoingStream",
         "IncomingStream",
         "Reply",
@@ -198,15 +209,17 @@ fn every_name() -> Vec<&'static str> {
 }
 
 /// The limits both runtime constructors build: the defaults, with datagram
-/// flows switched on at their documented size when `datagrams` is set.
-pub(crate) fn limits_with(datagrams: bool) -> ::weida::Limits {
+/// flows switched on at their documented size when `datagrams` is set, and
+/// path reports listed when `path_report` is.
+pub(crate) fn limits_with(datagrams: bool, path_report: bool) -> ::weida::Limits {
     let defaults = ::weida::Limits::default();
-    if datagrams {
-        ::weida::Limits {
-            datagram_receive_bytes: ::weida::DEFAULT_DATAGRAM_RECEIVE_BYTES,
-            ..defaults
-        }
-    } else {
-        defaults
+    ::weida::Limits {
+        datagram_receive_bytes: if datagrams {
+            ::weida::DEFAULT_DATAGRAM_RECEIVE_BYTES
+        } else {
+            defaults.datagram_receive_bytes
+        },
+        path_report,
+        ..defaults
     }
 }

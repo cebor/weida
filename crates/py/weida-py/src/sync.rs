@@ -73,7 +73,9 @@ use weida_py_core::{payload_of, py_bytes};
 
 use crate::cursors::{level_of, reporting_meta, set_of};
 use crate::errors::raise;
-use crate::values::{PyDishDrops, PyIdentity, PyIncomingMeta, PySurvey, PyTrust};
+use crate::values::{
+    PyConnectionStats, PyDishDrops, PyIdentity, PyIncomingMeta, PySurvey, PyTrust,
+};
 
 /// What a call on a spent runtime gets.
 fn spent<T>(py: Python<'_>, what: &str) -> PyResult<T> {
@@ -114,11 +116,16 @@ impl SyncRuntime {
     /// threads, or when this is called from inside a Tokio runtime — which
     /// would deadlock on the first call.
     #[new]
-    #[pyo3(signature = (worker_threads=1, datagrams=false))]
-    fn new(py: Python<'_>, worker_threads: usize, datagrams: bool) -> PyResult<SyncRuntime> {
+    #[pyo3(signature = (worker_threads=1, datagrams=false, path_report=false))]
+    fn new(
+        py: Python<'_>,
+        worker_threads: usize,
+        datagrams: bool,
+        path_report: bool,
+    ) -> PyResult<SyncRuntime> {
         let config = weida::RuntimeConfig {
             worker_threads,
-            limits: crate::limits_with(datagrams),
+            limits: crate::limits_with(datagrams, path_report),
             ..weida::RuntimeConfig::default()
         };
         let runtime = raise(py, py.detach(|| blocking::Runtime::new(config)))?;
@@ -143,11 +150,31 @@ impl SyncRuntime {
             py,
             py.detach(|| runtime.bind_quic(socket, identity.identity.clone())),
         )?;
-        let local = binding.local_addr().to_string();
+        let local = binding
+            .local_addr()
+            .expect("a QUIC binding has an address")
+            .to_string();
         Ok(SyncBinding {
             binding,
+            url_base: format!("weida://{fingerprint}@{local}"),
             local,
-            fingerprint,
+            fingerprint: Some(fingerprint),
+        })
+    }
+
+    /// Binds an in-process bus, which a client in this process dials as
+    /// `weida+inproc://<bus>/<path>`.
+    fn bind_inproc(&self, py: Python<'_>, bus: &str) -> PyResult<SyncBinding> {
+        let guard = self.runtime.lock().expect("runtime lock poisoned");
+        let Some(runtime) = guard.as_ref() else {
+            return spent(py, "runtime");
+        };
+        let binding = raise(py, runtime.bind_inproc(bus))?;
+        Ok(SyncBinding {
+            binding,
+            local: bus.to_owned(),
+            fingerprint: None,
+            url_base: format!("weida+inproc://{bus}"),
         })
     }
 
@@ -250,29 +277,35 @@ impl SyncRuntime {
     }
 }
 
-/// `weida.sync.Binding`: a bound socket and the endpoints on it.
+/// `weida.sync.Binding`: a bound socket or in-process bus and the endpoints
+/// on it.
 #[pyclass(frozen, name = "Binding", module = "weida.sync")]
 pub struct SyncBinding {
     binding: blocking::Binding,
+    /// The socket address, or the bus name.
     local: String,
-    fingerprint: String,
+    /// `None` on an in-process bus.
+    fingerprint: Option<String>,
+    /// What a client's URL starts with, before the path.
+    url_base: String,
 }
 
 #[pymethods]
 impl SyncBinding {
-    /// The address the socket is bound to, with the port the kernel chose.
+    /// The address the socket is bound to, with the port the kernel chose;
+    /// the bus name for an in-process binding.
     fn local_addr(&self) -> &str {
         &self.local
     }
 
-    /// The fingerprint a client pins.
-    fn fingerprint(&self) -> &str {
-        &self.fingerprint
+    /// The fingerprint a client pins; `None` for an in-process binding.
+    fn fingerprint(&self) -> Option<&str> {
+        self.fingerprint.as_deref()
     }
 
     /// The address a client dials for `path`.
     fn url(&self, path: &str) -> String {
-        format!("weida://{}@{}{path}", self.fingerprint, self.local)
+        format!("{}{path}", self.url_base)
     }
 
     /// Registers a replier at `path`.
@@ -342,6 +375,12 @@ impl SyncRequester {
         raise(py, py.detach(|| self.endpoint.connect(url)))
     }
 
+    /// One `weida.ConnectionStats` per live connection, labelled by the URL
+    /// as dialled; empty when none is live.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
+    }
+
     /// Sends `payload` and returns the reply, at most `max_reply_bytes`.
     fn request<'py>(
         &self,
@@ -373,6 +412,11 @@ impl SyncPusher {
     /// Dials `url`.
     fn connect(&self, py: Python<'_>, url: &str) -> PyResult<()> {
         raise(py, py.detach(|| self.endpoint.connect(url)))
+    }
+
+    /// One `weida.ConnectionStats` per live connection.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
     }
 
     /// Sends `payload` and waits for the peer's transport to acknowledge it.
@@ -412,6 +456,11 @@ impl SyncSubscriber {
     /// Dials `url`.
     fn connect(&self, py: Python<'_>, url: &str) -> PyResult<()> {
         raise(py, py.detach(|| self.endpoint.connect(url)))
+    }
+
+    /// One `weida.ConnectionStats` per live connection.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
     }
 
     /// Subscribes to `filter`; the empty filter takes every topic.
@@ -631,6 +680,12 @@ impl SyncPaired {
         raise(py, py.detach(|| self.endpoint.connect(url)))
     }
 
+    /// One `weida.ConnectionStats` per live connection; empty on a bound
+    /// pair.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
+    }
+
     /// Peers connected: `0` or `1`.
     fn peer_count(&self) -> usize {
         self.endpoint.peer_count()
@@ -706,6 +761,11 @@ impl SyncSurveyor {
     /// Dials `url` and adds one respondent to the set.
     fn connect(&self, py: Python<'_>, url: &str) -> PyResult<()> {
         raise(py, py.detach(|| self.endpoint.connect(url)))
+    }
+
+    /// One `weida.ConnectionStats` per live connection.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
     }
 
     /// Respondents currently connected.
@@ -793,6 +853,11 @@ impl SyncBusMember {
     /// Joins the member at `url`.
     fn connect(&self, py: Python<'_>, url: &str) -> PyResult<()> {
         raise(py, py.detach(|| self.endpoint.connect(url)))
+    }
+
+    /// One `weida.ConnectionStats` per live connection.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
     }
 
     /// Members this one has joined.
@@ -952,6 +1017,11 @@ impl SyncDish {
     /// Dials the radio at `url`.
     fn connect(&self, py: Python<'_>, url: &str) -> PyResult<()> {
         raise(py, py.detach(|| self.endpoint.connect(url)))
+    }
+
+    /// One `weida.ConnectionStats` per live connection to a radio.
+    fn connection_stats(&self) -> Vec<PyConnectionStats> {
+        PyConnectionStats::all(&self.endpoint.connection_stats())
     }
 
     /// Joins every topic `filter` matches; `max_age` in seconds is the
