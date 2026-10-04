@@ -5,6 +5,15 @@ first, then the numbers, then the chronology.
 
 ## Review needed
 
+**0037 is provisional and waits for you and cebor** (2026-10-04, main `05a6b8e`, documents
+only). [decisions/0037](decisions/0037-layered-segments.md) answers
+[requirements/griasdi-video.md](requirements/griasdi-video.md): the segment as an L0 unit that a
+radio fans out and a dialling `Peer` sends, ordered layers inside a segment cut from the top,
+a dish's `max_layer`, layer-major priority, the draft PR's finish grace, and per-dish drops at a
+radio. B-304 to B-312 are `parked` until it is accepted; once it is, tuco86/weida#2 is
+superseded by B-304 (its radio fixes and tests) and B-307 (its `Peer::segment`), and its
+Windows `current_account_sid` commit needs its own home.
+
 **0034 is built, B-279 to B-292, and three things want your eye** (2026-09-29, main
 `59f79f6`, gate green after every item). **(1) Two proposals wait in the site repositories**:
 `weida.doodleshnookie.net/docs/requirements/weida-late-is-lost.md` (untracked, that directory

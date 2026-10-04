@@ -29,6 +29,51 @@ acceptance: [0036](decisions/0036-connection-statistics.md) §4.5: with `Limits:
 kind: code | size: 45 | status: ready | needs: [B-299]
 acceptance: [0036](decisions/0036-connection-statistics.md) §4.8: `connection_stats()` on every dialling class of both Python surfaces returns `weida.ConnectionStats` values (url, age seconds, redials, transport as a value with path, tx, rx, or `None`); a test over QUIC loopback asserts a positive RTT and `None` over `weida+inproc`; [libraries/weida-py.md](libraries/weida-py.md) moves the row from absent to present.
 
+### B-304 — Supersession that keeps finished copies whole
+kind: code | size: 60 | status: parked | needs: []
+acceptance: [0037](decisions/0037-layered-segments.md) §4.5 in `crates/weida/src/radio.rs`, taken from tuco86/weida#2's two radio commits (`7ce78c2`, `402afd3`) and rebased on main with the grace read from `Link::transport_stats().map(|t| t.path)`. The PR's tests pass in `crates/weida/tests/radio.rs` with `common::delay_proxy`: `a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole` and `a_segment_finished_right_before_its_successor_still_arrives_whole`; `a_stalled_dish_loses_old_segments_while_a_fast_one_gets_every_one` still passes.
+note: parked until 0037 is accepted.
+
+### B-305 — PROTOCOL: DATA key 14 `layer`, SUBSCRIBE key 3 `max_layer`
+kind: spec | size: 45 | status: parked | needs: []
+acceptance: [PROTOCOL.md](PROTOCOL.md) §6.2 and §6.4 rows per [0037](decisions/0037-layered-segments.md) §4.3; key `13`'s row says "written by a radio or by `Peer::segment`"; golden vectors for a segment DATA header with `layer = 2` and a SUBSCRIBE with `max_layer = 1`; the violations for a value above 15 and for key `14` without key `13`.
+note: parked until 0037 is accepted.
+
+### B-306 — The codec for `layer` and `max_layer`
+kind: code | size: 45 | status: parked | needs: [B-305]
+acceptance: `weida-protocol` encodes and decodes both keys against B-305's vectors; a value above 15, and key `14` without key `13`, is a `PROTOCOL_VIOLATION`; the `roundtrip` fuzz target is extended.
+note: parked until 0037 is accepted.
+
+### B-307 — The segment as an L0 unit: `SegmentTerms`, `Peer::segment`, priority
+kind: code | size: 90 | status: parked | needs: [B-304]
+acceptance: [0037](decisions/0037-layered-segments.md) §4.2 and §4.4: `Radio::segment(topic, SegmentTerms)` and `Peer::segment(topic, SegmentTerms)` share one copy machinery, and `Peer::segment_drops` exists; copy streams get the §4.4 priority at open; a sender `max_age` applies, at a radio together with the dish's, the smaller winning; every `Radio::segment` caller is migrated. tuco86/weida#2's tests `a_peer_segment_reaches_an_acceptor_with_its_number` and `a_peer_segment_supersedes_the_previous_one_on_its_topic` pass. No priority test, because it would test `quinn`'s scheduler, as B-284 argued.
+note: parked until 0037 is accepted.
+
+### B-308 — Layers inside a segment
+kind: code | size: 90 | status: parked | needs: [B-306, B-307]
+acceptance: [0037](decisions/0037-layered-segments.md) §4.3: `write_layer`, `finish_layer`, lazy per-`(copy, layer)` streams with their own queues, the cut rule including the release of upper layers' queued bytes, `TopicDrops::layers_cut` with `TopicDrops` made `#[non_exhaustive]`, `JoinTerms` replacing `join`'s `max_age` parameter at every caller, the largest-cap rule, per-layer freshness, and `IncomingMeta::layer`. Tests in `crates/weida/tests/radio.rs`: `a_dish_short_of_budget_keeps_layer_zero_whole_while_upper_layers_are_cut`, `a_dish_capped_at_layer_zero_is_never_sent_layer_one`, `a_layer_cut_also_cuts_every_higher_layer_of_that_segment`, `a_dish_delivers_each_layer_of_a_segment_once`, `a_peer_segment_carries_its_layers_to_the_acceptor`.
+note: parked until 0037 is accepted.
+
+### B-309 — Per-dish drops at a radio
+kind: code | size: 45 | status: parked | needs: [B-308]
+acceptance: [0037](decisions/0037-layered-segments.md) §4.6: `Radio::dish_drops() -> Vec<DishDrops>`, one record per joined dish connection, removed when it closes. Test: two dishes, one short of budget; only its record counts `subscriber_budget` or `layers_cut`, and the record is gone after it disconnects.
+note: parked until 0037 is accepted.
+
+### B-310 — A layered relay as a program, and a guide section
+kind: code | size: 60 | status: parked | needs: [B-308]
+acceptance: an example in B-290's shape — a `Peer::segment` uplink writing three layers, an acceptor, a `Radio::segment` per [0037](decisions/0037-layered-segments.md) §4.8 — asserted by a test: a dish with `max_layer = 0` receives layer 0 of every segment and nothing else, and an uncapped dish receives all three; a [GUIDE.md](GUIDE.md) section "quality without re-encoding".
+note: parked until 0037 is accepted.
+
+### B-311 — Layered segments in `weida::blocking` and `weida-py`
+kind: code | size: 60 | status: parked | needs: [B-308, B-309]
+acceptance: the `weida::blocking` twins of `SegmentTerms`, `JoinTerms`, `write_layer`, `finish_layer` and `dish_drops`, and both Python surfaces; one layered round trip per Python surface.
+note: parked until 0037 is accepted.
+
+### B-312 — Documents for 0037
+kind: spec | size: 45 | status: parked | needs: [B-304, B-307, B-308, B-309]
+acceptance: [0037](decisions/0037-layered-segments.md) §5's edits; no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says key `13` is written by a radio only, or that a dialling side cannot send a segment; [requirements/griasdi-video.md](requirements/griasdi-video.md) points at what shipped.
+note: parked until 0037 is accepted.
+
 ### B-293 — A binding that proves client keys and judges none
 kind: code | size: 45 | status: done e467a68 | needs: []
 acceptance: `ServerTls::require_client(ClientTrust::AnyKey)` ([0035](decisions/0035-keys-proved-not-judged.md) §4.1) requires a client certificate, verifies the TLS 1.3 handshake signature, and judges nothing else; the peer is `PeerIdentity::Key` of the leaf's SPKI fingerprint. `ClientTrust::Trusted(TrustSource)` keeps today's meaning and the empty-trust refusal, and existing `require_client(Trust::…)` calls compile unchanged. A chain above `MAX_PEER_CHAIN_CERTS` (8) or `MAX_PEER_CHAIN_BYTES` (32 KiB) fails an `AnyKey` handshake. Tests: `tls::tests::any_key_bounds_the_chain_it_keeps`, and `a_binding_that_requires_any_key_proves_it_and_judges_nothing` in `crates/weida/tests/identity.rs` — an anonymous client fails with `Error::Tls`, two generated keys are admitted as two distinct peers, and a device leaf signed by a user key is admitted as its own fingerprint (open question 1).
