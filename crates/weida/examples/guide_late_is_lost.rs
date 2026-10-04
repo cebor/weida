@@ -25,7 +25,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use weida::{
     DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Error, FlowMeta, Identity, Incoming, Limits, Radio,
-    Received, Runtime, RuntimeConfig, Trust,
+    Received, Runtime, RuntimeConfig, SegmentTerms, Trust,
 };
 
 /// A runtime, its listener and the port it serves on, kept alive together.
@@ -178,7 +178,7 @@ pub async fn supersession() -> Result<Supersession, Error> {
     let mut frame = tokio::time::interval(Duration::from_millis(40));
     for _ in 0..SEGMENTS {
         frame.tick().await;
-        let mut segment = radio.segment("frames")?;
+        let mut segment = radio.segment("frames", SegmentTerms::default())?;
         for _ in 0..CHUNKS {
             segment.write(vec![0x42; CHUNK])?;
         }
@@ -257,7 +257,7 @@ pub async fn sfu() -> Result<Sfu, Error> {
     tokio::spawn(async move {
         while let Ok(Received::Segment(mut incoming)) = upstream.recv().await {
             let topic = incoming.meta().topic.clone().unwrap_or_default();
-            let Ok(mut outgoing) = downstream.segment(&topic) else {
+            let Ok(mut outgoing) = downstream.segment(&topic, SegmentTerms::default()) else {
                 continue;
             };
             let mut chunk = vec![0u8; 16 * 1024];
@@ -321,7 +321,7 @@ pub async fn sfu() -> Result<Sfu, Error> {
     let mut relayed_segments = 0;
     for _ in 0..SEGMENTS {
         let sent = noise.bytes(SEGMENT);
-        let mut segment = room.segment("room.video")?;
+        let mut segment = room.segment("room.video", SegmentTerms::default())?;
         for chunk in sent.chunks(16 * 1024) {
             segment.write(chunk.to_vec())?;
         }

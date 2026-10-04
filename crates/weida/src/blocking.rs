@@ -1195,15 +1195,15 @@ pub struct Radio {
 }
 
 impl Radio {
-    /// Opens the next segment on `topic`, superseding the previous one's
-    /// copies there as [`crate::Radio::segment`] describes.
+    /// Opens the next segment on `topic` under `terms`, superseding the
+    /// previous one's copies there as [`crate::Radio::segment`] describes.
     ///
     /// # Errors
     ///
     /// As [`crate::Radio::segment`].
-    pub fn segment(&self, topic: &str) -> Result<Segment, Error> {
+    pub fn segment(&self, topic: &str, terms: crate::SegmentTerms) -> Result<Segment, Error> {
         Ok(Segment {
-            inner: self.endpoint.segment(topic)?,
+            inner: self.endpoint.segment(topic, terms)?,
         })
     }
 

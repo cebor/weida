@@ -1,39 +1,26 @@
 //! RADIO/DISH: lossy fan-out of segments
 //! ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.6).
 //!
-//! A **segment** is a unit whose parts may depend on each other and on
-//! nothing earlier — a voice frame, a raw preview frame, a video GOP — and it
-//! is the join point. A radio numbers segments per topic (DATA key `13`) and
-//! sends each to every dish joined when it opens, one uni stream per dish.
-//! Three things drop a copy, and each is counted per topic and cause:
+//! A radio numbers segments per topic (DATA key `13`) and sends each to
+//! every dish joined when it opens, one uni stream per dish. The segment
+//! machinery — supersession, expiry, the budget and the write that never
+//! waits — is [`crate::segment`]'s, shared with `Peer::segment`; a radio adds
+//! the dish table, a dish's `max_age` and the datagram segments.
 //!
-//! * **supersession** — opening segment *n+1* resets at once every copy of
-//!   segment *n* on that topic whose writer had not finished it, or whose
-//!   queued chunks the transport does not take at once; a finished copy gets
-//!   the time its path needs, `rtt + 50 ms + rtt * bytes / cwnd`, and is
-//!   reset only if still unacknowledged then. No other topic's copies are
-//!   touched;
-//! * **expiry** — a dish's `max_age`, on the radio's clock from the segment's
-//!   open;
-//! * **the dish's budget** — `subscriber_buffer_bytes` of chunks a copy may
-//!   hold unwritten, and a queue of [`COPY_QUEUE`] chunks.
-//!
-//! Nothing here ever waits for a dish: [`Segment::write`] is synchronous.
-//! The dish in turn discards a segment older than the newest it delivered
-//! on the topic and never blocks its connection on a full queue.
+//! The dish discards a segment older than the newest it delivered on the
+//! topic and never blocks its connection on a full queue.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{Notify, Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc};
 use weida_core::{Error, Limits, PeerIdentity};
 use weida_protocol::header::limits::MAX_TOPIC_BYTES;
-use weida_protocol::{DataHeader, FrameKind, codes, encode_varint, filter, split_flow_datagram};
+use weida_protocol::{FrameKind, codes, encode_varint, filter, split_flow_datagram};
 
 use crate::config::ClientTls;
 use crate::conn::{ConnHandle, Ctl};
@@ -44,32 +31,9 @@ use crate::listener::{Namespace, Route};
 use crate::pubsub::{DropCause, DropTable, TopicDrops};
 use crate::reconnect::PeerEvents;
 use crate::runtime::RuntimeInner;
+use crate::segment::{CopyTarget, Segment, SegmentTerms, SegmentTopics, open_segment};
 use crate::stream::{Attach, Peer};
-use crate::transfer::{IncomingTransfer, write_data_preamble};
-use crate::transport::SendHalf;
-
-/// Chunks one copy may hold queued for its writer task. The real bound is
-/// the dish's byte budget; this keeps the channel from growing on tiny
-/// chunks.
-pub(crate) const COPY_QUEUE: usize = 64;
-
-/// What a finished copy waits beyond one round trip before a successor
-/// supersedes it: quinn's default `max_ack_delay` of 25 ms (the transport
-/// parameter default, quinn-proto `transport_parameters.rs`; weida's
-/// `transport_config` in `tls.rs` keeps it) plus scheduling margin.
-const SUPERSEDE_SLACK: Duration = Duration::from_millis(50);
-
-/// How long a finished copy of `sent` bytes may still take to be
-/// acknowledged on a path with smoothed round trip `rtt` and congestion
-/// window `cwnd`: the time the window needs to carry every byte, one round
-/// trip for the receipt and [`SUPERSEDE_SLACK`]. `sent` bounds what is still
-/// unsent from above, so a copy whose bytes are already out gets more than
-/// it needs, never less.
-fn finish_grace(rtt: Duration, cwnd: u64, sent: u64) -> Duration {
-    let carry = Duration::try_from_secs_f64(rtt.as_secs_f64() * sent as f64 / cwnd.max(1) as f64)
-        .unwrap_or(Duration::MAX);
-    rtt.saturating_add(SUPERSEDE_SLACK).saturating_add(carry)
-}
+use crate::transfer::IncomingTransfer;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -162,58 +126,12 @@ impl DishEntry {
     }
 }
 
-/// One copy's control: how its segment's successor or its end reach it.
-#[derive(Default)]
-struct CopyCtl {
-    superseded: AtomicBool,
-    acked: AtomicBool,
-    ended: AtomicBool,
-    /// The writer finished the segment: every chunk of it is queued.
-    finished: AtomicBool,
-    /// Bytes queued for this copy, all chunks together.
-    total: AtomicU64,
-    notify: Notify,
-}
-
-impl CopyCtl {
-    fn supersede(&self) {
-        if !self.acked.load(Ordering::Acquire) {
-            self.superseded.store(true, Ordering::Release);
-            self.notify.notify_one();
-        }
-    }
-
-    fn live(&self) -> bool {
-        !self.ended.load(Ordering::Acquire)
-    }
-
-    async fn superseded(&self) {
-        loop {
-            let notified = self.notify.notified();
-            if self.superseded.load(Ordering::Acquire) {
-                return;
-            }
-            // `notify_one` leaves a permit when nobody waits, so a
-            // supersession between the check and this await is not lost.
-            notified.await;
-        }
-    }
-}
-
-/// Per-topic segment numbering and the copies the next segment supersedes.
-#[derive(Default)]
-struct TopicState {
-    next: u64,
-    live: Vec<Arc<CopyCtl>>,
-}
-
 /// Everything a radio path holds: its dishes, its topics and its drops.
 pub(crate) struct RadioHub {
     path: Arc<str>,
     dishes: Mutex<Vec<DishEntry>>,
-    /// Per-topic state, and the number a topic created after an eviction
-    /// starts from.
-    topics: Mutex<(HashMap<Arc<str>, TopicState>, u64)>,
+    /// Per-topic numbering and the copies the next segment supersedes.
+    topics: SegmentTopics,
     drops: Arc<DropTable>,
     limits: Limits,
     /// The admission policy and its generation, which moves with every
@@ -227,7 +145,7 @@ impl RadioHub {
         RadioHub {
             path: Arc::from(path),
             dishes: Mutex::new(Vec::new()),
-            topics: Mutex::new((HashMap::new(), 0)),
+            topics: SegmentTopics::new(limits.max_sequence_scopes),
             drops: Arc::new(DropTable::new(limits.max_sequence_scopes)),
             limits,
             admission: Mutex::new((0, None)),
@@ -372,53 +290,6 @@ impl RadioHub {
         }
         dishes.retain(|d| !d.filters.is_empty());
     }
-
-    /// Takes the next number on `topic` and supersedes every copy of the
-    /// previous segment there that is not yet acknowledged.
-    fn next_segment(&self, topic: &Arc<str>) -> Result<u64, Error> {
-        let mut guard = lock(&self.topics);
-        let (topics, floor) = &mut *guard;
-        if !topics.contains_key(topic) && topics.len() >= self.limits.max_sequence_scopes {
-            // The table is the application's, but still bounded: a topic
-            // with no copy in flight has nothing to supersede and can go.
-            let idle = topics.iter_mut().find_map(|(topic, state)| {
-                state.live.retain(|c| c.live());
-                state
-                    .live
-                    .is_empty()
-                    .then(|| (Arc::clone(topic), state.next))
-            });
-            match idle {
-                Some((idle, next)) => {
-                    topics.remove(&idle);
-                    // A topic that comes back must not restart below what a
-                    // dish already delivered on it, or the dish would
-                    // discard it as stale: numbering resumes above every
-                    // number an evicted topic reached.
-                    *floor = (*floor).max(next);
-                }
-                None => return Err(Error::LimitExceeded),
-            }
-        }
-        let state = topics
-            .entry(Arc::clone(topic))
-            .or_insert_with(|| TopicState {
-                next: *floor,
-                live: Vec::new(),
-            });
-        let number = state.next;
-        state.next += 1;
-        for copy in state.live.drain(..) {
-            copy.supersede();
-        }
-        Ok(number)
-    }
-
-    fn track(&self, topic: &Arc<str>, copy: &Arc<CopyCtl>) {
-        if let Some(state) = lock(&self.topics).0.get_mut(topic) {
-            state.live.push(Arc::clone(copy));
-        }
-    }
 }
 
 /// State of a radio.
@@ -471,51 +342,44 @@ impl Radio {
     /// `rtt + 50 ms + rtt * bytes / cwnd`, and is reset only if it is still
     /// unacknowledged then. On a local transport that grace is zero.
     ///
+    /// `terms` set the sender's side
+    /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+    /// §4.2): a copy expires at the smaller of `terms.max_age` and its
+    /// dish's `max_age`, its stream carries `terms.priority` within its
+    /// layer, and `terms.follows_upstream` keeps a copy against its
+    /// successor unless a write has to wait.
+    ///
     /// The dish set is fixed here: a dish that joins while the segment is in
     /// flight receives the next one. Zero dishes is not an error. Fails with
     /// [`Error::LimitExceeded`] for a topic above 256 bytes, or when
     /// `max_sequence_scopes` topics all have a copy in flight.
-    pub fn segment(&self, topic: &str) -> Result<Segment, Error> {
+    pub fn segment(&self, topic: &str, terms: SegmentTerms) -> Result<Segment, Error> {
         if topic.len() > MAX_TOPIC_BYTES {
             return Err(Error::LimitExceeded);
         }
         let hub = self.hub();
         let topic: Arc<str> = Arc::from(topic);
-        let number = hub.next_segment(&topic)?;
-        let mut copies = Vec::new();
-        for entry in hub.dishes().iter() {
-            let Some(max_age) = entry.matching(&topic) else {
-                continue;
-            };
-            let (tx, rx) = mpsc::channel(COPY_QUEUE);
-            let ctl = Arc::new(CopyCtl::default());
-            hub.track(&topic, &ctl);
-            let deadline = max_age.map(|age| Box::pin(entry.conn.exec.sleep(age)));
-            entry.conn.exec.spawn(segment_copy(
-                ConnHandle::clone(&entry.conn),
-                Copy {
+        let number = hub.topics.next(&topic)?;
+        let targets = hub
+            .dishes()
+            .iter()
+            .filter_map(|entry| {
+                entry.matching(&topic).map(|max_age| CopyTarget {
+                    conn: ConnHandle::clone(&entry.conn),
                     path: Arc::clone(&hub.path),
-                    topic: Arc::clone(&topic),
-                    number,
-                    ctl: Arc::clone(&ctl),
                     budget: Arc::clone(&entry.budget),
-                    drops: Arc::clone(&hub.drops),
-                },
-                rx,
-                deadline,
-            ));
-            copies.push(CopyTx {
-                tx,
-                budget: Arc::clone(&entry.budget),
-                ctl,
-            });
-        }
-        Ok(Segment {
-            number,
+                    max_age,
+                })
+            })
+            .collect();
+        Ok(open_segment(
+            &hub.topics,
+            &hub.drops,
             topic,
-            copies,
-            drops: Arc::clone(&hub.drops),
-        })
+            number,
+            &terms,
+            targets,
+        ))
     }
 
     /// Sends a one-packet segment on `topic` to every joined dish, as a
@@ -537,7 +401,7 @@ impl Radio {
         }
         let hub = self.hub();
         let topic: Arc<str> = Arc::from(topic);
-        let number = hub.next_segment(&topic)?;
+        let number = hub.topics.next(&topic)?;
         let payload = payload.into();
         let mut body = Vec::with_capacity(8 + payload.len());
         encode_varint(number, &mut body).expect("segment numbers stay below 2^62");
@@ -650,264 +514,6 @@ impl Radio {
     }
 }
 
-/// What a copy's writer task is told.
-enum SegItem {
-    Chunk(Bytes),
-    Finish,
-}
-
-/// The sending side of one copy, kept by the [`Segment`].
-struct CopyTx {
-    tx: mpsc::Sender<SegItem>,
-    budget: Arc<Semaphore>,
-    ctl: Arc<CopyCtl>,
-}
-
-/// One segment, open on every dish that was joined when it opened.
-///
-/// [`Segment::write`] never waits: a dish without room for a chunk loses
-/// the segment, counted. Dropping a segment without [`Segment::finish`]
-/// resets every copy, so no dish mistakes a partial segment for a whole one.
-pub struct Segment {
-    number: u64,
-    topic: Arc<str>,
-    copies: Vec<CopyTx>,
-    drops: Arc<DropTable>,
-}
-
-impl Segment {
-    /// This segment's number on its topic.
-    pub fn number(&self) -> u64 {
-        self.number
-    }
-
-    /// The topic this segment belongs to.
-    pub fn topic(&self) -> &str {
-        &self.topic
-    }
-
-    /// Hands `chunk` to every copy still open; returns how many that is.
-    ///
-    /// A copy whose dish has no budget or queue room left for the chunk is
-    /// dropped and counted, and its dish loses this segment. Fails with
-    /// [`Error::LimitExceeded`] for a chunk above 4 GiB, which no budget can
-    /// account.
-    pub fn write(&mut self, chunk: impl Into<Bytes>) -> Result<usize, Error> {
-        let chunk = chunk.into();
-        let len = u32::try_from(chunk.len()).map_err(|_| Error::LimitExceeded)?;
-        let (topic, drops) = (&self.topic, &self.drops);
-        self.copies.retain(|copy| {
-            let Ok(permit) = copy.budget.try_acquire_many(len) else {
-                drops.record(topic, DropCause::SubscriberBudget);
-                return false;
-            };
-            match copy.tx.try_send(SegItem::Chunk(chunk.clone())) {
-                Ok(()) => {
-                    // Given back by the writer once the bytes are written.
-                    permit.forget();
-                    copy.ctl.total.fetch_add(u64::from(len), Ordering::AcqRel);
-                    true
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    drops.record(topic, DropCause::SubscriberQueue);
-                    false
-                }
-                // The copy already ended — superseded or expired — and its
-                // task counted why.
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
-            }
-        });
-        Ok(self.copies.len())
-    }
-
-    /// Ends the segment on every copy still open; returns how many that is.
-    pub fn finish(mut self) -> usize {
-        let copies = std::mem::take(&mut self.copies);
-        let mut finished = 0;
-        for copy in copies {
-            match copy.tx.try_send(SegItem::Finish) {
-                Ok(()) => {
-                    // Stored before the successor can open: the caller opens
-                    // it only after `finish` returns. A FIN that found the
-                    // queue full leaves the copy unfinished, so its successor
-                    // resets it at once.
-                    copy.ctl.finished.store(true, Ordering::Release);
-                    finished += 1;
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.drops.record(&self.topic, DropCause::SubscriberQueue);
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {}
-            }
-        }
-        finished
-    }
-}
-
-impl fmt::Debug for Segment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Segment")
-            .field("topic", &self.topic)
-            .field("number", &self.number)
-            .field("copies", &self.copies.len())
-            .finish()
-    }
-}
-
-/// What a copy's task needs besides its channel and deadline.
-struct Copy {
-    path: Arc<str>,
-    topic: Arc<str>,
-    number: u64,
-    ctl: Arc<CopyCtl>,
-    budget: Arc<Semaphore>,
-    drops: Arc<DropTable>,
-}
-
-/// How a copy's race ended.
-enum Stop {
-    Superseded,
-    Expired,
-}
-
-async fn expiry(deadline: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
-    match deadline {
-        Some(sleep) => sleep.as_mut().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Resolves when the copy is superseded while its writer is still writing
-/// the segment: such a copy is reset at once. A copy whose writer finished
-/// before the successor opened goes on: see [`run_copy`].
-async fn superseded_unfinished(ctl: &CopyCtl) {
-    ctl.superseded().await;
-    if ctl.finished.load(Ordering::Acquire) {
-        std::future::pending::<()>().await;
-    }
-}
-
-/// Resolves when a copy past its FIN has had its grace after supersession:
-/// the time its path needs to carry its bytes at the congestion window, one
-/// round trip for the receipt and [`SUPERSEDE_SLACK`].
-async fn finish_grace_over(ctl: &CopyCtl, conn: &ConnHandle) {
-    ctl.superseded().await;
-    let wait = conn
-        .conn
-        .transport_stats()
-        .map(|t| t.path)
-        .map_or(Duration::ZERO, |p| {
-            finish_grace(p.rtt, p.cwnd, ctl.total.load(Ordering::Acquire))
-        });
-    conn.exec.sleep(wait).await;
-}
-
-/// Writes one dish's copy of one segment, racing every step against
-/// supersession and the dish's deadline.
-async fn segment_copy(
-    conn: ConnHandle,
-    copy: Copy,
-    mut rx: mpsc::Receiver<SegItem>,
-    mut deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-) {
-    let stop = run_copy(&conn, &copy, &mut rx, &mut deadline).await;
-    match stop {
-        Some(Stop::Superseded) => copy.drops.record(&copy.topic, DropCause::Superseded),
-        Some(Stop::Expired) => copy.drops.record(&copy.topic, DropCause::Expired),
-        None => {}
-    }
-    copy.ctl.ended.store(true, Ordering::Release);
-    // Chunks still queued were charged to the dish's budget and will never
-    // be written: give their bytes back.
-    rx.close();
-    while let Ok(item) = rx.try_recv() {
-        if let SegItem::Chunk(chunk) = item {
-            copy.budget.add_permits(chunk.len());
-        }
-    }
-}
-
-/// Opens and writes one copy. Supersession takes a copy whose segment the
-/// writer had not finished at once. A copy whose writer finished first is
-/// whole on the writer's side and not stalled merely because its successor
-/// opened: it hands the chunks still queued to the transport if the
-/// transport takes them at once — a write the dish's flow control holds back
-/// means a stalled dish, and the copy is reset — and once its FIN is written
-/// it gets [`finish_grace_over`] before the reset.
-async fn run_copy(
-    conn: &ConnHandle,
-    copy: &Copy,
-    rx: &mut mpsc::Receiver<SegItem>,
-    deadline: &mut Option<Pin<Box<tokio::time::Sleep>>>,
-) -> Option<Stop> {
-    let ctl = &copy.ctl;
-    let opened = tokio::select! {
-        biased;
-        () = superseded_unfinished(ctl) => return Some(Stop::Superseded),
-        () = expiry(deadline) => return Some(Stop::Expired),
-        opened = open_copy(conn, copy) => opened,
-    };
-    let mut stream = match opened {
-        Ok(stream) => stream,
-        Err(Error::NoParkedConnection) => {
-            copy.drops
-                .record(&copy.topic, DropCause::NoParkedConnection);
-            return None;
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "a segment copy could not be opened");
-            return None;
-        }
-    };
-    loop {
-        let item = tokio::select! {
-            biased;
-            () = superseded_unfinished(ctl) => return reset(&mut stream, Stop::Superseded),
-            () = expiry(deadline) => return reset(&mut stream, Stop::Expired),
-            item = rx.recv() => item,
-        };
-        match item {
-            Some(SegItem::Chunk(chunk)) => {
-                // The write first: supersession only takes a write that
-                // has to wait.
-                let written = tokio::select! {
-                    biased;
-                    written = stream.write_all(&chunk) => Ok(written),
-                    () = ctl.superseded() => Err(Stop::Superseded),
-                    () = expiry(deadline) => Err(Stop::Expired),
-                };
-                copy.budget.add_permits(chunk.len());
-                match written {
-                    Ok(Ok(())) => {}
-                    // The dish refused the stream or went away.
-                    Ok(Err(_)) => return None,
-                    Err(stop) => return reset(&mut stream, stop),
-                }
-            }
-            Some(SegItem::Finish) => {
-                if stream.finish().is_err() {
-                    return None;
-                }
-                // Until the dish's transport holds every byte, the copy can
-                // still be superseded or expire: a reset is accepted after
-                // FIN until then.
-                return tokio::select! {
-                    biased;
-                    () = expiry(deadline) => reset(&mut stream, Stop::Expired),
-                    receipt = stream.stopped() => acked(ctl, receipt),
-                    () = finish_grace_over(ctl, conn) => reset(&mut stream, Stop::Superseded),
-                };
-            }
-            // The segment was dropped unfinished, or this copy was dropped
-            // for its budget or queue, which the writer already counted.
-            None => {
-                stream.reset(codes::CANCELED);
-                return None;
-            }
-        }
-    }
-}
-
 /// Opens a dish's datagram flow for one topic and sends the datagram that
 /// waited for it; on failure the slot goes, so the next datagram tries again.
 async fn open_datagram_flow(
@@ -950,20 +556,6 @@ async fn open_datagram_flow(
     }
 }
 
-fn reset(stream: &mut SendHalf, stop: Stop) -> Option<Stop> {
-    stream.reset(codes::CANCELED);
-    Some(stop)
-}
-
-/// Records a finished copy's receipt: delivered means acknowledged, which no
-/// successor supersedes any more.
-fn acked(ctl: &CopyCtl, receipt: Result<Option<u64>, Error>) -> Option<Stop> {
-    if matches!(receipt, Ok(None)) {
-        ctl.acked.store(true, Ordering::Release);
-    }
-    None
-}
-
 /// Moves a radio's datagram segments from one flow into its dish's queue:
 /// stale ones against the newest delivered on the topic are discarded, and a
 /// full queue discards rather than waits.
@@ -990,17 +582,6 @@ pub(crate) async fn pump_flow(route: DishRoute, flow: IncomingFlow) {
             route.shared.overflow.fetch_add(1, Ordering::Relaxed);
         }
     }
-}
-
-async fn open_copy(conn: &ConnHandle, copy: &Copy) -> Result<SendHalf, Error> {
-    let header = DataHeader {
-        topic: Some(copy.topic.to_string()),
-        segment: Some(copy.number),
-        ..DataHeader::addressed(copy.path.as_ref())
-    };
-    let mut stream = conn.open_uni().await?;
-    write_data_preamble(&mut stream, &header).await?;
-    Ok(stream)
 }
 
 // --- dish side ----------------------------------------------------------------

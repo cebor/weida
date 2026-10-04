@@ -17,8 +17,8 @@ use common::{Certs, Server};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use weida::{
-    ClientTls, ClientTrust, DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Identity, Limits, PeerIdentity,
-    Radio, Received, Runtime, RuntimeConfig, Trust,
+    ClientTls, ClientTrust, DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Error, Identity, Incoming,
+    Limits, PeerIdentity, Radio, Received, Runtime, RuntimeConfig, SegmentTerms, Trust,
 };
 
 /// Generous ceiling: every assertion below should settle well inside it.
@@ -72,7 +72,9 @@ fn segment_of(received: Received) -> weida::IncomingTransfer {
 }
 
 fn send(radio: &Radio, topic: &str, chunks: usize, chunk: usize) {
-    let mut segment = radio.segment(topic).expect("segment");
+    let mut segment = radio
+        .segment(topic, SegmentTerms::default())
+        .expect("segment");
     for _ in 0..chunks {
         segment.write(vec![0x42; chunk]).expect("write");
     }
@@ -175,7 +177,9 @@ async fn a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole() {
     let mut tick = tokio::time::interval(Duration::from_millis(1000 / 30));
     for _ in 0..SEGMENTS {
         tick.tick().await;
-        let mut segment = radio.segment("v").expect("segment");
+        let mut segment = radio
+            .segment("v", SegmentTerms::default())
+            .expect("segment");
         for f in 0..FRAMES {
             if f > 0 {
                 tick.tick().await;
@@ -213,7 +217,9 @@ async fn a_segment_finished_right_before_its_successor_still_arrives_whole() {
 
     const SEGMENTS: u64 = 5;
     for _ in 0..SEGMENTS {
-        let mut segment = radio.segment("v").expect("segment");
+        let mut segment = radio
+            .segment("v", SegmentTerms::default())
+            .expect("segment");
         for _ in 0..8 {
             segment.write(vec![0x42; 4096]).expect("write");
         }
@@ -242,12 +248,16 @@ async fn a_segment_whose_finish_found_a_full_queue_is_superseded_at_once() {
     dishes(&radio, 1).await;
 
     // No await from here on: the copy's task has not taken a chunk yet.
-    let mut first = radio.segment("v").expect("segment");
+    let mut first = radio
+        .segment("v", SegmentTerms::default())
+        .expect("segment");
     for _ in 0..64 {
         first.write(vec![0x42; 1024]).expect("write");
     }
     assert_eq!(first.finish(), 0);
-    let mut second = radio.segment("v").expect("segment");
+    let mut second = radio
+        .segment("v", SegmentTerms::default())
+        .expect("segment");
     second.write(vec![0x42; 1024]).expect("write");
     second.finish();
 
@@ -257,6 +267,187 @@ async fn a_segment_whose_finish_found_a_full_queue_is_superseded_at_once() {
     assert_eq!(drops.subscriber_queue, 1, "{drops:?}");
     assert_eq!(drops.superseded, 1, "{drops:?}");
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_segment_following_upstream_keeps_its_copy_while_its_successor_opens() {
+    // A relay opens segment n+1 the moment its upstream does, while the rest
+    // of segment n is still arriving from upstream.
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = server.client_runtime();
+    let dish = joined(&server, &runtime, "v", None).await;
+    dishes(&radio, 1).await;
+
+    let relayed = SegmentTerms::default().with_follows_upstream(true);
+    let mut a = radio.segment("v", relayed.clone()).expect("segment a");
+    a.write(vec![0x41; 4096]).expect("write");
+    let mut b = radio.segment("v", relayed).expect("segment b");
+    // The copy of a runs and sees its successor while a is unfinished.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..7 {
+        a.write(vec![0x41; 4096]).expect("write");
+    }
+    a.finish();
+    b.write(vec![0x42; 4096]).expect("write");
+    b.finish();
+
+    let mut bodies = Vec::new();
+    for _ in 0..2 {
+        let received = segment_of(within(dish.recv()).await.expect("recv"));
+        let number = received.meta().segment.expect("a segment number");
+        let body = within(received.collect(1 << 20))
+            .await
+            .expect("a whole segment");
+        bodies.push((number, body.len()));
+    }
+    bodies.sort_unstable();
+    assert_eq!(bodies, vec![(0, 8 * 4096), (1, 4096)]);
+    assert_eq!(radio.dropped_on("v").map_or(0, |d| d.superseded), 0);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_segment_following_upstream_still_resets_a_stalled_dish() {
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = stalling(&server);
+    let _dish = joined(&server, &runtime, "v", None).await;
+    dishes(&radio, 1).await;
+
+    // Four windows of a segment the dish never reads, left unfinished.
+    let relayed = SegmentTerms::default().with_follows_upstream(true);
+    let mut a = radio.segment("v", relayed.clone()).expect("segment a");
+    for _ in 0..16 {
+        a.write(vec![0x41; 16 * 1024]).expect("write");
+    }
+    let _b = radio.segment("v", relayed).expect("segment b");
+    within(async {
+        while radio.dropped_on("v").map_or(0, |d| d.superseded) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    drop(a);
+    runtime.shutdown().await;
+}
+
+// --- segments from a dialling peer ---------------------------------------------
+
+fn stream_of(incoming: Incoming) -> weida::IncomingTransfer {
+    match incoming {
+        Incoming::Stream(transfer) => transfer,
+        other => panic!("expected a stream, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_peer_segment_reaches_an_acceptor_with_its_number() {
+    let server = Server::start().await;
+    let acceptor = server.listener.acceptor("/up").expect("acceptor");
+    let client = server.client_runtime();
+    let peer = client.peer(server.trust());
+    within(peer.connect(&server.url("/up")))
+        .await
+        .expect("connect");
+
+    for n in 0..2u64 {
+        let mut segment = within(peer.segment("t", SegmentTerms::default()))
+            .await
+            .expect("segment");
+        assert_eq!(segment.number(), n);
+        segment.write(vec![n as u8; 1000]).expect("write");
+        segment.finish();
+        let transfer = stream_of(within(acceptor.accept()).await.expect("accept"));
+        assert_eq!(transfer.meta().segment, Some(n));
+        assert_eq!(transfer.meta().topic.as_deref(), Some("t"));
+        let body = within(transfer.collect(4096))
+            .await
+            .expect("a whole segment");
+        assert_eq!(&body[..], &[n as u8; 1000][..]);
+    }
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_peer_segment_supersedes_the_previous_one_on_its_topic() {
+    let server = Server::start_with(Limits {
+        stream_receive_window: 64 * 1024,
+        ..Limits::default()
+    })
+    .await;
+    let acceptor = server.listener.acceptor("/up").expect("acceptor");
+    let client = server.client_runtime();
+    let peer = client.peer(server.trust());
+    within(peer.connect(&server.url("/up")))
+        .await
+        .expect("connect");
+
+    // Segment 0 is four windows long and never read: it cannot finish.
+    let mut first = within(peer.segment("t", SegmentTerms::default()))
+        .await
+        .expect("segment 0");
+    for _ in 0..16 {
+        first.write(vec![0x42; 16 * 1024]).expect("write");
+    }
+    first.finish();
+    let held = stream_of(within(acceptor.accept()).await.expect("accept 0"));
+    assert_eq!(held.meta().segment, Some(0));
+
+    let mut second = within(peer.segment("t", SegmentTerms::default()))
+        .await
+        .expect("segment 1");
+    second.write(vec![0x43; 1000]).expect("write");
+    second.finish();
+    let read = within(held.collect(1 << 20)).await;
+    assert!(matches!(read, Err(Error::Canceled)), "{read:?}");
+    within(async {
+        while peer.segment_drops("t").map_or(0, |d| d.superseded) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(peer.segment_drops("t").map(|d| d.superseded), Some(1));
+
+    let next = stream_of(within(acceptor.accept()).await.expect("accept 1"));
+    assert_eq!(next.meta().segment, Some(1));
+    let body = within(next.collect(4096)).await.expect("a whole segment");
+    assert_eq!(body.len(), 1000);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_peers_on_one_connection_number_one_sequence() {
+    // Both peers dial the same address with the same trust, so the pool
+    // gives them one connection: their segments on a topic share a sequence
+    // the acceptor sees only rise.
+    let server = Server::start().await;
+    let acceptor = server.listener.acceptor("/up").expect("acceptor");
+    let client = server.client_runtime();
+    let a = client.peer(server.trust());
+    let b = client.peer(server.trust());
+    within(a.connect(&server.url("/up")))
+        .await
+        .expect("connect a");
+    within(b.connect(&server.url("/up")))
+        .await
+        .expect("connect b");
+
+    for (n, peer) in [&a, &b].into_iter().enumerate() {
+        let mut segment = within(peer.segment("t", SegmentTerms::default()))
+            .await
+            .expect("segment");
+        assert_eq!(segment.number(), n as u64);
+        segment.write(vec![0x42; 100]).expect("write");
+        segment.finish();
+        let transfer = stream_of(within(acceptor.accept()).await.expect("accept"));
+        assert_eq!(transfer.meta().segment, Some(n as u64));
+        let body = within(transfer.collect(4096))
+            .await
+            .expect("a whole segment");
+        assert_eq!(body.len(), 100);
+    }
+    client.shutdown().await;
 }
 
 #[tokio::test]

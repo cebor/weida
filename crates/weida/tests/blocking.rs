@@ -161,7 +161,9 @@ fn a_radio_segment_and_datagram_reach_a_blocking_dish() {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    let mut segment = radio.segment("v").expect("segment");
+    let mut segment = radio
+        .segment("v", weida::SegmentTerms::default())
+        .expect("segment");
     assert_eq!(segment.write(b"key").expect("write"), 1);
     assert_eq!(segment.write(b"frame").expect("write"), 1);
     assert_eq!(segment.finish(), 1);

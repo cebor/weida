@@ -98,6 +98,12 @@ pub(crate) struct ConnCtx {
     /// When this connection was established: after the QUIC handshake, before
     /// HELLO. What [`crate::ConnectionStats::age`] counts from.
     pub established: std::time::Instant,
+    /// Numbers [`crate::Peer::segment`] per `(path, topic)` on this dialling
+    /// connection, shared by every `Peer` the pool gave it; at most
+    /// `max_sequence_scopes` entries
+    /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+    /// §4.11).
+    pub segments_out: crate::segment::SegmentNumbers,
     agreed: watch::Receiver<Option<Agreed>>,
 }
 
@@ -147,6 +153,7 @@ impl ConnCtx {
             flows: crate::flow::FlowTable::new(&limits),
             agreed: agreed_rx,
             established: std::time::Instant::now(),
+            segments_out: crate::segment::SegmentNumbers::new(limits.max_sequence_scopes),
         });
 
         // Once per connection, never per message: a drain collects the

@@ -443,7 +443,7 @@ impl PyRadio {
     fn segment(&self, py: Python<'_>, topic: &str) -> PyResult<PySegment> {
         let segment = self
             .endpoint
-            .segment(topic)
+            .segment(topic, weida::SegmentTerms::default())
             .map_err(|e| to_py(py, &errno_of(e)))?;
         Ok(PySegment {
             segment: Mutex::new(Some(segment)),
