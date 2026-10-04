@@ -30,7 +30,7 @@ kind: code | size: 45 | status: ready | needs: [B-299]
 acceptance: [0036](decisions/0036-connection-statistics.md) §4.8: `connection_stats()` on every dialling class of both Python surfaces returns `weida.ConnectionStats` values (url, age seconds, redials, transport as a value with path, tx, rx, or `None`); a test over QUIC loopback asserts a positive RTT and `None` over `weida+inproc`; [libraries/weida-py.md](libraries/weida-py.md) moves the row from absent to present.
 
 ### B-304 — Supersession that keeps finished copies whole
-kind: code | size: 60 | status: ready | needs: []
+kind: code | size: 60 | status: done 9c92b10 | needs: []
 acceptance: [0037](decisions/0037-layered-segments.md) §4.5 in `crates/weida/src/radio.rs`, taken from tuco86/weida#2's two radio commits (`7ce78c2`, `402afd3`) and rebased on main with the grace read from `Link::transport_stats().map(|t| t.path)`. The PR's tests pass in `crates/weida/tests/radio.rs` with `common::delay_proxy`: `a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole` and `a_segment_finished_right_before_its_successor_still_arrives_whole`; `a_stalled_dish_loses_old_segments_while_a_fast_one_gets_every_one` still passes.
 
 ### B-305 — PROTOCOL: DATA key 14 `layer`, SUBSCRIBE key 3 `max_layer`
