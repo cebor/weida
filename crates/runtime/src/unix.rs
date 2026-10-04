@@ -49,9 +49,12 @@ impl BoundUnixSocket {
     ///    the rest to the caller (`docs/research/zeromq.md` §11).
     /// 2. **The socket-type check.** Closing a socket does not remove its
     ///    node, so a crash leaves one and `bind()` then fails with
-    ///    `EADDRINUSE`. A stale node is a socket nobody is listening on;
-    ///    anything else at that path is not ours to remove, and removing it
-    ///    anyway is how a bind deletes a caller's data.
+    ///    `EADDRINUSE`. A stale node is a socket nobody is listening on, and
+    ///    a connect probes for that: a live one is
+    ///    [`Error::AddressInUse`] and left alone (the probe's connection is
+    ///    accepted and closed by the incumbent). Anything else at that path is
+    ///    not ours to remove, and removing it anyway is how a bind deletes a
+    ///    caller's data.
     /// 3. **Unlink, then bind.** The usual answer to the stale node, and it
     ///    opens a substitution race that is closed only "unless directory
     ///    ownership and permissions prevent endpoint substitution"
@@ -64,6 +67,17 @@ impl BoundUnixSocket {
     ///    file is created with whatever `umask` allows, which is whatever the
     ///    process happened to inherit.
     pub fn bind(path: &Path) -> Result<(BoundUnixSocket, UnixListener), Error> {
+        BoundUnixSocket::bind_with(path, false)
+    }
+
+    /// As [`BoundUnixSocket::bind`], with libzmq's `ipc://` semantics: a
+    /// live node is replaced, and the listener that held it no longer
+    /// receives connections.
+    pub fn bind_stealing(path: &Path) -> Result<(BoundUnixSocket, UnixListener), Error> {
+        BoundUnixSocket::bind_with(path, true)
+    }
+
+    fn bind_with(path: &Path, steal: bool) -> Result<(BoundUnixSocket, UnixListener), Error> {
         if path.as_os_str().len() > MAX_SOCKET_PATH_BYTES {
             return Err(Error::InvalidAddress(format!(
                 "socket path exceeds this platform's {}-byte sun_path budget: {}",
@@ -74,7 +88,25 @@ impl BoundUnixSocket {
         // A stale node is a socket nobody is listening on. Anything else at
         // that path is not ours to remove.
         match std::fs::metadata(path) {
-            Ok(meta) if is_socket(&meta) => std::fs::remove_file(path).map_err(Error::Io)?,
+            Ok(meta) if is_socket(&meta) => {
+                if !steal {
+                    match std::os::unix::net::UnixStream::connect(path) {
+                        Ok(_) => return Err(Error::AddressInUse(path.display().to_string())),
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::ConnectionRefused
+                                    | std::io::ErrorKind::NotFound
+                            ) => {}
+                        Err(e) => return Err(Error::Io(e)),
+                    }
+                }
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(Error::Io(e)),
+                }
+            }
             Ok(_) => {
                 return Err(Error::InvalidAddress(format!(
                     "{} exists and is not a socket",
@@ -196,6 +228,32 @@ mod tests {
         }
         assert!(path.exists(), "the stale node must still be there");
         let (_bound, _listener) = BoundUnixSocket::bind(&path).expect("bind over the stale node");
+    }
+
+    /// Claim: a socket someone listens on is theirs; a second bind refuses
+    /// it and leaves it working.
+    #[tokio::test]
+    async fn a_live_socket_is_refused_and_left_alone() {
+        let path = dir("live").join("s");
+        let (_bound, _listener) = BoundUnixSocket::bind(&path).expect("first bind");
+        let err = BoundUnixSocket::bind(&path).unwrap_err();
+        assert!(matches!(err, Error::AddressInUse(_)), "{err:?}");
+        std::os::unix::net::UnixStream::connect(&path).expect("the first listener still answers");
+    }
+
+    /// Claim: the stealing bind replaces a live socket, as libzmq's `ipc://`.
+    #[tokio::test]
+    async fn bind_stealing_replaces_a_live_socket() {
+        let path = dir("steal").join("s");
+        let (first, _old) = BoundUnixSocket::bind(&path).expect("first bind");
+        std::mem::forget(first);
+        let (_bound, new) = BoundUnixSocket::bind_stealing(&path).expect("stealing bind");
+        let _client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+        new.accept()
+            .await
+            .expect("the new listener takes the connection");
     }
 
     /// Claim: anything at that path that is not a socket is refused, because

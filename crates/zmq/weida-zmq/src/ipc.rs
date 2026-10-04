@@ -38,12 +38,11 @@
 //! `zmq_ipc(7)`: "if a second process binds to an endpoint already bound by a
 //! process, this will succeed and the first process will lose its binding. In
 //! this behaviour, the `ipc` transport is not consistent with the `tcp` or
-//! `inproc` transports" (`docs/research/zeromq.md` §8). This library has the
-//! same behaviour, for the same reason: the stale-node problem has no answer
-//! other than unlink-then-bind — a socket file outlives the process that
-//! created it, so a crash would otherwise make the endpoint permanently
-//! unbindable — and an unlink cannot distinguish a stale node from a live
-//! one.
+//! `inproc` transports" (`docs/research/zeromq.md` §8). This library keeps
+//! that behaviour on purpose: a program ported from libzmq relies on it, so
+//! the bind is `weida-runtime`'s `BoundUnixSocket::bind_stealing`, which
+//! replaces a live node where weida's own `bind` refuses it with
+//! `AddressInUse`.
 //!
 //! What is done about it, and what is not:
 //!
@@ -111,14 +110,15 @@ pub struct IpcBinding {
 
 impl IpcBinding {
     /// Binds `path` with the hygiene above: the socket-type check, the
-    /// unlink, the explicit mode and the kernel's path budget.
+    /// unlink — of a live node too, as libzmq does — the explicit mode and
+    /// the kernel's path budget.
     ///
     /// `exec` is entered while the listener is constructed, because tokio
     /// registers a socket with the reactor as it is created and the calling
     /// thread may have none of its own.
     pub fn bind(exec: &Exec, path: &Path) -> Result<IpcBinding> {
         let _guard = exec.enter();
-        let (node, listener) = BoundUnixSocket::bind(path).map_err(ipc_error)?;
+        let (node, listener) = BoundUnixSocket::bind_stealing(path).map_err(ipc_error)?;
         Ok(IpcBinding { node, listener })
     }
 

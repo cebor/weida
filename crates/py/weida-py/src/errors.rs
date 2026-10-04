@@ -1,7 +1,7 @@
 //! weida's failure vocabulary, as this module's exception classes.
 //!
 //! `weida.Untrusted`, `weida.UnknownEndpoint`, `weida.Indeterminate` and
-//! eighteen more, each its own class under `weida.WeidaError`, each instance
+//! twenty-two more, each its own class under `weida.WeidaError`, each instance
 //! carrying `errno` and `cause`. One is renamed and the macro below says
 //! why: `Error::Runtime` becomes `weida.RuntimeFailure`, because
 //! `weida.Runtime` is the runtime. A caller writes the branch the failure model
@@ -75,6 +75,7 @@ failures!(
     (InvalidEndpointPath),
     (InvalidFingerprint),
     (AlreadyRegistered),
+    (AddressInUse),
     (NotConnected),
     (ConnectionLost),
     (Negotiation),

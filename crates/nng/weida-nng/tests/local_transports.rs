@@ -229,6 +229,21 @@ async fn an_allow_list_at_the_hook_refuses_an_ipc_peer() {
     assert_eq!(rep.pipe_count(), 0);
 }
 
+/// Claim: a path another listener holds is `NNG_EADDRINUSE`, as NNG's own
+/// `ipc://` reports it, and the first listener keeps it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_live_ipc_path_is_eaddrinuse() {
+    let ctx = Context::new(ContextConfig::default()).expect("context");
+    let path = temp_socket("inuse");
+    let url = format!("ipc://{}", path.display());
+    let first = RepSocket::with_options(&ctx, options()).expect("rep");
+    let _listening = first.listen(&url).await.expect("listen");
+    let second = RepSocket::with_options(&ctx, options()).expect("rep");
+    let refused = second.listen(&url).await;
+    assert!(matches!(refused, Err(Error::EADDRINUSE(_))), "{refused:?}");
+}
+
 /// Claim: the socket file is removed when the listener goes, so the next
 /// bind of the same path is not a stale-node race.
 #[cfg(unix)]

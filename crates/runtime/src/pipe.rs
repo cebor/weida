@@ -63,16 +63,14 @@ impl BoundPipe {
     /// 2. **Local clients only.** `PIPE_REJECT_REMOTE_CLIENTS` on every
     ///    instance; the address form's `\\.\pipe\` prefix is the other half
     ///    of the same rule [0010 §4.8].
-    /// 3. **First instance or nothing.** A name that exists is not ours.
+    /// 3. **First instance or nothing.** A name that exists is not ours:
+    ///    [`Error::AddressInUse`].
     pub fn bind(path: impl Into<OsString>) -> Result<(BoundPipe, NamedPipeServer), Error> {
         let path = path.into();
         let dacl = weida_winpipe::OwnerOnlyDacl::for_current_user().map_err(Error::Io)?;
         let first = weida_winpipe::create_instance(&path, &dacl, true).map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
-                Error::InvalidAddress(format!(
-                    "{} already exists: a pipe name that is taken is not ours to serve",
-                    path.to_string_lossy()
-                ))
+                Error::AddressInUse(path.to_string_lossy().into_owned())
             } else {
                 Error::Io(e)
             }
@@ -209,7 +207,7 @@ mod tests {
         let path = name("taken");
         let (_bound, _first) = BoundPipe::bind(path.clone()).expect("bind");
         let err = BoundPipe::bind(path).unwrap_err();
-        assert!(matches!(err, Error::InvalidAddress(_)), "{err:?}");
+        assert!(matches!(err, Error::AddressInUse(_)), "{err:?}");
     }
 
     /// Claim: a pipe nobody serves is the peer being gone.
