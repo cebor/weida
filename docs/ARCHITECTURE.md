@@ -849,11 +849,12 @@ which only an anchor check consults, since a pin ignores names — and waits for
 exchange before returning, so a returned connection is always negotiated. A closed entry is
 evicted when the same key is dialled again; a handshake the verifier refused becomes
 `Error::Untrusted(fp)`, carrying the fingerprint that actually answered so an operator can
-decide whether to pin it. The dialled peers themselves live in the `PeerSet` inside a `Peer`
-(module `stream`): each `connect()` appends a `(connection, path)` pair, `pick()` round-robins
-across the live ones, and `peer_count()` counts only peers whose connection is still open.
-`add()` reaps closed entries as it appends, so the set cannot grow with uptime — at most one
-dead entry per loss survives, until the next `connect()`.
+decide whether to pin it. The dialled peers themselves live in the `PeerShared` behind a `Peer`
+(module `stream`): each `connect()` adds a slot for the URL as dialled, live, down while a redial
+works on it, or gone; `pick()` round-robins across the live ones and waits for a redial when
+none is, `peer_count()` counts only slots whose connection is still open, and `disconnect(url)`
+removes a slot and ends its redial task, so the set holds one slot per dialled address and
+cannot grow with uptime.
 
 **What binds a peer's connections.** The **proved fingerprint, and nothing else**
 ([decisions/0008](decisions/0008-session-identity.md) §4.2): no field names a peer's other
@@ -1000,7 +1001,7 @@ when Req/Rep moved onto a bidirectional stream.
 | --- | --- | --- | --- |
 | P1 | one-way transfer: open uni → DATA header → payload → FIN → receipt | `Peer::open`, `OutgoingTransfer` | Push, Pub (per copy) |
 | P2 | exchange: open bidi → request on one half, reply or ERROR on the other | `Peer::open_bi`, `ReplyStream`, `IncomingRequest` | Req/Rep only |
-| P3 | peer set plus a selection policy | `PeerSet` in `stream.rs`; fan-out in `SubRegistry` | Req, Push (round-robin), Sub (all peers), Pub (fan-out) |
+| P3 | peer set plus a selection policy | `PeerShared`'s slots in `stream.rs`; fan-out in `SubRegistry` | Req, Push (round-robin), Sub (all peers), Pub (fan-out) |
 | P4 | bounded inbound queue behind an opaque path | `Namespace` + per-endpoint mpsc | Rep, Pull, Sub, Acceptor |
 
 So: **Req = P2 + P3**, **Push = P1 + P3**, **Rep = P4**, **Pull = P4**, **Sub = P3 + P4**,
