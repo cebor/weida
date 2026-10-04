@@ -2,7 +2,9 @@
 
 - **Status:** accepted
 - **Date:** 2026-10-04
-- **Items:** B-304 to B-312
+- **Amended:** 2026-10-04, §4.11 (numbers and freshness per connection, a copy that follows
+  upstream)
+- **Items:** B-304 to B-312, B-314
 - **Answers:** [requirements/griasdi-video.md](../requirements/griasdi-video.md) (all five asks
   of its "Proposal"; its open questions stay open)
 - **Amends:** [0034](0034-late-is-lost.md) §4.6 (the supersession and expiry rows of the
@@ -145,7 +147,8 @@ ever knowing what decodes it.
 
 One mechanism serves two senders:
 
-- **The machinery is shared.** Numbering per `(sender, path, topic)` in DATA key `13`,
+- **The machinery is shared.** Numbering per `(sender, path, topic)` in DATA key `13` (the
+  sender of a `Peer::segment` is its connection, §4.11),
   supersession with §4.5's finish grace, a sender `max_age`, the `write` that never waits, §4.4's
   priority, §4.3's layers and the drop counters live with the segment, not with the radio. The
   draft PR's `SegmentTopics` and its shared `segment_copy` are kept as the seam.
@@ -234,7 +237,8 @@ impl Segment {
   }
   ```
 
-- **Dish freshness becomes per `(topic, segment, layer)`.** An arrival is fresh if its segment is
+- **Dish freshness becomes per `(topic, segment, layer)`** (kept per connection and checked by
+  every receiver, §4.11). An arrival is fresh if its segment is
   newer than the newest delivered on its topic, or equal to it with that layer not yet delivered;
   anything else is stale and counted in `stale()`. The memory per topic grows from one number to
   a number and a 16-bit mask, and stays bounded by the same `max_topics`.
@@ -333,8 +337,9 @@ each encoded frame goes to `write_layer(layer_of(frame), frame)`.
 
 **The server relay.** The per-layer upstream streams of one segment arrive as separate
 `Incoming::Stream`s with the same topic and number, and map onto one radio `Segment`: a number
-newer than the last one relayed on that topic opens a new radio segment and drops the old one,
-whose unfinished layers are then reset; each upstream chunk of layer *k* goes to
+newer than the last one relayed on that topic opens a new radio segment that follows upstream
+(§4.11) and keeps the old one until the old one's upstream layers have ended; each upstream
+chunk of layer *k* goes to
 `write_layer(k, chunk)`; upstream EOF on layer *k* becomes `finish_layer(k)`, called only once
 every lower layer is finished, so a relay never finishes a layer whose base it is about to lose.
 The relay never calls `finish()` on a segment with an upstream layer that was reset; it drops it.
@@ -374,6 +379,45 @@ unchanged.
 - An older acceptor receiving `Peer::segment` sees each layer as a separate stream with the same
   topic and segment number, which is what it would see from a relay forwarding them.
 
+### 4.11 Amendment: numbers and freshness per connection, and a copy that follows upstream
+
+Accepted by the owner on 2026-10-04, after tuco86/weida#2 grew three commits during the build
+(5cbba1a, 2ebcbd9, a1be629). The pull request is closed and nothing of it is merged; each commit
+named a loss the sections above did not see, and the shapes below are this note's.
+
+- **`Peer::segment` numbers per connection.** §4.2 made the sender of a `Peer::segment` the
+  `Peer`. Two `Peer`s the pool hands one connection, or a `Peer` rebuilt on a connection that
+  stayed open, restart a sequence the receiver still remembers, and every segment below the old
+  newest is discarded. The number is taken per `(path, topic)` from the dialling connection
+  (`ConnCtx::segments_out`), shared by every `Peer` on it; each `Peer` still supersedes only its
+  own copies. The table holds at most `max_sequence_scopes` entries; at the cap it evicts one,
+  and a key that returns resumes above every number an evicted key reached, so a receiver never
+  reads it as stale. A radio keeps numbering per `(radio path, topic)`.
+- **Freshness is per connection, and every receiver checks it.** §4.3's table lived as long as
+  the dish. A dish that redials a restarted radio, which numbers from 0 again, discarded every
+  segment until the new numbers overtook the old newest. The newest segment and §4.3's 16-bit
+  layer mask are kept per `(path, topic)` on the receiving connection (`ConnCtx::segments_in`), so
+  a redial starts over and no incarnation id is needed: every radio restart is a new connection.
+  The same table guards every other route: the dispatcher refuses a stale stream segment with
+  `CANCELED` before it reaches an acceptor, a transfer endpoint or a pair, which keeps a relay's
+  upstream as clean as a dish. A dish still counts its own in `stale()`. Datagram segments are
+  checked against the same table at layer 0. At most `max_sequence_scopes` entries per
+  connection; at the cap an untracked key is fresh, as before.
+- **A copy can follow upstream.** §4.8's relay opens segment *n+1* the moment upstream does,
+  while the tail of *n* is still arriving, so under §4.5 the successor reset every copy of *n*
+  still being written: every viewer behind a relay lost each segment's tail. `SegmentTerms` gains
+  `follows_upstream: bool` (`with_follows_upstream`). Supersession takes a layer of such a copy
+  only where a write has to wait, which is §4.5's stalled-dish rule; otherwise the layer keeps
+  taking chunks, a layer may still open after the successor did, and a finished layer gets §4.5's
+  grace. Dropping the `Segment` unfinished still resets every unfinished layer, which is what a
+  relay does when an upstream layer is reset. It applies to `Radio::segment` and `Peer::segment`
+  alike; §4.8's relay sets it.
+- **The items.** B-307 takes the numbering and `follows_upstream`; a new B-314 takes freshness
+  per connection; B-308 puts the layer mask into that table and replaces its two-radio freshness
+  test, because two paths are two keys; B-310's relay follows upstream; B-311 exposes the term in
+  both Python surfaces; B-312 documents all three. The rest of the pull request (8d35ed8,
+  9bcb0e0, a0bcf4f) is not taken.
+
 ## 5. Consequences and follow-ups
 
 Documents, once the owner accepts the note (B-312): [PATTERNS.md](../PATTERNS.md) §1.12 (priority
@@ -402,11 +446,15 @@ acceptance: `weida-protocol` encodes and decodes both keys against B-305's vecto
 
 ### B-307 — The segment as an L0 unit: `SegmentTerms`, `Peer::segment`, priority
 kind: code | size: 90 | status: ready | needs: [B-304]
-acceptance: [0037](0037-layered-segments.md) §4.2 and §4.4: `Radio::segment(topic, SegmentTerms)` and `Peer::segment(topic, SegmentTerms)` share one copy machinery, and `Peer::segment_drops` exists; copy streams get the §4.4 priority at open; a sender `max_age` applies, at a radio together with the dish's, the smaller winning; every `Radio::segment` caller is migrated. tuco86/weida#2's tests `a_peer_segment_reaches_an_acceptor_with_its_number` and `a_peer_segment_supersedes_the_previous_one_on_its_topic` pass. No priority test, because it would test `quinn`'s scheduler, as B-284 argued.
+acceptance: [0037](0037-layered-segments.md) §4.2, §4.4 and §4.11: `Radio::segment(topic, SegmentTerms)` and `Peer::segment(topic, SegmentTerms)` share one copy machinery, and `Peer::segment_drops` exists; copy streams get the §4.4 priority at open; a sender `max_age` applies, at a radio together with the dish's, the smaller winning; a `Peer::segment` takes its number per `(path, topic)` from its connection (`ConnCtx::segments_out`, at most `max_sequence_scopes` entries); `SegmentTerms::follows_upstream` keeps a copy against its successor unless a write has to wait; every `Radio::segment` caller is migrated. Tests: tuco86/weida#2's `a_peer_segment_reaches_an_acceptor_with_its_number` and `a_peer_segment_supersedes_the_previous_one_on_its_topic`, `two_peers_on_one_connection_number_one_sequence`, `a_segment_following_upstream_keeps_its_copy_while_its_successor_opens` and `a_segment_following_upstream_still_resets_a_stalled_dish`. No priority test, because it would test `quinn`'s scheduler, as B-284 argued.
+
+### B-314 — Segment freshness per connection
+kind: code | size: 45 | status: ready | needs: [B-307]
+acceptance: [0037](0037-layered-segments.md) §4.11: `ConnCtx::segments_in` keeps the newest segment per `(path, topic)`, at most `max_sequence_scopes` entries; a dish checks stream and datagram segments against it and keeps only its counters; the dispatcher refuses a stale stream segment with `CANCELED` before it reaches an acceptor, a transfer endpoint or a pair. Tests in `crates/weida/tests/radio.rs`: `a_dish_redialled_to_a_restarted_radio_takes_its_numbers_from_zero` (with `common::Restartable`, moved from `tests/stats.rs`) and `an_acceptor_refuses_a_segment_older_than_one_it_delivered`.
 
 ### B-308 — Layers inside a segment
-kind: code | size: 90 | status: ready | needs: [B-306, B-307]
-acceptance: [0037](0037-layered-segments.md) §4.3: `write_layer`, `finish_layer`, lazy per-`(copy, layer)` streams with their own queues, the cut rule including the release of upper layers' queued bytes, `TopicDrops::layers_cut` with `TopicDrops` made `#[non_exhaustive]`, `JoinTerms` replacing `join`'s `max_age` parameter at every caller, the largest-cap rule, per-layer freshness, and `IncomingMeta::layer`. Tests in `crates/weida/tests/radio.rs`: `a_dish_short_of_budget_keeps_layer_zero_whole_while_upper_layers_are_cut`, `a_dish_capped_at_layer_zero_is_never_sent_layer_one`, `a_layer_cut_also_cuts_every_higher_layer_of_that_segment`, `a_dish_delivers_each_layer_of_a_segment_once`, `a_peer_segment_carries_its_layers_to_the_acceptor`.
+kind: code | size: 90 | status: ready | needs: [B-306, B-307, B-314]
+acceptance: [0037](0037-layered-segments.md) §4.3 and §4.11: `write_layer`, `finish_layer`, lazy per-`(copy, layer)` streams with their own queues, the cut rule including the release of upper layers' queued bytes, `TopicDrops::layers_cut` with `TopicDrops` made `#[non_exhaustive]`, `JoinTerms` replacing `join`'s `max_age` parameter at every caller, the largest-cap rule, per-layer freshness in B-314's per-connection table, and `IncomingMeta::layer`. Tests in `crates/weida/tests/radio.rs`: `a_dish_short_of_budget_keeps_layer_zero_whole_while_upper_layers_are_cut`, `a_dish_capped_at_layer_zero_is_never_sent_layer_one`, `a_layer_cut_also_cuts_every_higher_layer_of_that_segment`, `a_receiver_delivers_each_layer_of_a_segment_once`, `a_peer_segment_carries_its_layers_to_the_acceptor`.
 
 ### B-309 — Per-dish drops at a radio
 kind: code | size: 45 | status: ready | needs: [B-308]
@@ -414,15 +462,15 @@ acceptance: [0037](0037-layered-segments.md) §4.6: `Radio::dish_drops() -> Vec<
 
 ### B-310 — A layered relay as a program, and a guide section
 kind: code | size: 60 | status: ready | needs: [B-308]
-acceptance: an example in B-290's shape — a `Peer::segment` uplink writing three layers, an acceptor, a `Radio::segment` per [0037](0037-layered-segments.md) §4.8 — asserted by a test: a dish with `max_layer = 0` receives layer 0 of every segment and nothing else, and an uncapped dish receives all three; a [GUIDE.md](../GUIDE.md) section "quality without re-encoding".
+acceptance: an example in B-290's shape — a `Peer::segment` uplink writing three layers, an acceptor, a `Radio::segment` that follows upstream per [0037](0037-layered-segments.md) §4.8 and §4.11 — asserted by a test: a dish with `max_layer = 0` receives layer 0 of every segment and nothing else, and an uncapped dish receives all three; a [GUIDE.md](../GUIDE.md) section "quality without re-encoding".
 
 ### B-311 — Layered segments in `weida::blocking` and `weida-py`
 kind: code | size: 60 | status: ready | needs: [B-308, B-309]
-acceptance: the `weida::blocking` twins of `SegmentTerms`, `JoinTerms`, `write_layer`, `finish_layer` and `dish_drops`, and both Python surfaces; one layered round trip per Python surface.
+acceptance: the `weida::blocking` twins of `SegmentTerms` (with `follows_upstream`), `JoinTerms`, `write_layer`, `finish_layer` and `dish_drops`, and both Python surfaces; one layered round trip per Python surface.
 
 ### B-312 — Documents for 0037
-kind: spec | size: 45 | status: ready | needs: [B-304, B-307, B-308, B-309]
-acceptance: §5's edits; no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says key `13` is written by a radio only, or that a dialling side cannot send a segment; [requirements/griasdi-video.md](../requirements/griasdi-video.md) points at what shipped.
+kind: spec | size: 45 | status: ready | needs: [B-304, B-307, B-308, B-309, B-314]
+acceptance: §5's edits, and §4.11's three rules in PATTERNS §6.4, GUARANTEES §6 and INVARIANTS (`segments_out` and `segments_in` per connection, each bounded by `max_sequence_scopes`); no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says key `13` is written by a radio only, or that a dialling side cannot send a segment; [requirements/griasdi-video.md](../requirements/griasdi-video.md) points at what shipped.
 
 ## 6. What this note does not decide
 

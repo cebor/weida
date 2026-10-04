@@ -42,34 +42,32 @@ kind: code | size: 45 | status: done 46b0af8 | needs: [B-305]
 acceptance: `weida-protocol` encodes and decodes both keys against B-305's vectors; a value above 15, and key `14` without key `13`, is a `PROTOCOL_VIOLATION`; the `roundtrip` fuzz target is extended.
 
 ### B-307 — The segment as an L0 unit: `SegmentTerms`, `Peer::segment`, priority
-kind: code | size: 90 | status: parked | needs: [B-304]
-acceptance: [0037](decisions/0037-layered-segments.md) §4.2 and §4.4: `Radio::segment(topic, SegmentTerms)` and `Peer::segment(topic, SegmentTerms)` share one copy machinery, and `Peer::segment_drops` exists; copy streams get the §4.4 priority at open; a sender `max_age` applies, at a radio together with the dish's, the smaller winning; every `Radio::segment` caller is migrated. tuco86/weida#2's tests `a_peer_segment_reaches_an_acceptor_with_its_number` and `a_peer_segment_supersedes_the_previous_one_on_its_topic` pass. No priority test, because it would test `quinn`'s scheduler, as B-284 argued.
-note: parked 2026-10-04 by the owner until 0037 is amended for tuco86/weida#2's 5cbba1a (per-connection numbering), 2ebcbd9 (per-connection dish freshness) and a1be629 (`Radio::relay_segment`).
+kind: code | size: 90 | status: ready | needs: [B-304]
+acceptance: [0037](decisions/0037-layered-segments.md) §4.2, §4.4 and §4.11: `Radio::segment(topic, SegmentTerms)` and `Peer::segment(topic, SegmentTerms)` share one copy machinery, and `Peer::segment_drops` exists; copy streams get the §4.4 priority at open; a sender `max_age` applies, at a radio together with the dish's, the smaller winning; a `Peer::segment` takes its number per `(path, topic)` from its connection (`ConnCtx::segments_out`, at most `max_sequence_scopes` entries); `SegmentTerms::follows_upstream` keeps a copy against its successor unless a write has to wait; every `Radio::segment` caller is migrated. Tests: tuco86/weida#2's `a_peer_segment_reaches_an_acceptor_with_its_number` and `a_peer_segment_supersedes_the_previous_one_on_its_topic`, `two_peers_on_one_connection_number_one_sequence`, `a_segment_following_upstream_keeps_its_copy_while_its_successor_opens` and `a_segment_following_upstream_still_resets_a_stalled_dish`. No priority test, because it would test `quinn`'s scheduler, as B-284 argued.
+
+### B-314 — Segment freshness per connection
+kind: code | size: 45 | status: ready | needs: [B-307]
+acceptance: [0037](decisions/0037-layered-segments.md) §4.11: `ConnCtx::segments_in` keeps the newest segment per `(path, topic)`, at most `max_sequence_scopes` entries; a dish checks stream and datagram segments against it and keeps only its counters; the dispatcher refuses a stale stream segment with `CANCELED` before it reaches an acceptor, a transfer endpoint or a pair. Tests in `crates/weida/tests/radio.rs`: `a_dish_redialled_to_a_restarted_radio_takes_its_numbers_from_zero` (with `common::Restartable`, moved from `tests/stats.rs`) and `an_acceptor_refuses_a_segment_older_than_one_it_delivered`.
 
 ### B-308 — Layers inside a segment
-kind: code | size: 90 | status: parked | needs: [B-306, B-307]
-acceptance: [0037](decisions/0037-layered-segments.md) §4.3: `write_layer`, `finish_layer`, lazy per-`(copy, layer)` streams with their own queues, the cut rule including the release of upper layers' queued bytes, `TopicDrops::layers_cut` with `TopicDrops` made `#[non_exhaustive]`, `JoinTerms` replacing `join`'s `max_age` parameter at every caller, the largest-cap rule, per-layer freshness, and `IncomingMeta::layer`. Tests in `crates/weida/tests/radio.rs`: `a_dish_short_of_budget_keeps_layer_zero_whole_while_upper_layers_are_cut`, `a_dish_capped_at_layer_zero_is_never_sent_layer_one`, `a_layer_cut_also_cuts_every_higher_layer_of_that_segment`, `a_dish_delivers_each_layer_of_a_segment_once`, `a_peer_segment_carries_its_layers_to_the_acceptor`.
-note: parked with B-307 until 0037 is amended.
+kind: code | size: 90 | status: ready | needs: [B-306, B-307, B-314]
+acceptance: [0037](decisions/0037-layered-segments.md) §4.3 and §4.11: `write_layer`, `finish_layer`, lazy per-`(copy, layer)` streams with their own queues, the cut rule including the release of upper layers' queued bytes, `TopicDrops::layers_cut` with `TopicDrops` made `#[non_exhaustive]`, `JoinTerms` replacing `join`'s `max_age` parameter at every caller, the largest-cap rule, per-layer freshness in B-314's per-connection table, and `IncomingMeta::layer`. Tests in `crates/weida/tests/radio.rs`: `a_dish_short_of_budget_keeps_layer_zero_whole_while_upper_layers_are_cut`, `a_dish_capped_at_layer_zero_is_never_sent_layer_one`, `a_layer_cut_also_cuts_every_higher_layer_of_that_segment`, `a_receiver_delivers_each_layer_of_a_segment_once`, `a_peer_segment_carries_its_layers_to_the_acceptor`.
 
 ### B-309 — Per-dish drops at a radio
-kind: code | size: 45 | status: parked | needs: [B-308]
+kind: code | size: 45 | status: ready | needs: [B-308]
 acceptance: [0037](decisions/0037-layered-segments.md) §4.6: `Radio::dish_drops() -> Vec<DishDrops>`, one record per joined dish connection, removed when it closes. Test: two dishes, one short of budget; only its record counts `subscriber_budget` or `layers_cut`, and the record is gone after it disconnects.
-note: parked with B-307 until 0037 is amended.
 
 ### B-310 — A layered relay as a program, and a guide section
-kind: code | size: 60 | status: parked | needs: [B-308]
-acceptance: an example in B-290's shape — a `Peer::segment` uplink writing three layers, an acceptor, a `Radio::segment` per [0037](decisions/0037-layered-segments.md) §4.8 — asserted by a test: a dish with `max_layer = 0` receives layer 0 of every segment and nothing else, and an uncapped dish receives all three; a [GUIDE.md](GUIDE.md) section "quality without re-encoding".
-note: parked with B-307 until 0037 is amended.
+kind: code | size: 60 | status: ready | needs: [B-308]
+acceptance: an example in B-290's shape — a `Peer::segment` uplink writing three layers, an acceptor, a `Radio::segment` that follows upstream per [0037](decisions/0037-layered-segments.md) §4.8 and §4.11 — asserted by a test: a dish with `max_layer = 0` receives layer 0 of every segment and nothing else, and an uncapped dish receives all three; a [GUIDE.md](GUIDE.md) section "quality without re-encoding".
 
 ### B-311 — Layered segments in `weida::blocking` and `weida-py`
-kind: code | size: 60 | status: parked | needs: [B-308, B-309]
-acceptance: the `weida::blocking` twins of `SegmentTerms`, `JoinTerms`, `write_layer`, `finish_layer` and `dish_drops`, and both Python surfaces; one layered round trip per Python surface.
-note: parked with B-307 until 0037 is amended.
+kind: code | size: 60 | status: ready | needs: [B-308, B-309]
+acceptance: the `weida::blocking` twins of `SegmentTerms` (with `follows_upstream`), `JoinTerms`, `write_layer`, `finish_layer` and `dish_drops`, and both Python surfaces; one layered round trip per Python surface.
 
 ### B-312 — Documents for 0037
-kind: spec | size: 45 | status: parked | needs: [B-304, B-307, B-308, B-309]
-acceptance: [0037](decisions/0037-layered-segments.md) §5's edits; no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says key `13` is written by a radio only, or that a dialling side cannot send a segment; [requirements/griasdi-video.md](requirements/griasdi-video.md) points at what shipped.
-note: parked with B-307 until 0037 is amended.
+kind: spec | size: 45 | status: ready | needs: [B-304, B-307, B-308, B-309, B-314]
+acceptance: [0037](decisions/0037-layered-segments.md) §5's edits, and §4.11's three rules in PATTERNS §6.4, GUARANTEES §6 and INVARIANTS (`segments_out` and `segments_in` per connection, each bounded by `max_sequence_scopes`); no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says key `13` is written by a radio only, or that a dialling side cannot send a segment; [requirements/griasdi-video.md](requirements/griasdi-video.md) points at what shipped.
 
 ### B-313 — ARCHITECTURE names a `PeerSet` that no longer exists
 kind: spec | size: 15 | status: ready | needs: []

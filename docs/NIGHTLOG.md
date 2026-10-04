@@ -5,20 +5,6 @@ first, then the numbers, then the chronology.
 
 ## Review needed
 
-**0037 stops after B-306 and waits for an amendment** (2026-10-04, main `46b0af8`, gate
-green). tuco86/weida#2 was force-pushed during the run (head `92f322e`, rebased on `05a6b8e`),
-so 7ce78c2, 402afd3, 1e7eb9e and 5e6ee45 no longer exist. B-304 took the rebased twins
-17ec687 and 3178aa4, plus 5a76ae7 at your choice (`finished` stored only once the FIN is
-queued). B-305 and B-306 are done. The PR's newer commits partly contradict 0037: 5cbba1a
-numbers `Peer::segment` per connection and refuses stale segments at the dispatcher, against
-§4.2's numbering per (sender, path, topic); 2ebcbd9 moves dish freshness to the connection,
-against §4.3's per-topic table with a layer mask; a1be629 adds `Radio::relay_segment`, against
-§4.8's relay on plain `Radio::segment`. 8d35ed8 and 9bcb0e0 (local transport: refuse a busy
-address, `self@` account pins) and 92f322e (docs) lie outside 0037. You chose to stop and
-redesign, so B-307 to B-312 are `parked` until 0037 is amended; their acceptance lines will
-need revising then. Still yours: closing the PR, and a home for a0bcf4f (the Windows
-`current_account_sid` commit that used to be 5e6ee45).
-
 **0034 is built, B-279 to B-292, and three things want your eye** (2026-09-29, main
 `59f79f6`, gate green after every item). **(1) Two proposals wait in the site repositories**:
 `weida.doodleshnookie.net/docs/requirements/weida-late-is-lost.md` (untracked, that directory
@@ -471,3 +457,4 @@ sharing a bottleneck with media; the default stays `Cubic`. Recorded in IMPLEMEN
 2026-10-04T18:58Z | B-305 | done 7094fc7 | PROTOCOL §6.2: key `13` written by a radio or by `Peer::segment` toward a bound path, new key `14` `layer` (cap 15, absent means 0, only beside key `13`); §6.4 key `3` `max_layer` (cap 15, RADIO path only); §6.9 datagram segments have no layer; §8 vectors `57 01 09 A3 00 62 2F 74 0D 05 0E 02` and `57 03 0A A3 00 62 2F 74 01 61 61 03 01` with field lists, and the three violation headers. Docs only, no gate; `radio only`/`Only a radio` no longer appear in PROTOCOL | next review pass (§8), then B-306
 2026-10-04T19:00Z | review | 5b9e304 | 1 finding, filed as B-313: ARCHITECTURE.md:852 and :1003 still name `PeerSet`, removed by 76cbb28. Anchor `d666c1a` to `5b9e304`, 170 files. Gate green on a clean tree: fmt, clippy (workspace, no-default-features, five feature runs), 1851 workspace tests (0 failed, 39 ignored), ten doc runs. Allocation sweep over every new insertion site in `crates/weida/src` and `crates/protocol/src`: inbound flows capped by `max_flows` before insert, early datagrams by `flow_early_bytes`, radio dishes one per connection with filters under `max_subscriptions`, the dish's newest table under `max_sequence_scopes`, presented chains under `MAX_PEER_CHAIN_*`; the per-topic datagram slots and live copies are keyed by the radio's own topics. Identifier sweep: 124 `Type::member` and 135 CamelCase names in the six normative documents checked against the tree; `PeerSet` is the only stale one (`UnknownOutcome` is GUARANTEES' name for the concept beside `Indeterminate`). A reviewer subagent could not start (no model configured), so the pass ran here | next B-306
 2026-10-04T19:07Z | B-306 | done 46b0af8 | `weida-protocol`: `limits::MAX_LAYER = 15`, `DataHeader::layer` (key `14`, refused above 15 and without key `13`), `SubscriptionHeader::max_layer` (key `3`, refused above 15), `HeaderError::InvalidLayer`; work in c1f3ed8, plus 46b0af8 restoring a `max_age_ms` doc line the edit had dropped. Tests `golden_layered_segment_data_frame`, `golden_subscribe_with_max_layer_frame`, `a_layer_above_fifteen_or_without_a_segment_is_a_violation`; `fuzz_smoke` seeds and generator carry layers, the `roundtrip` fuzz target generates key `14` beside key `13`, `subscribe` asserts the cap; `cargo check` of the fuzz crate passes. Gate green on the second run (the first failed `cargo fmt --check` on one line): fmt, clippy (workspace, no-default-features, five feature runs), 1854 workspace tests (0 failed, 39 ignored), ten doc runs; after 46b0af8 fmt, `weida-protocol` rustdoc and tests re-run green | stopped: B-307..B-312 parked until 0037 is amended
+2026-10-04T19:33Z | — | 0037 amended | the owner closed tuco86/weida#2 and chose §4.11: `Peer::segment` numbers per connection (`ConnCtx::segments_out`), freshness per connection with the layer mask and checked by every receiver (`ConnCtx::segments_in`, new B-314), `SegmentTerms::follows_upstream` for relays; B-307, B-308, B-310, B-311 and B-312 revised and ready again; 8d35ed8, 9bcb0e0 and a0bcf4f discarded | next B-307
