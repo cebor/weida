@@ -22,5 +22,6 @@ mod imp;
 
 #[cfg(windows)]
 pub use imp::{
-    OwnerOnlyDacl, PipePeer, client_peer, create_instance, is_pipe_busy, open_client, server_peer,
+    OwnerOnlyDacl, PipePeer, client_peer, create_instance, current_user_sid, is_pipe_busy,
+    open_client, server_peer,
 };

@@ -48,8 +48,10 @@
 //! - On Windows: `BoundPipe`, which creates the instances of a named pipe
 //!   with an owner-only DACL, local clients only and the first-instance
 //!   flag, `connect_pipe`, which opens the client end and waits out
-//!   `ERROR_PIPE_BUSY`, and `client_principal` / `server_principal`, the
-//!   kernel's answer to the same question in SID form (0010 §4.4, §4.5).
+//!   `ERROR_PIPE_BUSY`, `client_principal` / `server_principal`, the
+//!   kernel's answer to the same question in SID form (0010 §4.4, §4.5),
+//!   and `current_account_sid`, this process's own answer to compare it
+//!   with.
 //!
 //! # The grep
 //!
@@ -79,7 +81,7 @@ mod unix;
 pub use budget::CloseBudget;
 pub use exec::{Exec, OwnedReactor};
 #[cfg(windows)]
-pub use pipe::{BoundPipe, client_principal, connect_pipe, server_principal};
+pub use pipe::{BoundPipe, client_principal, connect_pipe, current_account_sid, server_principal};
 pub use registry::NameRegistry;
 pub use resolve::{Resolved, Resolver, SharedResolver, SystemResolver};
 #[cfg(unix)]
