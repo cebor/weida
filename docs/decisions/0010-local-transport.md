@@ -216,6 +216,20 @@ rejected.
    address that looks like it authenticates but does not is worse than one that plainly does
    not. Who may connect is stated in the binding's configuration as accepted local principals.
 
+   **Amended (zoagn):** the userinfo `self` on `weida+unix` and `weida+pipe` pins the dialler's
+   own account: `weida+unix://self@<percent-encoded-socket-path>/<path>`,
+   `weida+pipe://self@<pipe-name>/<path>`. The kernel proves it at connect — the peer's uid or
+   SID is compared with this process's, before HELLO — so the address authenticates what it
+   says; a mismatch fails with `UntrustedPrincipal`. A redial keeps the address and so the pin.
+   Every other userinfo stays refused, `weida+inproc` takes none, and a bind address refuses
+   `self@`.
+
+   **Amended (zoagn), §4.5:** binding no longer unlinks blindly. `BoundUnixSocket::bind`
+   probes a socket node with a connection: a refused or missing one is stale and removed, a
+   live one fails with `AddressInUse` and stays; a named pipe whose first instance exists fails
+   the same way. `bind_stealing` keeps the unlink-then-bind of libzmq's `ipc://` for
+   `weida-zmq`, whose documented rule is that a second bind takes the endpoint.
+
 ## 5. Consequences and follow-ups
 
 - **[ARCHITECTURE.md](../ARCHITECTURE.md) §2, §3.** Identity becomes the sum of §4.4 and the

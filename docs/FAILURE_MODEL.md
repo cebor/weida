@@ -159,7 +159,7 @@ are stated in the same shape in their own subsection below.
 
 `Error::is_definite_failure()` is the machine-readable form of the word "definite": true for
 `ConnectionLost`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `Canceled`, `NotConnected`,
-`LimitExceeded` and `Untrusted`. A typed refusal — by stop code or by ERROR frame — proves
+`LimitExceeded`, `Untrusted` and `UntrustedPrincipal`. A typed refusal — by stop code or by ERROR frame — proves
 the payload never reached an application, and a refused handshake proves nothing was sent at
 all; that is what makes them definite. `Indeterminate` is outside the set by construction,
 because keeping it apart from failure is the whole point of master doc §22, and so is
@@ -180,6 +180,7 @@ acknowledges anything, and the receipt therefore says less than its QUIC counter
 | Connection lost | after local FIN, before the receipt | **cannot occur**, because there is no interval to lose the connection in | The receipt does not wait for anything, so nothing can happen between the FIN and it. |
 | Receipt resolves | after local FIN | `Delivery::delivered()` yields `Ok(())` as soon as the writer's FIN is set, with no involvement from the peer | The bounded channel (in process) or the kernel's socket buffer (`AF_UNIX`, named pipes) **is** the peer's transport, so a write that completed already put the bytes in it. `inproc::LocalSend::stopped` resolves on the writer's own finished flag; `grouped::LocalSend::stopped` is `Ok(None)` unconditionally. The receipt adds nothing to what `write_all` and `finish()` already returned. |
 | `STOP_SENDING` observed | any | **there is none.** In process a refusal still reaches the receipt, because the reader sets a flag the receipt reads and `stop_reason` maps it to the same typed error QUIC's stop code does. Over `AF_UNIX` it reaches the **write** instead, as `Error::Canceled`, and never `delivered()`. Over a named pipe it reaches neither | A local stream carries no application error code [0012 §4.7]. Closing an `AF_UNIX` reader's half makes the writer's next write `EPIPE`, which is a refusal without a code and arrives from `write_all`. A named-pipe reader cannot even do that — the writer's direction is the only one it could signal on and the reply owns it — so it **drains** the rest of the payload in the background and the writer finishes normally (`crates/weida/src/pipe.rs`). |
+| Dial of a `self@` address reaches another account's endpoint | nothing was sent past the control byte | `connect` fails with `Error::UntrustedPrincipal(peer)`; `is_definite_failure()` is true | The kernel attributes the endpoint to a uid or SID other than this process's, and the check runs before HELLO ([decisions/0010](decisions/0010-local-transport.md) §4.8, amended), so no frame was written. The error carries the principal that answered. A peer the kernel gives no principal is a `Transport` error instead, never a pass. |
 
 Two consequences, both load-bearing for an application that moves between transports:
 

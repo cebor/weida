@@ -45,9 +45,9 @@ not estimated:
 | Number | Value | Counted from |
 | --- | --- | --- |
 | `#[pyclass]`es | **44** | 26 `add_class` calls in `lib.rs` plus 18 in `sync.rs`'s `install` |
-| `weida.__all__` | **62** names | 33 literals in `every_name` (which include `sync`, `VERSION`, `ALPN`, `WeidaError` and the five cursor names), the five named levels appended after them, plus the 24 of `errors::NAMES` |
+| `weida.__all__` | **70** names | 39 literals in `every_name` (which include `sync`, `VERSION`, `ALPN`, `WeidaError` and the five cursor names), the five named levels appended after them, plus the 26 of `errors::NAMES` |
 | `weida.sync.__all__` | **18** names | the list in `sync.rs`'s `install`, one per class registered above it |
-| Exception classes | **25** | the 24 entries of the `failures!` invocation in `errors.rs`, **plus the base** `WeidaError` (`errors.rs:33`), which is not in that list |
+| Exception classes | **27** | the 26 entries of the `failures!` invocation in `errors.rs`, **plus the base** `WeidaError` (`errors.rs:33`), which is not in that list |
 | Test functions | **34** | 8 in `tests/test_asyncio.py`, 10 in `tests/test_patterns.py`, 9 in `tests/test_sync.py`, 7 in `tests/test_cursors.py` |
 | `IncomingMeta` attributes | **12** of the Rust struct's 15 fields | `values.rs:147-185` against `crates/weida/src/transfer.rs`; `tracestate`, `achieved` and `peer_chain` are absent (§5) |
 
@@ -84,7 +84,7 @@ interop number. The counts above were counted out of the tree with the sources n
 | `Runtime::exec()` (`runtime.rs:431`) | not a method; the bridge is built on it | present as the *reason that accessor exists*: `Bridge::new(runtime.exec().clone(), ...)` at `runtime.rs:61` puts this crate's futures on the runtime's own executor, so one process holds **one** Tokio runtime rather than two (`runtime.rs:13-18`) |
 | `Runtime::listener()` then `Listener::bind_quic(addr, identity)` | `await runtime.bind("host:port", identity)` → `Binding` | present as one call — `runtime.rs:78-109`. `bind` is a coroutine because it creates a socket and a QUIC endpoint, and a `__new__` that did that would block the event loop (`runtime.rs:20-25`) |
 | `Listener::bind_inproc(bus)` | `runtime.bind_inproc(bus)` → `Binding`, on both surfaces | present since **B-303**, synchronous because nothing is created that could block; the binding's `url(path)` is `weida+inproc://<bus><path>`, `fingerprint()` is `None` and `local_addr()` the bus name. A client in the same process dials it |
-| `Listener::bind_unix`, `bind_pipe` | — | absent: a Python **server** on a socket transport is what is missing; the dialling side's address grammar accepts `weida+unix://` and `weida+pipe://` (`endpoints.rs:59-62`). §10 |
+| `Listener::bind_unix`, `bind_pipe` | — | absent: a Python **server** on a socket transport is what is missing; the dialling side's address grammar accepts `weida+unix://` and `weida+pipe://` (`endpoints.rs:59-62`). A bind that finds a live socket or a taken pipe name fails in Rust with `Error::AddressInUse`; the exception family already carries `weida.AddressInUse` for the day a binder exists. §10 |
 | `Listener::replier/puller/publisher(path)` | `binding.replier(path)`, `.puller(path)`, `.publisher(path)` | present, synchronous, raising `weida.AlreadyRegistered` or `weida.InvalidEndpointPath` — `runtime.rs:225-261`. `pair`, `respondent` and `bus` join them at `runtime.rs:263-311` (§4.4) |
 | `Listener::acceptor(path)` (`listener.rs:350`) | — | absent: the raw L0 surface. §9.2 |
 | `Binding::local_addr()` | `binding.local_addr()` → `str` | present — `runtime.rs:205-207`, and port `0` resolved is what every test dials |
@@ -292,7 +292,7 @@ What differs, row by row:
 
 ## 7. The exception family
 
-**25 classes: 24 named failures plus the base**, counted as §1 states. Every failure of the
+**27 classes: 26 named failures plus the base**, counted as §1 states. Every failure of the
 library is a class under `weida.WeidaError`, each instance carrying `errno` and `cause`
 (`errors.rs:1-23`), and the base is what lets a caller catch the family
 (`test_asyncio.py:184-185`).
@@ -300,7 +300,7 @@ library is a class under `weida.WeidaError`, each instance carrying `errno` and 
 | Rust | Python | Verdict |
 | --- | --- | --- |
 | `Error::Runtime` | `weida.RuntimeFailure` | present, and **the one rename**: `weida.Runtime` is the runtime, a module cannot have one name for two things, and the module with the collision silently keeps whichever was added last. So the class is `RuntimeFailure`, its `errno` says the same, and the variant it comes from is written beside it (`errors.rs:45-53`, `72-73`). Both `smoke.py:33-36` and `test_sync.py:119-122` assert that `weida.Runtime` is not a `BaseException` |
-| the other 23 variants of `weida_core::Error` | the same names: `InvalidAddress`, `InvalidEndpointPath`, `InvalidFingerprint`, `AlreadyRegistered`, `NotConnected`, `ConnectionLost`, `Negotiation`, `Protocol`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `NoParkedConnection`, `NoReply`, `Canceled`, `Expired`, `Indeterminate`, `LimitExceeded`, `DatagramsUnavailable`, `TooLarge`, `Tls`, `Untrusted`, `Io`, `Transport` | present — `errors.rs:74-97`; the three 0034 added (`Expired`, `DatagramsUnavailable`, `TooLarge`) arrived with it, because the exhaustive match below does not compile without them |
+| the other 25 variants of `weida_core::Error` | the same names: `InvalidAddress`, `InvalidEndpointPath`, `InvalidFingerprint`, `AlreadyRegistered`, `AddressInUse`, `NotConnected`, `ConnectionLost`, `Negotiation`, `Protocol`, `Rejected`, `UnknownEndpoint`, `Unsupported`, `NoParkedConnection`, `NoReply`, `Canceled`, `Expired`, `Indeterminate`, `LimitExceeded`, `DatagramsUnavailable`, `TooLarge`, `Tls`, `Untrusted`, `UntrustedPrincipal`, `Io`, `Transport` | present — `errors.rs:74-98`; the three 0034 added (`Expired`, `DatagramsUnavailable`, `TooLarge`) and the two local-transport additions (`AddressInUse`: a live local address another listener holds; `UntrustedPrincipal`: a `self@` address that reached another account's endpoint) arrived with them, because the exhaustive match below does not compile without them |
 | a variant added to the library | a **compile error in this file** | present: `name_of` is an exhaustive `match` written by the same macro that writes the name list (`errors.rs:54-70`), so a new variant cannot silently arrive as the base class |
 | `Error::Display` | `cause` | present, and no second vocabulary: the library's own `Display` is the wording, because a binding that rephrased it would be a second one to keep in step (`errors.rs:101-109`) |
 | `Error::is_definite_failure()` keeping `Indeterminate` out of the definite set | `weida.Indeterminate` as a **sibling** of `ConnectionLost`, not a kind of it | present — `errors.rs:18-23`, and it is the one class worth reading twice: the transfer may or may not have arrived, and a caller that treats it as a definite failure is wrong ([FAILURE_MODEL.md](../FAILURE_MODEL.md)) |

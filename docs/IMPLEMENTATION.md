@@ -590,8 +590,9 @@ exists and is documented as an observation that must not be authorized on [0010 
 key, the uid of the process that owns the socket directory, and a PID on Linux.
 
 **Socket hygiene is the caller's directory plus our two rules.** `bind_unix` removes a
-stale socket node before binding and sets mode `0600` explicitly rather than inheriting
-`umask`, and its doc comment states the obligation the code cannot discharge: unlink-then-bind
+stale socket node before binding — a probe connection tells it from a live one, which is
+refused with `Error::AddressInUse` and left alone — and sets mode `0600` explicitly rather than
+inheriting `umask`, and its doc comment states the obligation the code cannot discharge: unlink-then-bind
 races unless the directory's ownership and permissions prevent substitution
 (`docs/research/ipc.md` §1.2, §7). `a_stale_socket_file_does_not_stop_the_next_bind` leaves
 a node behind, binds over it and checks the mode. The path budget is checked after
