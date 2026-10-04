@@ -35,7 +35,7 @@ use weida_py_core::{Bridge, payload_of};
 use crate::cursors::{PyCursors, PyReporter, reporting_meta};
 use crate::endpoints::{PyRequest, endpoint};
 use crate::errors::{errno_of, to_py};
-use crate::values::{PyIncomingMeta, PySurvey};
+use crate::values::{PyDishDrops, PyIncomingMeta, PySurvey};
 
 /// Turns a Python float of seconds into a deadline, or says why not.
 ///
@@ -384,7 +384,8 @@ fn max_age_of(py: Python<'_>, seconds: Option<f64>) -> PyResult<Option<Duration>
 /// What a dish receives, as the tuple Python sees:
 /// `("segment", payload, meta)` or `("datagram", topic, segment, payload)`.
 pub(crate) enum Heard {
-    Segment(Vec<u8>, PyIncomingMeta),
+    /// Boxed: the flattened metadata is several times a datagram's size.
+    Segment(Vec<u8>, Box<PyIncomingMeta>),
     Datagram(String, u64, Vec<u8>),
 }
 
@@ -396,7 +397,7 @@ impl<'py> IntoPyObject<'py> for Heard {
     fn into_pyobject(self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         match self {
             Heard::Segment(payload, meta) => {
-                ("segment", PyBytes::new(py, &payload), meta).into_bound_py_any(py)
+                ("segment", PyBytes::new(py, &payload), *meta).into_bound_py_any(py)
             }
             Heard::Datagram(topic, segment, payload) => {
                 ("datagram", topic, segment, PyBytes::new(py, &payload)).into_bound_py_any(py)
@@ -433,17 +434,30 @@ impl PyRadio {
         self.endpoint.path().to_owned()
     }
 
-    /// Opens the next segment on `topic` as one stream per joined dish, and
-    /// supersedes the previous segment's copies there: an unfinished copy at
-    /// once, a finished one after the time its path needs.
+    /// Opens the next segment on `topic` as one stream per joined dish and
+    /// layer, and supersedes the previous segment's copies there: an
+    /// unfinished copy at once, a finished one after the time its path
+    /// needs. `max_age` in seconds is the sender's latency budget,
+    /// `priority` orders topics within a layer, and `follows_upstream`
+    /// marks a relay's segment whose upstream may still be streaming the
+    /// previous one.
     ///
     /// # Errors
     ///
     /// `weida.LimitExceeded` for a topic above 256 bytes.
-    fn segment(&self, py: Python<'_>, topic: &str) -> PyResult<PySegment> {
+    #[pyo3(signature = (topic, max_age=None, priority=0, follows_upstream=false))]
+    fn segment(
+        &self,
+        py: Python<'_>,
+        topic: &str,
+        max_age: Option<f64>,
+        priority: i16,
+        follows_upstream: bool,
+    ) -> PyResult<PySegment> {
+        let terms = segment_terms(max_age_of(py, max_age)?, priority, follows_upstream);
         let segment = self
             .endpoint
-            .segment(topic, weida::SegmentTerms::default())
+            .segment(topic, terms)
             .map_err(|e| to_py(py, &errno_of(e)))?;
         Ok(PySegment {
             segment: Mutex::new(Some(segment)),
@@ -473,6 +487,16 @@ impl PyRadio {
         self.endpoint.dropped()
     }
 
+    /// What each joined dish connection lost, summed over topics: one
+    /// `weida.DishDrops` per connection, gone when it closes.
+    fn dish_drops(&self) -> Vec<PyDishDrops> {
+        self.endpoint
+            .dish_drops()
+            .iter()
+            .map(PyDishDrops::of)
+            .collect()
+    }
+
     fn __repr__(&self) -> String {
         format!("<weida.Radio {}>", self.endpoint.path())
     }
@@ -487,9 +511,17 @@ pub struct PySegment {
 
 #[pymethods]
 impl PySegment {
-    /// Hands `chunk` to every copy still open; returns how many that is. A
-    /// dish without room for it loses the segment, counted at the radio.
+    /// Hands `chunk` to layer 0 of every copy still open; returns how many
+    /// copies took it. A dish without room for it loses the segment,
+    /// counted at the radio.
     fn write(&self, py: Python<'_>, chunk: &Bound<'_, PyAny>) -> PyResult<usize> {
+        self.write_layer(py, 0, chunk)
+    }
+
+    /// Hands `chunk` to layer `layer` (`0..=15`) of every copy that wants
+    /// it; returns how many copies took it. A copy without room cuts its
+    /// layers from the top.
+    fn write_layer(&self, py: Python<'_>, layer: u8, chunk: &Bound<'_, PyAny>) -> PyResult<usize> {
         let body = payload_of(chunk)?;
         let mut guard = self.segment.lock().expect("segment lock poisoned");
         let Some(segment) = guard.as_mut() else {
@@ -498,10 +530,26 @@ impl PySegment {
                 &errno_of(weida::Error::Runtime("the segment is finished".into())),
             ));
         };
-        segment.write(body).map_err(|e| to_py(py, &errno_of(e)))
+        segment
+            .write_layer(layer, body)
+            .map_err(|e| to_py(py, &errno_of(e)))
     }
 
-    /// Ends the segment; returns how many copies it ended on.
+    /// Ends layer `layer` on every copy that has it open.
+    fn finish_layer(&self, py: Python<'_>, layer: u8) -> PyResult<()> {
+        let mut guard = self.segment.lock().expect("segment lock poisoned");
+        let Some(segment) = guard.as_mut() else {
+            return Err(to_py(
+                py,
+                &errno_of(weida::Error::Runtime("the segment is finished".into())),
+            ));
+        };
+        segment.finish_layer(layer);
+        Ok(())
+    }
+
+    /// Ends every layer still open; returns how many copies still hold
+    /// layer 0.
     fn finish(&self) -> usize {
         self.segment
             .lock()
@@ -530,15 +578,21 @@ impl PyDish {
     }
 
     /// Joins every topic `filter` matches; `max_age` in seconds is the
-    /// latency budget after which the radio resets this dish's copy.
-    #[pyo3(signature = (filter, max_age=None))]
+    /// latency budget after which the radio resets this dish's copy, and
+    /// `max_layer` (`0..=15`) the highest layer the radio sends it.
+    ///
+    /// # Errors
+    ///
+    /// `weida.LimitExceeded` for a `max_layer` above 15.
+    #[pyo3(signature = (filter, max_age=None, max_layer=None))]
     fn join<'py>(
         &self,
         py: Python<'py>,
         filter: String,
         max_age: Option<f64>,
+        max_layer: Option<u8>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let terms = join_terms(max_age_of(py, max_age)?);
+        let terms = join_terms(max_age_of(py, max_age)?, max_layer);
         let endpoint = Arc::clone(&self.endpoint);
         self.bridge.awaitable(py, async move {
             endpoint.join(&filter, terms).await.map_err(errno_of)
@@ -563,7 +617,7 @@ impl PyDish {
                 weida::Received::Segment(transfer) => {
                     let meta = PyIncomingMeta::of(transfer.meta());
                     let payload = transfer.collect(max_bytes).await.map_err(errno_of)?;
-                    Ok(Heard::Segment(payload, meta))
+                    Ok(Heard::Segment(payload, Box::new(meta)))
                 }
                 weida::Received::Datagram {
                     topic,
@@ -584,10 +638,32 @@ impl PyDish {
     }
 }
 
-/// The join terms of a dish's latency budget.
-pub(crate) fn join_terms(max_age: Option<std::time::Duration>) -> weida::JoinTerms {
-    match max_age {
-        Some(age) => weida::JoinTerms::default().with_max_age(age),
-        None => weida::JoinTerms::default(),
+/// The join terms of a dish's latency budget and layer cap.
+pub(crate) fn join_terms(
+    max_age: Option<std::time::Duration>,
+    max_layer: Option<u8>,
+) -> weida::JoinTerms {
+    let mut terms = weida::JoinTerms::default();
+    if let Some(age) = max_age {
+        terms = terms.with_max_age(age);
     }
+    if let Some(layer) = max_layer {
+        terms = terms.with_max_layer(layer);
+    }
+    terms
+}
+
+/// The terms a sender opens a segment under.
+pub(crate) fn segment_terms(
+    max_age: Option<std::time::Duration>,
+    priority: i16,
+    follows_upstream: bool,
+) -> weida::SegmentTerms {
+    let mut terms = weida::SegmentTerms::default()
+        .with_priority(priority)
+        .with_follows_upstream(follows_upstream);
+    if let Some(age) = max_age {
+        terms = terms.with_max_age(age);
+    }
+    terms
 }

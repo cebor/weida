@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use pyo3::prelude::*;
 use pyo3::types::PyType;
-use weida::{Fingerprint, Identity, IncomingMeta, Trust};
+use weida::{DishDrops, Fingerprint, Identity, IncomingMeta, Trust};
 
 use crate::errors::raise;
 
@@ -180,14 +180,17 @@ pub struct PyIncomingMeta {
     /// The W3C `traceparent` of this transfer, for a caller that propagates a
     /// trace.
     pub traceparent: Option<String>,
-    /// The RADIO segment number, on a segment a dish received.
+    /// The segment number, on a segment a dish or acceptor received.
     pub segment: Option<u64>,
+    /// The segment's layer, `0..=15`: present exactly when `segment` is
+    /// ([0037](../../../../docs/decisions/0037-layered-segments.md) §4.3).
+    pub layer: Option<u8>,
 }
 
 impl PyIncomingMeta {
     /// The metadata of one arrival, flattened into the Python shape.
     ///
-    /// Twelve of the Rust struct's fifteen fields. Three stay behind:
+    /// Thirteen of the Rust struct's sixteen fields. Three stay behind:
     /// `tracestate`, because a Python caller gets the `traceparent` and not
     /// the vendor state; `achieved`, a broker's completion claim no Python
     /// surface reads; and `peer_chain`, because its use is admitting a
@@ -209,6 +212,7 @@ impl PyIncomingMeta {
             report_id: meta.report_id,
             traceparent: meta.trace.map(|trace| trace.to_traceparent()),
             segment: meta.segment,
+            layer: meta.layer,
         }
     }
 }
@@ -272,6 +276,73 @@ impl PySurvey {
             self.failed,
             self.silent(),
             self.late
+        )
+    }
+}
+
+/// `weida.DishDrops`: what a radio dropped toward one joined dish
+/// connection, summed over topics
+/// ([0037](../../../../docs/decisions/0037-layered-segments.md) §4.6).
+///
+/// A value, like [`PySurvey`]: `Radio.dish_drops()` returns one per joined
+/// connection, and a closed connection's record is gone.
+#[pyclass(
+    frozen,
+    get_all,
+    skip_from_py_object,
+    name = "DishDrops",
+    module = "weida"
+)]
+#[derive(Clone)]
+pub struct PyDishDrops {
+    /// The peer the dish's connection proved, formatted as
+    /// `IncomingMeta.peer` is; `None` for an anonymous dish.
+    pub peer: Option<String>,
+    /// Copies dropped for an exhausted byte budget.
+    pub subscriber_budget: u64,
+    /// Copies dropped for a full queue.
+    pub subscriber_queue: u64,
+    /// Copies reset because a newer segment opened on their topic.
+    pub superseded: u64,
+    /// Copies reset because the `max_age` passed.
+    pub expired: u64,
+    /// Datagram segments larger than the dish's connection carries.
+    pub too_large: u64,
+    /// Datagram segments for a dish that carries no datagrams.
+    pub no_datagrams: u64,
+    /// Segment copies that lost layers above 0 and kept layer 0.
+    pub layers_cut: u64,
+}
+
+impl PyDishDrops {
+    /// One dish's record, flattened into the Python shape.
+    pub fn of(drops: &DishDrops) -> PyDishDrops {
+        PyDishDrops {
+            peer: drops.peer.as_ref().map(ToString::to_string),
+            subscriber_budget: drops.subscriber_budget,
+            subscriber_queue: drops.subscriber_queue,
+            superseded: drops.superseded,
+            expired: drops.expired,
+            too_large: drops.too_large,
+            no_datagrams: drops.no_datagrams,
+            layers_cut: drops.layers_cut,
+        }
+    }
+}
+
+#[pymethods]
+impl PyDishDrops {
+    fn __repr__(&self) -> String {
+        format!(
+            "<weida.DishDrops peer={:?} budget={} queue={} superseded={} expired={} too_large={} no_datagrams={} layers_cut={}>",
+            self.peer,
+            self.subscriber_budget,
+            self.subscriber_queue,
+            self.superseded,
+            self.expired,
+            self.too_large,
+            self.no_datagrams,
+            self.layers_cut
         )
     }
 }

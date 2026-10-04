@@ -114,6 +114,7 @@ fn weida(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<values::PyIdentity>()?;
     module.add_class::<values::PyIncomingMeta>()?;
     module.add_class::<values::PySurvey>()?;
+    module.add_class::<values::PyDishDrops>()?;
     module.add_class::<endpoints::PyRequester>()?;
     module.add_class::<endpoints::PyReplier>()?;
     module.add_class::<endpoints::PyRequest>()?;

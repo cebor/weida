@@ -1233,6 +1233,12 @@ impl Radio {
         self.endpoint.drops()
     }
 
+    /// What each joined dish connection lost, summed over topics; see
+    /// [`crate::Radio::dish_drops`].
+    pub fn dish_drops(&self) -> Vec<crate::DishDrops> {
+        self.endpoint.dish_drops()
+    }
+
     /// Decides which dish may join which filter; see
     /// [`crate::Radio::with_admission`]. A refused join is silence.
     pub fn with_admission(
@@ -1262,7 +1268,8 @@ pub struct Segment {
 }
 
 impl Segment {
-    /// Hands `chunk` to every copy still open; returns how many that is.
+    /// Hands `chunk` to layer 0 of every copy still open; returns how many
+    /// copies took it.
     ///
     /// # Errors
     ///
@@ -1271,7 +1278,26 @@ impl Segment {
         self.inner.write(bytes::Bytes::copy_from_slice(chunk))
     }
 
-    /// Ends the segment; returns how many copies it ended on.
+    /// Hands `chunk` to layer `layer` of every copy that wants it; returns
+    /// how many copies took it.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Segment::write_layer`]: a layer of 16 or above, a chunk
+    /// above 4 GiB, or a layer already finished.
+    pub fn write_layer(&mut self, layer: u8, chunk: &[u8]) -> Result<usize, Error> {
+        self.inner
+            .write_layer(layer, bytes::Bytes::copy_from_slice(chunk))
+    }
+
+    /// Ends layer `layer` on every copy that has it open; see
+    /// [`crate::Segment::finish_layer`].
+    pub fn finish_layer(&mut self, layer: u8) {
+        self.inner.finish_layer(layer);
+    }
+
+    /// Ends every layer still open; returns how many copies still hold
+    /// layer 0.
     pub fn finish(self) -> usize {
         self.inner.finish()
     }

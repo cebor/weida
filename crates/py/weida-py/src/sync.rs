@@ -73,7 +73,7 @@ use weida_py_core::{payload_of, py_bytes};
 
 use crate::cursors::{level_of, reporting_meta, set_of};
 use crate::errors::raise;
-use crate::values::{PyIdentity, PyIncomingMeta, PySurvey, PyTrust};
+use crate::values::{PyDishDrops, PyIdentity, PyIncomingMeta, PySurvey, PyTrust};
 
 /// What a call on a spent runtime gets.
 fn spent<T>(py: Python<'_>, what: &str) -> PyResult<T> {
@@ -82,6 +82,17 @@ fn spent<T>(py: Python<'_>, what: &str) -> PyResult<T> {
         Err(weida::Error::Runtime(format!(
             "this {what} was already shut down"
         ))),
+    )
+}
+
+/// A latency budget in seconds, or none.
+fn seconds(py: Python<'_>, max_age: Option<f64>) -> PyResult<Option<std::time::Duration>> {
+    raise(
+        py,
+        max_age
+            .map(std::time::Duration::try_from_secs_f64)
+            .transpose()
+            .map_err(|e| weida::Error::Runtime(format!("max_age: {e}"))),
     )
 }
 
@@ -831,13 +842,22 @@ pub struct SyncRadio {
 impl SyncRadio {
     /// Opens the next segment on `topic`, superseding the previous one's
     /// copies there: an unfinished copy at once, a finished one after the
-    /// time its path needs.
-    fn segment(&self, py: Python<'_>, topic: &str) -> PyResult<SyncSegment> {
+    /// time its path needs. `max_age` in seconds is the sender's latency
+    /// budget, `priority` orders topics within a layer, and
+    /// `follows_upstream` marks a relay's segment.
+    #[pyo3(signature = (topic, max_age=None, priority=0, follows_upstream=false))]
+    fn segment(
+        &self,
+        py: Python<'_>,
+        topic: &str,
+        max_age: Option<f64>,
+        priority: i16,
+        follows_upstream: bool,
+    ) -> PyResult<SyncSegment> {
+        let max_age = seconds(py, max_age)?;
+        let terms = crate::patterns::segment_terms(max_age, priority, follows_upstream);
         Ok(SyncSegment {
-            segment: Mutex::new(Some(raise(
-                py,
-                self.endpoint.segment(topic, weida::SegmentTerms::default()),
-            )?)),
+            segment: Mutex::new(Some(raise(py, self.endpoint.segment(topic, terms))?)),
         })
     }
 
@@ -858,6 +878,15 @@ impl SyncRadio {
         self.endpoint.dropped()
     }
 
+    /// What each joined dish connection lost, summed over topics.
+    fn dish_drops(&self) -> Vec<PyDishDrops> {
+        self.endpoint
+            .dish_drops()
+            .iter()
+            .map(PyDishDrops::of)
+            .collect()
+    }
+
     fn __repr__(&self) -> String {
         format!("<weida.sync.Radio {}>", self.endpoint.endpoint().path())
     }
@@ -872,17 +901,37 @@ pub struct SyncSegment {
 
 #[pymethods]
 impl SyncSegment {
-    /// Hands `chunk` to every copy still open; returns how many that is.
+    /// Hands `chunk` to layer 0 of every copy still open; returns how many
+    /// copies took it.
     fn write(&self, py: Python<'_>, chunk: &Bound<'_, PyAny>) -> PyResult<usize> {
+        self.write_layer(py, 0, chunk)
+    }
+
+    /// Hands `chunk` to layer `layer` (`0..=15`) of every copy that wants
+    /// it; returns how many copies took it.
+    fn write_layer(&self, py: Python<'_>, layer: u8, chunk: &Bound<'_, PyAny>) -> PyResult<usize> {
         let body = payload_of(chunk)?;
         let mut guard = self.segment.lock().expect("segment lock poisoned");
         match guard.as_mut() {
-            Some(segment) => raise(py, segment.write(&body)),
+            Some(segment) => raise(py, segment.write_layer(layer, &body)),
             None => spent(py, "segment"),
         }
     }
 
-    /// Ends the segment; returns how many copies it ended on.
+    /// Ends layer `layer` on every copy that has it open.
+    fn finish_layer(&self, py: Python<'_>, layer: u8) -> PyResult<()> {
+        let mut guard = self.segment.lock().expect("segment lock poisoned");
+        match guard.as_mut() {
+            Some(segment) => {
+                segment.finish_layer(layer);
+                Ok(())
+            }
+            None => spent(py, "segment"),
+        }
+    }
+
+    /// Ends every layer still open; returns how many copies still hold
+    /// layer 0.
     fn finish(&self) -> usize {
         self.segment
             .lock()
@@ -906,17 +955,17 @@ impl SyncDish {
     }
 
     /// Joins every topic `filter` matches; `max_age` in seconds is the
-    /// latency budget after which the radio resets this dish's copy.
-    #[pyo3(signature = (filter, max_age=None))]
-    fn join(&self, py: Python<'_>, filter: &str, max_age: Option<f64>) -> PyResult<()> {
-        let max_age = raise(
-            py,
-            max_age
-                .map(std::time::Duration::try_from_secs_f64)
-                .transpose()
-                .map_err(|e| weida::Error::Runtime(format!("max_age: {e}"))),
-        )?;
-        let terms = crate::patterns::join_terms(max_age);
+    /// latency budget after which the radio resets this dish's copy, and
+    /// `max_layer` (`0..=15`) the highest layer the radio sends it.
+    #[pyo3(signature = (filter, max_age=None, max_layer=None))]
+    fn join(
+        &self,
+        py: Python<'_>,
+        filter: &str,
+        max_age: Option<f64>,
+        max_layer: Option<u8>,
+    ) -> PyResult<()> {
+        let terms = crate::patterns::join_terms(seconds(py, max_age)?, max_layer);
         raise(py, py.detach(|| self.endpoint.join(filter, terms)))
     }
 
@@ -933,7 +982,7 @@ impl SyncDish {
         match delivered {
             blocking::Delivered::Segment(message) => {
                 let blocking::Message { payload, meta } = *message;
-                crate::patterns::Heard::Segment(payload, PyIncomingMeta::of(&meta))
+                crate::patterns::Heard::Segment(payload, Box::new(PyIncomingMeta::of(&meta)))
             }
             blocking::Delivered::Datagram {
                 topic,

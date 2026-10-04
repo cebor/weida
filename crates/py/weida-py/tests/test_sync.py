@@ -290,3 +290,37 @@ def test_a_radio_segment_and_datagram_reach_a_dish():
     assert dish.recv(CAP) == ("datagram", "v", 1, b"voice")
     client.shutdown()
     server.shutdown()
+
+
+def test_a_layered_segment_reaches_a_dish_layer_by_layer():
+    """Layered segments with no event loop: each layer is its own arrival."""
+    server = sync.Runtime()
+    binding = server.bind("127.0.0.1:0", weida.Identity.generate())
+    radio = binding.radio("/r")
+    client = sync.Runtime()
+    dish = client.dish(weida.Trust.by_address())
+    dish.join("v", max_layer=1)
+    dish.connect(binding.url("/r"))
+    deadline = time.monotonic() + DEADLINE
+    while radio.dish_count() != 1:
+        assert time.monotonic() < deadline, "no join arrived"
+        time.sleep(0.005)
+
+    seg = radio.segment("v", max_age=5.0, priority=3)
+    assert seg.write_layer(0, b"base") == 1
+    assert seg.write_layer(1, b"more") == 1
+    assert seg.write_layer(2, b"capped away") == 0
+    assert seg.finish() == 1
+    heard = set()
+    for _ in range(2):
+        kind, payload, meta = dish.recv(CAP)
+        assert kind == "segment"
+        assert meta.segment == 0
+        heard.add((meta.layer, payload))
+    assert heard == {(0, b"base"), (1, b"more")}
+
+    drops = radio.dish_drops()
+    assert len(drops) == 1
+    assert drops[0].layers_cut == 0
+    client.shutdown()
+    server.shutdown()
