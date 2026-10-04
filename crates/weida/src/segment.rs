@@ -747,8 +747,25 @@ impl Segment {
     }
 
     /// Ends every layer still open; returns how many copies still hold
-    /// layer 0.
+    /// layer 0. A copy that holds no layer at all — nothing was written to
+    /// it — gets an empty layer 0, so an empty segment arrives as an empty
+    /// stream wherever this counts it.
     pub fn finish(mut self) -> usize {
+        if self.finished & 1 == 0 {
+            for copy in &mut self.copies {
+                if copy.ctl.cut_now() == 0 || copy.layers.iter().any(Option::is_some) {
+                    continue;
+                }
+                if copy.ctl.is_superseded() && !copy.ctl.follows_upstream {
+                    copy.cut(0, DropCause::Superseded);
+                } else if copy.spec.expired() {
+                    copy.cut(0, DropCause::Expired);
+                } else {
+                    copy.open(0);
+                }
+            }
+            self.copies.retain(|copy| copy.ctl.cut_now() > 0);
+        }
         let opened = self.copies.iter().fold(0u16, |mask, copy| {
             copy.layers
                 .iter()

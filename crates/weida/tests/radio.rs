@@ -676,6 +676,54 @@ async fn a_peer_segment_carries_its_layers_to_the_acceptor() {
     client.shutdown().await;
 }
 
+#[tokio::test]
+async fn an_empty_segment_arrives_as_an_empty_layer_zero() {
+    // A radio segment to a dish.
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let acceptor = server.listener.acceptor("/up").expect("acceptor");
+    let runtime = server.client_runtime();
+    let dish = joined(&server, &runtime, "v", JoinTerms::default()).await;
+    dishes(&radio, 1).await;
+    let segment = radio
+        .segment("v", SegmentTerms::default())
+        .expect("segment");
+    assert_eq!(segment.finish(), 1);
+    let transfer = segment_of(within(dish.recv()).await.expect("recv"));
+    assert_eq!(
+        (transfer.meta().segment, transfer.meta().layer),
+        (Some(0), Some(0))
+    );
+    assert!(
+        within(transfer.collect(4096))
+            .await
+            .expect("whole")
+            .is_empty()
+    );
+
+    // A peer segment to an acceptor.
+    let peer = runtime.peer(server.trust());
+    within(peer.connect(&server.url("/up")))
+        .await
+        .expect("connect");
+    let segment = within(peer.segment("t", SegmentTerms::default()))
+        .await
+        .expect("segment");
+    assert_eq!(segment.finish(), 1);
+    let transfer = stream_of(within(acceptor.accept()).await.expect("accept"));
+    assert_eq!(
+        (transfer.meta().segment, transfer.meta().layer),
+        (Some(0), Some(0))
+    );
+    assert!(
+        within(transfer.collect(4096))
+            .await
+            .expect("whole")
+            .is_empty()
+    );
+    runtime.shutdown().await;
+}
+
 // --- freshness per connection ---------------------------------------------------
 
 #[tokio::test]
