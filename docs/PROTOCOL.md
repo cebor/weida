@@ -530,7 +530,8 @@ configuration error, not a negotiation position.
 | `10` | `array` of `uint` | `report` | no | 16 items, strictly ascending | levels the sender **orders** a report for; an order, not a guarantee |
 | `11` | `uint` | `report_mode` | no | one of §6.2's `report_mode` values | `0` `progress` (default, never written), `1` `final-only` |
 | `12` | `uint` | `delivery_attempt` | no | — | how often an L2 queue has handed this message out, first attempt included; **absent means `1`**. A count rather than a flag: a repeat is visible, and a poison message is countable. **Reserved and written by nobody today** — the number is spent so it cannot be spent twice, and B-203 is the slice that writes it |
-| `13` | `uint` | `segment` | no | — | RADIO segment number per (radio path, topic), from 0; **written by a radio only** ([decisions/0034](decisions/0034-late-is-lost.md) §4.6) |
+| `13` | `uint` | `segment` | no | — | segment number per (sender, path, topic), from 0; **written by a radio, or by `Peer::segment` toward a bound path** ([decisions/0034](decisions/0034-late-is-lost.md) §4.6, [decisions/0037](decisions/0037-layered-segments.md) §4.2) |
+| `14` | `uint` | `layer` | no | 15 | the layer of a stream segment, `0..=15`; **absent means `0`**, and layer 0 is never written; written only together with key `13` ([decisions/0037](decisions/0037-layered-segments.md) §4.3). A value above 15, or key `14` without key `13`, is a `PROTOCOL_VIOLATION` |
 
 **Every key is optional at the decoder, and that is deliberate.** A decoder sees a byte
 slice, not a stream: it cannot tell an initiating half from a reply half, so it cannot
@@ -711,6 +712,7 @@ from withdrawing it.
 | `0` | `tstr` | `endpoint` | yes | 512 B | publisher endpoint path the subscription applies to |
 | `1` | `tstr` | `filter` | yes | 256 B | topic filter; the grammar below. The empty string matches every topic |
 | `2` | `uint` | `max_age_ms` | no | — | the dish's latency budget; meaningful on a RADIO path only ([decisions/0034](decisions/0034-late-is-lost.md) §4.6). Encoded only when present |
+| `3` | `uint` | `max_layer` | no | 15 | the highest layer the dish wants; meaningful on a RADIO path only; absent means no cap ([decisions/0037](decisions/0037-layered-segments.md) §4.3). Encoded only when present. A value above 15 is a `PROTOCOL_VIOLATION` |
 
 Keys `0` and `1` are required. `filter` is required even when empty: an absent key and an empty
 string would otherwise be indistinguishable, and the empty filter is the "every topic"
@@ -967,7 +969,8 @@ records. The receiver demultiplexes by `flow` into the flow its FLOW stream regi
   error either.
 - **A RADIO datagram segment** carries, inside the flow's opaque bytes, `<varint segment>
   <opaque bytes>`: the segment number of DATA key `13`, for a one-packet segment. This is L1
-  framing inside the flow payload, not a wire rule of the flow itself.
+  framing inside the flow payload, not a wire rule of the flow itself. A datagram segment has
+  no layer: key `14` applies to stream segments only.
 
 ---
 
@@ -1079,11 +1082,17 @@ FLOW   {endpoint:"/v", flow:7}
 DATAGRAM flow 7, payload "hi"                (a DATAGRAM payload, not a frame: no preamble)
        07 68 69
 
-DATA   {endpoint:"/t", segment:5}            (key 13, written by a radio)
+DATA   {endpoint:"/t", segment:5}            (key 13, written by a radio or Peer::segment)
        57 01 07  A2 00 62 2F 74 0D 05
+
+DATA   {endpoint:"/t", segment:5, layer:2}   (key 14, a segment's layer)
+       57 01 09  A3 00 62 2F 74 0D 05 0E 02
 
 SUB    {endpoint:"/t", filter:"a", max_age_ms:150}   (key 2, a dish's latency budget)
        57 03 0B  A3 00 62 2F 74 01 61 61 02 18 96
+
+SUB    {endpoint:"/t", filter:"a", max_layer:1}      (key 3, a dish's layer cap)
+       57 03 0A  A3 00 62 2F 74 01 61 61 03 01
 
 HELLO  {versions:[0], max_header_bytes:16384, max_transfers:1024, caps:[1], req_caps:[]}
        57 00 11  A5 00 81 00 01 19 40 00 02 19 04 00 03 81 01 04 80
@@ -1214,11 +1223,23 @@ optional keys are omitted when absent (§6.8).
 one-byte varint of flow id `7`, and `68 69` is the opaque payload `"hi"` (§6.9).
 
 **Segment DATA vector** — `header_len = 0x07`, CBOR map of 2 entries: key `0` `endpoint = "/t"`,
-key `13` `segment = 5` (`0D 05`). Only a radio writes key `13`.
+key `13` `segment = 5` (`0D 05`). Key `13` is written by a radio, or by `Peer::segment` toward
+a bound path.
+
+**Layered segment DATA vector** — `header_len = 0x09`, CBOR map of 3 entries: key `0`
+`endpoint = "/t"`, key `13` `segment = 5` (`0D 05`), key `14` `layer = 2` (`0E 02`).
 
 **SUBSCRIBE with `max_age_ms` vector** — `header_len = 0x0B` (11 bytes), CBOR map of 3 entries:
 key `0` `endpoint = "/t"`, key `1` `filter = "a"`, key `2` `max_age_ms = 150`, which needs the
 one-byte-argument form `18 96` because it is above `23`.
+
+**SUBSCRIBE with `max_layer` vector** — `header_len = 0x0A`, CBOR map of 3 entries: key `0`
+`endpoint = "/t"`, key `1` `filter = "a"`, key `3` `max_layer = 1` (`03 01`).
+
+**Layer violations** — each of these headers closes the connection with
+`PROTOCOL_VIOLATION`: the DATA header `A2 0D 05 0E 10` (layer 16, above the cap of 15), the
+DATA header `A1 0E 01` (key `14` without key `13`), and the SUBSCRIBE header
+`A3 00 62 2F 74 01 61 61 03 10` (`max_layer` 16).
 
 **HELLO-with-datagram vector** — the v0 HELLO with key `3` `capabilities = [1]` (`81 01`
 instead of `80`), so `header_len` grows by one to `0x11` (17 bytes). This is what a side that
