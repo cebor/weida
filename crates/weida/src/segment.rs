@@ -250,6 +250,61 @@ impl SegmentTopics {
     }
 }
 
+/// The newest number per path, per topic.
+type PerPath = HashMap<Arc<str>, HashMap<Arc<str>, u64>>;
+
+/// The newest segment delivered per `(path, topic)` on one connection: what
+/// every receiver — a dish, an acceptor, a transfer endpoint, a pair —
+/// checks an arriving segment against
+/// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+/// §4.11). A redial is a new connection and starts over.
+pub(crate) struct Newest {
+    /// Per path, per topic, the newest number; and the entries in total.
+    table: Mutex<(PerPath, usize)>,
+    max: usize,
+}
+
+impl Newest {
+    /// A table of at most `max` `(path, topic)` entries.
+    pub(crate) fn new(max: usize) -> Newest {
+        Newest {
+            table: Mutex::new((HashMap::new(), 0)),
+            max,
+        }
+    }
+
+    /// `true` when `segment` is newer than every segment delivered on
+    /// (`path`, `topic`), which it then becomes. At the table's cap an
+    /// untracked key is always fresh: the check needs memory, and memory is
+    /// bounded.
+    pub(crate) fn fresh(&self, path: &str, topic: &str, segment: u64) -> bool {
+        let mut guard = lock(&self.table);
+        let (paths, count) = &mut *guard;
+        if let Some(last) = paths.get_mut(path).and_then(|t| t.get_mut(topic)) {
+            if segment <= *last {
+                return false;
+            }
+            *last = segment;
+            return true;
+        }
+        if *count < self.max {
+            match paths.get_mut(path) {
+                Some(topics) => {
+                    topics.insert(Arc::from(topic), segment);
+                }
+                None => {
+                    paths.insert(
+                        Arc::from(path),
+                        HashMap::from([(Arc::from(topic), segment)]),
+                    );
+                }
+            }
+            *count += 1;
+        }
+        true
+    }
+}
+
 /// The next segment number per `(path, topic)`.
 type NextNumbers = HashMap<(Arc<str>, Arc<str>), u64>;
 

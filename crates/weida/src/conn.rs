@@ -104,6 +104,10 @@ pub(crate) struct ConnCtx {
     /// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
     /// §4.11).
     pub segments_out: crate::segment::SegmentNumbers,
+    /// The newest segment delivered per `(path, topic)` on this connection,
+    /// to dishes and every other receiver alike: what a stale segment is
+    /// checked against; at most `max_sequence_scopes` entries (0037 §4.11).
+    pub segments_in: crate::segment::Newest,
     agreed: watch::Receiver<Option<Agreed>>,
 }
 
@@ -154,6 +158,7 @@ impl ConnCtx {
             agreed: agreed_rx,
             established: std::time::Instant::now(),
             segments_out: crate::segment::SegmentNumbers::new(limits.max_sequence_scopes),
+            segments_in: crate::segment::Newest::new(limits.max_sequence_scopes),
         });
 
         // Once per connection, never per message: a drain collects the
@@ -1165,6 +1170,22 @@ async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
         transfer.refuse(refusal.stop);
         return;
     }
+    // A segment not newer than one delivered here on its path and topic is
+    // stale, whoever receives it; a dish counts its own (0037 §4.11).
+    if !matches!(route, Some(Route::Dish(_)))
+        && let (Some(topic), Some(segment)) =
+            (transfer.meta().topic.as_deref(), transfer.meta().segment)
+        && !ctx.segments_in.fresh(path, topic, segment)
+    {
+        tracing::debug!(
+            path,
+            topic,
+            segment,
+            "a segment not newer than one delivered here is refused"
+        );
+        transfer.refuse(codes::CANCELED);
+        return;
+    }
     match route {
         // Awaiting a queue slot is the backpressure path: it stalls this
         // stream's task, which stalls the peer through QUIC flow control.
@@ -1198,10 +1219,10 @@ async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
                 e.0.refuse(Refusal::UNKNOWN.stop);
             }
         }
-        // A segment: the dish discards one older than the newest it
-        // delivered on the topic, and never blocks the connection on a full
-        // queue (0034 §4.6).
-        Some(Route::Dish(route)) => crate::radio::deliver_segment(&route, transfer),
+        // A segment: the dish discards one not newer than the newest
+        // delivered on this connection, path and topic, and never blocks the
+        // connection on a full queue (0034 §4.6, 0037 §4.11).
+        Some(Route::Dish(route)) => crate::radio::deliver_segment(ctx, path, &route, transfer),
         // `refusal_for` above already refused these.
         Some(Route::Request(_) | Route::Pub | Route::Radio(_)) | None => {
             unreachable!("refusal_for refuses every route that cannot serve a one-way transfer")

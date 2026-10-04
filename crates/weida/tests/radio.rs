@@ -450,6 +450,103 @@ async fn two_peers_on_one_connection_number_one_sequence() {
     client.shutdown().await;
 }
 
+// --- freshness per connection ---------------------------------------------------
+
+#[tokio::test]
+async fn a_dish_redialled_to_a_restarted_radio_takes_its_numbers_from_zero() {
+    let certs = Certs::generate();
+    let first = common::Restartable::start(&certs, "127.0.0.1:0".parse().expect("loopback")).await;
+    let addr = first.addr;
+    let radio = first.listener.radio("/r").expect("radio");
+    let client = Runtime::new(RuntimeConfig {
+        reconnect: weida::ReconnectPolicy {
+            initial: Duration::from_millis(5),
+            max: Duration::from_millis(50),
+            jitter: false,
+            ..weida::ReconnectPolicy::default()
+        },
+        ..RuntimeConfig::default()
+    })
+    .expect("client runtime");
+    let dish = client.dish(certs.client_tls());
+    within(dish.join("v", None)).await.expect("join");
+    within(dish.connect(&format!("weida://127.0.0.1:{}/r", addr.port())))
+        .await
+        .expect("connect");
+    dishes(&radio, 1).await;
+    for n in 0..3u64 {
+        send(&radio, "v", 1, 100);
+        let received = segment_of(within(dish.recv()).await.expect("recv"));
+        assert_eq!(received.meta().segment, Some(n));
+        within(received.collect(4096))
+            .await
+            .expect("a whole segment");
+    }
+
+    drop(radio);
+    first.stop().await;
+    let second = common::Restartable::start(&certs, addr).await;
+    let radio = second.listener.radio("/r").expect("radio");
+    // The redial sends the join again.
+    dishes(&radio, 1).await;
+    send(&radio, "v", 1, 100);
+    let received = segment_of(within(dish.recv()).await.expect("recv"));
+    assert_eq!(received.meta().segment, Some(0));
+    assert_eq!(dish.stale(), 0);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_acceptor_refuses_a_segment_older_than_one_it_delivered() {
+    use common::raw;
+    use weida::codes;
+    use weida_protocol::{DataHeader, FrameKind, encode_frame};
+
+    let server = Server::start().await;
+    let acceptor = server.listener.acceptor("/up").expect("acceptor");
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "localhost").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    // The stream stays open: a finished one that the transport acknowledged
+    // whole reports no STOP_SENDING.
+    async fn send(conn: &quinn::Connection, segment: u64) -> quinn::SendStream {
+        let header = DataHeader {
+            topic: Some("t".into()),
+            segment: Some(segment),
+            ..DataHeader::addressed("/up")
+        };
+        let mut stream = conn.open_uni().await.expect("open uni");
+        stream
+            .write_all(&encode_frame(FrameKind::Data, &header.encode()))
+            .await
+            .expect("write header");
+        stream.write_all(b"body").await.expect("write body");
+        stream
+    }
+
+    let mut newest = send(&conn, 5).await;
+    newest.finish().expect("finish");
+    let transfer = stream_of(within(acceptor.accept()).await.expect("accept"));
+    assert_eq!(transfer.meta().segment, Some(5));
+
+    let stale = send(&conn, 3).await;
+    assert_eq!(
+        within(stale.stopped()).await,
+        Ok(Some(
+            quinn::VarInt::from_u64(codes::CANCELED).expect("varint")
+        ))
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), acceptor.accept())
+            .await
+            .is_err(),
+        "a stale segment reached the acceptor"
+    );
+}
+
 #[tokio::test]
 async fn a_segment_supersedes_only_its_own_topic() {
     let server = Server::start().await;
