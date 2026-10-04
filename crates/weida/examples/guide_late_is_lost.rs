@@ -256,7 +256,7 @@ pub async fn sfu() -> Result<Sfu, Error> {
     tokio::spawn(async move {
         while let Ok(Received::Segment(mut incoming)) = upstream.recv().await {
             let topic = incoming.meta().topic.clone().unwrap_or_default();
-            let Ok(mut outgoing) = downstream.segment(&topic) else {
+            let Ok(mut outgoing) = downstream.relay_segment(&topic) else {
                 continue;
             };
             let mut chunk = vec![0u8; 16 * 1024];

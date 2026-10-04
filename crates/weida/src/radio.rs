@@ -168,6 +168,10 @@ pub(crate) struct CopyCtl {
     finished: AtomicBool,
     /// Bytes queued for this copy, all chunks together.
     total: AtomicU64,
+    /// A relay's copy ([`Radio::relay_segment`]): its writer may still be
+    /// taking chunks from upstream when the successor opens, so supersession
+    /// takes it only where a write has to wait, as a finished copy.
+    follows_upstream: bool,
     notify: Notify,
 }
 
@@ -609,6 +613,22 @@ impl Radio {
     /// [`Error::LimitExceeded`] for a topic above 256 bytes, or when
     /// `max_sequence_scopes` topics all have a copy in flight.
     pub fn segment(&self, topic: &str) -> Result<Segment, Error> {
+        self.open_segment(topic, false)
+    }
+
+    /// Opens segment *n+1* for a relay whose upstream may still be streaming
+    /// segment *n*: the successor resets a copy of *n* only where the dish's
+    /// flow control holds a write back. Otherwise the copy keeps taking the
+    /// chunks still arriving and gets the post-FIN grace. Dropping it
+    /// unfinished still resets every copy, which is what a relay does when
+    /// its upstream copy is reset.
+    ///
+    /// Fails as [`Radio::segment`] does.
+    pub fn relay_segment(&self, topic: &str) -> Result<Segment, Error> {
+        self.open_segment(topic, true)
+    }
+
+    fn open_segment(&self, topic: &str, follows_upstream: bool) -> Result<Segment, Error> {
         if topic.len() > MAX_TOPIC_BYTES {
             return Err(Error::LimitExceeded);
         }
@@ -621,7 +641,10 @@ impl Radio {
                 continue;
             };
             let (tx, rx) = mpsc::channel(COPY_QUEUE);
-            let ctl = Arc::new(CopyCtl::default());
+            let ctl = Arc::new(CopyCtl {
+                follows_upstream,
+                ..CopyCtl::default()
+            });
             hub.topics.track(&topic, &ctl);
             let deadline = max_age.map(|age| Box::pin(entry.conn.exec.sleep(age)));
             entry.conn.exec.spawn(segment_copy(
@@ -910,10 +933,10 @@ async fn expiry(deadline: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
 
 /// Resolves when the copy is superseded while its writer is still writing
 /// the segment: such a copy is reset at once. A copy whose writer finished
-/// before the successor opened goes on: see [`run_copy`].
+/// before the successor opened, and a relay's copy, go on: see [`run_copy`].
 async fn superseded_unfinished(ctl: &CopyCtl) {
     ctl.superseded().await;
-    if ctl.finished.load(Ordering::Acquire) {
+    if ctl.follows_upstream || ctl.finished.load(Ordering::Acquire) {
         std::future::pending::<()>().await;
     }
 }

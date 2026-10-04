@@ -1207,6 +1207,18 @@ impl Radio {
         })
     }
 
+    /// Opens the next segment on `topic` for a relay whose upstream may
+    /// still be streaming the previous one.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Radio::relay_segment`].
+    pub fn relay_segment(&self, topic: &str) -> Result<Segment, Error> {
+        Ok(Segment {
+            inner: self.endpoint.relay_segment(topic)?,
+        })
+    }
+
     /// Sends a one-packet segment on `topic`; returns how many dishes it was
     /// handed to.
     ///

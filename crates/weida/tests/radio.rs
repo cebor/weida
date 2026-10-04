@@ -303,6 +303,66 @@ async fn a_dish_redialled_to_a_restarted_radio_takes_its_numbers_from_zero() {
     client.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_relay_segment_keeps_its_copy_while_its_successor_opens() {
+    // A relay opens segment n+1 the moment its upstream does, while the rest
+    // of segment n is still arriving from upstream.
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = server.client_runtime();
+    let dish = joined(&server, &runtime, "v", None).await;
+    dishes(&radio, 1).await;
+
+    let mut a = radio.relay_segment("v").expect("segment a");
+    a.write(vec![0x41; 4096]).expect("write");
+    let mut b = radio.relay_segment("v").expect("segment b");
+    // The copy of a runs and sees its successor while a is unfinished.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..7 {
+        a.write(vec![0x41; 4096]).expect("write");
+    }
+    a.finish();
+    b.write(vec![0x42; 4096]).expect("write");
+    b.finish();
+
+    let mut bodies = Vec::new();
+    for _ in 0..2 {
+        let received = segment_of(within(dish.recv()).await.expect("recv"));
+        let number = received.meta().segment.expect("a segment number");
+        let body = within(received.collect(1 << 20))
+            .await
+            .expect("a whole segment");
+        bodies.push((number, body.len()));
+    }
+    assert_eq!(bodies, vec![(0, 8 * 4096), (1, 4096)]);
+    assert_eq!(radio.dropped_on("v").map_or(0, |d| d.superseded), 0);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_relay_segment_still_resets_a_stalled_dish() {
+    let server = Server::start().await;
+    let radio = server.listener.radio("/r").expect("radio");
+    let runtime = stalling(&server);
+    let _dish = joined(&server, &runtime, "v", None).await;
+    dishes(&radio, 1).await;
+
+    // Four windows of a segment the dish never reads, left unfinished.
+    let mut a = radio.relay_segment("v").expect("segment a");
+    for _ in 0..16 {
+        a.write(vec![0x41; 16 * 1024]).expect("write");
+    }
+    let _b = radio.relay_segment("v").expect("segment b");
+    within(async {
+        while radio.dropped_on("v").map_or(0, |d| d.superseded) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    drop(a);
+    runtime.shutdown().await;
+}
+
 // --- segments from a dialling peer ---------------------------------------------
 
 fn stream_of(incoming: Incoming) -> weida::IncomingTransfer {
