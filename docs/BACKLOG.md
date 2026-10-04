@@ -58,7 +58,7 @@ kind: code | size: 45 | status: done 845e504 | needs: [B-308]
 acceptance: [0037](decisions/0037-layered-segments.md) §4.6: `Radio::dish_drops() -> Vec<DishDrops>`, one record per joined dish connection, removed when it closes. Test: two dishes, one short of budget; only its record counts `subscriber_budget` or `layers_cut`, and the record is gone after it disconnects.
 
 ### B-310 — A layered relay as a program, and a guide section
-kind: code | size: 60 | status: ready | needs: [B-308]
+kind: code | size: 60 | status: done 8c718e4 | needs: [B-308]
 acceptance: an example in B-290's shape — a `Peer::segment` uplink writing three layers, an acceptor, a `Radio::segment` that follows upstream per [0037](decisions/0037-layered-segments.md) §4.8 and §4.11 — asserted by a test: a dish with `max_layer = 0` receives layer 0 of every segment and nothing else, and an uncapped dish receives all three; a [GUIDE.md](GUIDE.md) section "quality without re-encoding".
 
 ### B-311 — Layered segments in `weida::blocking` and `weida-py`
