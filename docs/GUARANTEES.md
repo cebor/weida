@@ -536,7 +536,8 @@ name a level that is decided and specified but not yet implemented.
 | Push/Pull | `BestEffort` | optional transport receipt | `None` |
 | Pub/Sub | `BestEffort`, with per-subscriber drop | none | `None` |
 | Pub/Sub over a local **socket** transport | `BestEffort`, with a second drop cause: the subscriber's reverse pool | none | `None` |
-| RADIO/DISH | `BestEffort`, with supersession and per-dish expiry ([decisions/0034](decisions/0034-late-is-lost.md) §4.6) | none | per topic, segments never go backwards at a dish |
+| RADIO/DISH | `BestEffort`, with supersession, expiry at the smaller of the sender's and the dish's `max_age`, and layer cuts from the top ([decisions/0034](decisions/0034-late-is-lost.md) §4.6, [decisions/0037](decisions/0037-layered-segments.md) §4.3) | none | per topic and layer, segments never go backwards at a dish |
+| `Peer::segment` | `BestEffort`, with supersession and sender expiry ([decisions/0037](decisions/0037-layered-segments.md) §4.2) | none | per topic, numbered |
 | flow | `BestEffort` per datagram ([decisions/0034](decisions/0034-late-is-lost.md) §4.2) | none | none |
 
 Three points deserve emphasis, because each is easy to assume otherwise:

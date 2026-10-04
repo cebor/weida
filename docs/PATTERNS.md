@@ -451,6 +451,9 @@ Two sender-local mechanisms, neither on the wire
   connection**, on `quinn`'s scale. A connection is one dialled path (§1.3), so priority orders
   transfers on one path and never across paths; on a local transport, where each stream is its
   own OS connection, it is a no-op. A datagram outranks every stream on its connection already.
+  Segment copies take theirs at open, from the layer and the sender's `SegmentTerms::priority`:
+  `(15 - layer) * 65536 + priority`, so every base layer on a connection goes before any
+  enhancement layer ([decisions/0037](decisions/0037-layered-segments.md) §4.4).
 
 *`a_transfer_past_its_deadline_is_reset`.*
 
@@ -662,6 +665,23 @@ Two things the patterns cannot express are natural here:
 
 *`acceptor_receives_both_stream_kinds`.*
 
+**A segment from the dialling side** ([decisions/0037](decisions/0037-layered-segments.md)
+§4.2, §4.11): `Peer::segment(topic, SegmentTerms)` opens one copy of a segment toward the bound
+path, with a radio's supersession, expiry, layers and never-waiting `write_layer`; its number
+comes from the connection, so every `Peer` sharing it sends one rising sequence, and its
+budget is the `Peer`'s `subscriber_buffer_bytes` over all its segments. `Peer::segment_drops`
+counts what its copies lost. The acceptor receives each layer as `Incoming::Stream` with
+`meta.topic`, `meta.segment` and `meta.layer` set, and a stale layer — a segment not newer than
+one delivered on that path and topic of the connection, or a layer of it already delivered — is
+refused with `CANCELED` before it reaches the acceptor.
+
+*`a_peer_segment_reaches_an_acceptor_with_its_number`,
+`a_peer_segment_supersedes_the_previous_one_on_its_topic`,
+`two_peers_on_one_connection_number_one_sequence`,
+`a_peer_segment_carries_its_layers_to_the_acceptor`,
+`an_acceptor_refuses_a_segment_older_than_one_it_delivered`,
+`a_receiver_delivers_each_layer_of_a_segment_once` (`crates/weida/tests/radio.rs`).*
+
 **A datagram flow** is the third carrier
 ([decisions/0034](decisions/0034-late-is-lost.md) §4.2), for units worthless once late — a
 20 ms voice frame. `Peer::open_flow(FlowMeta)` writes a FLOW header on a stream that stays open
@@ -836,22 +856,25 @@ raw preview frame, a video GOP — and it is the join point. `Listener::radio` b
 | --- | --- | --- |
 | Compatible peer | `Dish` | `Radio` |
 | Direction | binds | connects |
-| Send/receive pattern | `segment(topic)` → `write` chunks → `finish`; `datagram(topic, bytes)` for a one-packet segment | `join(filter, max_age)` / `leave(filter)`, then `recv` → `Received::Segment` (a streamed `IncomingTransfer`) or `Received::Datagram { topic, segment, payload }` |
+| Send/receive pattern | `segment(topic, terms)` → `write` / `write_layer(layer, chunk)` → `finish_layer` / `finish`; `datagram(topic, bytes)` for a one-packet segment | `join(filter, terms)` with `JoinTerms { max_age, max_layer }` / `leave(filter)`, then `recv` → `Received::Segment` (a streamed `IncomingTransfer`, one per layer) or `Received::Datagram { topic, segment, payload }` |
 | Topics | Pub/Sub's namespace and filter grammar, unchanged — ZeroMQ's "group" is weida's topic | |
 | Outgoing routing | every dish whose filter matches, one copy each; the dish set is fixed when a segment opens | — |
-| Carrier | a stream segment: one uni DATA stream per dish, numbered in DATA key `13`; a datagram segment: a flow per `(dish, topic)`, opened lazily on the connection the join arrived on, its payload `varint segment` + bytes | |
-| Supersession | opening segment *n+1* on a topic **resets every copy of segment *n* on that topic still unacknowledged**, with `CANCELED`, and no other topic's | a segment not newer than the newest it delivered on that topic is discarded on arrival, so segments never go backwards |
-| Expiry | per dish: its `max_age` on the radio's clock from the segment's open; the smallest among the dish's matching filters applies | states `max_age` when it joins (SUBSCRIBE key `2`) |
-| Backpressure | never blocks: `write` hands a chunk to every copy with room in its dish's `subscriber_buffer_bytes` and its 64-chunk queue, and a copy without room loses the segment | a full receive queue discards on arrival and never blocks the connection |
-| Delivery | `BestEffort`; a lost segment is a gap in the numbers the dish sees, counted per topic and cause in `dropped_on`: budget, queue, no parked connection, superseded, expired, too large, no datagrams | `stale()` and `overflow()` count the dish's own discards |
+| Carrier | a stream segment: one uni DATA stream per `(dish, layer)`, opened on the layer's first chunk; key `13` numbers the segment and key `14` names the layer above 0; a datagram segment: a flow per `(dish, topic)`, opened lazily on the connection the join arrived on, its payload `varint segment` + bytes | |
+| Supersession | opening segment *n+1* on a topic resets at once every layer of *n* whose writer had not finished it, or whose queued chunks the transport does not take at once, and every layer above it; a finished layer gets `rtt + 50 ms + rtt * bytes / cwnd` and is reset only if still unacknowledged then ([decisions/0037](decisions/0037-layered-segments.md) §4.5); `SegmentTerms::follows_upstream` treats a relay's copy as finished until a write has to wait (§4.11) | a layer not newer than what this connection delivered on that path and topic is discarded on arrival, so segments never go backwards |
+| Expiry | the smaller of the sender's `SegmentTerms::max_age` and the dish's `max_age`, on the radio's clock from the segment's open; the smallest among the dish's matching filters applies | states `max_age` when it joins (SUBSCRIBE key `2`) |
+| Layers | a segment carries layers `0..=15` in dependency order; a cap means a layer above it is never opened for that dish, and is not a drop | states `max_layer` when it joins (SUBSCRIBE key `3`); with several matching filters the largest cap applies, and a filter without one means no cap; freshness is per layer |
+| Backpressure | never blocks; the cut rule: a copy without room for a chunk of layer *k* cuts its layers above *k* first, whose queued bytes return to its budget, then *k* and above; a copy that loses layer 0 loses the segment | a full receive queue discards on arrival and never blocks the connection |
+| Delivery | `BestEffort`; a lost segment is a gap in the numbers the dish sees, counted per topic and cause in `dropped_on`: budget, queue, no parked connection, superseded, expired, too large, no datagrams, and `layers_cut` for a copy that kept layer 0; `Radio::dish_drops` counts the same per joined dish connection | `stale()` and `overflow()` count the dish's own discards |
+| From a dialling peer | `Peer::segment(topic, terms)` (§5): one copy toward the bound path, numbered per connection, `Peer::segment_drops` | the bound side receives `Incoming::Stream` with `topic`, `segment` and `layer` set |
 | Late joiner | receives the next segment; nothing is retained for it | |
 
 Five rules a caller can get wrong. **Supersession holds nothing**: it discards bytes already in
 flight, which is why it is not the coalescer [0016](decisions/0016-conflation.md) §4.2 refused.
 **A late joiner waits for the next segment**: a segment is the only point a decoder can start
 from, so the application chooses how often a join point comes. **Topics under one radio share
-one connection per dish**, so a datagram outranks a stream segment there and stream segments
-can be ordered with §1.12's priority; topics on different paths cannot be ordered at all. **A
+one connection per dish**, so a datagram outranks a stream segment there and every topic's
+layer 0 outranks every topic's enhancement layer, by the layer-major priority of §1.12; topics
+on different paths cannot be ordered at all. **A
 datagram segment is never turned into a stream segment**: a dish whose connection did not agree
 the datagram capability loses it with the cause named. **Joins are subscriptions**: they ride
 SUBSCRIBE and UNSUBSCRIBE, count against `max_subscriptions`, and a redialling dish re-sends
@@ -872,6 +895,16 @@ membership changed is one call. An anonymous dish can be admitted or refused but
 name, which is one more reason an SFU's binding requires `ClientTrust::AnyKey`.
 
 *`a_stalled_dish_loses_old_segments_while_a_fast_one_gets_every_one`,
+`a_healthy_dish_behind_a_slow_path_gets_back_to_back_segments_whole`,
+`a_segment_finished_right_before_its_successor_still_arrives_whole`,
+`a_segment_whose_finish_found_a_full_queue_is_cut_at_once`,
+`a_segment_following_upstream_keeps_its_copy_while_its_successor_opens`,
+`a_segment_following_upstream_still_resets_a_stalled_dish`,
+`a_dish_short_of_budget_keeps_layer_zero_whole_while_upper_layers_are_cut`,
+`a_dish_capped_at_layer_zero_is_never_sent_layer_one`,
+`a_layer_cut_also_cuts_every_higher_layer_of_that_segment`,
+`a_dish_redialled_to_a_restarted_radio_takes_its_numbers_from_zero`,
+`dish_drops_names_the_dish_that_lost_and_forgets_it_when_it_leaves`,
 `a_segment_supersedes_only_its_own_topic`,
 `a_joiner_receives_the_next_segment_and_nothing_earlier`,
 `a_dish_max_age_expires_its_copy`, `a_datagram_segment_reaches_every_joined_dish`,
@@ -901,4 +934,4 @@ name, which is one more reason an SFU's binding requires `ClientTrust::AnyKey`.
 | a reliable verdict without an exchange | any pattern, plus `TransferMeta::with_report` | a cursor rides a stream of its own, so a Push transfer stays one unidirectional stream and still gets an answer (§1.11, [decisions/0024](decisions/0024-three-families-one-back-channel.md) §4.4a) |
 | how far the far end got, not merely whether it finished | cursors, via `OutgoingTransfer::cursors` | a whole-message verdict tells an interrupted sender nothing; an absolute offset tells it a number (§1.11) |
 | voice, or any unit worthless once late, to one peer | a datagram flow | never sent late, never waits, loses its oldest at a bound, and says what it lost (§5) |
-| a live feed to many, where a laggard should lose the old unit rather than the new one | RADIO/DISH | supersession and per-dish expiry reset what is late, and a joiner starts at the next segment (§6.4) |
+| a live feed to many, where a laggard should lose the old unit rather than the new one | RADIO/DISH | supersession and per-dish expiry reset what is late, a layered unit loses its upper layers first, and a joiner starts at the next segment (§6.4) |

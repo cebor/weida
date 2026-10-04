@@ -26,7 +26,8 @@ reader can check rather than trust. The griasdi side was read from its branch
 `6dcb64b`. Everything under "Proposal" is design, not fact.
 
 **Answered by [decisions/0037](../decisions/0037-layered-segments.md)
-(accepted; built as B-304 to B-312).** Priority (gap 1 below) is 0037 §4.4, the uplink
+(accepted; shipped in `9c92b10`, `c1f3ed8`, `f9c90fa`, `11bcfcb`, `cfb75c8`, `845e504`,
+`8c718e4` and `8def210`).** Priority (gap 1 below) is 0037 §4.4, the uplink
 (gap 2) is §4.2, path statistics (gap 3) were already answered by
 [0036](../decisions/0036-connection-statistics.md)'s `connection_stats()`, the
 per-dish signal (gap 4) is §4.6, and layers (the fifth ask) are §4.3.
@@ -66,8 +67,8 @@ Verified at `05a6b8e`.
   not newer than the newest delivered. A segment arrives as
   `Received::Segment(IncomingTransfer)` (`radio.rs:933-936`) with
   `IncomingMeta::segment: Option<u64>` (`crates/weida/src/transfer.rs:214`).
-- **Segment numbers are DATA key `13`**, "written by a radio only"
-  (`docs/PROTOCOL.md:533`). The next free DATA key is `14`; SUBSCRIBE uses keys
+- **Segment numbers are DATA key `13`**, then "written by a radio only"
+  (`docs/PROTOCOL.md:533`; since `7094fc7` also by `Peer::segment`). The next free DATA key is `14`; SUBSCRIBE uses keys
   `0..=2` (`docs/PROTOCOL.md:709-713`), so the next free one is `3`. Unknown
   keys are skipped (`docs/PROTOCOL.md:470`, §5).
 - **No priority reaches a segment copy.** The only public priority is

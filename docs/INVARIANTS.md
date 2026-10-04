@@ -80,12 +80,19 @@ opened; `flow_queue_bytes` (16 KiB) bounds the unread datagrams of one flow, cha
 per-entry overhead so a flood of empty datagrams is bounded by the same cap; `flow_early_bytes`
 (4 KiB) and `flow_early_hold` (1 s) bound the one per-connection ring a peer can fill with
 datagrams for ids it never registered; a local flow's record is refused above 1200 bytes, so a
-reader's reassembly buffer is a constant. On the dish side the `newest` table that discards stale
-segments holds at most `max_sequence_scopes` topics — an untracked topic is simply never stale —
-and its queue is `endpoint_queue` deep and discards rather than blocks. On the radio side the
-topic table is capped at `max_sequence_scopes` too and evicts only a topic with no copy in
-flight, a copy holds at most 64 queued chunks, and a dish's chunks are charged against
-`subscriber_buffer_bytes` exactly as a subscriber's are.
+reader's reassembly buffer is a constant. On the receiving side every connection keeps one
+freshness table (`segments_in`), shared by its dishes and every other route, of at most
+`max_sequence_scopes` `(path, topic)` entries, each a segment number and a 16-bit layer mask —
+an untracked key is simply never stale — and a dish's queue is `endpoint_queue` deep and
+discards rather than blocks; a dialling connection numbers `Peer::segment` in a table
+(`segments_out`) of the same cap ([decisions/0037](decisions/0037-layered-segments.md) §4.11).
+On the radio side the topic table is capped at `max_sequence_scopes` too and evicts only a topic
+with no copy in flight; a copy has at most `MAX_SEGMENT_LAYERS` (16) layer streams, each with
+at most 64 queued chunks, all charged against one budget: a dish's `subscriber_buffer_bytes`
+exactly as a subscriber's are, or for `Peer::segment` the `Peer`'s, over all its segments.
+`Radio::dish_drops` holds one record per joined dish connection, removed with it, so at most
+`max_connections`. DATA key `14` and SUBSCRIBE key `3` are refused above 15 at the decoder
+([decisions/0037](decisions/0037-layered-segments.md) §4.3).
 
 **The chain a peer presented is inside it with a cap of its own**
 ([decisions/0035](decisions/0035-keys-proved-not-judged.md) §4.2). A connection keeps the

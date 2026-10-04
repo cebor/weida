@@ -593,8 +593,10 @@ One reads everything; the other never reads, behind a 64 KiB stream window:
 fast dish received segments [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]; the stalled dish lost 9 to supersession
 ```
 
-**Opening segment *n+1* resets every copy of segment *n* on that topic that is still
-unacknowledged**, and nothing else. The stalled dish's copy never finishes, so each new frame
+**Opening segment *n+1* resets every copy of segment *n* on that topic that is still being
+written or held back by the dish**, and nothing else; a finished copy gets the time its path
+needs to be acknowledged before it is reset ([0037](decisions/0037-layered-segments.md) §4.5).
+The stalled dish's copy never finishes, so each new frame
 resets the old one: it holds at most the newest segment, which is the only one worth showing.
 The fast dish acknowledged each frame before the next existed, so supersession never reaches
 it. Nothing was held to send instead — supersession discards bytes that are already in

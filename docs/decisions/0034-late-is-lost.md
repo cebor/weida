@@ -310,6 +310,11 @@ Five rules a caller can get wrong:
    ([0031](0031-transparent-redial-and-the-sender-outbox.md) §4.6). A join has no reply half,
    so [0017](0017-subscription-verdict.md)'s silence applies unchanged.
 
+**Amended by [0037](0037-layered-segments.md):** supersession gives a finished copy its path's
+time before the reset (§4.5), expiry takes the smaller of the sender's and the dish's
+`max_age`, a segment carries ordered layers cut from the top (§4.3), `Peer::segment` sends a
+segment from a dialling side (§4.2), and numbers and freshness are kept per connection (§4.11).
+
 ### 4.7 What this does to 0016 and to ordering
 
 - **[0016](0016-conflation.md) §4.2 refused a fan-out coalescer because it must hold the
@@ -498,6 +503,9 @@ acceptance: RADIO/DISH in `weida::blocking` (flows stay async-only there, becaus
 - **A connecting radio.** Connecting publishers are a recorded deferral
   ([PROTOCOL.md](../PROTOCOL.md) §11); the upstream direction is served by an L0 flow until a user
   needs a dialling radio.
+
+**Amended by [0037](0037-layered-segments.md):** the upstream direction of a stream segment is
+`Peer::segment`; a connecting radio stays deferred.
 
 ## 7. Sources
 
