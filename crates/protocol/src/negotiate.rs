@@ -14,6 +14,11 @@ use crate::header::{GuaranteeSet, Hello};
 /// sent only when both HELLOs list it.
 pub const CAPABILITY_DATAGRAM: u64 = 1;
 
+/// Capability code `2`, `path_report`: the sender reads, and will send, one
+/// REPORT stream (`docs/PROTOCOL.md` §6.1, §6.10). A REPORT stream is sent
+/// only when both HELLOs list it.
+pub const CAPABILITY_PATH_REPORT: u64 = 2;
+
 /// The negotiated parameters of a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Agreed {
@@ -31,6 +36,9 @@ pub struct Agreed {
     /// Both HELLOs listed [`CAPABILITY_DATAGRAM`], so FLOW streams and
     /// datagrams may be sent on this connection.
     pub datagrams: bool,
+    /// Both HELLOs listed [`CAPABILITY_PATH_REPORT`], so each side sends one
+    /// REPORT stream on this connection.
+    pub path_report: bool,
 }
 
 /// Why negotiation failed.
@@ -93,8 +101,9 @@ impl From<NegotiateError> for weida_core::Error {
 ///
 /// The effective version is the maximum of the intersection of the two version
 /// lists. Every capability the peer marks as required must appear in our own
-/// supported set, so a peer requiring a code we did not list fails. The only
-/// code defined is [`CAPABILITY_DATAGRAM`], agreed when both sides list it.
+/// supported set, so a peer requiring a code we did not list fails. The codes
+/// defined are [`CAPABILITY_DATAGRAM`] and [`CAPABILITY_PATH_REPORT`], each
+/// agreed when both sides list it.
 ///
 /// The guarantee set is the weaker of the two offers, and both sides'
 /// requirements must be reachable by it — there is no downgrade path
@@ -134,6 +143,8 @@ pub fn negotiate(ours: &Hello, theirs: &Hello) -> Result<Agreed, NegotiateError>
         guarantees,
         datagrams: ours.capabilities.contains(&CAPABILITY_DATAGRAM)
             && theirs.capabilities.contains(&CAPABILITY_DATAGRAM),
+        path_report: ours.capabilities.contains(&CAPABILITY_PATH_REPORT)
+            && theirs.capabilities.contains(&CAPABILITY_PATH_REPORT),
     })
 }
 
@@ -222,6 +233,7 @@ mod tests {
                 send_max_header_bytes: 8192,
                 guarantees: GuaranteeSet::CORE,
                 datagrams: false,
+                path_report: false,
             }
         );
     }
@@ -233,6 +245,15 @@ mod tests {
         assert!(negotiate(&with, &with).unwrap().datagrams);
         assert!(!negotiate(&with, &without).unwrap().datagrams);
         assert!(!negotiate(&without, &with).unwrap().datagrams);
+    }
+
+    #[test]
+    fn path_reports_are_agreed_only_when_both_list_the_code() {
+        let with = hello(&[0], &[CAPABILITY_PATH_REPORT], &[], 16384);
+        let without = hello(&[0], &[CAPABILITY_DATAGRAM], &[], 16384);
+        assert!(negotiate(&with, &with).unwrap().path_report);
+        assert!(!negotiate(&with, &without).unwrap().path_report);
+        assert!(!negotiate(&without, &with).unwrap().path_report);
     }
 
     #[test]

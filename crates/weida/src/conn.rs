@@ -574,6 +574,9 @@ async fn handle_local(ctx: &ConnHandle, send: SendHalf, mut recv: RecvHalf) -> R
             drop(send);
             crate::flow::handle_flow(ctx, recv, &header).await
         }
+        // A path report rides QUIC only (`docs/PROTOCOL.md` §6.10): a local
+        // transport has no path, and its HELLO never lists code 2.
+        FrameKind::Report => violation(ctx, "REPORT is legal only on QUIC"),
         FrameKind::Data => {
             let decoded = match DataHeader::decode(&header) {
                 Ok(h) => h,
@@ -803,6 +806,9 @@ async fn handle_stream(
         FrameKind::Credit => handle_credit(ctx, &header).await,
         FrameKind::Cursor => handle_cursor(ctx, stream, &header).await,
         FrameKind::Flow => crate::flow::handle_flow(ctx, stream, &header).await,
+        // This side lists no capability code 2 yet, so a REPORT stream is
+        // one the peer was not entitled to send (`docs/PROTOCOL.md` §6.10).
+        FrameKind::Report => violation(ctx, "REPORT without agreed capability 2"),
     }
 }
 

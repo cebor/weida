@@ -16,8 +16,8 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use weida_protocol::DataHeader;
 use weida_protocol::header::{Acknowledgement, CursorLevel, ReportMode, limits};
+use weida_protocol::{DataHeader, PathRecord};
 
 #[derive(Arbitrary, Debug)]
 struct ArbHeader {
@@ -45,6 +45,8 @@ struct ArbHeader {
     segment: Option<u64>,
     /// Key `14`, generated only beside key `13` and taken modulo 16.
     layer: Option<u8>,
+    /// The twelve values of a REPORT record, keys `0..=11` in order.
+    record: [u64; 12],
 }
 
 /// An ordered report: the id of key `9` and one seed per level of key `10`.
@@ -137,5 +139,44 @@ fuzz_target!(|input: ArbHeader| {
         DataHeader::decode(&bytes).as_ref(),
         Ok(&header),
         "roundtrip mismatch for {header:?}"
+    );
+
+    // A REPORT record (`docs/PROTOCOL.md` §6.10) roundtrips too, length
+    // prefix included: every field set is representable, since twelve uints
+    // stay below the 256-byte cap.
+    let [
+        rtt_us,
+        min_rtt_us,
+        cwnd,
+        congestion_events,
+        lost_packets,
+        lost_bytes,
+        sent_packets,
+        current_mtu,
+        tx_datagrams,
+        tx_bytes,
+        rx_datagrams,
+        rx_bytes,
+    ] = input.record;
+    let record = PathRecord {
+        rtt_us,
+        min_rtt_us,
+        cwnd,
+        congestion_events,
+        lost_packets,
+        lost_bytes,
+        sent_packets,
+        current_mtu,
+        tx_datagrams,
+        tx_bytes,
+        rx_datagrams,
+        rx_bytes,
+    };
+    let mut bytes = Vec::new();
+    record.encode_into(&mut bytes);
+    assert_eq!(
+        PathRecord::decode(&bytes),
+        Ok(Some((record, bytes.len()))),
+        "record roundtrip mismatch for {record:?}"
     );
 });

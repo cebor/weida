@@ -17,8 +17,8 @@ use weida_protocol::header::{
 };
 use weida_protocol::{
     CAPABILITY_DATAGRAM, CreditHeader, CursorHeader, DataHeader, ErrorHeader, FlowHeader,
-    FrameKind, Hello, SubscriptionHeader, decode_cursor_record, encode_cursor_record, encode_frame,
-    flow_prefix, split_flow_datagram,
+    FrameKind, Hello, PathRecord, ReportHead, SubscriptionHeader, decode_cursor_record,
+    encode_cursor_record, encode_frame, flow_prefix, split_flow_datagram,
 };
 
 /// Asserts one documented frame, and that its header half decodes back.
@@ -685,4 +685,49 @@ fn golden_hello_with_datagram_frame() {
         ],
     );
     assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
+}
+
+#[test]
+fn golden_report_head_frame() {
+    assert_frame(
+        "REPORT head",
+        FrameKind::Report,
+        ReportHead.encode(),
+        &[0x57, 0x08, 0x01, 0xA0],
+    );
+    assert_eq!(ReportHead::decode(&[0xA0]), Ok(ReportHead));
+}
+
+#[test]
+fn golden_report_record() {
+    // Not a frame: one record on a REPORT stream (`docs/PROTOCOL.md` §8).
+    let record = PathRecord {
+        rtt_us: 25_000,
+        cwnd: 12_000,
+        current_mtu: 1200,
+        ..PathRecord::default()
+    };
+    let mut bytes = Vec::new();
+    record.encode_into(&mut bytes);
+    let expected = [
+        0x0D, 0xA3, 0x00, 0x19, 0x61, 0xA8, 0x02, 0x19, 0x2E, 0xE0, 0x07, 0x19, 0x04, 0xB0,
+    ];
+    assert_eq!(bytes, expected);
+    assert_eq!(
+        PathRecord::decode(&expected),
+        Ok(Some((record, expected.len())))
+    );
+}
+
+#[test]
+fn a_report_record_above_256_bytes_is_refused_and_a_short_one_waits() {
+    // `41 01` is the varint 257: refused before any of the map is read.
+    assert_eq!(
+        PathRecord::decode(&[0x41, 0x01]),
+        Err(HeaderError::InvalidPathReport("record above 256 bytes"))
+    );
+    // Cut short: more bytes are needed. At FIN the reader calls it a
+    // violation, because a sender writes whole records.
+    assert_eq!(PathRecord::decode(&[0x0D, 0xA3, 0x00, 0x19]), Ok(None));
+    assert_eq!(PathRecord::decode(&[]), Ok(None));
 }

@@ -215,9 +215,9 @@ The algorithm is:
 2. If the intersection is empty, negotiation fails.
 3. The effective version is the maximum element of the intersection.
 4. If any code in `theirs.required_capabilities` is outside the local supported capability
-   set (`ours.capabilities`), negotiation fails. The only code defined is `1` `datagram`
-   (§6.1), so a peer that requires anything else, or requires `1` of a side that did not list
-   it, fails negotiation.
+   set (`ours.capabilities`), negotiation fails. The codes defined are `1` `datagram` and `2`
+   `path_report` (§6.1), so a peer that requires anything else, or requires a code of a side
+   that did not list it, fails negotiation.
 5. Compute the effective guarantee set, dimension by dimension, as the **weaker** of
    `ours.guarantees_offered` and `theirs.guarantees_offered`, an absent declaration meaning
    `core` (§6.1, §6.5). For a dimension whose levels are not ordered — `backpressure`, and
@@ -236,6 +236,7 @@ Agreed {
     send_max_header_bytes: u64,   // = theirs.max_header_bytes
     guarantees: GuaranteeSet,     // the effective set from step 5; spec ahead of code
     datagrams: bool,              // both HELLOs listed capability code 1 (§6.1)
+    path_report: bool,            // both HELLOs listed capability code 2 (§6.1)
 }
 ```
 
@@ -339,7 +340,7 @@ a defect because it lets a remote peer choose the allocation size.
 ### 3.2 Conditions that MUST close the connection with PROTOCOL_VIOLATION
 
 - Magic byte not equal to `0x57`.
-- Unknown `kind` value, i.e. anything in `8..=255`. Kinds `5` and `6` were reserved for the
+- Unknown `kind` value, i.e. anything in `9..=255`. Kinds `5` and `6` were reserved for the
   L2 credit frame and the cursor stream and are now defined (§6.6, §6.7): the reservation was
   a promise not to reuse the number, and the promise was kept when the number was spent.
 - `header_len` greater than the local `limits.max_header_bytes` (§3.1).
@@ -355,6 +356,9 @@ a defect because it lets a remote peer choose the allocation size.
 - A FLOW stream (§6.8) from a peer whose HELLO did not list capability code `1` in key `3`.
 - Any byte after a FLOW header on a QUIC stream, a FLOW naming a flow id that is still live on
   that connection and direction, or a local FLOW record longer than 1200 bytes (§2.1).
+- A REPORT stream (§6.10) from a peer when not both HELLOs listed capability code `2`, a second
+  REPORT stream from the peer on one connection, a REPORT record longer than 256 bytes, or a
+  REPORT record truncated at FIN.
 
 These rules are symmetric: they apply identically to streams received by the QUIC client
 and by the QUIC server. All network input is hostile (master doc §81 rule 18); neither role
@@ -378,8 +382,9 @@ connection-fatal framing violation.
 | `5` | CREDIT | header only, FIN directly after the header | uni |
 | `6` | CURSOR | head frame, then (level, offset) records until FIN | uni |
 | `7` | FLOW | header, then nothing on QUIC (datagrams on local transports, §2.1); FIN closes the flow | uni |
+| `8` | REPORT | head frame, then `[varint length][CBOR map]` records until FIN | uni, QUIC only |
 
-Kinds `8..=255` are reserved and MUST close the connection with `PROTOCOL_VIOLATION`. This
+Kinds `9..=255` are reserved and MUST close the connection with `PROTOCOL_VIOLATION`. This
 is not a forward-compatibility hook: a receiver cannot know whether an unknown stream kind
 carries payload it would have to drain.
 
@@ -405,7 +410,14 @@ closing the connection: nothing was allocated for an id it never handed out.
 flow's lifetime and whose units travel as QUIC DATAGRAM frames (§6.8, §6.9). It is sent only
 to a peer that listed capability code `1` (§6.1), so a peer that never listed the code never
 sees one. On QUIC a FLOW stream carries its header and then nothing until FIN; a byte after
-the header is a `PROTOCOL_VIOLATION`. Kind `8` is now the first free number.
+the header is a `PROTOCOL_VIOLATION`.
+
+**Kind `8` is known as of B-301**, and it is the path report of
+[decisions/0036](decisions/0036-connection-statistics.md) §4.5: one stream per side and
+connection that carries this side's view of the QUIC path — round trip, window, its own losses,
+its UDP counts — to the peer, which can see its own download loss no other way. It is sent only
+on QUIC and only when both HELLOs listed capability code `2` (§6.1). Kind `9` is now the first
+free number.
 
 HELLO, ERROR, SUBSCRIBE, UNSUBSCRIBE and CREDIT are header-only frames: the sender MUST FIN
 the stream immediately after the header. Receiver handling of bytes appearing after the
@@ -418,7 +430,8 @@ a DATA stream.
 
 ### 4.1 Which frame may open which stream
 
-- A **uni stream** MUST open with HELLO, DATA, SUBSCRIBE, UNSUBSCRIBE, CREDIT, CURSOR or FLOW. An
+- A **uni stream** MUST open with HELLO, DATA, SUBSCRIBE, UNSUBSCRIBE, CREDIT, CURSOR, FLOW or
+  REPORT. An
   ERROR frame on a uni stream is a violation (§3.2): an ERROR is the alternative to a reply,
   and it therefore has meaning only where a reply would have gone.
 - A **bidi stream** MUST open with DATA on its initiating half. Any other kind there is a
@@ -497,6 +510,7 @@ Capability codes:
 | Code | Name | Meaning |
 | --- | --- | --- |
 | `1` | `datagram` | the sender reads QUIC DATAGRAM frames and FLOW streams (§6.8, §6.9) |
+| `2` | `path_report` | the sender reads, and will send, one REPORT stream (§6.10) |
 
 A FLOW stream or a DATAGRAM frame MUST NOT be sent unless both HELLOs listed code `1` in key
 `3`. A FLOW stream from a peer whose HELLO did not list it closes the connection with
@@ -504,6 +518,12 @@ A FLOW stream or a DATAGRAM frame MUST NOT be sent unless both HELLOs listed cod
 (`datagram_receive_bytes > 0`, §10); on QUIC the same setting decides whether the transport
 parameter `max_datagram_frame_size` is advertised at all
 ([decisions/0034](decisions/0034-late-is-lost.md) §4.5).
+
+A REPORT stream MUST NOT be sent unless both HELLOs listed code `2`, by the same rule: a side
+lists code `2` exactly when its profile sets `path_report` (§10) **and** the connection is
+QUIC — a local transport has no path to report — so a server opts in per binding profile, a
+client per runtime, and neither is made to send by the other
+([decisions/0036](decisions/0036-connection-statistics.md) §4.5).
 
 **Keys `5` and `6` are specified ahead of code** (§11) and are the only optional HELLO keys.
 They declare guarantee sets per [decisions/0006](decisions/0006-guarantee-sets.md) §4.4,
@@ -972,6 +992,51 @@ records. The receiver demultiplexes by `flow` into the flow its FLOW stream regi
   framing inside the flow payload, not a wire rule of the flow itself. A datagram segment has
   no layer: key `14` applies to stream segments only.
 
+### 6.10 REPORT (kind 8)
+
+A REPORT stream carries one side's view of the QUIC path under the connection to the peer
+([decisions/0036](decisions/0036-connection-statistics.md) §4.5). Only the sender's QUIC stack
+knows which of its packets were lost, so this is how a receiver learns its download loss.
+
+The **head frame** is a CBOR header under §5's rules with no keys defined: the empty map,
+`A0`. Its keys are reserved, and a receiver skips unknown ones by §5's rule. After the head
+frame the stream carries **records** until FIN, each
+
+```text
+[length: varint][CBOR map of `length` bytes]
+```
+
+with `length` at most **256**. A record's map follows §5's rules; every value is a `uint`:
+
+| Key | Name | Meaning |
+| --- | --- | --- |
+| `0` | `rtt_us` | smoothed round-trip time, µs |
+| `1` | `min_rtt_us` | smallest round-trip time seen, µs |
+| `2` | `cwnd` | congestion window, bytes |
+| `3` | `congestion_events` | congestion events the sender's controller reacted to |
+| `4` | `lost_packets` | packets the sender sent and declared lost |
+| `5` | `lost_bytes` | bytes the sender sent and declared lost |
+| `6` | `sent_packets` | packets the sender sent |
+| `7` | `current_mtu` | the largest UDP payload the path carries now |
+| `8` | `tx_datagrams` | UDP datagrams the sender sent |
+| `9` | `tx_bytes` | bytes in them |
+| `10` | `rx_datagrams` | UDP datagrams the sender received |
+| `11` | `rx_bytes` | bytes in them |
+
+Unknown keys are skipped (§5); an absent key reads as `0`. Rules:
+
+1. **One stream per side and connection.** After negotiation agreed code `2`, each side opens
+   exactly one REPORT stream. A second one from the peer is a `PROTOCOL_VIOLATION`.
+2. **One record every 2 s**, a constant on the sender's own clock; the receiver cannot choose
+   the rate, and nothing in the protocol answers a record.
+3. **The receiver keeps the latest record only**, in one fixed-size slot per connection: a
+   record replaces the one before it, so a fast sender costs a slow reader nothing but reads.
+4. **A record longer than 256 bytes**, judged by its length prefix before any of it is read, and
+   **a record truncated at FIN** are `PROTOCOL_VIOLATION`s, as is a REPORT stream when not both
+   HELLOs listed code `2` (§3.2). A short read before FIN is not: the reader reads more bytes.
+5. **No address travels.** A record carries numbers only; no socket address, observed or
+   configured, appears in it ([decisions/0036](decisions/0036-connection-statistics.md) §4.4).
+
 ---
 
 ## 7. QUIC application error codes
@@ -1096,6 +1161,12 @@ SUB    {endpoint:"/t", filter:"a", max_layer:1}      (key 3, a dish's layer cap)
 
 HELLO  {versions:[0], max_header_bytes:16384, max_transfers:1024, caps:[1], req_caps:[]}
        57 00 11  A5 00 81 00 01 19 40 00 02 19 04 00 03 81 01 04 80
+
+REPORT head frame                            (kind 8, the empty map)
+       57 08 01  A0
+
+REPORT record {rtt_us:25000, cwnd:12000, current_mtu:1200}   (a record, not a frame)
+       0D  A3 00 19 61 A8 02 19 2E E0 07 19 04 B0
 ```
 
 Decoded field lists:
@@ -1244,6 +1315,18 @@ DATA header `A1 0E 01` (key `14` without key `13`), and the SUBSCRIBE header
 **HELLO-with-datagram vector** — the v0 HELLO with key `3` `capabilities = [1]` (`81 01`
 instead of `80`), so `header_len` grows by one to `0x11` (17 bytes). This is what a side that
 enables flows sends (§6.1).
+
+**REPORT head frame vector** — magic `0x57`, kind `0x08` (REPORT), `header_len = 0x01`, the
+empty CBOR map: no head key is defined (§6.10).
+
+**REPORT record vector** — not a frame: one record on a REPORT stream. `0D` is the varint
+length 13, then a CBOR map of 3 entries: key `0` `rtt_us = 25000` (`19 61 A8`), key `2`
+`cwnd = 12000` (`19 2E E0`), key `7` `current_mtu = 1200` (`19 04 B0`); the other keys are
+absent and read as `0`.
+
+**REPORT violations** — a record whose length prefix is `41 01` (257) closes the connection
+with `PROTOCOL_VIOLATION` before any of the map is read, and so does a stream that ends after
+`0D A3 00 19` (a record cut short at FIN).
 
 ---
 
@@ -1449,6 +1532,7 @@ Per connection (`Limits`):
 | `max_parked_reverse` | `8` | connections a subscriber parks toward a peer it dialled, so that peer can open a stream back (§2.1); each is a descriptor held for a copy that may never come and each counts against `max_local_streams` on both sides. A publisher that finds none parked drops that copy and counts it; zero disables the pool, which makes subscribing over a socket transport an error rather than a silence [0012 §4.4] |
 | `datagram_receive_bytes` | `0` | datagrams quinn buffers unread per connection, oldest dropped first; `0` turns flows off, so neither capability code `1` nor `max_datagram_frame_size` is advertised and nothing is buffered. `DEFAULT_DATAGRAM_RECEIVE_BYTES` (64 KiB) is the documented value for turning flows on ([decisions/0034](decisions/0034-late-is-lost.md) §4.5) |
 | `datagram_send_bytes` | 64 KiB | datagrams queued for sending per connection; beyond it the oldest is discarded (§6.9) |
+| `path_report` | `false` | lists capability code `2` on a QUIC connection, so that when the peer lists it too each side sends one REPORT stream with a record every 2 s and keeps the peer's latest record in one slot (§6.10, [decisions/0036](decisions/0036-connection-statistics.md) §4.5) |
 | `max_flows` | `64` | inbound flows one connection may hold live; a FLOW beyond it is stopped with `LIMIT_EXCEEDED` (§6.8) |
 | `flow_queue_bytes` | 16 KiB | unread datagram bytes held per inbound flow; a slow consumer loses its oldest datagrams, counted per flow |
 | `flow_early_bytes` | 4 KiB | per-connection ring for datagrams naming an id with no live flow yet (§6.9) |

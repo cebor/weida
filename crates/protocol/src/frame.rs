@@ -51,6 +51,12 @@ pub enum FrameKind {
     /// length-prefixed records on this stream
     /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md) §4.2).
     Flow,
+    /// One side's view of the QUIC path, for the peer; a head frame, then
+    /// length-prefixed records until FIN. QUIC only, and only when both
+    /// HELLOs listed capability code `2`
+    /// ([decisions/0036](../../../docs/decisions/0036-connection-statistics.md)
+    /// §4.5).
+    Report,
 }
 
 impl FrameKind {
@@ -65,6 +71,7 @@ impl FrameKind {
             FrameKind::Credit => 5,
             FrameKind::Cursor => 6,
             FrameKind::Flow => 7,
+            FrameKind::Report => 8,
         }
     }
 
@@ -81,6 +88,7 @@ impl FrameKind {
             5 => Some(FrameKind::Credit),
             6 => Some(FrameKind::Cursor),
             7 => Some(FrameKind::Flow),
+            8 => Some(FrameKind::Report),
             _ => None,
         }
     }
@@ -102,6 +110,7 @@ impl fmt::Display for FrameKind {
             FrameKind::Credit => "CREDIT",
             FrameKind::Cursor => "CURSOR",
             FrameKind::Flow => "FLOW",
+            FrameKind::Report => "REPORT",
         };
         f.write_str(s)
     }
@@ -239,12 +248,13 @@ mod tests {
             (FrameKind::Credit, 5),
             (FrameKind::Cursor, 6),
             (FrameKind::Flow, 7),
+            (FrameKind::Report, 8),
         ];
         for (kind, code) in all {
             assert_eq!(kind.to_u8(), code);
             assert_eq!(FrameKind::from_u8(code), Some(kind));
         }
-        for code in 8u8..=255 {
+        for code in 9u8..=255 {
             assert_eq!(FrameKind::from_u8(code), None, "kind {code}");
         }
     }
@@ -260,6 +270,7 @@ mod tests {
             FrameKind::Credit,
             FrameKind::Cursor,
             FrameKind::Flow,
+            FrameKind::Report,
         ] {
             assert!(!k.has_payload(), "{k}");
         }
@@ -292,6 +303,7 @@ mod tests {
             (FrameKind::Credit, 0x05),
             (FrameKind::Cursor, 0x06),
             (FrameKind::Flow, 0x07),
+            (FrameKind::Report, 0x08),
         ] {
             for header_len in [0usize, 3, 5, 9, 11, 16, 18] {
                 let frame = encode_frame(kind, &vec![0; header_len]);
@@ -328,13 +340,15 @@ mod tests {
 
     #[test]
     fn unknown_kind_is_a_violation() {
-        // Kind `8` is the first free one: `5` became CREDIT with the L2 queue
+        // Kind `9` is the first free one: `5` became CREDIT with the L2 queue
         // (`docs/decisions/0018-minimal-broker.md` §4.6), `6` became CURSOR
         // with the cursor stream
-        // (`docs/decisions/0024-three-families-one-back-channel.md` §4.4) and
-        // `7` became FLOW (`docs/decisions/0034-late-is-lost.md` §4.2).
-        let err = parse_preamble(&[MAGIC, 0x08, 0x00], CAP).unwrap_err();
-        assert_eq!(err, PreambleError::UnknownKind(8));
+        // (`docs/decisions/0024-three-families-one-back-channel.md` §4.4),
+        // `7` became FLOW (`docs/decisions/0034-late-is-lost.md` §4.2) and
+        // `8` became REPORT (`docs/decisions/0036-connection-statistics.md`
+        // §4.5).
+        let err = parse_preamble(&[MAGIC, 0x09, 0x00], CAP).unwrap_err();
+        assert_eq!(err, PreambleError::UnknownKind(9));
         assert!(err.is_violation());
     }
 

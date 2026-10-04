@@ -24,10 +24,12 @@ pub use frame::{
 };
 pub use header::{
     CreditHeader, CursorHeader, CursorLevel, DataHeader, ErrorHeader, FlowHeader, HeaderError,
-    Hello, ReportMode, SubscriptionHeader, decode_cursor_record, encode_cursor_record, filter,
-    limits as header_limits,
+    Hello, PathRecord, ReportHead, ReportMode, SubscriptionHeader, decode_cursor_record,
+    encode_cursor_record, filter, limits as header_limits,
 };
-pub use negotiate::{Agreed, CAPABILITY_DATAGRAM, NegotiateError, negotiate};
+pub use negotiate::{
+    Agreed, CAPABILITY_DATAGRAM, CAPABILITY_PATH_REPORT, NegotiateError, negotiate,
+};
 pub use varint::{VarintError, decode_varint, encode_varint, varint_len};
 
 /// Wire protocol version implemented by this crate (experimental).

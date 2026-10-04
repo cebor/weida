@@ -68,6 +68,8 @@ pub mod limits {
     /// Highest segment layer (`docs/PROTOCOL.md` §6.2 key `14`, §6.4 key
     /// `3`).
     pub const MAX_LAYER: u8 = 15;
+    /// Largest REPORT record map (`docs/PROTOCOL.md` §6.10).
+    pub const MAX_PATH_RECORD_BYTES: usize = 256;
 }
 
 /// HELLO keys.
@@ -881,6 +883,9 @@ pub enum HeaderError {
     /// carries key `14` without key `13` (`docs/PROTOCOL.md` §6.2 key `14`,
     /// §6.4 key `3`).
     InvalidLayer(&'static str),
+    /// A REPORT record is longer than [`limits::MAX_PATH_RECORD_BYTES`]
+    /// (`docs/PROTOCOL.md` §6.10).
+    InvalidPathReport(&'static str),
 }
 
 impl std::fmt::Display for HeaderError {
@@ -915,6 +920,7 @@ impl std::fmt::Display for HeaderError {
             HeaderError::InvalidFilter(why) => write!(f, "invalid topic filter: {why}"),
             HeaderError::InvalidReport(reason) => write!(f, "invalid report: {reason}"),
             HeaderError::InvalidLayer(reason) => write!(f, "invalid layer: {reason}"),
+            HeaderError::InvalidPathReport(reason) => write!(f, "invalid path report: {reason}"),
         }
     }
 }
@@ -2168,6 +2174,171 @@ pub fn decode_cursor_record(
         value: raw_level,
     })?;
     Ok(Some((level, offset, level_len + offset_len)))
+}
+
+/// REPORT head frame (kind `8`): the empty map, every key reserved
+/// (`docs/PROTOCOL.md` §6.10). Records follow it until FIN.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReportHead;
+
+impl ReportHead {
+    /// Encodes the head frame: `A0`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_into_with(&mut out, |e| {
+            e.map(0)?;
+            Ok(())
+        });
+        out
+    }
+
+    /// Decodes the head frame; unknown keys are skipped by §5's rule.
+    pub fn decode(bytes: &[u8]) -> Result<ReportHead, HeaderError> {
+        let mut d = Decoder::new(bytes);
+        {
+            let mut m = MapReader::new(&mut d)?;
+            while m.next_key()?.is_some() {
+                m.skip()?;
+            }
+        }
+        finish(&d)?;
+        Ok(ReportHead)
+    }
+}
+
+/// REPORT record keys (`docs/PROTOCOL.md` §6.10).
+mod path_key {
+    pub const RTT_US: u64 = 0;
+    pub const MIN_RTT_US: u64 = 1;
+    pub const CWND: u64 = 2;
+    pub const CONGESTION_EVENTS: u64 = 3;
+    pub const LOST_PACKETS: u64 = 4;
+    pub const LOST_BYTES: u64 = 5;
+    pub const SENT_PACKETS: u64 = 6;
+    pub const CURRENT_MTU: u64 = 7;
+    pub const TX_DATAGRAMS: u64 = 8;
+    pub const TX_BYTES: u64 = 9;
+    pub const RX_DATAGRAMS: u64 = 10;
+    pub const RX_BYTES: u64 = 11;
+}
+
+/// One REPORT record: the sender's view of the QUIC path under the
+/// connection (`docs/PROTOCOL.md` §6.10,
+/// [decisions/0036](../../../docs/decisions/0036-connection-statistics.md)
+/// §4.5). Numbers only; no address travels. A key the peer did not send
+/// reads as `0`, and the encoder writes only the non-zero ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PathRecord {
+    /// Smoothed round-trip time, µs (key `0`).
+    pub rtt_us: u64,
+    /// Smallest round-trip time seen, µs (key `1`).
+    pub min_rtt_us: u64,
+    /// Congestion window, bytes (key `2`).
+    pub cwnd: u64,
+    /// Congestion events the sender's controller reacted to (key `3`).
+    pub congestion_events: u64,
+    /// Packets the sender sent and declared lost (key `4`).
+    pub lost_packets: u64,
+    /// Bytes the sender sent and declared lost (key `5`).
+    pub lost_bytes: u64,
+    /// Packets the sender sent (key `6`).
+    pub sent_packets: u64,
+    /// The largest UDP payload the path carries now (key `7`).
+    pub current_mtu: u64,
+    /// UDP datagrams the sender sent (key `8`).
+    pub tx_datagrams: u64,
+    /// Bytes in them (key `9`).
+    pub tx_bytes: u64,
+    /// UDP datagrams the sender received (key `10`).
+    pub rx_datagrams: u64,
+    /// Bytes in them (key `11`).
+    pub rx_bytes: u64,
+}
+
+impl PathRecord {
+    fn fields(&self) -> [(u64, u64); 12] {
+        [
+            (path_key::RTT_US, self.rtt_us),
+            (path_key::MIN_RTT_US, self.min_rtt_us),
+            (path_key::CWND, self.cwnd),
+            (path_key::CONGESTION_EVENTS, self.congestion_events),
+            (path_key::LOST_PACKETS, self.lost_packets),
+            (path_key::LOST_BYTES, self.lost_bytes),
+            (path_key::SENT_PACKETS, self.sent_packets),
+            (path_key::CURRENT_MTU, self.current_mtu),
+            (path_key::TX_DATAGRAMS, self.tx_datagrams),
+            (path_key::TX_BYTES, self.tx_bytes),
+            (path_key::RX_DATAGRAMS, self.rx_datagrams),
+            (path_key::RX_BYTES, self.rx_bytes),
+        ]
+    }
+
+    /// Appends `[varint length][CBOR map]` to `out`. Twelve keys of at most
+    /// nine bytes each stay far below [`limits::MAX_PATH_RECORD_BYTES`].
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        let fields = self.fields();
+        let present = fields.iter().filter(|(_, v)| *v != 0).count() as u64;
+        let mut map = Vec::new();
+        encode_into_with(&mut map, |e| {
+            e.map(present)?;
+            for (key, value) in fields {
+                if value != 0 {
+                    e.u64(key)?.u64(value)?;
+                }
+            }
+            Ok(())
+        });
+        encode_varint(map.len() as u64, out).expect("a record is far below 2^62 bytes");
+        out.extend_from_slice(&map);
+    }
+
+    /// Decodes one record from the front of `input`.
+    ///
+    /// `Ok(None)` means the input ends inside a record: read more bytes and
+    /// retry, which is bounded because a record is at most
+    /// [`limits::MAX_PATH_RECORD_BYTES`] bytes plus its prefix; at FIN the
+    /// same answer is a truncated record and a violation. A length prefix
+    /// above the cap is refused before any of the map is read.
+    pub fn decode(input: &[u8]) -> Result<Option<(PathRecord, usize)>, HeaderError> {
+        let Ok((len, prefix)) = decode_varint(input) else {
+            return Ok(None);
+        };
+        if len > limits::MAX_PATH_RECORD_BYTES as u64 {
+            return Err(HeaderError::InvalidPathReport("record above 256 bytes"));
+        }
+        let len = len as usize;
+        let Some(map) = input.get(prefix..prefix + len) else {
+            return Ok(None);
+        };
+        let mut record = PathRecord::default();
+        let mut d = Decoder::new(map);
+        {
+            let mut m = MapReader::new(&mut d)?;
+            while let Some(key) = m.next_key()? {
+                let slot = match key {
+                    path_key::RTT_US => &mut record.rtt_us,
+                    path_key::MIN_RTT_US => &mut record.min_rtt_us,
+                    path_key::CWND => &mut record.cwnd,
+                    path_key::CONGESTION_EVENTS => &mut record.congestion_events,
+                    path_key::LOST_PACKETS => &mut record.lost_packets,
+                    path_key::LOST_BYTES => &mut record.lost_bytes,
+                    path_key::SENT_PACKETS => &mut record.sent_packets,
+                    path_key::CURRENT_MTU => &mut record.current_mtu,
+                    path_key::TX_DATAGRAMS => &mut record.tx_datagrams,
+                    path_key::TX_BYTES => &mut record.tx_bytes,
+                    path_key::RX_DATAGRAMS => &mut record.rx_datagrams,
+                    path_key::RX_BYTES => &mut record.rx_bytes,
+                    _ => {
+                        m.skip()?;
+                        continue;
+                    }
+                };
+                *slot = m.u64()?;
+            }
+        }
+        finish(&d)?;
+        Ok(Some((record, prefix + len)))
+    }
 }
 
 #[cfg(test)]
