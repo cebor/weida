@@ -74,7 +74,7 @@ kind: spec | size: 15 | status: done db2885f | needs: []
 acceptance: [ARCHITECTURE.md](ARCHITECTURE.md) lines 852 and 1003 name `PeerSet` "inside a `Peer`" and "in `stream.rs`"; 76cbb28 (the redial) replaced it with `PeerShared`'s slots. Both passages name what holds the dialled peers today (`PeerShared` in `crates/weida/src/stream.rs`), and `git grep -n PeerSet -- docs ':!docs/decisions' ':!docs/research' ':!docs/BACKLOG.md' ':!docs/NIGHTLOG.md' ':!docs/IMPLEMENTATION.md'` prints nothing (IMPLEMENTATION's two mentions are its history of the old type, written in the past tense).
 
 ### B-315 — An empty segment reaches nobody while `finish` counts it
-kind: code | size: 15 | status: ready | needs: [B-308]
+kind: code | size: 15 | status: done fa1a430 | needs: [B-308]
 acceptance: since cfb75c8 a copy opens a layer's stream on that layer's first chunk, so a `Segment` finished without any write opens no stream at all, yet `finish()` returns the number of copies; before B-308 every copy opened at `Radio::segment` and an empty segment arrived as an empty stream. `finish()` opens layer 0 on every copy that holds no layer, under `write_layer`'s supersession and deadline checks, and finishes it, so an empty segment arrives as an empty layer-0 stream exactly where `finish` counts one. Test in `crates/weida/tests/radio.rs`: `an_empty_segment_arrives_as_an_empty_layer_zero` — a radio segment and a `Peer::segment`, each finished unwritten, reach their receiver with `layer == Some(0)` and an empty body.
 
 ### B-293 — A binding that proves client keys and judges none
