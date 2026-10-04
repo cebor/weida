@@ -830,7 +830,8 @@ pub struct SyncRadio {
 #[pymethods]
 impl SyncRadio {
     /// Opens the next segment on `topic`, superseding the previous one's
-    /// copies still unacknowledged there.
+    /// copies there: an unfinished copy at once, a finished one after the
+    /// time its path needs.
     fn segment(&self, py: Python<'_>, topic: &str) -> PyResult<SyncSegment> {
         Ok(SyncSegment {
             segment: Mutex::new(Some(raise(py, self.endpoint.segment(topic))?)),

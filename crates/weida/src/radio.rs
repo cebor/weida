@@ -7,8 +7,12 @@
 //! sends each to every dish joined when it opens, one uni stream per dish.
 //! Three things drop a copy, and each is counted per topic and cause:
 //!
-//! * **supersession** — opening segment *n+1* resets every copy of segment
-//!   *n* on that topic that is still unacknowledged, and no other topic's;
+//! * **supersession** — opening segment *n+1* resets at once every copy of
+//!   segment *n* on that topic whose writer had not finished it, or whose
+//!   queued chunks the transport does not take at once; a finished copy gets
+//!   the time its path needs, `rtt + 50 ms + rtt * bytes / cwnd`, and is
+//!   reset only if still unacknowledged then. No other topic's copies are
+//!   touched;
 //! * **expiry** — a dish's `max_age`, on the radio's clock from the segment's
 //!   open;
 //! * **the dish's budget** — `subscriber_buffer_bytes` of chunks a copy may
@@ -48,6 +52,24 @@ use crate::transport::SendHalf;
 /// the dish's byte budget; this keeps the channel from growing on tiny
 /// chunks.
 pub(crate) const COPY_QUEUE: usize = 64;
+
+/// What a finished copy waits beyond one round trip before a successor
+/// supersedes it: quinn's default `max_ack_delay` of 25 ms (the transport
+/// parameter default, quinn-proto `transport_parameters.rs`; weida's
+/// `transport_config` in `tls.rs` keeps it) plus scheduling margin.
+const SUPERSEDE_SLACK: Duration = Duration::from_millis(50);
+
+/// How long a finished copy of `sent` bytes may still take to be
+/// acknowledged on a path with smoothed round trip `rtt` and congestion
+/// window `cwnd`: the time the window needs to carry every byte, one round
+/// trip for the receipt and [`SUPERSEDE_SLACK`]. `sent` bounds what is still
+/// unsent from above, so a copy whose bytes are already out gets more than
+/// it needs, never less.
+fn finish_grace(rtt: Duration, cwnd: u64, sent: u64) -> Duration {
+    let carry = Duration::try_from_secs_f64(rtt.as_secs_f64() * sent as f64 / cwnd.max(1) as f64)
+        .unwrap_or(Duration::MAX);
+    rtt.saturating_add(SUPERSEDE_SLACK).saturating_add(carry)
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -146,6 +168,10 @@ struct CopyCtl {
     superseded: AtomicBool,
     acked: AtomicBool,
     ended: AtomicBool,
+    /// The writer finished the segment: every chunk of it is queued.
+    finished: AtomicBool,
+    /// Bytes queued for this copy, all chunks together.
+    total: AtomicU64,
     notify: Notify,
 }
 
@@ -347,8 +373,8 @@ impl RadioHub {
         dishes.retain(|d| !d.filters.is_empty());
     }
 
-    /// Takes the next number on `topic` and resets every unacknowledged copy
-    /// of the previous segment there.
+    /// Takes the next number on `topic` and supersedes every copy of the
+    /// previous segment there that is not yet acknowledged.
     fn next_segment(&self, topic: &Arc<str>) -> Result<u64, Error> {
         let mut guard = lock(&self.topics);
         let (topics, floor) = &mut *guard;
@@ -439,7 +465,11 @@ impl Radio {
     }
 
     /// Opens segment *n+1* on `topic` as one stream per joined dish, and
-    /// resets every copy of segment *n* on that topic still unacknowledged.
+    /// supersedes segment *n* on that topic: a copy whose writer had not
+    /// finished it, or whose queued chunks the transport does not take at
+    /// once, is reset at once; a finished copy gets the time its path needs,
+    /// `rtt + 50 ms + rtt * bytes / cwnd`, and is reset only if it is still
+    /// unacknowledged then. On a local transport that grace is zero.
     ///
     /// The dish set is fixed here: a dish that joins while the segment is in
     /// flight receives the next one. Zero dishes is not an error. Fails with
@@ -477,6 +507,7 @@ impl Radio {
             copies.push(CopyTx {
                 tx,
                 budget: Arc::clone(&entry.budget),
+                ctl,
             });
         }
         Ok(Segment {
@@ -629,6 +660,7 @@ enum SegItem {
 struct CopyTx {
     tx: mpsc::Sender<SegItem>,
     budget: Arc<Semaphore>,
+    ctl: Arc<CopyCtl>,
 }
 
 /// One segment, open on every dish that was joined when it opened.
@@ -673,6 +705,7 @@ impl Segment {
                 Ok(()) => {
                     // Given back by the writer once the bytes are written.
                     permit.forget();
+                    copy.ctl.total.fetch_add(u64::from(len), Ordering::AcqRel);
                     true
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -693,7 +726,14 @@ impl Segment {
         let mut finished = 0;
         for copy in copies {
             match copy.tx.try_send(SegItem::Finish) {
-                Ok(()) => finished += 1,
+                Ok(()) => {
+                    // Stored before the successor can open: the caller opens
+                    // it only after `finish` returns. A FIN that found the
+                    // queue full leaves the copy unfinished, so its successor
+                    // resets it at once.
+                    copy.ctl.finished.store(true, Ordering::Release);
+                    finished += 1;
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     self.drops.record(&self.topic, DropCause::SubscriberQueue);
                 }
@@ -737,6 +777,31 @@ async fn expiry(deadline: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
     }
 }
 
+/// Resolves when the copy is superseded while its writer is still writing
+/// the segment: such a copy is reset at once. A copy whose writer finished
+/// before the successor opened goes on: see [`run_copy`].
+async fn superseded_unfinished(ctl: &CopyCtl) {
+    ctl.superseded().await;
+    if ctl.finished.load(Ordering::Acquire) {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Resolves when a copy past its FIN has had its grace after supersession:
+/// the time its path needs to carry its bytes at the congestion window, one
+/// round trip for the receipt and [`SUPERSEDE_SLACK`].
+async fn finish_grace_over(ctl: &CopyCtl, conn: &ConnHandle) {
+    ctl.superseded().await;
+    let wait = conn
+        .conn
+        .transport_stats()
+        .map(|t| t.path)
+        .map_or(Duration::ZERO, |p| {
+            finish_grace(p.rtt, p.cwnd, ctl.total.load(Ordering::Acquire))
+        });
+    conn.exec.sleep(wait).await;
+}
+
 /// Writes one dish's copy of one segment, racing every step against
 /// supersession and the dish's deadline.
 async fn segment_copy(
@@ -762,6 +827,13 @@ async fn segment_copy(
     }
 }
 
+/// Opens and writes one copy. Supersession takes a copy whose segment the
+/// writer had not finished at once. A copy whose writer finished first is
+/// whole on the writer's side and not stalled merely because its successor
+/// opened: it hands the chunks still queued to the transport if the
+/// transport takes them at once — a write the dish's flow control holds back
+/// means a stalled dish, and the copy is reset — and once its FIN is written
+/// it gets [`finish_grace_over`] before the reset.
 async fn run_copy(
     conn: &ConnHandle,
     copy: &Copy,
@@ -771,7 +843,7 @@ async fn run_copy(
     let ctl = &copy.ctl;
     let opened = tokio::select! {
         biased;
-        () = ctl.superseded() => return Some(Stop::Superseded),
+        () = superseded_unfinished(ctl) => return Some(Stop::Superseded),
         () = expiry(deadline) => return Some(Stop::Expired),
         opened = open_copy(conn, copy) => opened,
     };
@@ -790,17 +862,19 @@ async fn run_copy(
     loop {
         let item = tokio::select! {
             biased;
-            () = ctl.superseded() => return reset(&mut stream, Stop::Superseded),
+            () = superseded_unfinished(ctl) => return reset(&mut stream, Stop::Superseded),
             () = expiry(deadline) => return reset(&mut stream, Stop::Expired),
             item = rx.recv() => item,
         };
         match item {
             Some(SegItem::Chunk(chunk)) => {
+                // The write first: supersession only takes a write that
+                // has to wait.
                 let written = tokio::select! {
                     biased;
+                    written = stream.write_all(&chunk) => Ok(written),
                     () = ctl.superseded() => Err(Stop::Superseded),
                     () = expiry(deadline) => Err(Stop::Expired),
-                    written = stream.write_all(&chunk) => Ok(written),
                 };
                 copy.budget.add_permits(chunk.len());
                 match written {
@@ -817,17 +891,11 @@ async fn run_copy(
                 // Until the dish's transport holds every byte, the copy can
                 // still be superseded or expire: a reset is accepted after
                 // FIN until then.
-                let stopped = stream.stopped();
                 return tokio::select! {
                     biased;
-                    () = ctl.superseded() => reset(&mut stream, Stop::Superseded),
                     () = expiry(deadline) => reset(&mut stream, Stop::Expired),
-                    receipt = stopped => {
-                        if matches!(receipt, Ok(None)) {
-                            ctl.acked.store(true, Ordering::Release);
-                        }
-                        None
-                    }
+                    receipt = stream.stopped() => acked(ctl, receipt),
+                    () = finish_grace_over(ctl, conn) => reset(&mut stream, Stop::Superseded),
                 };
             }
             // The segment was dropped unfinished, or this copy was dropped
@@ -885,6 +953,15 @@ async fn open_datagram_flow(
 fn reset(stream: &mut SendHalf, stop: Stop) -> Option<Stop> {
     stream.reset(codes::CANCELED);
     Some(stop)
+}
+
+/// Records a finished copy's receipt: delivered means acknowledged, which no
+/// successor supersedes any more.
+fn acked(ctl: &CopyCtl, receipt: Result<Option<u64>, Error>) -> Option<Stop> {
+    if matches!(receipt, Ok(None)) {
+        ctl.acked.store(true, Ordering::Release);
+    }
+    None
 }
 
 /// Moves a radio's datagram segments from one flow into its dish's queue:

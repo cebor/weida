@@ -1196,7 +1196,7 @@ pub struct Radio {
 
 impl Radio {
     /// Opens the next segment on `topic`, superseding the previous one's
-    /// copies still unacknowledged there.
+    /// copies there as [`crate::Radio::segment`] describes.
     ///
     /// # Errors
     ///

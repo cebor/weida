@@ -186,7 +186,8 @@ pub async fn supersession() -> Result<Supersession, Error> {
         // A viewer that keeps up has taken this segment, and its transport
         // has acknowledged it, before the next frame exists — so
         // supersession never reaches it. The stalled viewer's copy is still
-        // unacknowledged when the next frame opens, every time.
+        // held back by its flow control when the next frame opens, every
+        // time.
         match read_rx.recv().await {
             Some((Some(number), Ok(len))) if len == CHUNK * CHUNKS => fast_received.push(number),
             _ => break,
