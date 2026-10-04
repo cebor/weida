@@ -70,8 +70,8 @@ kind: spec | size: 45 | status: done 82c0731 | needs: [B-304, B-307, B-308, B-30
 acceptance: [0037](decisions/0037-layered-segments.md) §5's edits, and §4.11's three rules in PATTERNS §6.4, GUARANTEES §6 and INVARIANTS (`segments_out` and `segments_in` per connection, each bounded by `max_sequence_scopes`); no passage outside `decisions/`, `research/`, BACKLOG and NIGHTLOG still says key `13` is written by a radio only, or that a dialling side cannot send a segment; [requirements/griasdi-video.md](requirements/griasdi-video.md) points at what shipped.
 
 ### B-313 — ARCHITECTURE names a `PeerSet` that no longer exists
-kind: spec | size: 15 | status: ready | needs: []
-acceptance: [ARCHITECTURE.md](ARCHITECTURE.md) lines 852 and 1003 name `PeerSet` "inside a `Peer`" and "in `stream.rs`"; 76cbb28 (the redial) replaced it with `PeerShared`'s slots. Both passages name what holds the dialled peers today (`PeerShared` in `crates/weida/src/stream.rs`), and `git grep -n PeerSet -- docs ':!docs/decisions' ':!docs/research' ':!docs/BACKLOG.md' ':!docs/NIGHTLOG.md'` prints nothing.
+kind: spec | size: 15 | status: done db2885f | needs: []
+acceptance: [ARCHITECTURE.md](ARCHITECTURE.md) lines 852 and 1003 name `PeerSet` "inside a `Peer`" and "in `stream.rs`"; 76cbb28 (the redial) replaced it with `PeerShared`'s slots. Both passages name what holds the dialled peers today (`PeerShared` in `crates/weida/src/stream.rs`), and `git grep -n PeerSet -- docs ':!docs/decisions' ':!docs/research' ':!docs/BACKLOG.md' ':!docs/NIGHTLOG.md' ':!docs/IMPLEMENTATION.md'` prints nothing (IMPLEMENTATION's two mentions are its history of the old type, written in the past tense).
 
 ### B-315 — An empty segment reaches nobody while `finish` counts it
 kind: code | size: 15 | status: ready | needs: [B-308]
