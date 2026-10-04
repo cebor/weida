@@ -42,7 +42,7 @@ kind: code | size: 45 | status: done 46b0af8 | needs: [B-305]
 acceptance: `weida-protocol` encodes and decodes both keys against B-305's vectors; a value above 15, and key `14` without key `13`, is a `PROTOCOL_VIOLATION`; the `roundtrip` fuzz target is extended.
 
 ### B-307 — The segment as an L0 unit: `SegmentTerms`, `Peer::segment`, priority
-kind: code | size: 90 | status: ready | needs: [B-304]
+kind: code | size: 90 | status: done f9c90fa | needs: [B-304]
 acceptance: [0037](decisions/0037-layered-segments.md) §4.2, §4.4 and §4.11: `Radio::segment(topic, SegmentTerms)` and `Peer::segment(topic, SegmentTerms)` share one copy machinery, and `Peer::segment_drops` exists; copy streams get the §4.4 priority at open; a sender `max_age` applies, at a radio together with the dish's, the smaller winning; a `Peer::segment` takes its number per `(path, topic)` from its connection (`ConnCtx::segments_out`, at most `max_sequence_scopes` entries); `SegmentTerms::follows_upstream` keeps a copy against its successor unless a write has to wait; every `Radio::segment` caller is migrated. Tests: tuco86/weida#2's `a_peer_segment_reaches_an_acceptor_with_its_number` and `a_peer_segment_supersedes_the_previous_one_on_its_topic`, `two_peers_on_one_connection_number_one_sequence`, `a_segment_following_upstream_keeps_its_copy_while_its_successor_opens` and `a_segment_following_upstream_still_resets_a_stalled_dish`. No priority test, because it would test `quinn`'s scheduler, as B-284 argued.
 
 ### B-314 — Segment freshness per connection
