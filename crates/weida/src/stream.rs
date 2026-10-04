@@ -572,7 +572,7 @@ impl Peer {
                 path,
                 topic: Arc::clone(&topic),
                 number,
-                ctl,
+                ctl: Arc::clone(&ctl),
                 budget: Arc::clone(&shared.segment_budget),
                 drops: Arc::clone(&shared.segment_drops),
             },
@@ -585,6 +585,7 @@ impl Peer {
             copies: vec![CopyTx {
                 tx,
                 budget: Arc::clone(&shared.segment_budget),
+                ctl,
             }],
             drops: Arc::clone(&shared.segment_drops),
         })
