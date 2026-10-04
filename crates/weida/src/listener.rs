@@ -440,9 +440,16 @@ impl Listener {
     /// ([decisions/0010](../../../docs/decisions/0010-local-transport.md)
     /// §4.5). Connections are grouped into peers exactly as on `AF_UNIX`
     /// ([decision 0012](../../../docs/decisions/0012-local-connection-grouping.md)).
+    /// A taken name is [`Error::AddressInUse`]; a `self@` name is refused,
+    /// because a pipe name carries no account pin.
     #[cfg(windows)]
     pub fn bind_pipe(&self, name: &str) -> Result<PipeBinding, Error> {
         let addr = weida_core::PipeAddr::parse(&format!("{}://{name}/", weida_core::SCHEME_PIPE))?;
+        if addr.same_account {
+            return Err(Error::InvalidAddress(
+                "a pipe name carries no account pin".to_owned(),
+            ));
+        }
         let exec = self.inner.runtime.exec.clone();
         let (binding, first) = {
             // Inside the runtime context, for the same reason as on unix.

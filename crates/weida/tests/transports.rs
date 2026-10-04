@@ -38,6 +38,11 @@ async fn within<F: Future>(f: F) -> F::Output {
 
 /// Req/Rep: one exchange, uppercased and returned.
 async fn req_rep_echo(h: &Harness) {
+    req_rep_echo_at(h, &h.url("/transform")).await;
+}
+
+/// [`req_rep_echo`], dialling `url`.
+async fn req_rep_echo_at(h: &Harness, url: &str) {
     let replier = h.listener.replier("/transform").expect("replier");
     let handler = tokio::spawn(async move {
         let mut request = replier.accept().await.expect("accept");
@@ -53,9 +58,7 @@ async fn req_rep_echo(h: &Harness) {
 
     let client = h.client();
     let requester = client.requester(h.trust());
-    within(requester.connect(&h.url("/transform")))
-        .await
-        .expect("connect");
+    within(requester.connect(url)).await.expect("connect");
     let (mut request, reply) = within(requester.open(TransferMeta::default()))
         .await
         .expect("open");
@@ -299,6 +302,37 @@ async fn a_second_binding_of_a_live_socket_is_refused() {
         "{refused:?}"
     );
     req_rep_echo(&h).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_self_pinned_unix_address_reaches_this_account() {
+    let h = Harness::start(Transport::Unix).await;
+    let url = h
+        .url("/transform")
+        .replacen("weida+unix://", "weida+unix://self@", 1);
+    req_rep_echo_at(&h, &url).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_self_pinned_pipe_address_reaches_this_account() {
+    let h = Harness::start(Transport::Pipe).await;
+    let url = h
+        .url("/transform")
+        .replacen("weida+pipe://", "weida+pipe://self@", 1);
+    req_rep_echo_at(&h, &url).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_pinned_pipe_name_cannot_be_bound() {
+    let h = Harness::start(Transport::Pipe).await;
+    let refused = h.listener.bind_pipe("self@weida-pinned");
+    assert!(
+        matches!(refused, Err(weida::Error::InvalidAddress(_))),
+        "{refused:?}"
+    );
 }
 
 #[cfg(windows)]

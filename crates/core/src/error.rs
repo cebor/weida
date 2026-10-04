@@ -87,6 +87,9 @@ pub enum Error {
     /// pinned nor certified by a configured anchor. Carries what the peer
     /// presented, so an operator can pin it after checking it out of band.
     Untrusted(crate::identity::Fingerprint),
+    /// A local address pinned `self`, and the kernel attributes the
+    /// endpoint to another account. Carries what the kernel reported.
+    UntrustedPrincipal(crate::identity::PeerIdentity),
     /// Underlying I/O failure.
     Io(std::io::Error),
     /// Transport-level failure that is not one of the modelled outcomes.
@@ -173,6 +176,9 @@ impl fmt::Display for Error {
             ),
             Error::Tls(m) => write!(f, "tls error: {m}"),
             Error::Untrusted(fp) => write!(f, "peer identity {fp} is not trusted"),
+            Error::UntrustedPrincipal(peer) => {
+                write!(f, "local peer {peer} is not this process's account")
+            }
             Error::Io(e) => write!(f, "io error: {e}"),
             Error::Transport(m) => write!(f, "transport error: {m}"),
         }
@@ -215,6 +221,7 @@ impl Error {
                 | Error::DatagramsUnavailable
                 | Error::TooLarge { .. }
                 | Error::Untrusted(_)
+                | Error::UntrustedPrincipal(_)
         )
     }
 }
@@ -346,6 +353,13 @@ mod tests {
             Error::DatagramsUnavailable,
             Error::TooLarge { max: 1200 },
             Error::Tls("x".into()),
+            Error::UntrustedPrincipal(crate::identity::PeerIdentity::Local(
+                crate::identity::LocalPrincipal {
+                    uid: 1,
+                    gid: 1,
+                    pid: None,
+                },
+            )),
             Error::Io(std::io::Error::other("x")),
             Error::Transport("x".into()),
         ];
@@ -367,6 +381,13 @@ mod tests {
             Error::LimitExceeded,
             Error::DatagramsUnavailable,
             Error::TooLarge { max: 1200 },
+            Error::UntrustedPrincipal(crate::identity::PeerIdentity::Local(
+                crate::identity::LocalPrincipal {
+                    uid: 1,
+                    gid: 1,
+                    pid: None,
+                },
+            )),
         ] {
             assert!(definite.is_definite_failure(), "{definite:?}");
         }

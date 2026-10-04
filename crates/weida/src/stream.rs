@@ -335,7 +335,7 @@ impl PeerShared {
             }
             #[cfg(unix)]
             Address::Unix(addr) => {
-                let conn = self.runtime.connect_unix(&addr.socket).await?;
+                let conn = self.runtime.connect_unix(addr).await?;
                 (conn, addr.path.as_str())
             }
             #[cfg(not(unix))]

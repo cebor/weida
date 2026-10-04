@@ -594,6 +594,11 @@ fn bind_local(listener: &weida::Listener, url: &str) -> Result<(String, String),
         ))),
         #[cfg(unix)]
         Address::Unix(addr) => {
+            if addr.same_account {
+                return Err(Error::InvalidAddress(
+                    "a bind address pins no account; self@ is for dialling".to_owned(),
+                ));
+            }
             let binding = listener.bind_unix(&addr.socket)?;
             std::mem::forget(binding);
             // `Display` rather than the decoded path: the socket path shares
@@ -607,6 +612,11 @@ fn bind_local(listener: &weida::Listener, url: &str) -> Result<(String, String),
         )),
         #[cfg(windows)]
         Address::Pipe(addr) => {
+            if addr.same_account {
+                return Err(Error::InvalidAddress(
+                    "a bind address pins no account; self@ is for dialling".to_owned(),
+                ));
+            }
             let binding = listener.bind_pipe(&addr.name)?;
             std::mem::forget(binding);
             Ok((path, addr.to_string()))
