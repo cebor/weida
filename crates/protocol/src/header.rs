@@ -1766,6 +1766,7 @@ pub struct SubscriptionHeader {
     /// The dish's latency budget in milliseconds (key `2`), meaningful on a
     /// RADIO path only
     /// ([decisions/0034](../../../docs/decisions/0034-late-is-lost.md)
+    /// §4.6). Encoded only when present.
     pub max_age_ms: Option<u64>,
     /// The highest layer the dish wants (key `3`), `0..=15`, meaningful on a
     /// RADIO path only; absent means no cap
