@@ -41,7 +41,7 @@ mod guide_many_peers;
 #[allow(dead_code)]
 mod guide_late_is_lost;
 
-use guide_late_is_lost::{sfu, supersession};
+use guide_late_is_lost::{layered, sfu, supersession};
 use guide_many_peers::{ceilings, selection, slow_reader, survey_with_a_silent_peer, width};
 use guide_one_transfer::{Outcome, STREAMED, gigabyte, hello, how_far, outcome, receipt_cost};
 
@@ -324,6 +324,34 @@ async fn an_sfu_and_a_relay_are_loops_over_opaque_payload() {
     );
 }
 
+/// Claim §2.8: a viewer's quality is a cap it states, not a second encoding.
+#[tokio::test]
+async fn quality_is_a_cap_per_viewer_not_a_second_encoding() {
+    let seen = within(layered()).await.expect("the layered relay");
+    assert_eq!(
+        seen.capped,
+        (0..5).map(|n| (n, 0)).collect::<Vec<(u64, u8)>>(),
+        "the capped viewer receives layer 0 of every segment"
+    );
+    let mut uncapped = seen.uncapped.clone();
+    uncapped.sort_unstable();
+    assert_eq!(
+        uncapped,
+        (0..5)
+            .flat_map(|n| (0..3).map(move |l| (n, l)))
+            .collect::<Vec<(u64, u8)>>(),
+        "the uncapped viewer receives every layer of every segment"
+    );
+    assert!(
+        !seen.capped_heard_more,
+        "the capped viewer hears nothing else"
+    );
+    assert!(
+        seen.payload_whole,
+        "every layer arrives as the sharer wrote it"
+    );
+}
+
 /// The guide's own rule, checked against the guide: every claim a chapter
 /// makes is asserted somewhere in this workspace.
 ///
@@ -345,7 +373,7 @@ fn every_claim_the_chapters_make_has_a_program_and_a_test() {
     .expect("read the guide");
 
     // One row per written chapter.
-    for (chapter, asserted) in [(1usize, 5usize), (2, 7)] {
+    for (chapter, asserted) in [(1usize, 5usize), (2, 8)] {
         let prefix = format!("**Claim §{chapter}.");
         let claims: Vec<&str> = guide
             .lines()

@@ -4,7 +4,7 @@
 //! cargo run -p weida --example guide_late_is_lost
 //! ```
 //!
-//! Two programs, one per claim `docs/GUIDE.md` §2.6 makes, in the shape of
+//! Three programs, one per claim `docs/GUIDE.md` §2.6 and §2.7 make, in the shape of
 //! the chapters before it: each returns its outcome as a **value**, so
 //! `crates/weida/tests/guide.rs` asserts the code a reader runs.
 //!
@@ -17,15 +17,22 @@
 //!   republishes every frame as a datagram segment on its radio; a relay is a
 //!   dish upstream and a radio downstream that copies stream segments chunk
 //!   by chunk.
+//! * [`layered`]: quality without re-encoding. A sharer sends three layers
+//!   per segment upstream with `Peer::segment`; a relay maps each upstream
+//!   layer onto a radio segment that follows upstream; a viewer capped at
+//!   layer 0 receives the base layer of every segment and nothing else, and
+//!   an uncapped viewer receives all three.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use weida::{
-    DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Error, FlowMeta, Identity, Incoming, JoinTerms, Limits,
-    Radio, Received, Runtime, RuntimeConfig, SegmentTerms, Trust,
+    DEFAULT_DATAGRAM_RECEIVE_BYTES, Dish, Error, FlowMeta, Identity, Incoming, IncomingTransfer,
+    JoinTerms, Limits, Radio, Received, Runtime, RuntimeConfig, Segment, SegmentTerms, Trust,
 };
 
 /// A runtime, its listener and the port it serves on, kept alive together.
@@ -87,18 +94,23 @@ pub fn with_datagrams() -> Limits {
 }
 
 /// A dish on a runtime of its own — one connection per dish, as a deployment
-/// has — joined to `filter` and connected to `url`.
+/// has — joined to `filter` under `terms` and connected to `url`.
 ///
 /// # Errors
 ///
 /// Whatever building a runtime, joining or dialling reports.
-pub async fn dish(url: &str, filter: &str, limits: Limits) -> Result<(Runtime, Dish), Error> {
+pub async fn dish(
+    url: &str,
+    filter: &str,
+    limits: Limits,
+    terms: JoinTerms,
+) -> Result<(Runtime, Dish), Error> {
     let runtime = Runtime::new(RuntimeConfig {
         limits,
         ..RuntimeConfig::default()
     })?;
     let dish = runtime.dish(Trust::by_address());
-    dish.join(filter, JoinTerms::default()).await?;
+    dish.join(filter, terms).await?;
     dish.connect(url).await?;
     Ok((runtime, dish))
 }
@@ -150,7 +162,13 @@ pub async fn supersession() -> Result<Supersession, Error> {
 
     let server = serve(Limits::default()).await?;
     let radio = server.listener.radio("/live")?;
-    let (_fast_rt, fast) = dish(&server.url("/live"), "frames", Limits::default()).await?;
+    let (_fast_rt, fast) = dish(
+        &server.url("/live"),
+        "frames",
+        Limits::default(),
+        JoinTerms::default(),
+    )
+    .await?;
     // The stalled dish never reads, and its window is small enough that a
     // segment it does not read cannot be acknowledged: what it holds is
     // exactly what a stalled viewer holds.
@@ -158,7 +176,13 @@ pub async fn supersession() -> Result<Supersession, Error> {
         stream_receive_window: 64 * 1024,
         ..Limits::default()
     };
-    let (_stalled_rt, _stalled) = dish(&server.url("/live"), "frames", stalled_limits).await?;
+    let (_stalled_rt, _stalled) = dish(
+        &server.url("/live"),
+        "frames",
+        stalled_limits,
+        JoinTerms::default(),
+    )
+    .await?;
     joined(&radio, 2).await;
 
     let (read_tx, mut read_rx) = mpsc::channel(1);
@@ -242,8 +266,20 @@ pub async fn sfu() -> Result<Sfu, Error> {
     });
 
     // Two listeners and a relay joined upstream.
-    let (_a_rt, a) = dish(&sfu.url("/room"), "room.voice", with_datagrams()).await?;
-    let (_b_rt, b) = dish(&sfu.url("/room"), "room.voice", with_datagrams()).await?;
+    let (_a_rt, a) = dish(
+        &sfu.url("/room"),
+        "room.voice",
+        with_datagrams(),
+        JoinTerms::default(),
+    )
+    .await?;
+    let (_b_rt, b) = dish(
+        &sfu.url("/room"),
+        "room.voice",
+        with_datagrams(),
+        JoinTerms::default(),
+    )
+    .await?;
     let relay = serve(Limits::default()).await?;
     let downstream = relay.listener.radio("/relay")?;
     let watching = downstream.clone();
@@ -277,7 +313,13 @@ pub async fn sfu() -> Result<Sfu, Error> {
             }
         }
     });
-    let (_viewer_rt, viewer) = dish(&relay.url("/relay"), "room.video", Limits::default()).await?;
+    let (_viewer_rt, viewer) = dish(
+        &relay.url("/relay"),
+        "room.video",
+        Limits::default(),
+        JoinTerms::default(),
+    )
+    .await?;
     joined(&watching, 1).await;
 
     // One speaker, 100 frames of noise at 5 ms.
@@ -345,6 +387,217 @@ pub async fn sfu() -> Result<Sfu, Error> {
     })
 }
 
+/// What [`layered`] observed.
+pub struct Layered {
+    /// `(segment, layer)` the uncapped viewer received, in arrival order.
+    pub uncapped: Vec<(u64, u8)>,
+    /// `(segment, layer)` the viewer capped at layer 0 received.
+    pub capped: Vec<(u64, u8)>,
+    /// Whether the capped viewer received anything after the last segment.
+    pub capped_heard_more: bool,
+    /// Whether every layer arrived byte for byte as the sharer wrote it.
+    pub payload_whole: bool,
+}
+
+/// One radio segment a relay is filling from upstream.
+struct Relayed {
+    segment: Segment,
+    /// Layers whose upstream stream ended whole, one bit each.
+    eof: u16,
+    /// Every layer below this one is finished downstream.
+    finished: u8,
+    /// Upstream layer streams of this segment still being read.
+    reading: u8,
+}
+
+/// The relay's segments: the newest number it opened, and every segment
+/// still filling — the newest, and older ones whose upstream layers have not
+/// ended yet.
+#[derive(Default)]
+struct RelayState {
+    newest: Option<u64>,
+    segments: BTreeMap<u64, Relayed>,
+}
+
+fn lock(state: &Mutex<RelayState>) -> std::sync::MutexGuard<'_, RelayState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Relays one upstream layer stream onto the radio segment of its number
+/// ([decisions/0037](../../../docs/decisions/0037-layered-segments.md)
+/// §4.8): a newer number opens a radio segment that follows upstream, each
+/// chunk of layer *k* goes to `write_layer(k)`, and a layer is finished only
+/// once every lower layer is. An upstream layer that was reset drops the
+/// segment, which resets every layer not finished downstream.
+async fn relay_layer(
+    room: Radio,
+    state: Arc<Mutex<RelayState>>,
+    topic: String,
+    number: u64,
+    layer: u8,
+    mut upstream: IncomingTransfer,
+) {
+    {
+        let mut state = lock(&state);
+        if state.newest.is_none_or(|newest| number > newest) {
+            let terms = SegmentTerms::default().with_follows_upstream(true);
+            let Ok(segment) = room.segment(&topic, terms) else {
+                return;
+            };
+            state.newest = Some(number);
+            // Older segments with nothing left to read are done.
+            state.segments.retain(|_, relayed| relayed.reading > 0);
+            state.segments.insert(
+                number,
+                Relayed {
+                    segment,
+                    eof: 0,
+                    finished: 0,
+                    reading: 0,
+                },
+            );
+        }
+        match state.segments.get_mut(&number) {
+            Some(relayed) => relayed.reading += 1,
+            None => return,
+        }
+    }
+    let mut chunk = vec![0u8; 16 * 1024];
+    let whole = loop {
+        match upstream.read(&mut chunk).await {
+            Ok(0) => break true,
+            Ok(n) => {
+                if let Some(relayed) = lock(&state).segments.get_mut(&number) {
+                    let _ = relayed.segment.write_layer(layer, chunk[..n].to_vec());
+                }
+            }
+            Err(_) => break false,
+        }
+    };
+    let mut state = lock(&state);
+    let newest = state.newest;
+    let Some(relayed) = state.segments.get_mut(&number) else {
+        return;
+    };
+    relayed.reading -= 1;
+    if !whole {
+        state.segments.remove(&number);
+        return;
+    }
+    relayed.eof |= 1 << layer;
+    while relayed.finished < 16 && relayed.eof & (1 << relayed.finished) != 0 {
+        relayed.segment.finish_layer(relayed.finished);
+        relayed.finished += 1;
+    }
+    if relayed.reading == 0 && newest != Some(number) {
+        state.segments.remove(&number);
+    }
+}
+
+/// The guide's §2.7: quality without re-encoding. A sharer writes three
+/// layers per segment upstream; a relay forwards each layer as it arrives;
+/// one viewer joins uncapped, one with `max_layer = 0`.
+///
+/// # Errors
+///
+/// Whatever binding, dialling, sending or reading reports.
+pub async fn layered() -> Result<Layered, Error> {
+    const SEGMENTS: u64 = 5;
+    const LAYERS: u8 = 3;
+    let relay = serve(Limits::default()).await?;
+    let room = relay.listener.radio("/room")?;
+    let up = relay.listener.acceptor("/up")?;
+    let state = Arc::new(Mutex::new(RelayState::default()));
+    let relaying = room.clone();
+    tokio::spawn(async move {
+        while let Ok(incoming) = up.accept().await {
+            let Incoming::Stream(upstream) = incoming else {
+                continue;
+            };
+            let meta = upstream.meta();
+            let (Some(topic), Some(number), Some(layer)) =
+                (meta.topic.clone(), meta.segment, meta.layer)
+            else {
+                continue;
+            };
+            tokio::spawn(relay_layer(
+                relaying.clone(),
+                Arc::clone(&state),
+                topic,
+                number,
+                layer,
+                upstream,
+            ));
+        }
+    });
+
+    let (_uncapped_rt, uncapped) = dish(
+        &relay.url("/room"),
+        "share.video",
+        Limits::default(),
+        JoinTerms::default(),
+    )
+    .await?;
+    let (_capped_rt, capped) = dish(
+        &relay.url("/room"),
+        "share.video",
+        Limits::default(),
+        JoinTerms::default().with_max_layer(0),
+    )
+    .await?;
+    joined(&room, 2).await;
+
+    let sharer_rt = Runtime::new(RuntimeConfig::default())?;
+    let sharer = sharer_rt.peer(Trust::by_address());
+    sharer.connect(&relay.url("/up")).await?;
+    let mut noise = Noise(0x2545_f491_4f6c_dd1d);
+    let mut seen = Layered {
+        uncapped: Vec::new(),
+        capped: Vec::new(),
+        capped_heard_more: false,
+        payload_whole: true,
+    };
+    for _ in 0..SEGMENTS {
+        let mut segment = sharer
+            .segment("share.video", SegmentTerms::default())
+            .await?;
+        let sent: Vec<Vec<u8>> = (0..LAYERS).map(|_| noise.bytes(8 * 1024)).collect();
+        for (layer, body) in (0..LAYERS).zip(&sent) {
+            segment.write_layer(layer, body.clone())?;
+        }
+        segment.finish();
+        for (viewer, count, heard) in [
+            (&uncapped, LAYERS, &mut seen.uncapped),
+            (&capped, 1, &mut seen.capped),
+        ] {
+            for _ in 0..count {
+                let received = tokio::time::timeout(Duration::from_secs(5), viewer.recv()).await;
+                let Ok(Ok(Received::Segment(transfer))) = received else {
+                    seen.payload_whole = false;
+                    break;
+                };
+                let (Some(number), Some(layer)) = (transfer.meta().segment, transfer.meta().layer)
+                else {
+                    seen.payload_whole = false;
+                    continue;
+                };
+                let body = transfer.collect(64 * 1024).await?;
+                if sent.get(usize::from(layer)) != Some(&body.to_vec()) {
+                    seen.payload_whole = false;
+                }
+                heard.push((number, layer));
+            }
+        }
+    }
+    seen.capped_heard_more = tokio::time::timeout(Duration::from_millis(300), capped.recv())
+        .await
+        .is_ok();
+    sharer_rt.shutdown().await;
+    Ok(seen)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("§2.6 a dish that falls behind loses the old segment");
@@ -358,6 +611,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{} of 100 frames reached both listeners; {} of 5 segments crossed the relay; payload untouched: {}",
         sfu.forwarded, sfu.relayed_segments, sfu.payload_opaque
+    );
+    println!("§2.7 a viewer's quality is a cap it states, not a second encoding");
+    let layered = layered().await?;
+    println!(
+        "capped viewer received {} segments of layer 0 and nothing else: {}; uncapped viewer received {} layer segments; payload untouched: {}",
+        layered.capped.len(),
+        !layered.capped_heard_more,
+        layered.uncapped.len(),
+        layered.payload_whole
     );
     Ok(())
 }

@@ -18,7 +18,7 @@ are in the same chapter as the success case rather than in an appendix.
 1. **Every program here is a file in this repository, and a test drives that file.** The
    chapters do not carry snippets written for the page. Chapter 1's program is
    `crates/weida/examples/guide_one_transfer.rs`, chapter 2's is
-   `crates/weida/examples/guide_many_peers.rs` with §2.6's in
+   `crates/weida/examples/guide_many_peers.rs` with §2.6's and §2.7's in
    `crates/weida/examples/guide_late_is_lost.rs`; each is included as a module by
    `crates/weida/tests/guide.rs`, which asserts the claims its chapter makes. A claim added
    without a program and an assertion fails
@@ -634,7 +634,47 @@ into a stream segment, which would deliver it late. Where both kinds share a bot
 bulk upload, [IMPLEMENTATION.md](IMPLEMENTATION.md) §4 (B-289) measured what the path and the
 congestion controller cost the voice.
 
-### 2.7 What this chapter does not tell you
+### 2.7 Quality without re-encoding
+
+The program: `examples/guide_late_is_lost.rs`, its `layered`. The test: the same
+`crates/weida/tests/guide.rs`.
+
+**Claim §2.8: a viewer's quality is a cap it states, not a second encoding.**
+
+A sharer sends five segments of three layers each — 8 KiB of noise per layer — upstream with
+`Peer::segment`. A relay forwards every upstream layer to its radio as it arrives. One viewer
+joins uncapped, the other with `JoinTerms::default().with_max_layer(0)`:
+
+```text
+capped viewer received 5 segments of layer 0 and nothing else: true; uncapped viewer received 15 layer segments; payload untouched: true
+```
+
+**A segment carries ordered layers, and weida cuts them from the top**
+([0037](decisions/0037-layered-segments.md) §4.1, §4.3). Layer *k* may depend on the layers
+below it and never above, and each `(copy, layer)` is its own stream with its own queue, so a
+copy without room for a chunk of layer *k* gives up its layers above *k* first, and only then
+*k* and above. Every cut — by budget, queue, cap or supersession — removes a suffix of the
+ladder, so whatever a viewer holds is a prefix a decoder can use, and which bytes form a layer
+stays the application's.
+
+**The cap is per dish.** `max_layer` travels in the join (SUBSCRIBE key `3`); the radio never
+opens a layer above it for that dish, and that is not a drop. One encoding serves every
+viewer, so the encoder follows the uplink rather than the slowest viewer, and a viewer whose
+link degrades joins again with a lower cap instead of asking anybody to re-encode.
+
+**Priority is layer-major.** A layer stream opens at `(15 - layer) * 65536 + priority`, so
+every topic's base layer on a connection goes before any topic's enhancement layer, and the
+voice datagrams of §2.6 outrank all of it — on one connection only, which is why a session's
+voice and video share one path (§4.4).
+
+**The relay finishes a layer only after every lower one.** Each upstream layer arrives as its
+own `Incoming::Stream` with the topic, the segment number and the layer; a newer number opens a
+radio segment that follows upstream, so the previous segment keeps taking the chunks still
+arriving (§4.11); an upstream EOF on layer *k* becomes `finish_layer(k)` once every layer below
+*k* is finished, and an upstream layer that was reset drops the segment, which resets every
+layer not finished downstream. A relay never finishes a layer whose base it is about to lose.
+
+### 2.8 What this chapter does not tell you
 
 - **Every number here is one process on loopback.** No propagation delay, no NIC, no loss, and
   a congestion controller that never sees a real bottleneck (§0.4).
