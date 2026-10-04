@@ -54,7 +54,7 @@ kind: code | size: 90 | status: done cfb75c8 | needs: [B-306, B-307, B-314]
 acceptance: [0037](decisions/0037-layered-segments.md) §4.3 and §4.11: `write_layer`, `finish_layer`, lazy per-`(copy, layer)` streams with their own queues, the cut rule including the release of upper layers' queued bytes, `TopicDrops::layers_cut` with `TopicDrops` made `#[non_exhaustive]`, `JoinTerms` replacing `join`'s `max_age` parameter at every caller, the largest-cap rule, per-layer freshness in B-314's per-connection table, and `IncomingMeta::layer`. Tests in `crates/weida/tests/radio.rs`: `a_dish_short_of_budget_keeps_layer_zero_whole_while_upper_layers_are_cut`, `a_dish_capped_at_layer_zero_is_never_sent_layer_one`, `a_layer_cut_also_cuts_every_higher_layer_of_that_segment`, `a_receiver_delivers_each_layer_of_a_segment_once`, `a_peer_segment_carries_its_layers_to_the_acceptor`.
 
 ### B-309 — Per-dish drops at a radio
-kind: code | size: 45 | status: ready | needs: [B-308]
+kind: code | size: 45 | status: done 845e504 | needs: [B-308]
 acceptance: [0037](decisions/0037-layered-segments.md) §4.6: `Radio::dish_drops() -> Vec<DishDrops>`, one record per joined dish connection, removed when it closes. Test: two dishes, one short of budget; only its record counts `subscriber_budget` or `layers_cut`, and the record is gone after it disconnects.
 
 ### B-310 — A layered relay as a program, and a guide section
