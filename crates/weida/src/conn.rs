@@ -98,6 +98,14 @@ pub(crate) struct ConnCtx {
     /// When this connection was established: after the QUIC handshake, before
     /// HELLO. What [`crate::ConnectionStats::age`] counts from.
     pub established: std::time::Instant,
+    /// Numbers [`crate::Peer::segment`] per (path, topic) on this dialling
+    /// connection, shared by every `Peer` the pool gave it; at most
+    /// `max_sequence_scopes` entries.
+    pub segments_out: crate::radio::SegmentNumbers,
+    /// The newest segment delivered per (path, topic) on this connection, to
+    /// dishes and acceptors alike: what a stale segment is checked against;
+    /// at most `max_sequence_scopes` entries.
+    pub segments_in: crate::radio::Newest,
     agreed: watch::Receiver<Option<Agreed>>,
 }
 
@@ -147,6 +155,8 @@ impl ConnCtx {
             flows: crate::flow::FlowTable::new(&limits),
             agreed: agreed_rx,
             established: std::time::Instant::now(),
+            segments_out: crate::radio::SegmentNumbers::new(limits.max_sequence_scopes),
+            segments_in: crate::radio::Newest::new(limits.max_sequence_scopes),
         });
 
         // Once per connection, never per message: a drain collects the
@@ -1156,6 +1166,22 @@ async fn dispatch(ctx: &ConnHandle, path: &str, transfer: IncomingTransfer) {
     if let Some(refusal) = refusal_for(route.as_ref(), Wanted::OneWay) {
         tracing::debug!(path, ?refusal, "the path does not serve a one-way transfer");
         transfer.refuse(refusal.stop);
+        return;
+    }
+    // A segment not newer than one delivered here on its path and topic is
+    // stale, whoever receives it; a dish counts its own (0034 §4.6).
+    if !matches!(route, Some(Route::Dish(_)))
+        && let (Some(topic), Some(segment)) =
+            (transfer.meta().topic.as_deref(), transfer.meta().segment)
+        && !ctx.segments_in.fresh(path, topic, segment)
+    {
+        tracing::debug!(
+            path,
+            topic,
+            segment,
+            "a segment not newer than one delivered here is refused"
+        );
+        transfer.refuse(codes::CANCELED);
         return;
     }
     match route {

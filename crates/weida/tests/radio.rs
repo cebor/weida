@@ -338,6 +338,89 @@ async fn a_peer_segment_supersedes_the_previous_one_on_its_topic() {
 }
 
 #[tokio::test]
+async fn two_peers_on_one_connection_number_one_sequence() {
+    // Both peers dial the same address with the same trust, so the pool
+    // gives them one connection: their segments on a topic share a sequence
+    // the acceptor sees only rise.
+    let server = Server::start().await;
+    let acceptor = server.listener.acceptor("/up").expect("acceptor");
+    let client = server.client_runtime();
+    let a = client.peer(server.trust());
+    let b = client.peer(server.trust());
+    within(a.connect(&server.url("/up")))
+        .await
+        .expect("connect a");
+    within(b.connect(&server.url("/up")))
+        .await
+        .expect("connect b");
+
+    for (n, peer) in [&a, &b].into_iter().enumerate() {
+        let mut segment = within(peer.segment("t", None)).await.expect("segment");
+        assert_eq!(segment.number(), n as u64);
+        segment.write(vec![0x42; 100]).expect("write");
+        segment.finish();
+        let transfer = stream_of(within(acceptor.accept()).await.expect("accept"));
+        assert_eq!(transfer.meta().segment, Some(n as u64));
+        let body = within(transfer.collect(4096))
+            .await
+            .expect("a whole segment");
+        assert_eq!(body.len(), 100);
+    }
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_acceptor_refuses_a_segment_older_than_one_it_delivered() {
+    use common::raw;
+    use weida::codes;
+    use weida_protocol::{DataHeader, FrameKind, encode_frame};
+
+    let server = Server::start().await;
+    let acceptor = server.listener.acceptor("/up").expect("acceptor");
+    let endpoint = raw::client_endpoint(&server.certs);
+    let conn = within(endpoint.connect(server.addr, "localhost").expect("connect"))
+        .await
+        .expect("handshake");
+    raw::send_hello(&conn).await;
+
+    // The stream stays open: a finished one that the transport acknowledged
+    // whole reports no STOP_SENDING.
+    async fn send(conn: &quinn::Connection, segment: u64) -> quinn::SendStream {
+        let header = DataHeader {
+            topic: Some("t".into()),
+            segment: Some(segment),
+            ..DataHeader::addressed("/up")
+        };
+        let mut stream = conn.open_uni().await.expect("open uni");
+        stream
+            .write_all(&encode_frame(FrameKind::Data, &header.encode()))
+            .await
+            .expect("write header");
+        stream.write_all(b"body").await.expect("write body");
+        stream
+    }
+
+    let mut newest = send(&conn, 5).await;
+    newest.finish().expect("finish");
+    let transfer = stream_of(within(acceptor.accept()).await.expect("accept"));
+    assert_eq!(transfer.meta().segment, Some(5));
+
+    let stale = send(&conn, 3).await;
+    assert_eq!(
+        within(stale.stopped()).await,
+        Ok(Some(
+            quinn::VarInt::from_u64(codes::CANCELED).expect("varint")
+        ))
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), acceptor.accept())
+            .await
+            .is_err(),
+        "a stale segment reached the acceptor"
+    );
+}
+
+#[tokio::test]
 async fn a_segment_supersedes_only_its_own_topic() {
     let server = Server::start().await;
     let radio = server.listener.radio("/r").expect("radio");

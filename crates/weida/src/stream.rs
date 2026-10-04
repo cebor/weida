@@ -561,7 +561,8 @@ impl Peer {
         let (conn, path) = self.shared.pick().await?;
         let shared = &self.shared;
         let topic: Arc<str> = Arc::from(topic);
-        let number = shared.segment_topics.next(&topic)?;
+        shared.segment_topics.supersede(&topic)?;
+        let number = conn.segments_out.next(&path, &topic);
         let (tx, rx) = mpsc::channel(COPY_QUEUE);
         let ctl = Arc::new(CopyCtl::default());
         shared.segment_topics.track(&topic, &ctl);

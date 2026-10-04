@@ -222,6 +222,12 @@ impl SegmentTopics {
         }
     }
 
+    /// Resets every unacknowledged copy of the previous segment on `topic`
+    /// without taking a number: the sender numbers elsewhere.
+    pub(crate) fn supersede(&self, topic: &Arc<str>) -> Result<(), Error> {
+        self.next(topic).map(drop)
+    }
+
     /// Takes the next number on `topic` and resets every unacknowledged copy
     /// of the previous segment there.
     pub(crate) fn next(&self, topic: &Arc<str>) -> Result<u64, Error> {
@@ -269,6 +275,121 @@ impl SegmentTopics {
         if let Some(state) = lock(&self.topics).0.get_mut(topic) {
             state.live.push(Arc::clone(copy));
         }
+    }
+}
+
+/// A number per (path, topic).
+type PerPath = HashMap<Arc<str>, HashMap<Arc<str>, u64>>;
+
+/// The newest segment delivered per (path, topic) on one connection: what a
+/// receiver — a dish or an acceptor — checks an arriving segment against.
+pub(crate) struct Newest {
+    /// Per path, per topic, the newest number; and the entries in total.
+    table: Mutex<(PerPath, usize)>,
+    max: usize,
+}
+
+impl Newest {
+    /// A table of at most `max` (path, topic) entries.
+    pub(crate) fn new(max: usize) -> Newest {
+        Newest {
+            table: Mutex::new((HashMap::new(), 0)),
+            max,
+        }
+    }
+
+    /// `true` when `segment` is newer than every segment delivered on
+    /// (`path`, `topic`), which it then becomes. At the table's cap an
+    /// untracked key is always fresh: the check needs memory, and memory is
+    /// bounded.
+    pub(crate) fn fresh(&self, path: &str, topic: &str, segment: u64) -> bool {
+        let mut guard = lock(&self.table);
+        let (paths, count) = &mut *guard;
+        if let Some(last) = paths.get_mut(path).and_then(|t| t.get_mut(topic)) {
+            if segment <= *last {
+                return false;
+            }
+            *last = segment;
+            return true;
+        }
+        if *count < self.max {
+            match paths.get_mut(path) {
+                Some(topics) => {
+                    topics.insert(Arc::from(topic), segment);
+                }
+                None => {
+                    paths.insert(
+                        Arc::from(path),
+                        HashMap::from([(Arc::from(topic), segment)]),
+                    );
+                }
+            }
+            *count += 1;
+        }
+        true
+    }
+}
+
+/// The segment numbers per (path, topic) of one dialling connection: every
+/// [`crate::Peer`] that sends segments over it shares one sequence, so a
+/// receiver's [`Newest`] on that connection sees them only rise.
+pub(crate) struct SegmentNumbers {
+    /// Per path, per topic, the next number; the entries in total; and the
+    /// number a key created after an eviction starts from.
+    table: Mutex<(PerPath, usize, u64)>,
+    max: usize,
+}
+
+impl SegmentNumbers {
+    /// A table of at most `max` (path, topic) entries.
+    pub(crate) fn new(max: usize) -> SegmentNumbers {
+        SegmentNumbers {
+            table: Mutex::new((HashMap::new(), 0, 0)),
+            max,
+        }
+    }
+
+    /// Takes the next number on (`path`, `topic`). Never fails: at the cap
+    /// it evicts an entry, and a key that comes back resumes above every
+    /// number an evicted one reached, so a receiver never takes it as stale.
+    pub(crate) fn next(&self, path: &Arc<str>, topic: &Arc<str>) -> u64 {
+        let mut guard = lock(&self.table);
+        let (paths, count, floor) = &mut *guard;
+        if let Some(next) = paths.get_mut(&**path).and_then(|t| t.get_mut(&**topic)) {
+            let number = *next;
+            *next += 1;
+            return number;
+        }
+        if *count >= self.max {
+            let evicted = paths.iter().find_map(|(p, topics)| {
+                topics
+                    .iter()
+                    .next()
+                    .map(|(t, next)| (Arc::clone(p), Arc::clone(t), *next))
+            });
+            if let Some((p, t, next)) = evicted {
+                if let Some(topics) = paths.get_mut(&p) {
+                    topics.remove(&t);
+                    if topics.is_empty() {
+                        paths.remove(&p);
+                    }
+                }
+                *count -= 1;
+                *floor = (*floor).max(next);
+            }
+        }
+        let number = *floor;
+        if *count < self.max {
+            paths
+                .entry(Arc::clone(path))
+                .or_default()
+                .insert(Arc::clone(topic), number + 1);
+            *count += 1;
+        } else {
+            // A table of no entries at all: every segment takes the floor.
+            *floor += 1;
+        }
+        number
     }
 }
 
